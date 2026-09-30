@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "cann_version": "9.2.0",
+  "shmem": {
+    "repository": "https://gitcode.com/cann/shmem",
+    "ref": "refs/heads/dev",
+    "revision": "7f9d961d378225e69058080532cf4f5be16cc83d",
+    "distribution": "pinned third-party/shmem submodule or external SDK; headers and library recorded by record_shmem_sdk.py",
+    "header_sha256_lf": {
+      "host/shmem_host_def.h": "659aaa719af9c38bafef72921a73cca325c3c30f0f43be30b6ba9f0535de6cf6",
+      "host/init/shmem_host_init.h": "d1f35d7d15bd2121b7c4092c7c0a8c8dae1d7153166eb45628484e194c171419",
+      "host/mem/shmem_host_heap.h": "5ef864fd9c6c812169de6e1dfbbb6b55481cd9cb67e543a681c3e19d5ce627b4",
+      "host/data_plane/shmem_host_cc.h": "dc8704f0d3fe00abe99ad5c9fa0bb74a79f7cda8c2af9242dc717cdd9f45ceb6",
+      "host_device/shmem_common_types.h": "528cd9698815312358253c40b74f4f0668b86af637843f9f767f6d625c273a34",
+      "host_device/shmem_common_macros.h": "d1540f47e041ddc544a975ddf9fda2e9801c5243d5730a5966598229adb7af60"
+    }
+  },
+  "python_build": {
+    "build": "1.2.2.post1",
+    "setuptools": "79.0.1",
+    "wheel": "0.47.0",
+    "pybind11": "3.0.4"
+  },
+  "target": "Ascend950",
+  "device_kernels": [
+    "full-notify-metadata",
+    "expanded-dispatch-urma-mte",
+    "expanded-combine-urma-mte",
+    "expanded-dispatch-low-latency",
+    "expanded-combine-low-latency"
+  ],
+  "qualification": "See docs/api.md; build success does not qualify EP operations",
+  "megamoe": {
+    "catlass_repository": "https://gitcode.com/cann/catlass",
+    "catlass_revision": "2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1",
+    "qualification": "CPU tests only; Ascend950 multi-rank validation required"
+  }
+}

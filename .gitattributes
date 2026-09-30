@@ -1,0 +1,10 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
+# Keep source and documentation line endings stable across Windows and Linux.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.whl binary

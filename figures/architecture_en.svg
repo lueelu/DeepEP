@@ -1,0 +1,84 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1022" viewBox="0 0 1400 1022" role="img" aria-labelledby="diagram-title diagram-description">
+<title id="diagram-title">DeepEP Software Architecture</title>
+<desc id="diagram-description">Core EP interfaces and the experimental MegaMoE API, execution and runtime support, Ascend C kernels, communication components and the Ascend platform.</desc>
+<rect id="canvas" x="0" y="0" width="1400" height="1022" rx="0" fill="#ffffff" stroke="#ffffff" stroke-width="1.5"/>
+<rect id="library" x="144" y="132" width="1208" height="560" rx="16" fill="#fbfcfe" stroke="#a7b9d0" stroke-width="1.5"/>
+<rect id="host_zone" x="160" y="288" width="800" height="252" rx="10" fill="#f0f5fb" stroke="#d6e1ef" stroke-width="1.5"/>
+<rect id="application" x="160" y="24" width="1176" height="76" rx="10" fill="#f3f6fa" stroke="#d2dbe7" stroke-width="1.5"/>
+<rect id="core_api" x="160" y="178" width="800" height="94" rx="10" fill="#eaf2ff" stroke="#6c91d0" stroke-width="1.5"/>
+<rect id="beta_api" x="984" y="178" width="352" height="94" rx="10" fill="#fff8ee" stroke="#d6a25e" stroke-width="1.5" stroke-dasharray="7 5"/>
+<rect id="beta_api_badge" x="1152" y="192" width="166" height="30" rx="6" fill="#fff0d9" stroke="#d6a25e" stroke-width="1.5"/>
+<rect id="core_semantics" x="176" y="300" width="768" height="106" rx="10" fill="#ffffff" stroke="#b6c9e4" stroke-width="1.5"/>
+<rect id="core_layout" x="192" y="353" width="232" height="36" rx="6" fill="#eaf2ff" stroke="#d6e1ef" stroke-width="1.5"/>
+<rect id="core_dispatch" x="444" y="353" width="232" height="36" rx="6" fill="#eaf2ff" stroke="#d6e1ef" stroke-width="1.5"/>
+<rect id="core_combine" x="696" y="353" width="232" height="36" rx="6" fill="#eaf2ff" stroke="#d6e1ef" stroke-width="1.5"/>
+<rect id="core_execution" x="176" y="438" width="768" height="86" rx="10" fill="#ffffff" stroke="#b6c9e4" stroke-width="1.5"/>
+<rect id="runtime" x="984" y="288" width="352" height="128" rx="10" fill="#f4f0fa" stroke="#b6a6cb" stroke-width="1.5"/>
+<rect id="policies" x="984" y="440" width="352" height="100" rx="10" fill="#f4f0fa" stroke="#b6a6cb" stroke-width="1.5"/>
+<rect id="device_zone" x="160" y="580" width="1176" height="90" rx="10" fill="#eaf2ff" stroke="#6c91d0" stroke-width="1.5"/>
+<rect id="shmem" x="160" y="730" width="562" height="84" rx="10" fill="#edf6f8" stroke="#89aebb" stroke-width="1.5"/>
+<rect id="templates" x="750" y="730" width="586" height="84" rx="10" fill="#fff8eb" stroke="#cba65d" stroke-width="1.5" stroke-dasharray="7 5"/>
+<rect id="cann" x="160" y="850" width="1176" height="58" rx="10" fill="#f3f6fa" stroke="#b9c7d8" stroke-width="1.5"/>
+<rect id="hardware" x="160" y="942" width="1176" height="56" rx="10" fill="#172b4d" stroke="#172b4d" stroke-width="1.5"/>
+<polyline id="core_entry" points="560,100 560,178" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline points="556.0,170.0 560,178 564.0,170.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline id="beta_entry" points="1160,100 1160,178" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline points="1156.0,170.0 1160,178 1164.0,170.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline id="core_call" points="560,272 560,300" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline points="556.0,292.0 560,300 564.0,292.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline id="core_prepare" points="560,406 560,438" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline points="556.0,430.0 560,438 564.0,430.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline id="core_launch" points="560,524 560,580" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline points="556.0,572.0 560,580 564.0,572.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline id="runtime_support" points="984,352 960,352" fill="none" stroke="#8b73aa" stroke-width="1.8" stroke-dasharray="6 5"/>
+<polyline points="968.0,348.0 960,352 968.0,356.0" fill="none" stroke="#8b73aa" stroke-width="1.8"/>
+<polyline id="policy_input" points="984,490 960,490" fill="none" stroke="#8b73aa" stroke-width="1.8" stroke-dasharray="6 5"/>
+<polyline points="968.0,486.0 960,490 968.0,494.0" fill="none" stroke="#8b73aa" stroke-width="1.8"/>
+<polyline id="comm_dependency" points="441,692 441,730" fill="none" stroke="#7896a3" stroke-width="1.8" stroke-dasharray="6 5"/>
+<polyline points="437.0,722.0 441,730 445.0,722.0" fill="none" stroke="#7896a3" stroke-width="1.8"/>
+<polyline id="template_dependency" points="1043,692 1043,730" fill="none" stroke="#b28f4f" stroke-width="1.8" stroke-dasharray="6 5"/>
+<polyline points="1039.0,722.0 1043,730 1047.0,722.0" fill="none" stroke="#b28f4f" stroke-width="1.8"/>
+<polyline id="shmem_platform" points="441,814 441,850" fill="none" stroke="#647b94" stroke-width="1.8" stroke-dasharray="6 5"/>
+<polyline points="437.0,842.0 441,850 445.0,842.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline id="templates_platform" points="1043,814 1043,850" fill="none" stroke="#647b94" stroke-width="1.8" stroke-dasharray="6 5"/>
+<polyline points="1039.0,842.0 1043,850 1047.0,842.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<polyline id="hardware_dependency" points="748,908 748,942" fill="none" stroke="#647b94" stroke-width="1.8" stroke-dasharray="6 5"/>
+<polyline points="744.0,934.0 748,942 752.0,934.0" fill="none" stroke="#647b94" stroke-width="1.8"/>
+<text id="layer_applications" x="24" y="67" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#61738a" text-anchor="start" data-max-width="112">Applications</text>
+<text id="layer_interfaces" x="24" y="232" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#61738a" text-anchor="start" data-max-width="112">Interfaces</text>
+<text id="layer_host" x="24" y="383" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#61738a" text-anchor="start" data-max-width="112">Host logic</text>
+<text id="layer_device" x="24" y="630" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#61738a" text-anchor="start" data-max-width="112">Device</text>
+<text id="layer_dependencies" x="24" y="778" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#61738a" text-anchor="start" data-max-width="112">Components</text>
+<text id="layer_platform" x="24" y="884" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#61738a" text-anchor="start" data-max-width="112">Platform</text>
+<text id="layer_cluster" x="24" y="975" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#61738a" text-anchor="start" data-max-width="112">Hardware</text>
+<text id="app_title" x="748.0" y="70" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="25" font-weight="600" fill="#172b4d" text-anchor="middle" data-max-width="1136">Inference engines · Training frameworks · MoE applications</text>
+<text id="library_label" x="160" y="165" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="23" font-weight="600" fill="#172b4d" text-anchor="start" data-max-width="370">DeepEP</text>
+<text id="core_api_title" x="180" y="216" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="26" font-weight="700" fill="#244f8d" text-anchor="start" data-max-width="760">Core EP API</text>
+<text id="core_api_body" x="180" y="253" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#172b4d" text-anchor="start" data-max-width="760">Layout · Dispatch / Combine · Handles &amp; events · Async overlap</text>
+<text id="core_sem_title" x="192" y="333" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="23" font-weight="600" fill="#172b4d" text-anchor="start" data-max-width="736">EP operation semantics</text>
+<text id="core_layout_text" x="308.0" y="377" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="600" fill="#244f8d" text-anchor="middle" data-max-width="216">Routing &amp; layout</text>
+<text id="core_dispatch_text" x="560.0" y="377" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="600" fill="#244f8d" text-anchor="middle" data-max-width="216">Token dispatch</text>
+<text id="core_combine_text" x="812.0" y="377" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="600" fill="#244f8d" text-anchor="middle" data-max-width="216">Result combine</text>
+<text id="core_exec_title" x="192" y="471" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="24" font-weight="600" fill="#172b4d" text-anchor="start" data-max-width="736">Execution preparation &amp; launch</text>
+<text id="core_exec_body" x="192" y="510" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#172b4d" text-anchor="start" data-max-width="736">Capability matching · Variant selection · Parameter binding · Kernel launch</text>
+<text id="beta_api_title" x="1002" y="216" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="24" font-weight="600" fill="#9a640b" text-anchor="start" data-max-width="142">MegaMoE</text>
+<text id="beta_api_status" x="1235.0" y="214" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="600" fill="#9a640b" text-anchor="middle" data-max-width="154">Experimental API</text>
+<text id="beta_api_body" x="1002" y="256" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#9a640b" text-anchor="start" data-max-width="316">Large fused MoE kernel · Beta</text>
+<text id="runtime_title" x="1002" y="325" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="23" font-weight="600" fill="#604987" text-anchor="start" data-max-width="316">Shared runtime</text>
+<text id="runtime_body1" x="1002" y="364" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#172b4d" text-anchor="start" data-max-width="316">Context · Memory &amp; buffers</text>
+<text id="runtime_body2" x="1002" y="398" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#172b4d" text-anchor="start" data-max-width="316">Streams &amp; events · Completion</text>
+<text id="policy_title" x="1002" y="477" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="23" font-weight="600" fill="#604987" text-anchor="start" data-max-width="316">Topology &amp; policies</text>
+<text id="policy_body" x="1002" y="513" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="18" font-weight="400" fill="#172b4d" text-anchor="start" data-max-width="316">Links · Cores · Tiles · Pipelines</text>
+<text id="device_title" x="748.0" y="616" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="25" font-weight="600" fill="#244f8d" text-anchor="middle" data-max-width="1136">Ascend C kernels</text>
+<text id="device_body" x="748.0" y="655" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#172b4d" text-anchor="middle" data-max-width="1136">Fine-grained pipelines · Data movement · Synchronization · Communication–compute overlap</text>
+<text id="shmem_title" x="180" y="765" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="24" font-weight="600" fill="#2e6476" text-anchor="start" data-max-width="522">SHMEM communication</text>
+<text id="shmem_body" x="180" y="801" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#172b4d" text-anchor="start" data-max-width="522">Resources · Remote access · Synchronization</text>
+<text id="template_title" x="770" y="764" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="23" font-weight="600" fill="#8f681f" text-anchor="start" data-max-width="546">Compute &amp; communication-fusion templates</text>
+<text id="template_body" x="770" y="801" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="20" font-weight="400" fill="#172b4d" text-anchor="start" data-max-width="546">CATLASS · CatCCOS</text>
+<text id="cann_title" x="748.0" y="889" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="24" font-weight="600" fill="#172b4d" text-anchor="middle" data-max-width="1136">CANN / Ascend C · Runtime and compiler toolchain</text>
+<text id="hardware_title" x="748.0" y="980" font-family="'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', Arial, sans-serif" font-size="24" font-weight="600" fill="#ffffff" text-anchor="middle" data-max-width="1136">Ascend NPU cluster · Device interconnects and execution resources</text>
+</svg>

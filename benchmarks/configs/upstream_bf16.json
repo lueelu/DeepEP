@@ -1,0 +1,12 @@
+{
+  "api": "elastic",
+  "operation": "roundtrip",
+  "dtype": "bf16",
+  "layout": "ordinary",
+  "world_size": 8,
+  "tokens_per_rank": [4096, 4095, 4094, 4093, 4092, 4091, 4090, 4089],
+  "hidden": 7168,
+  "topk": 6,
+  "experts": 256,
+  "alignment": 1
+}

@@ -1,0 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
+pytest==8.3.5
+setuptools==79.0.1
+pre-commit==4.3.0

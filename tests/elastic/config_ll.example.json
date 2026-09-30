@@ -1,0 +1,20 @@
+{
+  "hosts": ["xxx.xxx.xxx.xxx", "xxx.xxx.xxx.xxx"],
+  "num_processes": 8,
+  "num_bytes": 8589934592,
+  "master_port": "xxxxx",
+  "shmem_port": "xxxxx",
+  "output_dir": "benchmark-runs",
+  "warmup": 5,
+  "loops": 20,
+  "perf_tail": 0,
+  "route": "normal",
+  "matrix": {
+    "num_tokens": [8, 16, 32],
+    "dtype": ["bf16", "fp16", "fp8"],
+    "num_experts": [64, 128],
+    "hidden": [4096, 7168],
+    "num_topk": [4, 8],
+    "do_cpu_sync": [0, 1]
+  }
+}

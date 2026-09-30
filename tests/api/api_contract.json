@@ -1,0 +1,612 @@
+{
+  "schema_version": 3,
+  "contract": "EP declarations adapted from the cited upstream sources, not an exact upstream signature snapshot.",
+  "platform_naming": {
+    "scaleup": "Intra-domain transport; no particular interconnect implementation is implied.",
+    "scaleout": "Inter-domain transport; no particular interconnect implementation is implied.",
+    "memory_transport": "Memory-semantic transport only, not all scale-up backends; flags do not establish capability.",
+    "qps": "Reserved for a QP-capable backend, not a shared DMA queue/channel count; no QP policy is implemented.",
+    "compute_units": "Backend-defined compute scheduling units; values are not hardware tuning recommendations.",
+    "device": "NPU execution, timeout and reference-capture terminology.",
+    "aligned_col_major_sf": "Reserved scale-factor layout option; no implementation or alignment capability is implied.",
+    "compatibility": "Only the declared project keyword names are accepted; removed platform-specific aliases are not retained."
+  },
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/DeepEP",
+    "revision": "a56d6156febcd9976e55adc85b5155bfac9f28f8",
+    "sources": {
+      "deep_ep/buffers/legacy.py": "efc37e62c34418d2057e5df87a7729c67e88a8d3ca8a6dd969f0f60cde770a23",
+      "deep_ep/buffers/elastic.py": "a5a08ccf47eb3521ea6df1d040bfa53b8454b7bf9b940b56b3549bba21922170",
+      "deep_ep/utils/event.py": "fb5e51f6456afced877fefb7042bd96f8d87e984c867d75a0f125932ffd6ba84",
+      "csrc/legacy/buffer.hpp": "1f8bb500a4b8f3152244ed7fcaecf404e4eb985ab5e025fec91fbe41657a9688",
+      "csrc/legacy/config.hpp": "1788b4ac3a0300245935d5e92b9261f45f0dd6277618faf7b4f53f1f1198d1f0"
+    }
+  },
+  "implementation_status": "declarations_only",
+  "exports": [
+    "Buffer",
+    "ElasticBuffer",
+    "EPHandle",
+    "Config",
+    "EventHandle",
+    "EventOverlap"
+  ],
+  "deviations": [
+    {
+      "symbol": "ElasticBuffer.dispatch",
+      "parameter": "do_expand",
+      "upstream_default": false,
+      "project_default": null,
+      "reason": "None will select False on first dispatch and inherit the handle layout on cached dispatch; explicit conflicts must fail. No dispatch is implemented yet."
+    }
+  ],
+  "deferred_exports": {
+    "topk_idx_t": "Requires the native build's index-width choice; no dtype alias is fabricated.",
+    "module_level_topology_queries": "Only ElasticBuffer method declarations are included."
+  },
+  "excluded_scope": [
+    "Engram",
+    "pipeline parallelism",
+    "AGRS",
+    "device architecture probes",
+    "native extension internals"
+  ],
+  "target_contracts": {
+    "status": "specified_not_implemented",
+    "Buffer.get_dispatch_layout": {
+      "returns": [
+        "num_tokens_per_rank",
+        "num_tokens_per_scaleout_rank",
+        "num_tokens_per_expert",
+        "is_token_in_rank",
+        "event"
+      ]
+    },
+    "Buffer.dispatch": {
+      "returns": [
+        "recv_x",
+        "recv_topk_idx",
+        "recv_topk_weights",
+        "num_recv_tokens_per_expert_list",
+        "handle",
+        "event"
+      ]
+    },
+    "Buffer.combine": {
+      "returns": [
+        "combined_x",
+        "combined_topk_weights",
+        "event"
+      ]
+    },
+    "ElasticBuffer.dispatch": {
+      "returns": [
+        "recv_x",
+        "recv_topk_idx",
+        "recv_topk_weights",
+        "handle",
+        "event"
+      ],
+      "unexpanded": {
+        "x": "[N,H]",
+        "topk_idx": "[N,K]",
+        "weights": "[N,K] or None"
+      },
+      "expanded": {
+        "x": "[R,H]",
+        "topk_idx": null,
+        "weights": "[R] or None"
+      }
+    },
+    "ElasticBuffer.combine": {
+      "returns": [
+        "combined_x",
+        "combined_topk_weights",
+        "event"
+      ],
+      "x": "[T,H]",
+      "weights": "[T,K] or None",
+      "weight_semantics": "Independent FP32 route values; not an implicit multiplication of x."
+    },
+    "EPHandle": {
+      "caller_fields": [
+        "do_expand",
+        "num_experts",
+        "num_max_tokens_per_rank",
+        "num_recv_tokens_per_expert_list"
+      ],
+      "ownership": "Routing plan belongs to one buffer and survives until the matching backward/recompute finishes.",
+      "metadata_version": 6,
+      "forward_list": {
+        "shape": "[world_size,T*K,6]",
+        "dtype": "int32",
+        "fields": ["token_end", "token_id", "primary_row", "secondary_rank", "secondary_row", "gather_row"],
+        "token_end": "Exclusive row end within the source partition, repeated on every row of the same token."
+      },
+      "backward_list_order": ["token_chunk", "gateway_group", "src_rank", "gather_row"],
+      "weight_return_meta": {
+        "shape": "[num_expanded_tokens]",
+        "dtype": "int32",
+        "encoding": "(src_rank * T + token_id) * K + topk_id",
+        "topk_id": "Original top-k position, not expert ID.",
+        "storage": "View of framework-owned [world_size*T*K] storage; cached routing must remain unchanged."
+      }
+    },
+    "events": {
+      "Buffer.capture": "EventOverlap",
+      "ElasticBuffer.capture": "EventHandle",
+      "rule": "Normalize only EventOverlap wrappers; never unwrap EventHandle a second time."
+    }
+  },
+  "objects": {
+    "Buffer": {
+      "module": "deep_ep.buffers.legacy",
+      "source": "deep_ep/buffers/legacy.py",
+      "methods": {
+        "__init__": {
+          "upstream_line": 33,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "group", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_scaleup_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_scaleout_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "low_latency_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "num_qps_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": 24},
+            {"name": "allow_memory_transport_for_low_latency_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "allow_multinode_memory_transport", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "explicitly_destroy", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "enable_shrink", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "comm", "kind": "POSITIONAL_OR_KEYWORD", "default": null}
+          ]
+        },
+        "destroy": {
+          "upstream_line": 138,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "set_num_compute_units": {
+          "upstream_line": 154,
+          "kind": "staticmethod",
+          "parameters": [
+            {"name": "new_num_compute_units", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "capture": {
+          "upstream_line": 166,
+          "kind": "staticmethod",
+          "parameters": []
+        },
+        "get_low_latency_scaleout_size_hint": {
+          "upstream_line": 176,
+          "kind": "staticmethod",
+          "parameters": [
+            {"name": "num_max_dispatch_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "hidden", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_ranks", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_comm_stream": {
+          "upstream_line": 191,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_dispatch_config": {
+          "upstream_line": 233,
+          "kind": "staticmethod",
+          "parameters": [
+            {"name": "num_ranks", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_combine_config": {
+          "upstream_line": 263,
+          "kind": "staticmethod",
+          "parameters": [
+            {"name": "num_ranks", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_dispatch_layout": {
+          "upstream_line": 293,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "previous_event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "async_finish", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allocate_on_comm_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        },
+        "dispatch": {
+          "upstream_line": 322,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "x", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_tokens_per_scaleout_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "is_token_in_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_tokens_per_expert", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "topk_weights", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "expert_alignment", "kind": "POSITIONAL_OR_KEYWORD", "default": 1},
+            {"name": "num_worst_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "config", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "previous_event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "async_finish", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allocate_on_comm_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        },
+        "combine": {
+          "upstream_line": 408,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "x", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_weights", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "bias", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "config", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "previous_event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "async_finish", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allocate_on_comm_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        },
+        "clean_low_latency_buffer": {
+          "upstream_line": 538,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_max_dispatch_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "hidden", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "low_latency_dispatch": {
+          "upstream_line": 553,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "x", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_max_dispatch_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "cumulative_local_expert_recv_stats", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "dispatch_wait_recv_cost_stats", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "use_fp8", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "round_scale", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "use_ue8m0", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "async_finish", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "return_recv_hook", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        },
+        "low_latency_combine": {
+          "upstream_line": 624,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "x", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_weights", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "use_logfmt", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "zero_copy", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "async_finish", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "return_recv_hook", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "out", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "combine_wait_recv_cost_stats", "kind": "POSITIONAL_OR_KEYWORD", "default": null}
+          ]
+        },
+        "get_next_low_latency_combine_buffer": {
+          "upstream_line": 700,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        }
+      }
+    },
+    "EPHandle": {
+      "module": "deep_ep.buffers.elastic",
+      "source": "deep_ep/buffers/elastic.py",
+      "methods": {
+        "__init__": {
+          "upstream_line": 59,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "do_expand", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "expert_alignment", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_max_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_expanded_tokens", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_recv_tokens_per_expert_list", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "psum_num_recv_tokens_per_scaleup_rank", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "psum_num_recv_tokens_per_expert", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_unaligned_recv_tokens_per_expert", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "recv_src_metadata", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "dst_buffer_slot_idx", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "token_metadata_at_forward", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "channel_linked_list", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "is_low_latency", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        }
+      }
+    },
+    "ElasticBuffer": {
+      "module": "deep_ep.buffers.elastic",
+      "source": "deep_ep/buffers/elastic.py",
+      "methods": {
+        "__init__": {
+          "upstream_line": 228,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "group", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_cpu_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_max_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "hidden", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_topk", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "use_fp8_dispatch", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "deterministic", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allow_hybrid_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "allow_multiple_reduction", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "prefer_overlap_with_compute", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "sl_idx", "kind": "POSITIONAL_OR_KEYWORD", "default": 3},
+            {"name": "num_allocated_qps", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_cpu_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 300},
+            {"name": "num_device_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 100},
+            {"name": "explicitly_destroy", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "rank", "kind": "KEYWORD_ONLY", "default": null},
+            {"name": "world_size", "kind": "KEYWORD_ONLY", "default": null}
+          ]
+        },
+        "destroy": {
+          "upstream_line": 369,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_buffer_size_hint": {
+          "upstream_line": 381,
+          "kind": "staticmethod",
+          "parameters": [
+            {"name": "group", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_max_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "hidden", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_topk", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "use_fp8_dispatch", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allow_hybrid_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "allow_multiple_reduction", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "world_size", "kind": "KEYWORD_ONLY", "default": null}
+          ]
+        },
+        "barrier": {
+          "upstream_line": 497,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "use_comm_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "with_cpu_sync", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "sequential", "kind": "POSITIONAL_OR_KEYWORD", "default": true}
+          ]
+        },
+        "capture": {
+          "upstream_line": 530,
+          "kind": "staticmethod",
+          "parameters": []
+        },
+        "get_comm_stream": {
+          "upstream_line": 539,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_physical_domain_size": {
+          "upstream_line": 549,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_logical_domain_size": {
+          "upstream_line": 559,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "get_theoretical_num_compute_units": {
+          "upstream_line": 729,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_topk", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_scaleout_topk", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "scaleout_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "scaleup_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "compute_read_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 200},
+            {"name": "compute_write_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 50}
+          ]
+        },
+        "get_theoretical_num_qps": {
+          "upstream_line": 836,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "dispatch": {
+          "upstream_line": 855,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "x", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "topk_weights", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "cumulative_local_expert_recv_stats", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_max_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "expert_alignment", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_qps", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "previous_event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "previous_event_before_epilogue", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "async_with_compute_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allocate_on_comm_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "do_handle_copy", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "do_cpu_sync", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "do_expand", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "do_zero_padding", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "use_aligned_col_major_sf", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        },
+        "combine": {
+          "upstream_line": 1046,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "x", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "topk_weights", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "bias", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_qps", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "previous_event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "previous_event_before_epilogue", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "async_with_compute_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allocate_on_comm_stream", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        }
+      }
+    },
+    "EventOverlap": {
+      "module": "deep_ep.utils.event",
+      "source": "deep_ep/utils/event.py",
+      "methods": {
+        "__init__": {
+          "upstream_line": 17,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "extra_tensors", "kind": "POSITIONAL_OR_KEYWORD", "default": null}
+          ]
+        },
+        "current_stream_wait": {
+          "upstream_line": 39,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "release_handle", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        },
+        "register_hook_after_wait": {
+          "upstream_line": 56,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "hook_after_wait", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "__call__": {
+          "upstream_line": 63,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "release_handle", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+          ]
+        },
+        "__enter__": {
+          "upstream_line": 74,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "__exit__": {
+          "upstream_line": 88,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "exc_type", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "exc_val", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "exc_tb", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        }
+      }
+    },
+    "Config": {
+      "module": "deep_ep._config",
+      "source": "csrc/legacy/buffer.hpp",
+      "methods": {
+        "__init__": {
+          "upstream_line": 1752,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD", "default": 20},
+            {"name": "num_max_scaleup_chunked_send_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 6},
+            {"name": "num_max_scaleup_chunked_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 256},
+            {"name": "num_max_scaleout_chunked_send_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 6},
+            {"name": "num_max_scaleout_chunked_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 256}
+          ]
+        },
+        "get_scaleup_buffer_size_hint": {
+          "upstream_line": 1759,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_ONLY"},
+            {"name": "hidden_bytes", "kind": "POSITIONAL_ONLY"},
+            {"name": "num_ranks", "kind": "POSITIONAL_ONLY"}
+          ]
+        },
+        "get_scaleout_buffer_size_hint": {
+          "upstream_line": 1760,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_ONLY"},
+            {"name": "hidden_bytes", "kind": "POSITIONAL_ONLY"},
+            {"name": "num_ranks", "kind": "POSITIONAL_ONLY"}
+          ]
+        }
+      }
+    },
+    "EventHandle": {
+      "module": "deep_ep.utils.event",
+      "source": "csrc/legacy/buffer.hpp",
+      "methods": {
+        "__init__": {
+          "upstream_line": 1763,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        },
+        "current_stream_wait": {
+          "upstream_line": 1765,
+          "kind": "method",
+          "parameters": [
+            {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
+          ]
+        }
+      }
+    }
+  }
+}

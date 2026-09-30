@@ -1,0 +1,21 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
+include VERSION CMakeLists.txt build_support.py dependencies.lock.json
+include LICENSE
+include .gitmodules
+include requirements-dev.txt pytest.ini
+include requirements-build.txt
+recursive-include cmake *.cmake CMakeLists.txt
+recursive-include csrc *.cpp *.hpp *.h
+recursive-include docs *.md
+recursive-include scripts *.py *.sh
+recursive-include tests *.py *.json *.cpp *.h *.md
+recursive-include benchmarks *.py *.json *.csv *.md
+include third-party/*.md third-party/*.LICENSE
+prune third-party/shmem
+prune third-party/catlass
+recursive-include experiments/megamoe *.sh *.py *.cpp *.hpp *.cmake CMakeLists.txt *.json *.md *.txt *.LICENSE
+include experiments/__init__.py
+include experiments/ep_gmm_fused/tests/requirements.txt
+recursive-include experiments/ep_gmm_fused *.py *.cpp *.hpp *.h *.cmake CMakeLists.txt *.md *.json LICENSE

@@ -1,0 +1,16 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
+target-version = "py311"
+line-length = 120
+
+[lint]
+# E4：导入位置与写法；E7：语句写法；E9：语法及文件读取问题。
+# F：未使用的导入、未定义名称及其他 Pyflakes 常规错误。
+select = ["E4", "E7", "E9", "F"]
+
+[format]
+# 使用双引号、空格缩进和 LF 换行；长行按 120 列目标排版。
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

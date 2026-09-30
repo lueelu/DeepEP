@@ -1,0 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
+[build-system]
+requires = ["setuptools==79.0.1", "wheel==0.47.0", "pybind11==3.0.4"]
+build-backend = "setuptools.build_meta"

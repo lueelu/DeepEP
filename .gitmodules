@@ -1,0 +1,10 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
+[submodule "third-party/shmem"]
+	path = third-party/shmem
+	url = https://gitcode.com/cann/shmem.git
+	branch = dev
+[submodule "third-party/catlass"]
+	path = third-party/catlass
+	url = https://gitcode.com/cann/catlass.git

@@ -1,0 +1,445 @@
+{
+  "schema": "deepep-reference-golden/v2",
+  "upstream_commit": "a56d6156febcd9976e55adc85b5155bfac9f28f8",
+  "precision_standard": "Ascend operator precision standard 2.1 / L2",
+  "device_qualification_cases": [
+    {
+      "name": "device_ep1_bf16",
+      "world_size": 1,
+      "experts": 8,
+      "hidden": 256,
+      "topk": 1,
+      "tokens_per_rank": [
+        1
+      ],
+      "dtype": "bfloat16",
+      "expert_alignment": 1,
+      "with_weights": true,
+      "expanded": false,
+      "operation": "roundtrip",
+      "distribution": "small"
+    },
+    {
+      "name": "device_ep2_bf16",
+      "world_size": 2,
+      "experts": 8,
+      "hidden": 256,
+      "topk": 2,
+      "tokens_per_rank": [
+        1,
+        17
+      ],
+      "dtype": "bfloat16",
+      "expert_alignment": 1,
+      "with_weights": true,
+      "expanded": false,
+      "operation": "combine",
+      "distribution": "uniform"
+    },
+    {
+      "name": "device_ep2_fp8_aligned",
+      "world_size": 2,
+      "experts": 8,
+      "hidden": 512,
+      "topk": 2,
+      "tokens_per_rank": [
+        15,
+        17
+      ],
+      "dtype": "float8_e4m3fn",
+      "expert_alignment": 128,
+      "with_weights": true,
+      "expanded": true,
+      "operation": "roundtrip",
+      "distribution": "outlier"
+    },
+    {
+      "name": "device_ep4_bf16_aligned",
+      "world_size": 4,
+      "experts": 64,
+      "hidden": 1024,
+      "topk": 4,
+      "tokens_per_rank": [
+        15,
+        16,
+        17,
+        33
+      ],
+      "dtype": "bfloat16",
+      "expert_alignment": 128,
+      "with_weights": true,
+      "expanded": true,
+      "operation": "roundtrip",
+      "distribution": "normal"
+    },
+    {
+      "name": "device_ep4_fp8_topk8",
+      "world_size": 4,
+      "experts": 64,
+      "hidden": 256,
+      "topk": 8,
+      "tokens_per_rank": [
+        33,
+        17,
+        16,
+        15
+      ],
+      "dtype": "float8_e4m3fn",
+      "expert_alignment": 1,
+      "with_weights": false,
+      "expanded": false,
+      "operation": "dispatch",
+      "distribution": "uniform"
+    },
+    {
+      "name": "device_ep8_upstream_bf16",
+      "world_size": 8,
+      "experts": 256,
+      "hidden": 7168,
+      "topk": 6,
+      "tokens_per_rank": [
+        9,
+        8,
+        7,
+        6,
+        5,
+        4,
+        3,
+        2
+      ],
+      "dtype": "bfloat16",
+      "expert_alignment": 1,
+      "with_weights": true,
+      "expanded": false,
+      "operation": "roundtrip",
+      "distribution": "outlier"
+    },
+    {
+      "name": "device_ep8_upstream_fp8",
+      "world_size": 8,
+      "experts": 256,
+      "hidden": 7168,
+      "topk": 6,
+      "tokens_per_rank": [
+        9,
+        8,
+        7,
+        6,
+        5,
+        4,
+        3,
+        2
+      ],
+      "dtype": "float8_e4m3fn",
+      "expert_alignment": 128,
+      "with_weights": true,
+      "expanded": true,
+      "operation": "roundtrip",
+      "distribution": "normal"
+    },
+    {
+      "name": "device_ep8_token_boundary",
+      "world_size": 8,
+      "experts": 256,
+      "hidden": 256,
+      "topk": 8,
+      "tokens_per_rank": [
+        4096,
+        257,
+        256,
+        17,
+        16,
+        15,
+        1,
+        0
+      ],
+      "dtype": "bfloat16",
+      "expert_alignment": 128,
+      "with_weights": false,
+      "expanded": true,
+      "operation": "dispatch",
+      "distribution": "uniform"
+    }
+  ],
+  "notes": [
+    "CPU FP64 mathematical oracle is the golden truth.",
+    "Second benchmark emulates the pinned upstream BF16 or per-128 E4M3FN dispatch path and BF16 observable combine output.",
+    "Device qualification must replace or supplement emulation with captured upstream-device results using the same inputs.",
+    "Device qualification cases require one torchrun execution for each EP world size and are not materialized during CPU manifest checks."
+  ],
+  "cases": [
+    {
+      "name": "ep1_edge",
+      "config": {
+        "name": "ep1_edge",
+        "world_size": 1,
+        "experts": 8,
+        "hidden": 128,
+        "topk": 1,
+        "tokens_per_rank": [
+          1
+        ],
+        "dtype": "bfloat16",
+        "distribution": "small"
+      },
+      "valid_route_slots": 1,
+      "ordinary_rows": [
+        1
+      ],
+      "expanded_rows": [
+        1
+      ],
+      "expert_counts_sha256": "d0bcfd713113eeb4523d631169016ba9008e3d161f6053044dbdb204e1e7e9cb",
+      "cpu_fp64_combine_sha256": "84038ea3d278ac4ba358d738be5f49e8029612d757812bd9c16b0d553a0a7404",
+      "upstream_dtype_combine_sha256": "da0a2ba6417175ddb62c9b46390f342bd1f99ede03e17a32caefe959af26e014",
+      "upstream_dtype_error": {
+        "mare": 0.0,
+        "mere": 0.0,
+        "rmse": 0.0,
+        "small_error_count": 0,
+        "normal_count": 0,
+        "small_count": 128
+      }
+    },
+    {
+      "name": "ep2_non_aligned",
+      "config": {
+        "name": "ep2_non_aligned",
+        "world_size": 2,
+        "experts": 8,
+        "hidden": 127,
+        "topk": 2,
+        "tokens_per_rank": [
+          1,
+          17
+        ],
+        "dtype": "bfloat16",
+        "distribution": "uniform"
+      },
+      "valid_route_slots": 36,
+      "ordinary_rows": [
+        16,
+        15
+      ],
+      "expanded_rows": [
+        19,
+        17
+      ],
+      "expert_counts_sha256": "c3e8c4cd424dae712809ba65d663346d19bd86f140c0978f4abc783e52bf6c75",
+      "cpu_fp64_combine_sha256": "af4639a5809955ebf96e916677d8b9ba59decaad8a1f64842b5ab1d4ad2574fa",
+      "upstream_dtype_combine_sha256": "5b9a400a49751c34d6ea417913c3c4517a35331ac0a9f397ae14a5e5bae2d187",
+      "upstream_dtype_error": {
+        "mare": 0.006976556321821979,
+        "mere": 0.0019531206403689896,
+        "rmse": 0.06269478709848714,
+        "small_error_count": 0,
+        "normal_count": 2285,
+        "small_count": 1
+      }
+    },
+    {
+      "name": "ep4_boundaries",
+      "config": {
+        "name": "ep4_boundaries",
+        "world_size": 4,
+        "experts": 64,
+        "hidden": 256,
+        "topk": 4,
+        "tokens_per_rank": [
+          15,
+          16,
+          17,
+          33
+        ],
+        "dtype": "bfloat16",
+        "distribution": "normal"
+      },
+      "valid_route_slots": 322,
+      "ordinary_rows": [
+        69,
+        67,
+        70,
+        70
+      ],
+      "expanded_rows": [
+        83,
+        78,
+        81,
+        80
+      ],
+      "expert_counts_sha256": "3f2731038a23c0ab0e24055249c73bf7cabf99ccfc0bd108d3ffcbec572c1fc9",
+      "cpu_fp64_combine_sha256": "2bd86831def7a08fef1b68be771c296d22cfc48265a97e54dfdd21cb7d0c00da",
+      "upstream_dtype_combine_sha256": "6dd7dab1f7ec5ea123c9b76b6f0cbb0e3593c92da6664d89edb511c77cbaccf3",
+      "upstream_dtype_error": {
+        "mare": 0.006825403327537808,
+        "mere": 0.0019214118830111263,
+        "rmse": 16.26357904738777,
+        "small_error_count": 0,
+        "normal_count": 20736,
+        "small_count": 0
+      }
+    },
+    {
+      "name": "ep8_upstream_bf16",
+      "config": {
+        "name": "ep8_upstream_bf16",
+        "world_size": 8,
+        "experts": 256,
+        "hidden": 7168,
+        "topk": 6,
+        "tokens_per_rank": [
+          9,
+          8,
+          7,
+          6,
+          5,
+          4,
+          3,
+          2
+        ],
+        "dtype": "bfloat16",
+        "distribution": "outlier"
+      },
+      "valid_route_slots": 264,
+      "ordinary_rows": [
+        10,
+        33,
+        44,
+        34,
+        11,
+        0,
+        0,
+        0
+      ],
+      "expanded_rows": [
+        16,
+        64,
+        101,
+        68,
+        15,
+        0,
+        0,
+        0
+      ],
+      "expert_counts_sha256": "7b8f0ff352e502128fec46dd19d91031aed63f5382849db5fabda872bf83ffb9",
+      "cpu_fp64_combine_sha256": "20c8ce26d894ef6de2b75905e819f3e01cba7881ae20eb5aba59f76d031be2b3",
+      "upstream_dtype_combine_sha256": "9c9ab766e7cb7e5b91adce0d623a867f65c15fc67286c22b79fd4c149c00b219",
+      "upstream_dtype_error": {
+        "mare": 0.00732186529114666,
+        "mere": 0.0019295358478571742,
+        "rmse": 0.11563051897985133,
+        "small_error_count": 2,
+        "normal_count": 314845,
+        "small_count": 547
+      }
+    },
+    {
+      "name": "ep8_upstream_fp8",
+      "config": {
+        "name": "ep8_upstream_fp8",
+        "world_size": 8,
+        "experts": 256,
+        "hidden": 7168,
+        "topk": 6,
+        "tokens_per_rank": [
+          9,
+          8,
+          7,
+          6,
+          5,
+          4,
+          3,
+          2
+        ],
+        "dtype": "float8_e4m3fn",
+        "distribution": "uniform"
+      },
+      "valid_route_slots": 264,
+      "ordinary_rows": [
+        10,
+        33,
+        44,
+        34,
+        11,
+        0,
+        0,
+        0
+      ],
+      "expanded_rows": [
+        16,
+        64,
+        101,
+        68,
+        15,
+        0,
+        0,
+        0
+      ],
+      "expert_counts_sha256": "7b8f0ff352e502128fec46dd19d91031aed63f5382849db5fabda872bf83ffb9",
+      "cpu_fp64_combine_sha256": "ac34c5d504ea6d239e91e4b12e9ef1daa06e5c7e1d96ccc1f51f49f583ec3a2f",
+      "upstream_dtype_combine_sha256": "9ab6f727409828e963ef3cfb7a1472c5fec6c07542bcc2aa01d83e7c4af511ba",
+      "upstream_dtype_error": {
+        "mare": 0.0627649101279312,
+        "mere": 0.022302223002644467,
+        "rmse": 36.769434460910475,
+        "small_error_count": 0,
+        "normal_count": 315381,
+        "small_count": 11
+      }
+    },
+    {
+      "name": "ep8_token_volume",
+      "config": {
+        "name": "ep8_token_volume",
+        "world_size": 8,
+        "experts": 256,
+        "hidden": 16,
+        "topk": 8,
+        "tokens_per_rank": [
+          4096,
+          4095,
+          4094,
+          4093,
+          4092,
+          4091,
+          4090,
+          4089
+        ],
+        "dtype": "float8_e4m3fn",
+        "distribution": "normal"
+      },
+      "valid_route_slots": 259232,
+      "ordinary_rows": [
+        15695,
+        15683,
+        15683,
+        15685,
+        15698,
+        15707,
+        15707,
+        15709
+      ],
+      "expanded_rows": [
+        32414,
+        32384,
+        32373,
+        32379,
+        32414,
+        32421,
+        32420,
+        32427
+      ],
+      "expert_counts_sha256": "b4742558732edc6feb593ba8d8d4abe78d73154f44e15b234be9d4cef10baeec",
+      "cpu_fp64_combine_sha256": "dd1ade7de19b12a05001158d65fb77e29876377eb65fe07125f88ae77a9d4949",
+      "upstream_dtype_combine_sha256": "7750ae3fcb8458c81580f2f285fa9f0e98c06737a10ec4f5e5d701c5638e12f8",
+      "upstream_dtype_error": {
+        "mare": 0.06743813706708424,
+        "mere": 0.020324513697975832,
+        "rmse": 1449.0526634100931,
+        "small_error_count": 0,
+        "normal_count": 523840,
+        "small_count": 0
+      }
+    }
+  ]
+}

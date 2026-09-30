@@ -1,0 +1,4 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
+numpy>=1.24,<3

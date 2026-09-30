@@ -1,0 +1,11 @@
+{
+  "api": "elastic",
+  "operation": "dispatch",
+  "dtype": "bf16",
+  "layout": "expanded",
+  "world_size": 2,
+  "tokens_per_rank": [16, 15],
+  "hidden": 256,
+  "topk": 2,
+  "experts": 8
+}

@@ -1,0 +1,55 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
+# Python and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Native build and packaging outputs
+/build/
+/dist/
+_skbuild/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.dll
+*.pyd
+*.whl
+
+# Machine-local configuration and reports
+.env
+.env.*
+!.env.example
+*.log
+/benchmark-runs/
+/outputs/python-cluster/
+/benchmark-golden/
+/api-contracts.xml
+/cpu-correctness.xml
+/source-tests.xml
+/installed-tests.xml
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# User-owned MegaMoE deployment configuration
+/experiments/megamoe/hosts*.json
+/experiments/megamoe/clusters*.json
+/.test-deps/
+/.venv-comm-gmm/
+/.venv-ep-gmm-fused/
+/third-party/catccos/
+/third-party/shmem/

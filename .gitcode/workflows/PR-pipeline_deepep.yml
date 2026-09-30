@@ -1,0 +1,212 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by dilililiwhy 2026
+
+name: PR-pipeline_deepep
+
+concurrency:
+  max: 120
+  exceed-action: QUEUE
+  enable: true
+  preemption:
+    enable: true
+    events: [mr_id]
+
+on:
+  pr_comment:
+    types: [created]
+    keyword: '^compile$'
+
+  pull_request_comment:
+    types: [created]
+    branches: [ 'main' ]
+    comments: [ '^compile$' ]
+
+env:
+  repo: ${{ atomgit.event.repository.name }}
+  pr_id: ${{ atomgit.event.pull_request.number }}
+  org_name: "Ascend"
+
+permissions:
+  project: read
+  repository: read
+  id-token: write
+  pr: write
+  note: write
+  action: read
+
+stages:
+  stage_1:
+    name: only_doc
+    select: selected_by_default
+    jobs:
+      Detect_file_changes:
+        name: Detect_file_changes
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
+        outputs:
+          need_build_ut: ${{ steps.set-skip.outputs.need_build_ut }}
+        steps:
+          - name: checkout
+            uses: checkout
+            with:
+              ref: refs/merge-requests/${{ env.pr_id }}/merge
+              fetch-depth: 0
+              allow-unsafe-pr-checkout: true
+          - name: Only_doc_commit
+            id: filter
+            uses: paths-changes-filter
+            with:
+              event-name: 'pull_request'
+              base: ${{ atomgit.event.pull_request.base.ref }}
+              repo: ${{ atomgit.repository }}
+              number: ${{ env.pr_id }}
+              token: ${{ secrets.GIT_TOKEN }}
+              list-files: json
+              predicate-quantifier: every
+              filters: |
+                changed:
+                  - '**'
+                non-doc:
+                  - '!**/*.md'
+                  - '!**/*.rst'
+                  - '!**/*.log'
+                  - '!**/*.png'
+                  - '!**/*.jpg'
+                  - '!**/*.doc'
+                  - '!**/*.eddx'
+                  - '!**/*.svg'
+
+          - name: set build skip flag
+            id: set-skip
+            run: |
+              echo "changed: ${{ steps.filter.outputs.changed_files }}"
+              echo "non-doc: ${{ steps.filter.outputs.non-doc }}"
+              if [ "${{ steps.filter.outputs.non-doc }}" = "true" ]; then
+                echo "need_build_ut=yes" >> "$ATOMGIT_OUTPUT"
+              else
+                echo "need_build_ut=no" >> "$ATOMGIT_OUTPUT"
+              fi
+              echo "${{ steps.filter.outputs.changed_files }}" | tr -d '[]" ' | tr ',' '\n' > modify_files.txt
+              cat modify_files.txt
+          - name: upload modify_files.txt
+            uses: upload-artifact
+            with:
+              name: modify_files.txt
+              path: modify_files.txt
+              overwrite: true
+
+      associate_pr_comment:
+        name: associate_pr_comment
+        select: selected_by_default
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
+        steps:
+          - name: associate-pr-comment
+            uses: associate-pr-comment
+          - name: pre_pipeline
+            id: pre_pipeline
+            uses: cann/.gitcode/actions/pre-pipeline@689551d6b29a77d8c2a005b8f1b3883db24820ef
+            with:
+              owner: ${{ env.org_name }}
+              repo: ${{ atomgit.event.repository.name }}
+              pr_number: ${{ atomgit.event.pull_request.number }}
+              token: ${{ secrets.GIT_TOKEN }}
+              apply_label: 'true'
+              run_url: https://gitcode.com/${{ env.org_name }}/${{ atomgit.event.repository.name }}/actions/runs/${{ atomgit.workflow_run_id }}
+
+  stage_2:
+    name: CodeCheck
+    select: selected_by_default
+    jobs:
+      CPU_correctness:
+        name: CPU API, reference, runtime and build preflight tests
+        if: ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
+        runs-on: [ self-hosted, default, x86, cpu=16 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
+        steps:
+          - name: checkout
+            uses: checkout
+            with:
+              ref: refs/merge-requests/${{ env.pr_id }}/merge
+          - name: Install test dependencies
+            run: python3.11 -m pip install -r requirements-dev.txt
+          - name: Verify contracts, runtime fault injection, build preflight and device collection
+            run: |
+              command -v g++
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3.11 -m pytest -m "not framework" --junitxml=cpu-correctness.xml
+          - name: Validate benchmark presets without devices
+            run: |
+              python3.11 -m benchmarks.bench_ep --dry-run --preset smoke
+              python3.11 -m benchmarks.bench_ep --dry-run --preset upstream-bf16
+              python3.11 -m benchmarks.bench_ep --dry-run --preset upstream-fp8
+          - name: Upload CPU correctness results
+            uses: upload-artifact
+            with:
+              name: cpu-correctness
+              path: cpu-correctness.xml
+              overwrite: true
+
+      CodeCheck_pre_commit:
+        name: Pre-commit checks
+        # Run for documentation-only PRs too; all files keeps rule changes covered.
+        runs-on: [ self-hosted, default, x86, cpu=16 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
+        steps:
+          - name: checkout
+            uses: checkout
+            with:
+              ref: refs/merge-requests/${{ env.pr_id }}/merge
+          - name: Install development dependencies
+            run: python3.11 -m pip install -r requirements-dev.txt
+          - name: Check all tracked files
+            run: python3.11 -m pre_commit run --all-files --show-diff-on-failure
+
+      sca-pr:
+        if : ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
+        steps:
+          - name: checkout
+            uses: checkout
+          - name: Run SCA PR scan
+            uses: openlibing/sca-action/sca-pr-action@v1.0.0
+            with:
+              project-name: Ascend-CANN
+
+      malicious-scan:
+        if : ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
+        steps:
+          - name: checkout
+            uses: checkout
+          - name: Run malicious code scan
+            uses: openlibing/malicious-code-scan-action/malicious-code-pr-scan-action@v1.0.0
+            with:
+              repository-name: ${{ atomgit.repository }}
+              pr-id: "${{ atomgit.event.pull_request.number }}"
+              project-name: Ascend-CANN
+
+post:
+  jobs:
+    query_pipeline:
+      runs-on: [ self-hosted, default, x86, cpu=8 ]
+      container:
+        image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
+      steps:
+        - name: query_pipeline
+          id: query_pipeline
+          uses: cann/.gitcode/actions/query-pipeline@689551d6b29a77d8c2a005b8f1b3883db24820ef
+          with:
+            owner: ${{ env.org_name }}
+            repo: ${{ atomgit.event.repository.name }}
+            run_id: ${{ atomgit.workflow_run_id }}
+            token: ${{ secrets.GIT_TOKEN }}
+            pr_number: ${{ atomgit.event.pull_request.number }}
+            apply_label: 'true'

@@ -1,0 +1,65 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
+minimum_pre_commit_version: 4.3.0
+default_stages: [pre-commit]
+
+repos:
+  # 基础文件检查。
+  - repo: https://gitcode.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0
+    hooks:
+      # 清理行尾空白，保留 Markdown 的双空格换行。
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      # 确保非空文本文件以一个换行符结束。
+      - id: end-of-file-fixer
+      # 检查 YAML 语法及重复键。
+      - id: check-yaml
+      # 检查 JSON 语法及重复键。
+      - id: check-json
+      # 拦截超过 1 MiB 的普通 Git 文件，CI 中也检查已提交文件。
+      - id: check-added-large-files
+        args: [--maxkb=1024, --enforce-all]
+      # 检查遗留的合并冲突标记，不依赖当前是否正在执行 merge。
+      - id: check-merge-conflict
+        args: [--assume-in-merge]
+      # 检查常见私钥文件标记，防止误提交私钥。
+      - id: detect-private-key
+
+  # Python 常规错误检查与格式化。
+  - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit
+    rev: 60ef368a6f48dfb4317651017f66dbb055241a6c  # v0.12.12
+    hooks:
+      # 检查导入、语句、语法及未定义名称等常规问题，规则见 .ruff.toml。
+      - id: ruff-check
+        args: [--config=.ruff.toml]
+        exclude: ^third-party/
+      # 统一 Python 缩进、空格、换行和引号；格式不符时自动改写文件。
+      - id: ruff-format
+        args: [--config=.ruff.toml]
+        exclude: ^third-party/
+
+  # C/C++/AscendC 格式化。
+  - repo: https://gitcode.com/pre-commit-clang/mirrors-clang-format
+    rev: 7d85583be209cb547946c82fbe51f4bc5dd1d017  # v18.1.8
+    hooks:
+      # 按 .clang-format 统一缩进、换行和大括号，跳过第三方源码。
+      - id: clang-format
+        # 使用扩展名筛选，确保 .asc 文件也会执行格式化。
+        types: [file]
+        types_or: []
+        files: \.(c|h|cpp|hpp|cc|hh|cxx|hxx|asc)$
+        args: [--style=file]
+        exclude: ^third-party/
+
+  # 英文拼写检查。
+  - repo: https://gitcode.com/gh_mirrors/co/codespell
+    rev: 63c8f8312b7559622c0d82815639671ae42132ac  # v2.4.1
+    hooks:
+      # 检查文档、代码和文本配置中的常见拼写错误，不改写数据与图稿。
+      - id: codespell
+        files: \.(md|rst|txt|py|c|h|cpp|hpp|cc|hh|cxx|hxx|asc|ya?ml|toml)$
+        exclude: ^third-party/(?!README\.md$)
+        # AGRS、CANN、Clos、ND 布局，以及代码中的 Te、sav、aActual 标识符；EnQue 是 SDK API 名。
+        args: ["--ignore-words-list=agrs,cann,clos,nd,te,sav,aactual,EnQue"]

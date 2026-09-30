@@ -1,0 +1,5 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
+-r ../../../requirements-dev.txt
+numpy==1.26.4
