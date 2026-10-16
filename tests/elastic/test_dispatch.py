@@ -641,7 +641,7 @@ def _host_elastic_buffer(monkeypatch):
             ["dispatch", "rank_dispatch" if tensors["dedup_group_size"] == 1 else "server_dispatch"]
         ),
         combine=lambda session, tensors, *args: calls.update(
-            ["combine", "combine_ep8_mte" if tensors.get("ep8_rank_mte", False) else "combine_default"]
+            ["combine", "combine_ep8_pipeline" if tensors.get("ep8_rank_pipeline", False) else "combine_default"]
         ),
         combine_ep8_mte_version=lambda: 2,
     )
@@ -770,7 +770,7 @@ def test_default_dedup_dispatch_combine_and_cached_handle(monkeypatch):
                 assert calls["rank_dispatch"] == int(expected)
                 assert calls["server_dispatch"] == int(not expected)
                 buffer.combine(recv, handle)
-                assert calls["combine_ep8_mte"] == int(world == 8 and expected)
+                assert calls["combine_ep8_pipeline"] == int(world == 8 and expected)
                 assert calls["combine_default"] == int(world != 8 or not expected)
                 _, _, _, cached, _ = buffer.dispatch(x, handle=handle)
                 assert cached is handle and calls["notify"] == 1
@@ -791,7 +791,7 @@ def test_ep8_combine_weights_use_mte(monkeypatch):
     buffer.combine(recv, handle)
     out, weights, _ = buffer.combine(recv, handle, topk_weights=tensor((2,), torch.float32))
     assert out.shape == (2, 128) and weights.shape == (2, 1)
-    assert calls["combine_ep8_mte"] == 2 and calls["combine_default"] == 0
+    assert calls["combine_ep8_pipeline"] == 2 and calls["combine_default"] == 0
     assert calls["notify"] == 1 and calls["combine"] == 2
 
 
@@ -808,12 +808,12 @@ def test_ep8_combine_weights_require_native_support(monkeypatch):
     indices.zero_()
     recv, _, _, handle, _ = buffer.dispatch(x, topk_idx=indices, num_experts=8)
     buffer.combine(recv, handle)
-    with pytest.raises(RuntimeError, match="EP8 rank MTE v2"):
+    with pytest.raises(RuntimeError, match="EP8 return pipeline v2"):
         buffer.combine(recv, handle, topk_weights=tensor((2,), torch.float32))
     assert calls["combine"] == 1 and not buffer._runtime.notify_failed
     native.combine_ep8_mte_version = lambda: 2
     buffer.combine(recv, handle, topk_weights=tensor((2,), torch.float32))
-    assert calls["combine_ep8_mte"] == 2
+    assert calls["combine_ep8_pipeline"] == 2
 
 
 def test_cached_layout_variants_and_capacity_checks(monkeypatch):

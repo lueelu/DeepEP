@@ -239,7 +239,7 @@ def profile_combine(args, rank, scenario, buffer, expert, invoke, validate, info
             if clean["kernel"] != "combine_reuse_kernel":
                 raise RuntimeError("Reuse profiling selected the wrong kernel")
             return dict(clean_profile=clean, reuse_tokens=buffer._combine_last_reuse_tokens, precision_checked=True)
-        kernel = "combine_ep8_mte_kernel" if getattr(args, "ep8_rank_mte", False) else "combine_kernel"
+        kernel = "combine_ep8_kernel" if getattr(args, "ep8_rank_pipeline", False) else "combine_kernel"
         profile_kernel = kernel.replace("_kernel", "_profile_kernel")
         if clean["kernel"] != kernel:
             raise RuntimeError("Combine performance must use the uninstrumented kernel")
@@ -272,7 +272,7 @@ def profile_combine(args, rank, scenario, buffer, expert, invoke, validate, info
             hidden=getattr(args, "hidden", 7168),
             sample=sample,
             chunk_tokens=chunk_tokens,
-            ep8_rank_mte=getattr(args, "ep8_rank_mte", False),
+            ep8_rank_pipeline=getattr(args, "ep8_rank_pipeline", False),
         )
         events = _combine_chunks["decode"](
             chunk_profile.cpu().tolist(),
@@ -281,7 +281,7 @@ def profile_combine(args, rank, scenario, buffer, expert, invoke, validate, info
             tokens=args.tokens,
             sample=sample,
             chunk_tokens=chunk_tokens,
-            ep8_rank_mte=getattr(args, "ep8_rank_mte", False),
+            ep8_rank_pipeline=getattr(args, "ep8_rank_pipeline", False),
         )
         directory = args.output / "diagnostics" / scenario
         directory.mkdir(parents=True, exist_ok=True)
@@ -1354,28 +1354,28 @@ def test_combine_return_slots_cover_topk(world, topk):
         (["--with-weights"], True),
     ],
 )
-def test_ep8_rank_mte_cli_selects_kernel_automatically(monkeypatch, tmp_path, extra, expected):
+def test_ep8_rank_pipeline_cli_selects_kernel_automatically(monkeypatch, tmp_path, extra, expected):
     calls = []
     monkeypatch.setitem(_notify, "_launch", lambda args, worker: calls.append(args))
     prefix = ["test_combine.py", "--ep-size", "8", "--experts", "384", "--output", str(tmp_path)]
     monkeypatch.setattr(sys, "argv", prefix + extra)
     main()
-    assert len(calls) == 1 and calls[0].ep8_rank_mte == expected
+    assert len(calls) == 1 and calls[0].ep8_rank_pipeline == expected
 
 
-def test_ep8_rank_mte_profile_selects_the_requested_kernel(tmp_path):
+def test_ep8_rank_pipeline_profile_selects_the_requested_kernel(tmp_path):
     csv = tmp_path / "kernel_details.csv"
     csv.write_text(
         "Name,Duration(us)\ncombine_prepare_kernel,3\ncombine_prepare_kernel,4\n"
         "combine_kernel,1200\ncombine_kernel,1300\n"
-        "combine_ep8_mte_kernel,400\ncombine_ep8_mte_kernel,500\n"
-        "combine_ep8_mte_profile_kernel,600\n",
+        "combine_ep8_kernel,400\ncombine_ep8_kernel,500\n"
+        "combine_ep8_profile_kernel,600\n",
         encoding="utf-8",
     )
     normal = _notify["read_kernel_summary"](tmp_path, "combine", 2)
-    optimized = _notify["read_kernel_summary"](tmp_path, "combine", 2, ep8_rank_mte=True)
+    optimized = _notify["read_kernel_summary"](tmp_path, "combine", 2, ep8_rank_pipeline=True)
     assert normal["avg_us"] == 1250 and optimized["avg_us"] == 450
-    assert optimized["kernel"] == "combine_ep8_mte_kernel"
+    assert optimized["kernel"] == "combine_ep8_kernel"
     assert optimized["prepare"]["avg_us"] == 3.5
 
 
@@ -3066,7 +3066,7 @@ def main():
     _notify["add_profile_args"](parser, ("combine",))
     args = parser.parse_args()
     _notify["resolve_dedup_args"](args, "no_server_dedup")
-    args.ep8_rank_mte = args.ep_size == 8 and args.no_server_dedup
+    args.ep8_rank_pipeline = args.ep_size == 8 and args.no_server_dedup
     if args.reuse_window_tokens < 0 or args.combine_capacity_mib < 0:
         parser.error("Reuse window and workspace limit must be nonnegative")
     if (args.reuse_window_tokens or args.combine_capacity_mib) and args.no_server_dedup:
@@ -3592,8 +3592,8 @@ _chunk_ROOT = Path(__file__).resolve().parents[2]
 _chunk_chunk = runpy.run_path(str(_chunk_ROOT / "tests/elastic/combine_chunks.py"))
 
 
-def _chunk_records(ep8_rank_mte=False):
-    world, tokens, sample = (8 if ep8_rank_mte else 16, 257, 7)
+def _chunk_records(ep8_rank_pipeline=False):
+    world, tokens, sample = (8 if ep8_rank_pipeline else 16, 257, 7)
     _, count, words = _chunk_chunk["shape"](world, tokens)
     data = [[[0] * words for _ in range(count)] for _ in range(64)]
     chunks = count // 3
@@ -3601,7 +3601,7 @@ def _chunk_records(ep8_rank_mte=False):
         for k in range(chunks):
             kinds = (
                 [5] + ([4] if core < 32 else [2])
-                if ep8_rank_mte
+                if ep8_rank_pipeline
                 else [5] + ([4] if core < 8 else [3] if core < 24 else [2])
             )
             for kind in kinds:
@@ -3613,7 +3613,7 @@ def _chunk_records(ep8_rank_mte=False):
                     Core=core,
                     Group=0,
                     Chunk=k,
-                    Peer=(core // 4 if ep8_rank_mte else core) if kind == 4 else 2**32 - 1,
+                    Peer=(core // 4 if ep8_rank_pipeline else core) if kind == 4 else 2**32 - 1,
                     Begin=100 + k * 1000,
                     WorkBegin=110 + k * 1000,
                     WorkEnd=120 + k * 1000,
@@ -3626,7 +3626,7 @@ def _chunk_records(ep8_rank_mte=False):
 
 
 @pytest.mark.parametrize("weights", [False, True])
-def test_ep8_rank_mte_diagnostics_validate_new_core_ownership(weights):
+def test_ep8_rank_pipeline_diagnostics_validate_new_core_ownership(weights):
     rows = _summary_records(world=8)
     for core, row in enumerate(rows):
         row[_summary_FIELDS.index("WithWeights")] = int(weights)
@@ -3634,25 +3634,25 @@ def test_ep8_rank_mte_diagnostics_validate_new_core_ownership(weights):
         if core < 32:
             row[_summary_FIELDS.index("GatherEnd")] = row[_summary_FIELDS.index("ProducerBegin")]
     args = dict(rank=0, world=8, tokens=4096, topk=6, weights=weights, sample=1)
-    decoded = _summary_metrics["decode_profile"](rows, **args, ep8_rank_mte=True)
+    decoded = _summary_metrics["decode_profile"](rows, **args, ep8_rank_pipeline=True)
     assert [c["role"] for c in decoded] == ["local"] * 32 + ["gateway"] * 32
     assert all(c["phases_us"]["gather"] == 0 for c in decoded[:32])
     with pytest.raises(ValueError, match="Missing/stale"):
         _summary_metrics["decode_profile"](rows, **args)
 
-    records, args = _chunk_records(ep8_rank_mte=True)
-    events = _chunk_chunk["decode"](records, **args, ep8_rank_mte=True)
+    records, args = _chunk_records(ep8_rank_pipeline=True)
+    events = _chunk_chunk["decode"](records, **args, ep8_rank_pipeline=True)
     local = [e for e in events if e["kind"] == "local_return"]
     assert {e["core"] for e in local} == set(range(32))
     assert all(e["peer"] == e["core"] // 4 for e in local)
     trace = _chunk_report(events)
-    trace.update(world_size=8, kernel="combine_ep8_mte_profile_kernel")
+    trace.update(world_size=8, kernel="combine_ep8_profile_kernel")
     assert _chunk_chunk["perfetto_trace"](trace, "ep8.json")["traceEvents"]
     with pytest.raises(ValueError):
         _chunk_chunk["decode"](records, **args)
     records[4][5][_chunk_chunk["FIELDS"].index("Peer")] = 4
     with pytest.raises(ValueError, match="local peer/core"):
-        _chunk_chunk["decode"](records, **args, ep8_rank_mte=True)
+        _chunk_chunk["decode"](records, **args, ep8_rank_pipeline=True)
 
 
 def _chunk_report(events, **extra):
@@ -4146,6 +4146,56 @@ def test_peer_cpp_python_record_abi():
     header = (_peer_ROOT / "csrc/kernels/combine/peer_profile.hpp").read_text()
     enum = header.split("enum Field : uint32_t {", 1)[1].split("};", 1)[0]
     assert [re.split("\\s*=", item.strip())[0] for item in enum.split(",")] == _peer_peer["FIELDS"]
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_ep8_window_source_pool_requires_every_owner(rank):
+    records, args = _chunk_records(ep8_rank_pipeline=True)
+    args["rank"] = rank
+    chunks = len(records[0]) // 3
+    ends = _combine_peers["window_ends"](args["tokens"])
+    fields = {name: i for i, name in enumerate(_chunk_chunk["FIELDS"])}
+    result = [[[0] * _chunk_chunk["WORDS"] for _ in records[0]] for _ in range(64)]
+    for core in range(64):
+        for chunk in range(chunks):
+            end = next(e for e in ends if e >= chunk)
+            begin = 32 if end != ends[-1] else 11
+            kinds = ([4] if core < 11 else []) + ([2] if core >= 32 else []) + ([5] if core >= begin else [])
+            for kind in kinds:
+                index = (2 if kind == 5 else 1 if kind == 4 else 0) * chunks + chunk
+                row = records[0 if kind in (4, 5) else 32][index].copy()
+                row[fields["Core"]], row[fields["WindowEnd"]] = core, end
+                row[fields["Flags"]] = (
+                    (0x45600000 | 64 << 8 | (64 - begin))
+                    if kind == 5
+                    else _chunk_chunk["EP8_SINGLE_QP_FLAG"]
+                    if kind == 4
+                    else 0
+                )
+                if kind == 4:
+                    row[fields["Peer"]] = (core if core < rank else core + 1) if core < 7 else rank
+                result[core][index] = row
+    _chunk_chunk["decode"](result, **args, ep8_rank_pipeline=True)
+    result[62][2 * chunks] = [0] * _chunk_chunk["WORDS"]
+    with pytest.raises(ValueError, match="Missing final-reduce"):
+        _chunk_chunk["decode"](result, **args, ep8_rank_pipeline=True)
+
+
+def test_ep8_summary_decoder_validates_compact_core_roles():
+    rows = _summary_records(world=8)
+    fields = {name: i for i, name in enumerate(_summary_FIELDS)}
+    for core, row in enumerate(rows):
+        row[fields["WithWeights"]] = 0
+        row[fields["Role"]] = 0 if core < 11 else 2 if core >= 32 else 3
+    decoded = _summary_metrics["decode_profile"](
+        rows, rank=0, world=8, tokens=4096, topk=6, weights=False, sample=1, ep8_rank_pipeline=True
+    )
+    assert [d["role"] for d in decoded] == ["local"] * 11 + ["idle"] * 21 + ["gateway"] * 32
+    rows[12][fields["Role"]] = 0
+    with pytest.raises(ValueError, match="Missing/stale"):
+        _summary_metrics["decode_profile"](
+            rows, rank=0, world=8, tokens=4096, topk=6, weights=False, sample=1, ep8_rank_pipeline=True
+        )
 
 
 if __name__ == "__main__":

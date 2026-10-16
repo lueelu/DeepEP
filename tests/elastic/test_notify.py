@@ -640,17 +640,17 @@ def _statistics(kernel, durations):
     )
 
 
-def read_kernel_summary(directory, operator, expected_samples, *, ep8_rank_mte=False, combine_reuse=False):
+def read_kernel_summary(directory, operator, expected_samples, *, ep8_rank_pipeline=False, combine_reuse=False):
     """Select one CSV source only; retain all samples and reject incomplete captures."""
     kernel = _PROFILE_KERNELS[operator]
     if combine_reuse:
-        if operator != "combine" or ep8_rank_mte:
+        if operator != "combine" or ep8_rank_pipeline:
             raise ValueError("Reuse profiling requires server Combine")
         kernel = "combine_reuse_kernel"
-    if ep8_rank_mte:
+    if ep8_rank_pipeline:
         if operator != "combine":
-            raise ValueError("EP8 rank MTE profiling requires Combine")
-        kernel = "combine_ep8_mte_kernel"
+            raise ValueError("EP8 return pipeline profiling requires Combine")
+        kernel = "combine_ep8_kernel"
     wanted = {kernel}
     if operator == "combine" and not combine_reuse:
         wanted.add("combine_prepare_kernel")
@@ -869,8 +869,8 @@ def profile_operator(args, rank, scenario, invoke, validate, build_info, log):
     validate(last)
     if getattr(args, "combine_reuse", False):
         summary = read_kernel_summary(directory, args.profile_op, args.profile_iters, combine_reuse=True)
-    elif getattr(args, "ep8_rank_mte", False):
-        summary = read_kernel_summary(directory, args.profile_op, args.profile_iters, ep8_rank_mte=True)
+    elif getattr(args, "ep8_rank_pipeline", False):
+        summary = read_kernel_summary(directory, args.profile_op, args.profile_iters, ep8_rank_pipeline=True)
     else:
         summary = read_kernel_summary(directory, args.profile_op, args.profile_iters)
     summary.update(metadata, precision_checked=True)

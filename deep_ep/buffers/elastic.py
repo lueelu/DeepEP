@@ -1127,11 +1127,14 @@ class ElasticBuffer:
                         "topk_weights must be contiguous FP32 [num_expanded_tokens] on the buffer NPU without grad"
                     )
                 rows, gathered = handle.address_stride, handle._gather_stride
-                ep8_mte = runtime.world_size == 8 and getattr(handle, "_rank_return_plan", False)
-                if ep8_mte:
+                ep8_pipeline = runtime.world_size == 8 and getattr(handle, "_rank_return_plan", False)
+                if ep8_pipeline:
                     required_version = 2 if topk_weights is not None else 1
-                    if getattr(native, "combine_ep8_mte_version", lambda: 0)() < required_version:
-                        raise RuntimeError(f"Rebuild/install all ranks for EP8 rank MTE v{required_version}")
+                    if (
+                        getattr(native, "combine_ep8_version", getattr(native, "combine_ep8_mte_version", lambda: 0))()
+                        < required_version
+                    ):
+                        raise RuntimeError(f"Rebuild/install all ranks for EP8 return pipeline v{required_version}")
                 layout_key = (runtime.world_size, tokens, topk, rows, gathered, chunk, handle.hidden)
                 cached = handle._combine_layout_cache
                 if cached is None or cached[0] != layout_key:
@@ -1191,8 +1194,8 @@ class ElasticBuffer:
                         )
                     if stage_input:
                         tensors["stage_input"] = True
-                    if ep8_mte:
-                        tensors["ep8_rank_mte"] = True
+                    if ep8_pipeline:
+                        tensors["ep8_rank_pipeline"] = True
                     output_weights = None
                     if topk_weights is not None:
                         output_weights = torch.empty((tokens, topk), dtype=torch.float32, device=x.device)
@@ -1227,7 +1230,7 @@ class ElasticBuffer:
                     handle.hidden,
                 ]
                 signature += [int(profile is not None), profile_sample]
-                signature += [int(ep8_mte)]
+                signature += [int(ep8_pipeline)]
                 signature += [int(stage_input)]
                 signature += [reuse_tokens, combine_capacity]
             except Exception as exc:

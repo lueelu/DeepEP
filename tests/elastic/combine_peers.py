@@ -86,6 +86,19 @@ def expected_records(rank, world, tokens, chunk_tokens=256):
 def decode(records, *, rank, world, tokens, sample, chunk_tokens=256):
     dimensions = shape(world, tokens, chunk_tokens)
     expected = expected_records(rank, world, tokens, chunk_tokens)
+    compact = (
+        world == 8
+        and len(records) == 2
+        and any(
+            len(words) == WORDS and any(words) and words[5] == 11 + peer
+            for peer, rows in enumerate(records[0])
+            for lanes in rows
+            for words in lanes
+        )
+    )
+    if compact:
+        ends = window_ends(tokens, chunk_tokens)
+        expected = {key: ((11 if end == ends[-1] else 32) + key[1], qp, end) for key, (_, qp, end) in expected.items()}
     events, seen = [], set()
     if len(records) != 2 or not 0 <= rank < world or sample < 1:
         raise ValueError("Invalid peer tensor identity")
