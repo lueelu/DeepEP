@@ -928,6 +928,7 @@ class ElasticBuffer:
                     diagnostics = getattr(self, "_dispatch_diagnostics", None)
                     if diagnostics is not None:
                         tensors["benchmark_barriers"] = diagnostics.get("benchmark_barriers", False)
+                        tensors["benchmark_entry_barrier"] = diagnostics.get("benchmark_entry_barrier", False)
                         tensors["profile"] = diagnostics.get("profile")
                         tensors["weight_profile"] = diagnostics.get("weight_profile")
                         tensors["rotation_wqes"] = diagnostics.get("rotation_wqes", 4)
@@ -958,7 +959,7 @@ class ElasticBuffer:
             try:
                 with npu.stream(runtime.stream):
                     if diagnostics is not None:
-                        tensors["kernel_timing"] = True
+                        tensors["kernel_timing"] = diagnostics.get("kernel_timing", True)
                     device_times = native.dispatch(
                         runtime.native,
                         tensors,

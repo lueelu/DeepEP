@@ -8,6 +8,7 @@ NPU: python tests/elastic/test_dispatch.py --ep-size 2 --nproc-per-node 2 \
 """
 
 import argparse
+from contextlib import contextmanager, nullcontext
 import csv
 import math
 import statistics
@@ -26,6 +27,36 @@ import random
 
 _ROUTES = ("normal", "random", "duplicates", "invalid", "empty", "hotspot")
 _profile = runpy.run_path(str(Path(__file__).with_name("test_notify.py")))
+
+
+def add_dispatch_barrier_arg(parser):
+    parser.add_argument(
+        "--dispatch-barrier",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Align HT Dispatch performance samples with an entry device barrier (default: enabled)",
+    )
+
+
+@contextmanager
+def dispatch_benchmark(buffer, *, enabled=True, kernel_timing=False):
+    """Apply benchmark options temporarily, including when sampling fails."""
+    missing = object()
+    previous = getattr(buffer, "_dispatch_diagnostics", missing)
+    diagnostics = dict(previous) if isinstance(previous, dict) else {}
+    diagnostics.update(
+        benchmark_barriers=False,
+        benchmark_entry_barrier=enabled,
+        kernel_timing=kernel_timing,
+    )
+    buffer._dispatch_diagnostics = diagnostics
+    try:
+        yield diagnostics
+    finally:
+        if previous is missing:
+            del buffer._dispatch_diagnostics
+        else:
+            buffer._dispatch_diagnostics = previous
 
 
 def _progress_logger(operation, rank):
@@ -708,6 +739,43 @@ def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
         assert calls["combine"] == calls["dispatch"] == 3
 
 
+def test_dispatch_benchmark_flags_and_restore(monkeypatch):
+    import pytest
+    from deep_ep.buffers import elastic
+
+    torch = pytest.importorskip("torch")
+    buffer, tensor, _ = _host_elastic_buffer(monkeypatch)
+    native = elastic.require_native("benchmark regression")
+    forwarded = []
+    monkeypatch.setattr(native, "dispatch", lambda session, tensors, *args: forwarded.append(dict(tensors)))
+    x, indices = tensor((2, 7168), torch.bfloat16), tensor((2, 1), torch.int64)
+    _, _, _, handle, _ = buffer.dispatch(x, topk_idx=indices, num_experts=2)
+    assert not forwarded[-1].get("benchmark_entry_barrier", False)
+    assert not forwarded[-1].get("benchmark_barriers", False)
+    parser = argparse.ArgumentParser()
+    add_dispatch_barrier_arg(parser)
+    for argv, expected in (([], True), (["--no-dispatch-barrier"], False)):
+        enabled = parser.parse_args(argv).dispatch_barrier
+        assert enabled is expected
+        with dispatch_benchmark(buffer, enabled=enabled):
+            buffer.dispatch(x, handle=handle)
+            assert forwarded[-1]["benchmark_entry_barrier"] is enabled
+            assert forwarded[-1]["benchmark_barriers"] is False
+            assert forwarded[-1]["kernel_timing"] is False
+    buffer.dispatch(x, handle=handle)
+    assert "benchmark_entry_barrier" not in forwarded[-1]
+    assert "kernel_timing" not in forwarded[-1]
+    previous = {"benchmark_barriers": True}
+    buffer._dispatch_diagnostics = previous
+    with pytest.raises(RuntimeError, match="sample failed"):
+        with dispatch_benchmark(buffer, kernel_timing=True):
+            buffer.dispatch(x, handle=handle)
+            assert forwarded[-1]["kernel_timing"] is True
+            raise RuntimeError("sample failed")
+    assert buffer._dispatch_diagnostics is previous
+    assert previous["benchmark_barriers"] is True
+
+
 def test_dispatch_cpu_sync_validation(monkeypatch):
     import pytest
 
@@ -1152,8 +1220,10 @@ struct DevicePhaseTiming {
         return {};
     }
 };
-std::vector<float> run(Session& session, const DispatchTiling& t, bool with_weights, bool benchmark_barriers = false)
+std::vector<float> run(Session& session, const DispatchTiling& t, bool with_weights,
+                       bool benchmark_barriers = false, bool entry_only = false)
 {
+    const bool benchmark_entry_barrier = benchmark_barriers || entry_only;
     const bool measure = false;
     void* stream = nullptr;
     std::vector<uint8_t> storage(t.workspace_bytes);
@@ -1169,11 +1239,11 @@ std::vector<float> run(Session& session, const DispatchTiling& t, bool with_weig
 int main()
 {
     Session session;
-    auto check = [&](const DispatchTiling& t, bool weights, bool cold, bool benchmark = false) {
+    auto check = [&](const DispatchTiling& t, bool weights, bool cold, bool benchmark = false, bool entry = false) {
         calls.clear();
-        run(session, t, weights, benchmark);
+        run(session, t, weights, benchmark, entry);
         const auto clears = 3U + t.world * (t.fp8 + unsigned(weights));
-        const std::string launch = benchmark ? "BKBF" : "KF";
+        const std::string launch = benchmark ? "BKBF" : (entry ? "BKF" : "KF");
         assert(calls == (cold ? "SH" + std::string(clears, 'Z') + "SH" + launch : launch));
     };
     for (bool fp8 : {false, true})
@@ -1183,6 +1253,8 @@ int main()
                 check(t, weights, true);
                 for (int i = 0; i < 4; ++i) check(t, weights, false);
                 check(t, weights, false, true);
+                check(t, weights, false, false, true);
+                check(t, weights, false);
                 session.invalidate_dispatch_controls();  // Notify/LL overwrote the workspace.
                 check(t, weights, true);
                 check(t, weights, false);
@@ -1446,6 +1518,7 @@ def profile_operator(args, rank, scenario, invoke, validate, build_info, log, *,
     directory.mkdir(parents=True, exist_ok=False)
     metadata = dict(
         operator=args.profile_op,
+        dispatch_entry_barrier=args.profile_op == "dispatch" and args.dispatch_barrier,
         rank=rank,
         world_size=args.ep_size,
         scenario=scenario,
@@ -1580,6 +1653,7 @@ def main():
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
     add_profile_args(parser, ("notify", "dispatch"))
+    add_dispatch_barrier_arg(parser)
     args = parser.parse_args()
     _profile["resolve_dedup_args"](args)
     if args.rank_dedup and args.ep_size not in (8, 16):
@@ -1605,8 +1679,8 @@ def worker(local_rank, args):
     info = json.loads(Path(deep_ep.__file__).with_name("_build_info.json").read_text())
     if "elastic-dispatch-expanded-v1" not in info.get("capabilities", []):
         raise RuntimeError("Installed wheel does not contain payload dispatch")
-    if "elastic-notify-metadata-v6" not in info.get("capabilities", []):
-        raise RuntimeError("Rebuild/install the wheel with Notify metadata v6")
+    if "elastic-notify-metadata-v7" not in info.get("capabilities", []):
+        raise RuntimeError("Rebuild/install the wheel with Notify metadata v7")
     torch.npu.set_device(local_rank)
     modes = _ROUTES if args.route == "all" else (args.route,)
     dtypes = (False, True) if args.dtype == "both" else (args.dtype == "fp8",)
@@ -1758,16 +1832,22 @@ def worker(local_rank, args):
                                     elif returned_weights is not None:
                                         raise AssertionError("Profile dispatch unexpectedly returned weights")
 
-                            profile_operator(
-                                args,
-                                rank,
-                                f"{mode}-{'fp8' if fp8 else 'bf16'}-weights{int(use_weights)}",
-                                invoke,
-                                validate,
-                                info,
-                                log,
-                                stream=buffer._runtime.stream,
+                            alignment = (
+                                dispatch_benchmark(buffer, enabled=args.dispatch_barrier)
+                                if args.profile_op == "dispatch"
+                                else nullcontext()
                             )
+                            with alignment:
+                                profile_operator(
+                                    args,
+                                    rank,
+                                    f"{mode}-{'fp8' if fp8 else 'bf16'}-weights{int(use_weights)}",
+                                    invoke,
+                                    validate,
+                                    info,
+                                    log,
+                                    stream=buffer._runtime.stream,
+                                )
                         if previous_output is not None:
                             for prior, expected_prior in previous_output:
                                 assert_bytes(prior, expected_prior, "retained output across cached/fresh calls")
@@ -1990,6 +2070,7 @@ def test_dispatch_barrier_timing_and_profile_versions():
             weights=False,
             backend="udma",
             source_sha256="test",
+            dispatch_entry_barrier=True,
             clean_device_ms=[[0.1, 1.0, 0.2, 1.3]],
             kernel_profiles=[],
             event_only=True,
@@ -2006,6 +2087,11 @@ def test_dispatch_barrier_timing_and_profile_versions():
     assert report["entry_barrier"]["mean_ms"] == 0.1
     assert report["exit_barrier"]["mean_ms"] == 0.2
     assert report["algorithm_bandwidth"] == old_report["algorithm_bandwidth"]
+    assert report["dispatch_entry_barrier"] is True
+    ranks[1]["dispatch_entry_barrier"] = False
+    with pytest.raises(ValueError, match="Inconsistent Dispatch entry-barrier settings"):
+        metrics["summarize"](ranks)
+    ranks[1]["dispatch_entry_barrier"] = True
     ranks[1].pop("device_time_columns")
     with pytest.raises(ValueError, match="Mixed device timing columns"):
         metrics["summarize"](ranks)

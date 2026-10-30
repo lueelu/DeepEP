@@ -22,13 +22,17 @@ HT、LL 入口可以执行设备测量；通用入口当前支持配置规划，
 
 `test_dispatch.py` 的 `--profile-op notify` 单独测量 Notify kernel；`--profile-op dispatch` 使用已生成的 handle 测量 cached dispatch，不包含 fresh 调用的 Notify。`test_combine.py --profile-op combine` 测量 combine kernel，单独记录 prepare kernel，后者不计入 combine 耗时。
 
+HT Dispatch 性能用例默认在每次预热和采样的 kernel 前插入设备侧 barrier，减少 Python/C++ 准备工作造成的跨 rank 启动偏斜。profiler 的 Dispatch kernel 时长不包含这个 barrier。使用 `--no-dispatch-barrier` 可对照正常调用的启动行为；所有 rank 须采用一致配置。直接调用 `buffer.dispatch()` 默认关闭该测试功能，Notify/Combine 测量也保持原有行为。命令和内部开关示例见[Dispatch 启动对齐](../tests/README.md#dispatch-性能测试的启动对齐)。
+
 每个 rank 在 `output/profile/<op>/<scenario>/rank_<rank>/<timestamp>/` 保存配置 `capture.json`、profiler 记录和 `summary.json`。预热后采集指定次数，检查样本完整性及输出正确性，再报告逐 rank 的原始样本、均值、中位数、最小值和最大值，单位为微秒。没有自动生成跨 rank 汇总；不得将某个 rank 的结果标为全作业耗时，也不能将 kernel 时间标为完整 API 或 MoE 前向时延。
 
 ## HT peer-table Event 计时
 
-`run_peer_table_check.py` 使用 NPU Event 记录 dispatch 设备区间，`--kernel-profile` 另外采集插桩结果，`--routing-profile` 增加 fresh handle 的 Notify/建表采样。Notify 总时间已经包含建表子区间，不能重复相加。Host join、冷初始化以及 Python 分配/校验不在对应设备 Event 区间内。
+`run_peer_table_check.py` 使用 NPU Event 记录 dispatch 设备区间，`--kernel-profile` 另外采集插桩结果，`--routing-profile` 增加 fresh handle 的 Notify/建表采样。Notify 总时间已经包含建表子区间，不能重复相加。冷初始化的 Host 同步以及 Python 分配/校验不在对应设备 Event 区间内。
 
-`dispatch_metrics.py` 输出 `kernel-summary.json`，保留逐次跨 rank 最大值并计算均值与中位数。各阶段的 rank 最大值不能相加解释为端到端耗时。命令、区间划分及跨轮同步约束见 [peer-table 测试说明](../tests/README.md#ht-peer-table-检查与计时)。
+cached Dispatch 的采样默认开启前置 barrier，包括 API 墙钟、clean Event 和插桩采样。Event 的 `entry_barrier` 单独记录其耗时，`kernel` 记录 payload kernel，`device_total` 包含二者；默认不插入后置测试 barrier，`exit_barrier` 只保留末尾 Event 间隔。API 墙钟包含前置 barrier 等待及 Host 调用成本。JSON 的 `dispatch_entry_barrier` 记录是否开启；fresh Notify/建表采样保持原有同步方式。
+
+`dispatch_metrics.py` 输出 `kernel-summary.json`，保留 `dispatch_entry_barrier`、逐次跨 rank 最大值，并计算均值与中位数。汇总要求各 rank 的 barrier 配置一致。各阶段的 rank 最大值不能相加解释为端到端耗时。命令、区间划分及跨轮同步约束见 [peer-table 测试说明](../tests/README.md#ht-peer-table-检查与计时)。
 
 ## LL kernel 耗时
 
@@ -65,6 +69,8 @@ LL ST 不直接输出逻辑带宽，也不测量完整专家计算。不得将�
 `bandwidth_gbps = effective_bytes / (mean_rank_max_us * 1000)`，使用十进制 GB/s。这不是物理链路带宽、单 rank 带宽或互联利用率。全无效路由可以有零有效字节，但耗时样本仍须为正有限值。
 
 ## 比较与发布记录
+
+`require_native()` 首次成功调用时检查扩展文件并验证 native 模块，后续 Dispatch、Combine 等调用复用同一进程内的缓存，减少热路径上的文件系统查询。首次加载失败会保留错误并允许后续重试。更新 wheel 或 native 库后使用新进程；性能预热应覆盖首次加载。此缓存减少 Host 准备开销，前置 barrier 则用于对齐各 rank 的 kernel 启动，两者作用不同。
 
 比较结果需保持版本、dtype/量化、负载、拓扑、路由、缓存策略、计时边界和统计方法一致。没有匹配的实测基线就不填写加速比；未测量不填 0。各测试的实际精度判据见[精度说明](precision.md)，不能用统一的“L2 通过”覆盖不同入口。
 

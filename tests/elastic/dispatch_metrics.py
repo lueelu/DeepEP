@@ -222,6 +222,9 @@ def summarize(data):
     for key in ("hidden", "scales", "rotation_wqes", "route_profile", "route_seed", "route_sha256", "fm_transport"):
         if any(key in r for r in data) and (not all(key in r for r in data) or len({r[key] for r in data}) != 1):
             raise ValueError(f"Mixed configuration: {key}")
+    barriers = [rank["dispatch_entry_barrier"] for rank in data]
+    if any(type(value) is not bool for value in barriers) or len(set(barriers)) != 1:
+        raise ValueError("Inconsistent Dispatch entry-barrier settings")
     count = len(data[0]["clean_device_ms"])
     if count < 1 or any(len(r["clean_device_ms"]) != count for r in data):
         raise ValueError("Incomplete clean device samples")
@@ -237,6 +240,7 @@ def summarize(data):
         "clean_samples": count,
         "backend": data[0]["backend"],
         "source_sha256": data[0]["source_sha256"],
+        "dispatch_entry_barrier": barriers[0],
     }
     result.update(
         {

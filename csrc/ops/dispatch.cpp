@@ -148,6 +148,8 @@ void bind_dispatch(py::module_& module)
         // the production synchronization contract by itself.
         const bool benchmark_barriers =
             tensors.contains("benchmark_barriers") && tensors["benchmark_barriers"].cast<bool>();
+        const bool benchmark_entry_barrier = benchmark_barriers || (tensors.contains("benchmark_entry_barrier") &&
+                                                                    tensors["benchmark_entry_barrier"].cast<bool>());
         if (tensors.contains("plan") && !tensors["plan"].is_none()) {
             if (!session.peer_table()) throw std::invalid_argument("peer-table session required");
             config.peer_table = reinterpret_cast<uint64_t>(
@@ -196,7 +198,7 @@ void bind_dispatch(py::module_& module)
             session.remember_dispatch_controls(controls);
         }
         timing.mark(0, stream);
-        if (benchmark_barriers) notify_dispatch_barrier_kernel_do(stream, 64U);
+        if (benchmark_entry_barrier) notify_dispatch_barrier_kernel_do(stream, 64U);
         timing.mark(1, stream);
         dispatch_kernel_do(stream, workspace, destinations, forward, counts, weights, scales,
                            reinterpret_cast<uint8_t*>(&config));

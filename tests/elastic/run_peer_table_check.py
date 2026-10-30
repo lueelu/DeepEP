@@ -284,103 +284,103 @@ def worker(local_rank, args):
                         "output storage reused while retained"
                     )
             log(f"correctness.passed generation={generation} rows={len(selected)}")
-        for iteration in range(args.warmup + args.iterations):
-            started = time.perf_counter()
-            output, _, weights, handle, event = buffer.dispatch(
-                x, handle=handle, do_expand=True, topk_weights=input_weights
-            )
-            event.current_stream_wait()
-            torch.npu.synchronize()
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            if iteration >= args.warmup:
-                timings.append(elapsed_ms)
-        if args.kernel_profile or args.event_only:
-            # Clean Event measurements and instrumented diagnostics are separate
-            # from the original Python API wall-clock samples above.
-            buffer._dispatch_diagnostics = {"rotation_wqes": args.rotation_wqes}
+        with helper["dispatch_benchmark"](buffer, enabled=args.dispatch_barrier) as diagnostics:
             for iteration in range(args.warmup + args.iterations):
+                started = time.perf_counter()
                 output, _, weights, handle, event = buffer.dispatch(
                     x, handle=handle, do_expand=True, topk_weights=input_weights
                 )
                 event.current_stream_wait()
                 torch.npu.synchronize()
+                elapsed_ms = (time.perf_counter() - started) * 1000
                 if iteration >= args.warmup:
-                    clean_device_ms.append(buffer._dispatch_diagnostics["device_ms"])
-            assert torch.equal((output[0] if fp8 else output).cpu().view(torch.uint8), actual), (
-                "clean timing hidden mismatch"
-            )
-            if fp8:
-                assert torch.equal(output[1].cpu(), actual_scales), "clean timing scale mismatch"
-            if args.weights:
-                assert torch.equal(weights.cpu(), expected_weights), "clean timing weight mismatch"
-            log("clean.kernel_event.done")
-            if not args.kernel_profile:
-                del buffer._dispatch_diagnostics
-        if args.kernel_profile:
-            profile = torch.zeros((64, 32), dtype=torch.int64, device=(x[0] if fp8 else x).device)
-            buffer._dispatch_diagnostics["profile"] = profile
-            weight_profile = (
-                torch.zeros((32, 16), dtype=torch.int64, device=(x[0] if fp8 else x).device) if args.weights else None
-            )
-            if args.weights:
-                buffer._dispatch_diagnostics["weight_profile"] = weight_profile
-            detail = torch.zeros((64, 32), dtype=torch.int64, device=profile.device) if args.submit_detail else None
-            if detail is not None:
-                buffer._dispatch_diagnostics["detail_profile"] = detail
-            # Warm up the instrumented specialization separately from clean Event runs.
-            for _ in range(args.profile_warmup):
-                if detail is not None:
-                    buffer._dispatch_diagnostics["detail_mode"] = 1
-                output, _, weights, handle, event = buffer.dispatch(
-                    x, handle=handle, do_expand=True, topk_weights=input_weights
-                )
-                event.current_stream_wait()
-                torch.npu.synchronize()
-            samples = args.profile_samples * (2 if args.submit_detail else 1)
-            for sample in range(samples):
-                mode = 1 if sample < args.profile_samples else 2
-                if detail is not None:
-                    detail.zero_()
-                    buffer._dispatch_diagnostics["detail_mode"] = mode
-                profile.zero_()
-                if weight_profile is not None:
-                    weight_profile.zero_()
-                torch.npu.synchronize()
-                output, _, weights, handle, event = buffer.dispatch(
-                    x, handle=handle, do_expand=True, topk_weights=input_weights
-                )
-                event.current_stream_wait()
-                torch.npu.synchronize()
-                cores = metrics["decode_profile"](
-                    profile.cpu().tolist(), rank, fp8=fp8, weights=args.weights, world=world, qp1_workers=8
-                )
+                    timings.append(elapsed_ms)
+            if args.kernel_profile or args.event_only:
+                # Clean Event measurements and instrumented diagnostics are separate
+                # from the original Python API wall-clock samples above.
+                diagnostics.update(rotation_wqes=args.rotation_wqes, kernel_timing=True)
+                for iteration in range(args.warmup + args.iterations):
+                    output, _, weights, handle, event = buffer.dispatch(
+                        x, handle=handle, do_expand=True, topk_weights=input_weights
+                    )
+                    event.current_stream_wait()
+                    torch.npu.synchronize()
+                    if iteration >= args.warmup:
+                        clean_device_ms.append(buffer._dispatch_diagnostics["device_ms"])
                 assert torch.equal((output[0] if fp8 else output).cpu().view(torch.uint8), actual), (
-                    "profile hidden mismatch"
+                    "clean timing hidden mismatch"
                 )
                 if fp8:
-                    assert torch.equal(output[1].cpu(), actual_scales), "profile scale mismatch"
-                weight_cores = []
+                    assert torch.equal(output[1].cpu(), actual_scales), "clean timing scale mismatch"
                 if args.weights:
-                    assert torch.equal(weights.cpu(), expected_weights), "profile weight mismatch"
-                    weight_cores = metrics["decode_weight_profile"](weight_profile.cpu().tolist(), rank)
-                    assert sum(c["received_entries"] for c in weight_cores) == len(selected)
-                detail_cores = (
-                    metrics["decode_detail"](detail.cpu().tolist(), rank, args.rotation_wqes, mode)
-                    if detail is not None
-                    else []
+                    assert torch.equal(weights.cpu(), expected_weights), "clean timing weight mismatch"
+                log("clean.kernel_event.done")
+            if args.kernel_profile:
+                profile = torch.zeros((64, 32), dtype=torch.int64, device=(x[0] if fp8 else x).device)
+                buffer._dispatch_diagnostics["profile"] = profile
+                weight_profile = (
+                    torch.zeros((32, 16), dtype=torch.int64, device=(x[0] if fp8 else x).device)
+                    if args.weights
+                    else None
                 )
-                kernel_profiles.append(
-                    {
-                        "sample": sample,
-                        "detail_mode": mode if detail is not None else 0,
-                        "detail_cores": detail_cores,
-                        "cores": cores,
-                        "weight_cores": weight_cores,
-                        "instrumented_device_ms": buffer._dispatch_diagnostics["device_ms"],
-                    }
-                )
-            del buffer._dispatch_diagnostics
-            log(f"kernel.profile.done samples={args.profile_samples}")
+                if args.weights:
+                    buffer._dispatch_diagnostics["weight_profile"] = weight_profile
+                detail = torch.zeros((64, 32), dtype=torch.int64, device=profile.device) if args.submit_detail else None
+                if detail is not None:
+                    buffer._dispatch_diagnostics["detail_profile"] = detail
+                # Warm up the instrumented specialization separately from clean Event runs.
+                for _ in range(args.profile_warmup):
+                    if detail is not None:
+                        buffer._dispatch_diagnostics["detail_mode"] = 1
+                    output, _, weights, handle, event = buffer.dispatch(
+                        x, handle=handle, do_expand=True, topk_weights=input_weights
+                    )
+                    event.current_stream_wait()
+                    torch.npu.synchronize()
+                samples = args.profile_samples * (2 if args.submit_detail else 1)
+                for sample in range(samples):
+                    mode = 1 if sample < args.profile_samples else 2
+                    if detail is not None:
+                        detail.zero_()
+                        buffer._dispatch_diagnostics["detail_mode"] = mode
+                    profile.zero_()
+                    if weight_profile is not None:
+                        weight_profile.zero_()
+                    torch.npu.synchronize()
+                    output, _, weights, handle, event = buffer.dispatch(
+                        x, handle=handle, do_expand=True, topk_weights=input_weights
+                    )
+                    event.current_stream_wait()
+                    torch.npu.synchronize()
+                    cores = metrics["decode_profile"](
+                        profile.cpu().tolist(), rank, fp8=fp8, weights=args.weights, world=world, qp1_workers=8
+                    )
+                    assert torch.equal((output[0] if fp8 else output).cpu().view(torch.uint8), actual), (
+                        "profile hidden mismatch"
+                    )
+                    if fp8:
+                        assert torch.equal(output[1].cpu(), actual_scales), "profile scale mismatch"
+                    weight_cores = []
+                    if args.weights:
+                        assert torch.equal(weights.cpu(), expected_weights), "profile weight mismatch"
+                        weight_cores = metrics["decode_weight_profile"](weight_profile.cpu().tolist(), rank)
+                        assert sum(c["received_entries"] for c in weight_cores) == len(selected)
+                    detail_cores = (
+                        metrics["decode_detail"](detail.cpu().tolist(), rank, args.rotation_wqes, mode)
+                        if detail is not None
+                        else []
+                    )
+                    kernel_profiles.append(
+                        {
+                            "sample": sample,
+                            "detail_mode": mode if detail is not None else 0,
+                            "detail_cores": detail_cores,
+                            "cores": cores,
+                            "weight_cores": weight_cores,
+                            "instrumented_device_ms": buffer._dispatch_diagnostics["device_ms"],
+                        }
+                    )
+                log(f"kernel.profile.done samples={args.profile_samples}")
         routing_samples = []
         if args.routing_profile:
             # Fresh handles force both Notify and peer-table preparation on every sample.
@@ -438,6 +438,7 @@ def worker(local_rank, args):
                     "route_sha256": route_sha256,
                     "backend": args.backend,
                     "event_only": args.event_only,
+                    "dispatch_entry_barrier": args.dispatch_barrier,
                     "checked_generations": 3,
                     "checked_rows": len(selected),
                     "checked_retained_outputs": True,
@@ -445,7 +446,7 @@ def worker(local_rank, args):
                     "cached_public_api_wall_ms": timings,
                     "timing_boundary": "Python dispatch through NPU synchronize, includes API validation and host synchronization; not kernel-only",
                     "payload_copy_mode": "none; direct framework GM input/output",
-                    "barrier_timing_note": "Entry and exit barriers are timed separately from the payload kernel",
+                    "barrier_timing_note": "Entry barrier is excluded from kernel Event time but included in API wall time; no benchmark exit barrier",
                     "routing_device_ms": routing_samples,
                     "routing_time_columns": {
                         "notify_device_ms": ["kernel", "post_barrier", "count_copy", "total"],
@@ -453,7 +454,7 @@ def worker(local_rank, args):
                     },
                     "clean_device_ms": clean_device_ms,
                     "kernel_profiles": kernel_profiles,
-                    "device_time_columns": buffer._dispatch_diagnostics["device_phase_names"],
+                    "device_time_columns": ["entry_barrier", "kernel", "exit_barrier", "device_total"],
                     "profile_ticks_per_us": 1000,
                 },
                 indent=2,
@@ -483,6 +484,7 @@ def main():
     parser.add_argument("--backend", choices=("peer-table",), default="peer-table")
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--experts", type=int, default=1024)
+    helper["add_dispatch_barrier_arg"](parser)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument(

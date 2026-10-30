@@ -22,11 +22,25 @@ def _unavailable(operation: str) -> NoReturn:
     )
 
 
-def require_native(operation):
+class _MissingNativeExtension(ImportError):
+    pass
+
+
+@lru_cache(maxsize=1)
+def _require_native_cached():
+    # Cache only a successfully validated module, shared by all operation names.
+    # Exceptions are not cached, so missing files or failed imports can be retried.
     directory = Path(__file__).resolve().parent
     if not any((directory / ("_C" + suffix)).is_file() for suffix in EXTENSION_SUFFIXES):
-        _unavailable(operation)
+        raise _MissingNativeExtension
     return _load_native()
+
+
+def require_native(operation):
+    try:
+        return _require_native_cached()
+    except _MissingNativeExtension:
+        _unavailable(operation)
 
 
 @lru_cache(maxsize=1)

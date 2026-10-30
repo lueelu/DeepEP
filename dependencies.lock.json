@@ -4,7 +4,7 @@
   "shmem": {
     "repository": "https://gitcode.com/cann/shmem",
     "ref": "refs/heads/dev",
-    "revision": "4dd80e2129da42bd773982c2bb3758af1ed0bba8",
+    "revision": "836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7",
     "distribution": "pinned third-party/shmem submodule or external SDK; headers and library recorded by record_shmem_sdk.py",
     "header_sha256_lf": {
       "host/shmem_host_def.h": "659aaa719af9c38bafef72921a73cca325c3c30f0f43be30b6ba9f0535de6cf6",
