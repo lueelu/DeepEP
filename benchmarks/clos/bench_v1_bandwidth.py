@@ -97,7 +97,8 @@ def worker(args):
     import torch
     import torch.distributed as dist
     import torch_npu  # noqa: F401
-    from deep_ep import Buffer, Config, topk_idx_t
+    from deep_ep._clos_adapter import Buffer
+    from deep_ep import Config, topk_idx_t
     import test_v1_intranode as golden
 
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
