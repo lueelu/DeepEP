@@ -24,7 +24,7 @@ from build_support import (  # noqa: E402
 BETA = "experiments/megamoe/python"
 beta_enabled = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
 ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
-packages = find_packages(include=["deep_ep", "deep_ep.*", "ascend_deepep", "ascend_deepep.*"])
+packages = find_packages(include=["deep_ep", "deep_ep.*"])
 package_dir = {}
 cmdclass = {"build_ext": CMakeBuild, "install_lib": CheckedInstallLib}
 if ep_gmm_fused:

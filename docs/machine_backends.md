@@ -11,8 +11,8 @@ PR（`CARD_4PMESH`，board `0x6c`）复用迁入实现的 MTE kernel，不另建
 V1 的统一入口为 `deep_ep/buffer.py`，V2 的统一入口为
 `deep_ep/buffers/elastic.py`；POD 与 Clos 的实现分别位于
 `deep_ep/backends/pod/` 和 `deep_ep/backends/clos/`。构造时选择一次后端，
-后续 dispatch/combine 直接调用对应实现。`ascend_deepep` 和 V1 的
-`deep_ep.buffers.legacy` 仅保留兼容导入，不存放另一份算子实现。
+后续 dispatch/combine 直接调用对应实现。Python 公开入口统一为 `deep_ep`；
+V1 的 `deep_ep.buffers.legacy` 仅保留兼容导入，不存放另一份算子实现。
 
 ## 构建
 
@@ -140,5 +140,6 @@ SDK 初始化状态，禁止覆盖另一后端的 QP/heap 配置。必须在整�
 完成操作、`destroy()` 后再重建。handle 不能跨 Buffer 或后端复用；公共 EventHandle
 可作为 Clos 的 previous_event/epilogue 依赖，等待语义和原有 stream 顺序保留。
 
-`ascend_deepep` 保留为迁入实现的兼容导入路径；新代码通过 `deep_ep` 选择后端。
+业务代码通过 `deep_ep.Buffer` / `deep_ep.ElasticBuffer` 选择后端。
+后端专用测试直接导入 `deep_ep.backends.clos`，不会受开发机的自动分类影响。
 导入、CPU 契约检查、编译成功都不等于 NPU 精度或性能验证通过。

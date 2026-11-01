@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, Iterable, List
 import torch
 import torch.multiprocessing as mp
 
-from ascend_deepep.dup_server_golden import (
+from deep_ep.backends.clos.dup_server_golden import (
     DupServerDispatchMeta,
     build_dup_server_golden_notify,
     build_dup_server_golden_source_notify,
@@ -1351,7 +1351,7 @@ def run_dispatch(
     import torch.distributed as dist
     import torch_npu  # noqa: F401
 
-    from ascend_deepep import ElasticBuffer, topk_idx_t
+    from deep_ep.backends.clos import ElasticBuffer, topk_idx_t
 
     rank = global_rank if global_rank is not None else global_rank_for_local(local_rank, args)
     device_id = args.first_device + local_rank

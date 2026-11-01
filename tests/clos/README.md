@@ -1,7 +1,7 @@
 # Clos backend regression tests
 
 The imported tests retain the `deepep` c090403 CPU references, routes, tolerances
-and kernel expectations. Backend tests use `ascend_deepep` explicitly so that
+and kernel expectations. Backend tests use `deep_ep.backends.clos` explicitly so that
 running them on a POD development machine does not silently test the POD path.
 Public selection, naming, event compatibility and EP16 sizing tests are in
 `tests/api/test_machine_selection.py` and `test_clos_integration.py`.

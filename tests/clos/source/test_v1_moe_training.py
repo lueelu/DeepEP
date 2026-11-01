@@ -16,7 +16,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
-from ascend_deepep import Buffer, Config, topk_idx_t
+from deep_ep.backends.clos import Buffer, Config, topk_idx_t
 
 
 class FusedDispatch(torch.autograd.Function):

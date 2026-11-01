@@ -15,7 +15,7 @@ def public_runtime(monkeypatch):
     from deep_ep import _card_adapter
     from deep_ep import buffer as legacy
     from deep_ep.buffers import elastic
-    from ascend_deepep import buffer as source_v1, elastic as source_v2
+    from deep_ep.backends.clos import buffer as source_v1, elastic as source_v2
 
     calls = []
     group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)

@@ -22,8 +22,8 @@ import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 
-from ascend_deepep import ElasticBuffer, topk_idx_t
-from ascend_deepep._native import load_native_module
+from deep_ep.backends.clos import ElasticBuffer, topk_idx_t
+from deep_ep.backends.clos._native import load_native_module
 
 
 def _layouts(world_size):

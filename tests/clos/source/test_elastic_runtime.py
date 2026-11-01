@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu  # noqa: F401
 
-from ascend_deepep import ElasticBuffer, EventHandle
+from deep_ep.backends.clos import ElasticBuffer, EventHandle
 
 
 DEVICE_LARGE_PAGE_SIZE = 2 * 1024 * 1024

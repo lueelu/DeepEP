@@ -184,7 +184,7 @@ def git_identity():
         golden=file_identity(REPO / "tests/clos/source/test_v1_intranode.py"),
         sources=[
             file_identity(p)
-            for folder in ("ascend_deepep", "deep_ep", "csrc", "kernels", "include", "benchmarks")
+            for folder in ("deep_ep", "csrc", "kernels", "include", "benchmarks")
             for p in sorted((REPO / folder).rglob("*"))
             if p.is_file() and p.suffix in (".py", ".cpp", ".h")
         ],
@@ -192,7 +192,7 @@ def git_identity():
 
 
 def loaded_identity():
-    import ascend_deepep
+    from deep_ep.backends import clos
     import torch
     import torch_npu
 
@@ -218,7 +218,7 @@ def loaded_identity():
         python=sys.version,
         torch=torch.__version__,
         torch_npu=torch_npu.__version__,
-        python_module=file_identity(ascend_deepep.__file__),
+        python_module=file_identity(clos.__file__),
         libraries=[file_identity(p) for p in sorted(paths)],
     )
 

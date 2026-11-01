@@ -3,15 +3,15 @@ import os
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from ascend_deepep.buffer import _prepare_shmem_bootstrap
+from deep_ep.backends.clos.buffer import _prepare_shmem_bootstrap
 
 
 class BootstrapTest(unittest.TestCase):
     def prepare(self, native, gather=None, rank=0, endpoint=None, comm=None):
         with (
-            patch("ascend_deepep.buffer.load_native_module", return_value=native),
+            patch("deep_ep.backends.clos.buffer.load_native_module", return_value=native),
             patch(
-                "ascend_deepep.buffer._bootstrap_all_gather",
+                "deep_ep.backends.clos.buffer._bootstrap_all_gather",
                 side_effect=gather or (lambda group, comm, size, value: [value] * size),
             ),
         ):

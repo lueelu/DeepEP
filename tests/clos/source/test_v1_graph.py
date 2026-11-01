@@ -17,8 +17,8 @@ import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 
-from ascend_deepep import Buffer, Config
-from ascend_deepep._native import load_native_module
+from deep_ep.backends.clos import Buffer, Config
+from deep_ep.backends.clos._native import load_native_module
 
 
 def lengths(capacity, world, uneven, step=0):

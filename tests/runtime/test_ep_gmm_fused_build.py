@@ -263,6 +263,20 @@ def test_old_or_explicitly_reused_staging_cannot_leak_into_core_wheel(packaging_
     assert not list((packaging_source / "dist").glob("*.whl"))
 
 
+def test_removed_python_package_cannot_leak_from_reused_build_staging(packaging_source):
+    result = run_packaging(packaging_source, "OFF", "OFF", "build_py")
+    assert result.returncode == 0, result.stderr
+    staging = next((packaging_source / "build").glob("lib*"))
+    stale = staging / "ascend_deepep/__init__.py"
+    stale.parent.mkdir()
+    stale.write_text("# Obsolete compatibility package from a previous build.\n")
+    result = run_packaging(packaging_source, "OFF", "OFF", "bdist_wheel", "--skip-build")
+    assert result.returncode != 0
+    assert "Obsolete ascend_deepep package" in result.stderr
+    assert stale.is_file()
+    assert not list((packaging_source / "dist").glob("*.whl"))
+
+
 @pytest.fixture
 def sdk_environment(build, monkeypatch, tmp_path):
     cann, sdk, source = tmp_path / "cann", tmp_path / "sdk", tmp_path / "source"

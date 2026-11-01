@@ -12,7 +12,7 @@ import torch
 
 import deep_ep
 import deep_ep.buffer as deep_ep_buffer_module
-import ascend_deepep.buffer as buffer_module
+import deep_ep.backends.clos.buffer as buffer_module
 from deep_ep.buffers.legacy import Buffer as DeepEPBuffer
 from deep_ep.utils import envs
 from deep_ep.utils.event import EventHandle as DeepEPEventHandle
@@ -27,7 +27,7 @@ from deep_ep.utils.math import (
     safe_div,
 )
 
-from ascend_deepep import (
+from deep_ep.backends.clos import (
     Buffer,
     Config,
     EventHandle,
@@ -38,9 +38,9 @@ from ascend_deepep import (
     SlotState,
     topk_idx_t,
 )
-from ascend_deepep._native import _resolve_native_class
-from ascend_deepep.config import _MAX_NUM_AIV
-from ascend_deepep.utils import align_up
+from deep_ep.backends.clos._native import _resolve_native_class
+from deep_ep.backends.clos.config import _MAX_NUM_AIV
+from deep_ep.backends.clos.utils import align_up
 
 
 class _FakeBufferRuntime:
@@ -408,12 +408,12 @@ def _make_buffer(**kwargs):
     }
     parameters.update(kwargs)
     with (
-        patch("ascend_deepep.buffer.get_native_class", return_value=_FakeBufferRuntime),
+        patch("deep_ep.backends.clos.buffer.get_native_class", return_value=_FakeBufferRuntime),
         patch(
-            "ascend_deepep.buffer._create_communication_stream",
+            "deep_ep.backends.clos.buffer._create_communication_stream",
             return_value=_FakeCommunicationStream(),
         ),
-        patch("ascend_deepep.buffer._prepare_shmem_bootstrap", return_value=([], "test")),
+        patch("deep_ep.backends.clos.buffer._prepare_shmem_bootstrap", return_value=([], "test")),
     ):
         return Buffer(**parameters)
 
@@ -644,7 +644,7 @@ class EventTest(unittest.TestCase):
         cpu_npu.start()
         self.addCleanup(cpu_npu.stop)
         self.npu = _FakeNpu()
-        self.npu_patch = patch("ascend_deepep.event._get_npu_api", return_value=self.npu)
+        self.npu_patch = patch("deep_ep.backends.clos.event._get_npu_api", return_value=self.npu)
         self.npu_patch.start()
 
     def tearDown(self):
@@ -1009,10 +1009,10 @@ class BufferConstructionTest(unittest.TestCase):
                     with (
                         self.subTest(env=inherited, kwargs=kwargs, transport=transport),
                         patch.dict(os.environ, environment, clear=True),
-                        patch("ascend_deepep.buffer.load_native_module", return_value=native),
-                        patch("ascend_deepep.buffer.get_native_class", return_value=_FakeBufferRuntime),
+                        patch("deep_ep.backends.clos.buffer.load_native_module", return_value=native),
+                        patch("deep_ep.backends.clos.buffer.get_native_class", return_value=_FakeBufferRuntime),
                         patch(
-                            "ascend_deepep.buffer._create_communication_stream",
+                            "deep_ep.backends.clos.buffer._create_communication_stream",
                             return_value=_FakeCommunicationStream(),
                         ),
                         patch("torch.distributed.all_gather_object", side_effect=gather) as exchange,
@@ -1040,7 +1040,7 @@ class BufferConstructionTest(unittest.TestCase):
             with (
                 self.subTest(endpoint=endpoint),
                 patch.dict(os.environ, {"ASCEND_DEEPEP_SHMEM_IP_PORT": "tcp://127.0.0.1:30000"}),
-                patch("ascend_deepep.buffer._prepare_shmem_bootstrap") as prepare,
+                patch("deep_ep.backends.clos.buffer._prepare_shmem_bootstrap") as prepare,
                 self.assertRaises(ValueError),
             ):
                 Buffer(_Group(), num_nvl_bytes=64 * 1024**2, shmem_ip_port=endpoint)
@@ -1077,12 +1077,12 @@ class BufferConstructionTest(unittest.TestCase):
             "explicitly_destroy": True,
         }
         with (
-            patch("ascend_deepep.buffer.get_native_class", return_value=_FakeBufferRuntime),
+            patch("deep_ep.backends.clos.buffer.get_native_class", return_value=_FakeBufferRuntime),
             patch(
-                "ascend_deepep.buffer._create_communication_stream",
+                "deep_ep.backends.clos.buffer._create_communication_stream",
                 return_value=_FakeCommunicationStream(),
             ),
-            patch("ascend_deepep.buffer._prepare_shmem_bootstrap", return_value=([], "test")),
+            patch("deep_ep.backends.clos.buffer._prepare_shmem_bootstrap", return_value=([], "test")),
         ):
             buffer = Buffer(**parameters)
         try:
@@ -1234,7 +1234,7 @@ class BufferConstructionTest(unittest.TestCase):
 
     def test_finalizer_retains_active_slot_resources(self):
         orphaned = []
-        with patch("ascend_deepep.buffer._ORPHANED_NATIVE_RESOURCES", orphaned):
+        with patch("deep_ep.backends.clos.buffer._ORPHANED_NATIVE_RESOURCES", orphaned):
             buffer = _make_buffer(explicitly_destroy=False)
             native = buffer.native
             slot = buffer.acquire_slot()

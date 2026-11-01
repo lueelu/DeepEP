@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from ascend_deepep.dup_server_golden import (
+from deep_ep.backends.clos.dup_server_golden import (
     DupServerDispatchMeta,
     build_dup_server_golden_notify,
     build_dup_server_golden_source_notify,

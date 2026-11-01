@@ -18,7 +18,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu  # noqa: F401
 
-from ascend_deepep import ElasticBuffer, topk_idx_t
+from deep_ep.backends.clos import ElasticBuffer, topk_idx_t
 
 
 PUBLIC_HANDLE_FIELDS = (

@@ -1113,7 +1113,7 @@ def run_rank(local_rank: int, args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark ascend_deepep Buffer operators on real NPUs")
+    parser = argparse.ArgumentParser(description="Benchmark DeepEP Clos Buffer operators on real NPUs")
     parser.add_argument("--op", choices=SUPPORTED_OPS, default="all")
     parser.add_argument(
         "--ep-size",

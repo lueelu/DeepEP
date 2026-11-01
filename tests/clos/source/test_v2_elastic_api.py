@@ -8,9 +8,9 @@ from types import SimpleNamespace
 
 import torch
 import deep_ep
-from ascend_deepep import ElasticBuffer, EPHandle, topk_idx_t
+from deep_ep.backends.clos import ElasticBuffer, EPHandle, topk_idx_t
 from test_public_api import _FakeBufferRuntime, _Group
-from ascend_deepep.config import _MAX_NUM_AIV
+from deep_ep.backends.clos.config import _MAX_NUM_AIV
 
 
 class _Stream:
@@ -110,30 +110,30 @@ class ElasticApiTest(unittest.TestCase):
         self.compute_stream = _Stream()
         self.device_sync = Mock()
         self.patches = (
-            patch("ascend_deepep.elastic._prepare_shmem_bootstrap", return_value=([], "")),
+            patch("deep_ep.backends.clos.elastic._prepare_shmem_bootstrap", return_value=([], "")),
             patch(
-                "ascend_deepep.elastic.get_native_class",
+                "deep_ep.backends.clos.elastic.get_native_class",
                 return_value=_ElasticRuntime,
             ),
             patch(
-                "ascend_deepep.elastic._create_communication_stream",
+                "deep_ep.backends.clos.elastic._create_communication_stream",
                 return_value=self.stream,
             ),
             patch(
-                "ascend_deepep.elastic._try_record_event",
+                "deep_ep.backends.clos.elastic._try_record_event",
                 return_value=None,
             ),
             patch(
-                "ascend_deepep.elastic._current_npu_stream",
+                "deep_ep.backends.clos.elastic._current_npu_stream",
                 return_value=self.compute_stream,
             ),
             patch(
-                "ascend_deepep.elastic._use_comm_stream",
+                "deep_ep.backends.clos.elastic._use_comm_stream",
                 side_effect=lambda stream: nullcontext(),
             ),
-            patch("ascend_deepep.elastic.EventHandle", _Event),
+            patch("deep_ep.backends.clos.elastic.EventHandle", _Event),
             patch(
-                "ascend_deepep.elastic._synchronize_npu_device",
+                "deep_ep.backends.clos.elastic._synchronize_npu_device",
                 self.device_sync,
             ),
         )
@@ -227,7 +227,7 @@ class ElasticApiTest(unittest.TestCase):
 
                         # Use a recorded prologue event without requiring explicit
                         # previous_event when allocation remains on caller stream.
-                        with patch("ascend_deepep.elastic._try_record_event", side_effect=record) as rec:
+                        with patch("deep_ep.backends.clos.elastic._try_record_event", side_effect=record) as rec:
                             result = b.combine(
                                 x,
                                 h,
@@ -353,7 +353,7 @@ class ElasticApiTest(unittest.TestCase):
     def test_async_retains_rebuilt_plan(self):
         b = self.make(transport="udma")
         x, _, w, h, _ = self.fresh(b)
-        with patch("ascend_deepep.elastic._try_record_event", side_effect=lambda _: _Event()):
+        with patch("deep_ep.backends.clos.elastic._try_record_event", side_effect=lambda _: _Event()):
             _, _, _, _, event = b.dispatch(x, handle=h, topk_weights=w, async_with_compute_stream=True)
         self.assertTrue(any(t is b.runtime.returned_plan for t in event.extra_tensors))
         self.assertIsNot(b.runtime.returned_plan, h._dispatch_plan)
@@ -515,12 +515,12 @@ class ElasticApiTest(unittest.TestCase):
 
         with (
             patch(
-                "ascend_deepep.elastic._use_comm_stream",
+                "deep_ep.backends.clos.elastic._use_comm_stream",
                 side_effect=use_stream,
             ),
-            patch("ascend_deepep.elastic.EventHandle", TrackingEvent),
+            patch("deep_ep.backends.clos.elastic.EventHandle", TrackingEvent),
             patch(
-                "ascend_deepep.elastic._synchronize_npu_device",
+                "deep_ep.backends.clos.elastic._synchronize_npu_device",
                 side_effect=lambda: log.append(("device_sync", None)),
             ),
         ):

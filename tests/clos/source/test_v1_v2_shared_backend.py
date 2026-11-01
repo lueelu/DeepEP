@@ -18,7 +18,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu  # noqa: F401
 
-from ascend_deepep import Buffer, Config, ElasticBuffer, EventHandle, EventOverlap
+from deep_ep.backends.clos import Buffer, Config, ElasticBuffer, EventHandle, EventOverlap
 import test_v1_intranode as golden
 
 

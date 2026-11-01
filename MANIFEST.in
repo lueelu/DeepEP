@@ -10,7 +10,6 @@ recursive-include cmake *.cmake CMakeLists.txt
 recursive-include csrc *.cpp *.hpp *.h
 recursive-include csrc/clos *.json
 include csrc/clos/NOTICE.md
-recursive-include ascend_deepep *.py
 recursive-include docs *.md
 recursive-include scripts *.py *.sh
 recursive-include tests *.py *.json *.cpp *.h *.md

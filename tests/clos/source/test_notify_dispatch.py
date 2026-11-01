@@ -8,8 +8,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu  # noqa: F401
 
-from ascend_deepep import Buffer, Config, topk_idx_t
-from ascend_deepep.config import _MAX_NUM_AIV
+from deep_ep.backends.clos import Buffer, Config, topk_idx_t
+from deep_ep.backends.clos.config import _MAX_NUM_AIV
 
 
 DEVICE_LARGE_PAGE_SIZE = 2 * 1024 * 1024

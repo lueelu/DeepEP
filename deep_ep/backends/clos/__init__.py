@@ -1,4 +1,4 @@
-"""Internal implementation and legacy import path for deep_ep on Ascend."""
+"""Internal Clos backend for the public deep_ep interfaces."""
 
 from __future__ import annotations
 

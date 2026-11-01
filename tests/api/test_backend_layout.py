@@ -2,6 +2,7 @@
 
 import importlib
 import inspect
+from pathlib import Path
 import subprocess
 import sys
 
@@ -34,29 +35,37 @@ def test_pod_operations_are_inherited_without_per_call_routing(public, backend, 
 def test_all_backend_packages_are_in_distribution():
     from setuptools import find_packages
 
-    packages = set(find_packages(include=["deep_ep", "deep_ep.*", "ascend_deepep", "ascend_deepep.*"]))
-    assert {"deep_ep.backends", "deep_ep.backends.pod", "deep_ep.backends.clos", "ascend_deepep"} <= packages
+    root = Path(__file__).resolve().parents[2]
+    packages = set(find_packages(where=root))
+    assert {"deep_ep.backends", "deep_ep.backends.pod", "deep_ep.backends.clos"} <= packages
+    assert not any(name == "ascend_deepep" or name.startswith("ascend_deepep.") for name in packages)
+    assert not (root / "ascend_deepep").exists()
 
 
-@pytest.mark.parametrize("first", ["ascend_deepep", "deep_ep.backends.clos"])
-def test_clos_import_orders_share_module_state(first):
+@pytest.mark.parametrize("first", ["deep_ep", "deep_ep.backends.clos"])
+def test_public_and_backend_imports_do_not_require_removed_package(first):
     pytest.importorskip("torch")
     code = f"""
 import importlib
+import importlib.abc
+import sys
+class RejectRemovedPackage(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "ascend_deepep" or fullname.startswith("ascend_deepep."):
+            raise AssertionError("imported removed package: " + fullname)
+sys.meta_path.insert(0, RejectRemovedPackage())
 importlib.import_module({first!r})
 import deep_ep
-import ascend_deepep
+from deep_ep import _clos_adapter
 from deep_ep.backends import clos
 for name in ("buffer", "elastic", "config", "_native", "event", "resources", "dtypes", "utils"):
-    old = importlib.import_module("ascend_deepep." + name)
-    new = importlib.import_module("deep_ep.backends.clos." + name)
-    assert old is new, name
-    sentinel = object()
-    old._compat_test_state = sentinel
-    assert new._compat_test_state is sentinel, name
-assert ascend_deepep.Buffer is clos.Buffer
-assert ascend_deepep.ElasticBuffer is clos.ElasticBuffer
+    importlib.import_module("deep_ep.backends.clos." + name)
+assert issubclass(_clos_adapter.Buffer, clos.Buffer)
+assert issubclass(_clos_adapter.ElasticBuffer, clos.ElasticBuffer)
+assert deep_ep.ExpandHandle is clos.ExpandHandle
+assert deep_ep.Config(num_sms=32).num_sms == 32
 assert isinstance(object.__new__(clos.EPHandle), deep_ep.EPHandle)
+assert not any(n == "ascend_deepep" or n.startswith("ascend_deepep.") for n in sys.modules)
 """
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr

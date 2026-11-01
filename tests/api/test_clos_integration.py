@@ -5,8 +5,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 import deep_ep  # noqa: E402
-from ascend_deepep import Config as OriginalConfig  # noqa: E402
-from ascend_deepep.elastic import EPHandle as ClosHandle  # noqa: E402
+from deep_ep.backends.clos import Config as OriginalConfig  # noqa: E402
+from deep_ep.backends.clos.elastic import EPHandle as ClosHandle  # noqa: E402
 from deep_ep._clos_adapter import Buffer, ElasticBuffer  # noqa: E402
 
 
@@ -44,7 +44,7 @@ def test_cpu_helpers_do_not_initialize_npu():
 
 
 def test_clos_accepts_public_event_dependencies_without_recording_or_waiting():
-    from ascend_deepep.elastic import _validate_event_dependency, _validate_epilogue_event
+    from deep_ep.backends.clos.elastic import _validate_event_dependency, _validate_epilogue_event
 
     event = object.__new__(deep_ep.EventHandle)
     _validate_event_dependency(event, True)
