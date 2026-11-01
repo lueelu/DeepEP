@@ -22,6 +22,22 @@ from deep_ep.backends.clos import Buffer, Config, ElasticBuffer, EventHandle, Ev
 import test_v1_intranode as golden
 
 
+def buffer_entrypoints(args, group):
+    if not args.public_auto:
+        return Buffer, ElasticBuffer, {"transport": args.transport or "udma"}
+    if args.transport is not None:
+        raise ValueError("--public-auto selects the engine from topology; omit --transport")
+    from deep_ep import Buffer as PublicBuffer, ElasticBuffer as PublicElasticBuffer
+    from deep_ep._machine import select
+
+    # This golden checks the Clos layout. Fail collectively before constructing
+    # a Buffer if the node belongs to another backend; never force Clos here.
+    selection = select(group=group)
+    if selection["machine_type"] != "clos_only":
+        raise RuntimeError(f"This precision entry requires auto-detected clos_only, got {selection}")
+    return PublicBuffer, PublicElasticBuffer, {}
+
+
 def wait(result):
     event = result[-1]
     if event.event is not None:
@@ -115,22 +131,23 @@ def run_rank(rank, args):
     )
     num_experts = args.ep_size * args.experts_per_rank
     group = dist.group.WORLD
+    buffer_type, elastic_type, engine_options = buffer_entrypoints(args, group)
     # The same workspace capacity for both APIs avoids allocation-size confounds.
     capacity = max(
         config.get_nvl_buffer_size_hint(args.hidden * 2, args.ep_size, args.num_tokens),
-        ElasticBuffer.get_buffer_size_hint(group, args.num_tokens, args.hidden, args.num_topk),
+        elastic_type.get_buffer_size_hint(group, args.num_tokens, args.hidden, args.num_topk),
     )
     common = dict(
         explicitly_destroy=True,
-        transport=args.transport,
         shmem_ip_port=args.shmem_ip_port,
         udma_schedule="peer",
         num_max_tokens_per_rank=args.num_tokens,
+        **engine_options,
     )
     if args.api == "v1":
-        buffer = Buffer(group, num_nvl_bytes=capacity, **common)
+        buffer = buffer_type(group, num_nvl_bytes=capacity, **common)
     else:
-        buffer = ElasticBuffer(
+        buffer = elastic_type(
             group,
             num_bytes=capacity,
             hidden=args.hidden,
@@ -139,6 +156,23 @@ def run_rank(rank, args):
             udma_wqes_per_visit=args.udma_wqes_per_visit,
             **common,
         )
+    if args.public_auto:
+        selection = buffer.machine_selection
+        print(
+            "MACHINE_SELECTION "
+            + json.dumps(
+                dict(
+                    rank=rank,
+                    api=args.api,
+                    selection=selection,
+                    transport=buffer.transport,
+                    implementation=f"{type(buffer).__module__}.{type(buffer).__name__}",
+                )
+            ),
+            flush=True,
+        )
+        assert selection["machine_type"] == "clos_only" and selection["source"] != "explicit"
+        assert buffer.transport == "udma"
     x = golden._make_x(rank, args).to("npu")
     idx_cpu = golden._make_topk_idx(rank, args)
     idx = idx_cpu.to("npu")
@@ -280,6 +314,8 @@ def run_rank(rank, args):
         buffer = None
         if success:
             dist.destroy_process_group()
+    if args.public_auto:
+        print(f"PUBLIC_PRECISION_PASSED api={args.api} rank={rank}", flush=True)
 
 
 def main():
@@ -294,7 +330,12 @@ def main():
     p.add_argument("--num-aiv", type=int, default=64)
     p.add_argument("--udma-peers-per-worker", type=int, default=1)
     p.add_argument("--udma-wqes-per-visit", type=int, default=8)
-    p.add_argument("--transport", choices=("udma", "mte"), default="udma")
+    p.add_argument("--transport", choices=("udma", "mte"), default=None)
+    p.add_argument(
+        "--public-auto",
+        action="store_true",
+        help="Use public V1/V2 with automatic topology selection; requires a clos_only machine",
+    )
     p.add_argument("--seed", type=int, default=20260823)
     p.add_argument("--dist-init-method", default="tcp://127.0.0.1:29500")
     p.add_argument("--shmem-ip-port", default=None)
@@ -307,6 +348,8 @@ def main():
     p.add_argument("--profile-warmup", type=int, default=10)
     p.add_argument("--profile-iters", type=int, default=30)
     args = p.parse_args()
+    if args.public_auto and args.transport is not None:
+        p.error("--public-auto selects the engine from topology; omit --transport")
     if args.profile and args.fixed_capacity:
         p.error("matched performance uses exact receive counts, not padded outputs")
     args.dtype, args.expert_alignment = "bf16", 1
