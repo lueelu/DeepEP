@@ -15,6 +15,27 @@ PR（`CARD_4PMESH`，board `0x6c`）复用迁入实现的 MTE kernel，不另建
 构建产物包括 `_C`、`_clos_C` 和各自的 device library；二者加载同一 SDK 的 `libshmem.so`。
 本迁移构建面向 Ascend950，统一使用 64-bit top-k 索引。
 
+## 运行前检查机型
+
+在已安装本分支的 Python 环境中，检查本机参与任务的物理卡号，例如预期全 Clos 的八卡：
+
+```bash
+python -u scripts/check_machine.py --physical-devices 0 1 2 3 4 5 6 7 \
+    --expect clos_only --json machine_check.json
+```
+
+`--expect` 也可设为 `pod` 或 `card_4pmesh`，仅校验自动识别结果，不强制改变选择。
+成功打印 `MACHINE_CHECK_PASSED` 并返回 0；识别失败、机型不符或各卡结果不一致返回非零。
+省略 `--expect` 可先查看识别结果。报告记录识别模块的实际路径、SHA 和逐卡证据；
+输出文件须不存在。无需编译或加载 native 扩展；代码尚未安装时可加
+`--implementation source` 检查当前 checkout，但这不证明已安装包的版本一致。
+
+脚本与 Buffer 共用拓扑分类逻辑，只读取 rootinfo/topo，必要时执行限时 5 秒的 DCMI
+管理查询；不导入 Torch，不设置 NPU，不创建 Buffer/SHMEM 会话或分配设备内存。
+卡号必须是物理 chip ID，不是 EP rank 或可见设备的逻辑编号。此检查不验证逻辑卡号映射、
+链路健康或通信正确性。实际任务应使用相同代码、拓扑文件及物理设备，并通过
+`buffer.machine_type` / `buffer.machine_selection` 确认最终选择。多机需每台分别检查。
+
 ## 选择后端
 
 在调用方设置当前 NPU 后构造 Buffer。两个类均接受：

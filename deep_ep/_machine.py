@@ -153,7 +153,17 @@ def board_id(physical):
 
 
 def detect(rootinfo_path=None):
-    physical = physical_device()
+    return detect_physical(physical_device(), rootinfo_path)
+
+
+def detect_physical(physical, rootinfo_path=None):
+    """Use the runtime classification rules without selecting/initializing an NPU.
+
+    The caller supplies a physical chip ID, not a framework-visible device index
+    or EP rank. File reads and bounded DCMI management queries are the only probes.
+    """
+    if isinstance(physical, bool) or not isinstance(physical, int) or not 0 <= physical < 2**32:
+        raise ValueError("physical device must be an unsigned 32-bit chip ID")
     path = Path(rootinfo_path or "/etc/hccl_rootinfo.json")
     if path.exists():
         root, root_hash = read_json(path)

@@ -1,7 +1,10 @@
 """Backend selection and keyword translation, without loading an NPU runtime."""
 
 import copy
+import importlib.util
 import inspect
+import json
+from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -167,3 +170,170 @@ def test_operation_aliases_do_not_inspect_signatures_on_each_call(monkeypatch):
     monkeypatch.setattr(_compat.inspect, "signature", lambda _: pytest.fail("hot-path reflection"))
     assert call(a=64) == 64
     assert call(num_sms=32) == 32
+
+
+def test_runtime_detection_delegates_to_physical_probe(monkeypatch):
+    calls, selection = [], {"machine_type": "clos_only"}
+    monkeypatch.setattr(_machine, "physical_device", lambda: 13)
+
+    def probe(physical, rootinfo):
+        calls.append((physical, rootinfo))
+        return selection
+
+    monkeypatch.setattr(_machine, "detect_physical", probe)
+    assert _machine.detect("current.json") is selection
+    assert calls == [(13, "current.json")]
+
+
+@pytest.mark.parametrize("physical", [-1, 2**32, True, "0", None])
+def test_physical_probe_rejects_invalid_ids_before_queries(monkeypatch, physical):
+    monkeypatch.setattr(_machine, "board_id", lambda _: pytest.fail("unexpected driver query"))
+    with pytest.raises(ValueError, match="physical device"):
+        _machine.detect_physical(physical)
+
+
+def machine_script():
+    path = Path(__file__).resolve().parents[2] / "scripts/check_machine.py"
+    spec = importlib.util.spec_from_file_location("machine_check_script", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_clos_files(tmp_path):
+    root, topo = topology()
+    topo_path, root_path = tmp_path / "topo.json", tmp_path / "root.json"
+    topo_path.write_text(json.dumps(topo), encoding="utf-8")
+    root["topo_file_path"] = str(topo_path)
+    root_path.write_text(json.dumps(root), encoding="utf-8")
+    return root_path
+
+
+@pytest.mark.parametrize("expected,code", [("clos_only", 0), ("pod", 1), ("card_4pmesh", 1)])
+def test_machine_cli_checks_expectation_without_overriding(tmp_path, expected, code):
+    script = machine_script()
+    root_path, output = write_clos_files(tmp_path), tmp_path / "report.json"
+    assert (
+        script.main(
+            [
+                "--implementation",
+                "source",
+                "--physical-device",
+                "0",
+                "--rootinfo",
+                str(root_path),
+                "--expect",
+                expected,
+                "--json",
+                str(output),
+            ]
+        )
+        == code
+    )
+    report = json.loads(output.read_text())
+    assert report["passed"] is (code == 0)
+    assert report["results"][0]["selection"]["machine_type"] == "clos_only"
+    assert report["results"][0]["selection"]["source"] == "rootinfo"
+    assert len(report["selector"]["sha256"]) == 64
+
+
+def test_machine_cli_installed_path_does_not_import_package(monkeypatch, tmp_path):
+    script = machine_script()
+    package = tmp_path / "deep_ep"
+    package.mkdir()
+    (package / "__init__.py").write_text("raise AssertionError('package must not execute')\n")
+    (package / "_machine.py").write_bytes(Path(_machine.__file__).read_bytes())
+    monkeypatch.syspath_prepend(str(tmp_path))
+    root_path, output = write_clos_files(tmp_path), tmp_path / "report.json"
+    assert script.main(["--physical-devices", "0", "--rootinfo", str(root_path), "--json", str(output)]) == 0
+    report = json.loads(output.read_text())
+    assert Path(report["selector"]["path"]) == package / "_machine.py"
+    assert report["implementation"] == "installed"
+
+
+def test_machine_cli_has_no_framework_runtime_or_shmem_import(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    root_path = write_clos_files(tmp_path)
+    code = """
+import ctypes, importlib.abc, runpy, sys
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name.split('.')[0] in ('torch', 'torch_npu', 'deep_ep', 'ascend_deepep'):
+            raise AssertionError('unexpected package import: ' + name)
+sys.meta_path.insert(0, Block())
+def forbidden(*args, **kwargs):
+    raise AssertionError('unexpected dynamic library load')
+ctypes.CDLL = forbidden
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            code,
+            str(root / "scripts/check_machine.py"),
+            "--implementation",
+            "source",
+            "--physical-devices",
+            "0",
+            "--rootinfo",
+            str(root_path),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "MACHINE_CHECK_PASSED" in result.stdout
+
+
+def test_machine_cli_preserves_missing_evidence_and_checks_all_devices(tmp_path):
+    script = machine_script()
+    root_path, output = write_clos_files(tmp_path), tmp_path / "report.json"
+    assert (
+        script.main(
+            [
+                "--implementation",
+                "source",
+                "--physical-devices",
+                "1",
+                "0",
+                "--rootinfo",
+                str(root_path),
+                "--json",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    records = json.loads(output.read_text())["results"]
+    assert records[0]["selection"] is None and records[0]["error"]
+    assert records[1]["passed"]
+
+
+def test_machine_cli_rejects_mixed_machines(monkeypatch, tmp_path):
+    script, output = machine_script(), tmp_path / "report.json"
+    selector = SimpleNamespace(
+        detect_physical=lambda device, _: {
+            "physical_device": device,
+            "machine_type": "pod" if device else "clos_only",
+            "source": "stub",
+        }
+    )
+    monkeypatch.setattr(script, "load_selector", lambda _: (selector, {"path": "CPU stub"}))
+    assert script.main(["--physical-devices", "0", "1", "--json", str(output)]) == 1
+    report = json.loads(output.read_text())
+    assert not report["passed"] and "disagree" in report["errors"][0]
+
+
+def test_machine_cli_does_not_overwrite_report(monkeypatch, tmp_path):
+    script, output = machine_script(), tmp_path / "report.json"
+    output.write_text("previous evidence")
+    monkeypatch.setattr(script, "load_selector", lambda _: pytest.fail("must reject before querying"))
+    with pytest.raises(SystemExit) as error:
+        script.main(["--physical-devices", "0", "--json", str(output)])
+    assert error.value.code == 2
+    assert output.read_text() == "previous evidence"
