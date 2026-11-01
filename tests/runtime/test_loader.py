@@ -12,6 +12,24 @@ import pytest
 from deep_ep import _native
 
 
+def test_require_native_reuses_success_across_operations(monkeypatch):
+    from pathlib import Path
+    from unittest.mock import Mock
+
+    module = object()
+    probe, load = Mock(return_value=True), Mock(return_value=module)
+    monkeypatch.setattr(Path, "is_file", probe)
+    monkeypatch.setattr(_native, "_load_native", load)
+    _native._require_native_cached.cache_clear()
+    try:
+        for operation in ("Dispatch", "Combine", "Notify", "Dispatch"):
+            assert _native.require_native(operation) is module
+        probe.assert_called_once()
+        load.assert_called_once()
+    finally:
+        _native._require_native_cached.cache_clear()
+
+
 @pytest.mark.parametrize("fault", [None, "origin", "protocol", "checksum", "missing"])
 def test_native_loader_identity(monkeypatch, tmp_path, fault):
     library = tmp_path / "libshmem.so"

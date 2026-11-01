@@ -6,7 +6,7 @@
 
 | 目录 | 用途 | 固定提交 |
 | --- | --- | --- |
-| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `7f9d961d378225e69058080532cf4f5be16cc83d` |
+| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7` |
 | `catlass/` | MegaMoE 编译时使用的模板头文件，不单独编译动态库 | `2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1` |
 
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
