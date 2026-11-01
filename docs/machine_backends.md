@@ -124,7 +124,9 @@ V1/V2 在 UDMA 下默认 `udma_auto_policy=True`，fresh/cached dispatch 与 com
 策略不修改用户指定的核数：V1 通过 `Config(num_sms=...)`，V2 在 dispatch/combine
 传 `num_sms=...`。核数须为合法偶数，且不少于 `ceil((EP-1)/peers_per_worker) * workers_per_peer`；
 不足会报错。例如 EP128 自动策略需要 32 个发送 AIV，不能使用 20 核。
-省略核数或传 0 时沿用 32 核缺省语义。
+V1 保留 `Config` / `set_num_sms` 的缺省语义；V2 fresh dispatch 的 `num_sms=0`
+保留原 `get_theoretical_num_sms()` 估算，cached dispatch/combine 的 0 沿用 handle 核数。
+自动带宽脚本默认显式传 32 核，这与库的缺省核数选择不同。
 
 自动模式下显式传入的策略参数不改变结果；与有效值不同会在 rank 0 记录 warning。
 要调优，请在构造 Buffer 时设 `udma_auto_policy=False`，完整指定所用策略参数。例如 V2：
