@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <algorithm>
 
 #include "ascend_deepep/kernels/types.h"
 #include "ascend_deepep/platform.h"
@@ -18,7 +19,7 @@ constexpr int64_t kMaxCombineTopk = 128;
 constexpr int64_t kCombineUbBytes = ascend_deepep::platform::kKernelUbBytes;
 constexpr int64_t kCombineAlignmentBytes = 32;
 constexpr int64_t kCombineWorkspaceBaseAlignment = 512;
-constexpr int64_t kCombineUdmaCompletionSignalBytes = 512;
+constexpr int64_t kCombineUdmaCompletionSignalBytes = ascend_deepep::udma::kSignalBytes;
 constexpr int64_t kCombineUdmaWqeScratchBytes = ascend_deepep::udma::kBatchWqes * ascend_deepep::udma::kWqeBytes;
 constexpr uint32_t kCombineDtypeBfloat16 = 0;
 constexpr uint32_t kCombineDtypeFloat16 = 1;
@@ -75,17 +76,10 @@ CombineWorkspaceLayout MakeCombineWorkspaceLayout(int64_t base_offset, int64_t w
     TORCH_CHECK(base_offset <= std::numeric_limits<int64_t>::max() - payload_bytes,
                 "combine workspace end offset overflows int64");
     const int64_t payload_end = base_offset + payload_bytes;
-    int64_t udma_completion_signal_offset = payload_end;
-    int64_t end_offset = payload_end;
-    if (use_udma) {
-        udma_completion_signal_offset = AlignUpInt64(payload_end, kCombineUdmaCompletionSignalBytes);
-        const int64_t signal_slots = world_size;
-        const int64_t signal_bytes =
-            CheckedMulInt64(signal_slots, kCombineUdmaCompletionSignalBytes, "combine UDMA completion signal buffer");
-        TORCH_CHECK(udma_completion_signal_offset <= std::numeric_limits<int64_t>::max() - signal_bytes,
-                    "combine UDMA completion signal buffer overflows int64");
-        end_offset = udma_completion_signal_offset + signal_bytes;
-    }
+    // Same fixed marker header as dispatch; resetting it cannot overwrite
+    // a slower rank's previous payload/notify workspace.
+    const int64_t udma_completion_signal_offset = use_udma ? 0 : payload_end;
+    const int64_t end_offset = payload_end;
     return {token_capacity,
             x_row_stride,
             topk_weights_row_stride,
@@ -153,7 +147,9 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     std::size_t symmetric_buffer_bytes, std::size_t notify_workspace_bytes, bool use_udma, ShmemInstance& shmem,
     void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, c10::intrusive_ptr<CombineEpilogue>* epilogue,
-    c10::optional<torch::Tensor> expanded_x, c10::optional<torch::Tensor> single_source_slots)
+    c10::optional<torch::Tensor> expanded_x, c10::optional<torch::Tensor> single_source_slots,
+    std::function<void()> aggregate, c10::optional<torch::Tensor> pipeline_mapping,
+    c10::optional<torch::Tensor> pipeline_values, int64_t pipeline_chunk_tokens)
 {
     V1Allocator allocator(allocation_stream_id);
     allocator.Record({x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
@@ -192,6 +188,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
     const int64_t num_channels = resolved_num_aiv;
+    if (shmem.CombinePeerOrder() == ascend_deepep::udma::kGroupRoundRobinOrder)
+        udma_peers_per_worker = shmem.PeersPerGroupPerWorker();
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
         TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
@@ -202,8 +200,10 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                     "udma_wqes_per_visit must be 4, 8, 16 or 32");
         const int64_t workers = shmem.TokenSchedule()
                                     ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
-                                    : (world_size - 1 + udma_peers_per_worker - 1) / udma_peers_per_worker;
-        TORCH_CHECK(workers <= resolved_num_aiv && workers <= ascend_deepep::udma::kQpCount,
+                                    : shmem.WorkersPerPeer() *
+                                          ascend_deepep::udma::Workers(world_size, udma_peers_per_worker,
+                                                                       shmem.CombinePeerOrder(), shmem.RanksPerGroup());
+        TORCH_CHECK(workers <= resolved_num_aiv && workers * shmem.QpsPerWorker() <= ascend_deepep::udma::kQpCount,
                     "UDMA peer grouping exceeds the AIV or 32-QP pool budget");
     }
     TORCH_CHECK(channel_prefix_matrix.size(1) == num_channels,
@@ -256,7 +256,11 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         CheckedMulInt64(num_topk, static_cast<int64_t>(sizeof(float)), "combine top-k weights row");
     TORCH_CHECK(notify_workspace_bytes <= static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
                 "Buffer notify workspace reservation exceeds int64");
-    const int64_t workspace_base_offset = static_cast<int64_t>(notify_workspace_bytes);
+    const int64_t control_bytes =
+        use_udma ? CheckedMulInt64(world_size, kCombineUdmaCompletionSignalBytes, "UDMA control header") : 0;
+    TORCH_CHECK(static_cast<int64_t>(notify_workspace_bytes) <= std::numeric_limits<int64_t>::max() - control_bytes,
+                "combine workspace base overflows int64");
+    const int64_t workspace_base_offset = control_bytes + static_cast<int64_t>(notify_workspace_bytes);
     const CombineWorkspaceLayout workspace = MakeCombineWorkspaceLayout(
         workspace_base_offset, world_size, token_capacity, hidden_bytes,
         topk_weights.has_value() ? topk_weights_row_bytes : 0, use_udma, static_cast<int64_t>(symmetric_buffer_bytes));
@@ -268,6 +272,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                 "combine workspace exceeds the symmetric buffer");
     TORCH_CHECK(expanded_x.has_value() == single_source_slots.has_value(),
                 "both single-source combine inputs must be provided");
+    TORCH_CHECK(!aggregate || (expanded_x.has_value() && use_udma && epilogue != nullptr),
+                "early single-source combine requires expanded UDMA inputs and an epilogue");
     ascend_deepep::CombineTilingData tiling{};
     if (expanded_x.has_value()) {
         TORCH_CHECK(use_udma && epilogue != nullptr, "single-source combine requires the UDMA V2 path");
@@ -293,6 +299,10 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.num_topk = static_cast<uint32_t>(num_topk);
     tiling.block_dim = static_cast<uint32_t>(resolved_num_aiv);
     tiling.num_channels = static_cast<uint32_t>(num_channels);
+    tiling.udma_peer_order = shmem.CombinePeerOrder();
+    tiling.udma_ranks_per_group = shmem.RanksPerGroup();
+    tiling.udma_workers_per_peer = shmem.WorkersPerPeer();
+    tiling.udma_qps_per_worker = shmem.QpsPerWorker();
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
@@ -309,6 +319,42 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.udma_completion_signal_offset = static_cast<uint64_t>(workspace.udma_completion_signal_offset);
     tiling.combine_workspace_bytes = static_cast<uint64_t>(workspace.total_bytes);
 
+    c10::optional<torch::Tensor> pipeline_ready;
+    if (pipeline_chunk_tokens) {
+        TORCH_CHECK(shmem.QpsPerWorker() == 1, "aggregate pipeline requires one QP per worker");
+        TORCH_CHECK(use_udma && epilogue && !aggregate && pipeline_mapping.has_value() && expanded_x.has_value(),
+                    "invalid aggregate pipeline mode");
+        TORCH_CHECK(!shmem.TokenSchedule() || (resolved_num_aiv == 32 && world_size <= 8),
+                    "self-send aggregate pipeline requires 32 AIV and EP <= 8");
+        TORCH_CHECK(pipeline_chunk_tokens == 32 || pipeline_chunk_tokens == 64, "invalid pipeline chunk size");
+        TORCH_CHECK(resolved_num_aiv == 32 || resolved_num_aiv == 64, "pipeline requires 32/64 AIV");
+        TORCH_CHECK(
+            shmem.TokenSchedule() ||
+                shmem.WorkersPerPeer() * ascend_deepep::udma::Workers(world_size, udma_peers_per_worker,
+                                                                      shmem.CombinePeerOrder(), shmem.RanksPerGroup()) <
+                    resolved_num_aiv,
+            "aggregate pipeline needs at least one producer core");
+        TORCH_CHECK(num_recv_tokens <= std::numeric_limits<int32_t>::max() - 64,
+                    "pipeline receive rows exceed signed device range");
+        CheckNpuContiguous(*pipeline_mapping, "pipeline_mapping");
+        TORCH_CHECK(pipeline_mapping->scalar_type() == torch::kInt32 && pipeline_mapping->dim() == 2 &&
+                        pipeline_mapping->size(0) == num_recv_tokens && pipeline_mapping->size(1) > 0 &&
+                        pipeline_mapping->size(1) <= 128,
+                    "invalid aggregate pipeline mapping");
+        TORCH_CHECK(pipeline_values.has_value() == topk_weights.has_value(), "pipeline values mismatch");
+        if (!shmem.TokenSchedule()) {
+            const int64_t chunks = (num_recv_tokens + pipeline_chunk_tokens - 1) / pipeline_chunk_tokens;
+            const int64_t ready_bytes = CheckedMulInt64(std::max<int64_t>(chunks, 1), 512, "pipeline ready bytes");
+            pipeline_ready = allocator.Empty({(ready_bytes + 511) / 8}, x.options().dtype(torch::kInt64));
+        }
+        allocator.Record({pipeline_mapping, pipeline_values, pipeline_ready});
+        tiling.pipeline_mapping = reinterpret_cast<uint64_t>(pipeline_mapping->data_ptr());
+        tiling.pipeline_values = pipeline_values ? reinterpret_cast<uint64_t>(pipeline_values->data_ptr()) : 0;
+        tiling.pipeline_ready =
+            pipeline_ready ? (reinterpret_cast<uint64_t>(pipeline_ready->data_ptr()) + 511U) / 512U * 512U : 0;
+        tiling.pipeline_chunk_tokens = static_cast<uint32_t>(pipeline_chunk_tokens);
+        tiling.pipeline_topk = static_cast<uint32_t>(pipeline_mapping->size(1));
+    }
     const auto ffts_addr = shmem.FftsAddr();
     // Capture the prepared tensors/tiling by value once; no recomputation or
     // allocation between communication and reduction, and no host synchronize.
@@ -316,6 +362,9 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         // Explicit odr-use retains GM source owners, not just tiling addresses.
         (void)expanded_x;
         (void)single_source_slots;
+        (void)pipeline_mapping;
+        (void)pipeline_values;
+        (void)pipeline_ready;
         LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
                               send_head, recv_x, recv_topk_weights, tiling, symmetric_buffer, ffts_addr, use_udma,
                               phase);
@@ -324,7 +373,15 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     };
     if (epilogue != nullptr) {
         *epilogue = c10::make_intrusive<CombineEpilogue>([launch] { return launch(CombinePhase::Reduction); });
-        launch(CombinePhase::Communication);
+        if (pipeline_chunk_tokens) {
+            launch(CombinePhase::Pipeline);
+        } else if (aggregate) {
+            launch(CombinePhase::EarlySingles);
+            aggregate();
+            launch(CombinePhase::Remaining);
+        } else {
+            launch(CombinePhase::Communication);
+        }
     } else {
         launch(CombinePhase::Fused);
     }

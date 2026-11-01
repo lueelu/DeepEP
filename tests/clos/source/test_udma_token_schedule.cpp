@@ -13,7 +13,7 @@ using namespace ascend_deepep::udma;
 using Key = std::tuple<unsigned, uint64_t, uint64_t, unsigned>;
 bool corrupt = false;
 
-void Case(unsigned world, unsigned cores, unsigned tokens, bool aux, unsigned aliases)
+void Case(unsigned world, unsigned cores, unsigned tokens, bool aux, unsigned aliases, unsigned visit = 8)
 {
     const unsigned rank = world / 2, workers = TokenWorkers(cores), channel_tokens = (tokens + cores - 1) / cores;
     const unsigned stride = (channel_tokens + 7) / 8 * 8, xb = 14, sb = 8;
@@ -53,7 +53,7 @@ void Case(unsigned world, unsigned cores, unsigned tokens, bool aux, unsigned al
     d.scale_element_bytes = 4;
     d.x_scales_buffer_offset = side_offset;
     d.udma_completion_signal_offset = signal;
-    d.udma_wqes_per_visit = 8;
+    d.udma_wqes_per_visit = visit;
     d.udma_token_schedule = 1;
     for (unsigned p = 0; p < world; ++p)
         for (unsigned w = 0; w < workers; ++w) {
@@ -130,7 +130,7 @@ void Case(unsigned world, unsigned cores, unsigned tokens, bool aux, unsigned al
     c.topk_weights_row_stride = sb;
     c.topk_weights_buffer_offset = side_offset;
     c.udma_completion_signal_offset = signal;
-    c.udma_wqes_per_visit = 8;
+    c.udma_wqes_per_visit = visit;
     c.udma_token_schedule = 1;
     actual.clear();
     for (unsigned core = 0; core < cores; ++core) {
@@ -190,8 +190,14 @@ try {
                     Case(world, cores, t, aux, count % 2 ? 1 : 3);
                     ++count;
                 }
-    Case(8, 64, 8192, true, 3);
-    ++count;
+    // Cross compact-index window, channel, span and 32-WQE batch boundaries.
+    // The scalar oracle above independently checks every source/destination.
+    for (unsigned cores : {32, 64})
+        for (unsigned visit : {4, 8, 16, 32})
+            for (bool aux : {false, true}) {
+                Case(8, cores, 16385, aux, count % 2 ? 1 : 3, visit);
+                ++count;
+            }
     Markers();
     std::cout << "PASS token_schedule_cases=" << count << " decoded_wqes=" << model::decoded_wqes << " CPU-only\n";
     return 0;

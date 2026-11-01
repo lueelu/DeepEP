@@ -1,12 +1,12 @@
 #pragma once
 
-#include "ascend_deepep/kernels/udma_shared_sender.h"
+#include "ascend_deepep/kernels/udma_dispatch_sender.h"
 #include "ascend_deepep/kernels/types.h"
 #include "simt_api/device_sync_functions.h"
 
 namespace ascend_deepep::udma {
 // Separate list windows from the sender's in-flight WQE staging region.
-constexpr uint32_t kTokenListsOffset = kSenderScratchBytes;
+constexpr uint32_t kTokenListsOffset = kDispatchSenderBytes;
 static_assert(kTokenListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
@@ -20,9 +20,8 @@ __aicore__ inline void DispatchTokenRemote(
     const uint32_t workers = TokenWorkers(cores);
     if (core < workers)
         for (uint32_t first = 0; first < td.world_size - 1; first += kMaxPeers) {
-            Sender sender(
-                td.rank, td.world_size, core, kMaxPeers, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()),
-                workspace, first, core);
+            DispatchSender sender(
+                td, core, wq, workspace, x, scales, first, core);
             AscendC::GlobalTensor<int32_t> plan_gm;
             plan_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(plan));
             AscendC::GlobalTensor<int32_t> rank_gm, channel_gm;
@@ -31,8 +30,8 @@ __aicore__ inline void DispatchTokenRemote(
             const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
             const uint32_t max_tile = 65536U / td.world_size < kTileTokens ? 65536U / td.world_size : kTileTokens;
             const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
-            const uint32_t x_bytes = td.hidden * td.x_element_bytes;
             const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
+            const uint32_t fields = td.has_x_scales && scale_bytes ? 2U : 1U;
             for (uint32_t ch = core; ch < td.num_channels; ch += workers) {
                 const uint32_t begin = ch * channel_tokens < td.num_tokens ? ch * channel_tokens : td.num_tokens;
                 const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
@@ -74,25 +73,20 @@ __aicore__ inline void DispatchTokenRemote(
                     }
                     while (remaining) {
                         for (uint32_t p = 0; p < sender.Count(); ++p) {
-                            for (uint32_t visit = 0; visit < td.udma_wqes_per_visit && cursor[p] < counts[p]; ++visit) {
-                                const uint32_t token = lists.GetValue(p * kTileTokens + cursor[p]);
-                                if (field[p] == 0) {
-                                    sender.Put(
-                                        p, workspace + td.x_buffer_offset + uint64_t(row[p]) * x_bytes,
-                                        x + uint64_t(token) * x_bytes, x_bytes);
-                                    if (td.has_x_scales && scale_bytes) {
-                                        field[p] = 1;
-                                        continue;
-                                    }
-                                } else {
-                                    sender.Put(
-                                        p, workspace + td.x_scales_buffer_offset + uint64_t(row[p]) * scale_bytes,
-                                        scales + uint64_t(token) * scale_bytes, scale_bytes);
-                                }
-                                field[p] = 0;
-                                ++cursor[p];
-                                ++row[p];
-                                --remaining;
+                            uint32_t visit = td.udma_wqes_per_visit;
+                            while (visit && cursor[p] < counts[p]) {
+                                const uint64_t base = (uint64_t(sender.Rank(p)) * td.num_channels + ch) * plan_stride;
+                                const uint64_t index = base + consumed[p] - counts[p] + cursor[p];
+                                const uint32_t available = (counts[p] - cursor[p]) * fields - field[p];
+                                const uint32_t count = sender.PutRows(
+                                    p, reinterpret_cast<const __gm__ int32_t*>(plan) + index, row[p], field[p],
+                                    available < visit ? available : visit);
+                                const uint32_t rows = (field[p] + count) / fields;
+                                field[p] = (field[p] + count) % fields;
+                                cursor[p] += rows;
+                                row[p] += rows;
+                                remaining -= rows;
+                                visit -= count;
                             }
                         }
                     }

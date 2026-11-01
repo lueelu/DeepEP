@@ -36,8 +36,13 @@ class _ElasticRuntime(_FakeBufferRuntime):
 
     def _intranode_combine_begin(self, *args):
         self.phase_log = getattr(self, "phase_log", [])
-        self.phase_log.append("communication")
         self.single_combine_args = args[15:]
+        if len(args) > 17 and args[17] is not None:
+            self.phase_log.append("pipeline" if args[18] else "early_submit")
+            x, values = self.aggregate(args[0], None, args[1], args[17], args[8], args[11], args[16], args[5])
+            self.phase_log.append("aggregate")
+            args = (x, values, *args[2:])
+        self.phase_log.append("communication")
         result = self.intranode_combine(*args[:15])
         consumed = False
 
@@ -149,11 +154,28 @@ class ElasticApiTest(unittest.TestCase):
             _Group(size=8), num_max_tokens_per_rank=17, hidden=128, num_topk=4, explicitly_destroy=True, **kwargs
         )
 
+    def manual_make(self, **kwargs):
+        # Existing scheduler tests explicitly exercise manual tuning.
+        options = dict(
+            udma_auto_policy=False,
+            udma_schedule="peer",
+            udma_dispatch_peer_order="rank",
+            udma_combine_peer_order="rank",
+            udma_workers_per_peer=1,
+            udma_qps_per_worker=1,
+            udma_peers_per_worker=4,
+            udma_wqes_per_visit=8,
+        )
+        options.update(kwargs)
+        return self.make(**options)
+
     def fresh(self, buffer, **kwargs):
         x = torch.ones((13, 128), dtype=torch.bfloat16)
         idx = torch.zeros((13, 4), dtype=topk_idx_t)
         weights = torch.ones((13, 4), dtype=torch.float32)
-        return buffer.dispatch(x, topk_idx=idx, topk_weights=weights, num_experts=32, num_sms=_MAX_NUM_AIV, **kwargs)
+        return buffer.dispatch(
+            x, topk_idx=idx, topk_weights=weights, num_experts=32, num_sms=kwargs.pop("num_sms", _MAX_NUM_AIV), **kwargs
+        )
 
     def test_exports_and_shared_backend(self):
         from deep_ep._clos_adapter import ElasticBuffer as ClosElasticBuffer
@@ -162,7 +184,7 @@ class ElasticApiTest(unittest.TestCase):
         self.assertIsInstance(object.__new__(EPHandle), deep_ep.EPHandle)
         for transport in ("udma", "mte"):
             with self.subTest(transport=transport):
-                b = self.make(transport=transport, udma_peers_per_worker=1)
+                b = self.manual_make(transport=transport, udma_peers_per_worker=1)
                 self.assertTrue(b.runtime.v1_shared_jetty)
                 self.assertFalse(b.runtime.v1_token_schedule)
                 x, idx, weights, h, _ = self.fresh(b)
@@ -180,8 +202,70 @@ class ElasticApiTest(unittest.TestCase):
                         b.combine(x, h, split_reduce=removed)
                 b.destroy()
 
+    def test_peer_orders_forwarded_and_cached_handle_reused(self):
+        orders = ("rank", "group", "group_staggered")
+        for dispatch in orders:
+            for combine in orders:
+                b = self.manual_make(
+                    transport="udma",
+                    udma_dispatch_peer_order=dispatch,
+                    udma_combine_peer_order=combine,
+                    udma_ranks_per_group=4,
+                )
+                self.assertEqual(b.runtime.udma_peer_options, (orders.index(dispatch), orders.index(combine), 4))
+                for name in ("udma_dispatch_peer_order", "udma_combine_peer_order", "udma_ranks_per_group"):
+                    with self.assertRaises(AttributeError):
+                        setattr(b, name, getattr(b, name))
+                x, _, weights, handle, _ = self.fresh(b)
+                cached = b.dispatch(torch.ones((13, 128), dtype=torch.bfloat16), handle=handle)
+                self.assertIs(cached[3], handle)
+                b.combine(x, handle, topk_weights=weights)
+                b.destroy()
+        for options in (
+            {"udma_dispatch_peer_order": "group"},
+            {"udma_combine_peer_order": "bad"},
+            {"udma_ranks_per_group": 3},
+            {"udma_ranks_per_group": True},
+            {"transport": "mte", "udma_ranks_per_group": 4},
+            {"udma_schedule": "token", "udma_ranks_per_group": 4},
+        ):
+            with self.subTest(options=options), self.assertRaises((ValueError, TypeError)):
+                self.manual_make(**({"transport": "udma"} | options))
+
+    def test_group_round_robin_cached_interfaces(self):
+        b = self.manual_make(
+            transport="udma",
+            udma_dispatch_peer_order="group_round_robin",
+            udma_combine_peer_order="group_round_robin",
+            udma_ranks_per_group=2,
+            udma_peers_per_group_per_worker=2,
+            udma_workers_per_peer=2,
+        )
+        self.assertEqual(b.runtime.udma_peer_options, (3, 3, 2, 2, 2))
+        for expanded in (False, True):
+            x, _, weights, h, _ = self.fresh(b, do_expand=expanded)
+            b.combine(x, h, topk_weights=weights)
+            cached = b.dispatch(torch.ones((13, 128), dtype=torch.bfloat16), handle=h, do_expand=expanded)
+            b.combine(cached[0], cached[3])
+        b.destroy()
+
+    def test_two_qps_per_worker_cached_interfaces(self):
+        b = self.manual_make(transport="udma", udma_qps_per_worker=2)
+        self.assertEqual(b.runtime.udma_peer_options, (0, 0, 0, 0, 1, 2))
+        self.assertEqual(b.udma_qps_per_worker, 2)
+        for expanded in (False, True):
+            x, _, weights, h, _ = self.fresh(b, do_expand=expanded)
+            b.combine(x, h, topk_weights=weights)
+            cached = b.dispatch(torch.ones((13, 128), dtype=torch.bfloat16), handle=h, do_expand=expanded)
+            b.combine(cached[0], cached[3])
+        b.destroy()
+        with self.assertRaises(ValueError):
+            self.manual_make(transport="udma", udma_workers_per_peer=2, udma_qps_per_worker=2)
+
     def test_single_source_cache_is_private_and_reused(self):
-        b = self.make(transport="udma", udma_peers_per_worker=1)
+        b = self.manual_make(transport="udma", udma_peers_per_worker=1)
+        self.assertFalse(b._use_early_single_source_combine)
+        b._use_early_single_source_combine = True
         x, _, weights, h, _ = self.fresh(b, do_expand=True)
         table = h._single_source_slots
         mapping = h._expand_layout[2]
@@ -197,10 +281,66 @@ class ElasticApiTest(unittest.TestCase):
         replacement = cached[0].clone()
         b.combine(replacement, h)
         self.assertIs(b.runtime.single_combine_args[0], replacement)
+        b._use_early_single_source_combine = False
+        b.runtime.phase_log = []
+        b.combine(replacement, h)
+        self.assertEqual(b.runtime.phase_log, ["communication", "reduce"])
+        self.assertIsNone(b.runtime.single_combine_args[2])
         b._use_single_source_combine = False
         b.combine(replacement, h)
-        self.assertEqual(b.runtime.single_combine_args, (None, None))
+        self.assertEqual(b.runtime.single_combine_args, (None, None, None, 0))
         self.assertEqual(b.runtime.single_aggregate_args, (None, None))
+        b.destroy()
+
+    def test_private_aggregate_pipeline_cached_and_guards(self):
+        b = self.manual_make(transport="udma", udma_peers_per_worker=1)
+        self.assertEqual(b._aggregate_pipeline_chunk_tokens, 0)
+        x, _, weights, h, _ = self.fresh(b, do_expand=True, num_sms=32)
+        for chunk in (32, 64):
+            b._aggregate_pipeline_chunk_tokens = chunk
+            b.runtime.phase_log = []
+            b.combine(x, h, topk_weights=weights)
+            self.assertEqual(b.runtime.phase_log, ["pipeline", "aggregate", "communication", "reduce"])
+            self.assertIs(b.runtime.single_combine_args[2], h._expand_layout[2])
+            self.assertEqual(b.runtime.single_combine_args[3], chunk)
+            self.assertIsNone(b.runtime.aggregate_args[1])
+            cached = b.dispatch(torch.ones((13, 128), dtype=torch.bfloat16), handle=h, do_expand=True)
+            b.combine(cached[0], cached[3])
+            self.assertIs(b.runtime.single_combine_args[2], h._expand_layout[2])
+        for chunk in (-1, 1, 128):
+            b._aggregate_pipeline_chunk_tokens = chunk
+            with self.assertRaisesRegex(ValueError, "pipeline chunk"):
+                b.combine(x, h)
+        b._aggregate_pipeline_chunk_tokens = 32
+        for attr, value in (
+            ("transport", "mte"),
+            ("_use_single_source_combine", False),
+            ("_use_early_single_source_combine", True),
+        ):
+            old = getattr(b, attr)
+            setattr(b, attr, value)
+            with self.assertRaisesRegex(ValueError, "pipeline requires"):
+                b.combine(x, h)
+            setattr(b, attr, old)
+        b.destroy()
+
+    def test_private_self_send_pipeline_requires_independent_qps(self):
+        b = self.manual_make(transport="udma", udma_schedule="token")
+        x, _, weights, h, _ = self.fresh(b, do_expand=True, num_sms=32)
+        for chunk in (32, 64):
+            b._aggregate_pipeline_chunk_tokens = chunk
+            b.combine(x, h, topk_weights=weights, num_sms=32)
+            self.assertEqual(b.runtime.single_combine_args[3], chunk)
+            with (
+                patch("deep_ep.backends.clos.elastic._MAX_NUM_AIV", 64),
+                patch("deep_ep.backends.clos.config._MAX_NUM_AIV", 64),
+            ):
+                x64, _, _, h64, _ = self.fresh(b, do_expand=True, num_sms=64)
+                with self.assertRaisesRegex(ValueError, "self-send aggregate pipeline"):
+                    b.combine(x64, h64, num_sms=64)
+        b.num_ranks = 16
+        with self.assertRaisesRegex(ValueError, "self-send aggregate pipeline"):
+            b.combine(x, h, num_sms=32)
         b.destroy()
 
     def test_combine_epilogue_dependency_and_completion_order(self):
@@ -209,7 +349,7 @@ class ElasticApiTest(unittest.TestCase):
             for allocation in (False, True):
                 for asynchronous in (False, True):
                     with self.subTest(expanded=expanded, allocation=allocation, asynchronous=asynchronous):
-                        b = self.make()
+                        b = self.manual_make()
                         x, _, w, h, _ = self.fresh(b, do_expand=expanded)
                         log = b.runtime.phase_log = []
                         gate = _Event()
@@ -252,7 +392,7 @@ class ElasticApiTest(unittest.TestCase):
                         b.destroy()
 
     def test_event_constraints_match_legacy_elastic(self):
-        b = self.make()
+        b = self.manual_make()
         x, _, _, h, _ = self.fresh(b)
         with self.assertRaises(ValueError):
             b.combine(x, h, previous_event=_Event(), allocate_on_comm_stream=False)
@@ -264,8 +404,47 @@ class ElasticApiTest(unittest.TestCase):
         b.combine(x, h, previous_event_before_epilogue=_Event(), allocate_on_comm_stream=False)
         b.destroy()
 
+    def test_early_combine_keeps_input_and_epilogue_events_on_their_sides(self):
+        b = self.manual_make(transport="udma")
+        b._use_early_single_source_combine = True
+        x, _, w, h, _ = self.fresh(b, do_expand=True)
+        log = b.runtime.phase_log = []
+        dependency, gate, completion = _Event(), _Event(), _Event()
+        dependency.current_stream_wait = lambda: log.append("input_wait")
+        gate.current_stream_wait = lambda: log.append("epilogue_wait")
+        completion.current_stream_wait = lambda: log.append("caller_wait")
+
+        def record(_):
+            if not log:
+                return dependency
+            log.append("completion_record")
+            return completion
+
+        with patch("deep_ep.backends.clos.elastic._try_record_event", side_effect=record):
+            result = b.combine(
+                x, h, topk_weights=w, previous_event_before_epilogue=gate, async_with_compute_stream=True
+            )
+        self.assertEqual(
+            log,
+            [
+                "input_wait",
+                "early_submit",
+                "aggregate",
+                "communication",
+                "epilogue_wait",
+                "reduce",
+                "completion_record",
+            ],
+        )
+        self.assertIs(b.runtime.single_combine_args[2], h._expand_layout[2])
+        self.assertIs(result[-1].event, completion)
+        self.assertTrue(any(v is b.runtime.last_epilogue for v in result[-1].extra_tensors))
+        result[-1].current_stream_wait(release_handle=True)
+        self.assertEqual(log[-1], "caller_wait")
+        b.destroy()
+
     def test_cached_plan_and_new_weights(self):
-        b = self.make(transport="udma")
+        b = self.manual_make(transport="udma")
         x, _, w, h, _ = self.fresh(b)
         original = h._dispatch_plan
         _, idx, weights, cached, _ = b.dispatch(x, handle=h)
@@ -291,7 +470,7 @@ class ElasticApiTest(unittest.TestCase):
             "dst_buffer_slot_idx",
         )
         for expanded in (False, True):
-            b = self.make(transport="udma")
+            b = self.manual_make(transport="udma")
             _, _, _, h, _ = self.fresh(b, do_expand=expanded, expert_alignment=8 if expanded else 1)
             self.assertEqual(b.runtime.defer_public_expert_prefix, expanded)
             tensors = [getattr(h, n) for n in fields]
@@ -340,7 +519,7 @@ class ElasticApiTest(unittest.TestCase):
             setattr(h, name, original)
 
     def test_fixed_capacity_and_rejection(self):
-        b = self.make(transport="udma")
+        b = self.manual_make(transport="udma")
         x, _, _, h, _ = self.fresh(b, do_cpu_sync=False)
         self.assertEqual(x.shape[0], 17 * 8)
         self.assertEqual(h.num_recv_tokens, 17 * 8)
@@ -351,7 +530,7 @@ class ElasticApiTest(unittest.TestCase):
         b.destroy()
 
     def test_async_retains_rebuilt_plan(self):
-        b = self.make(transport="udma")
+        b = self.manual_make(transport="udma")
         x, _, w, h, _ = self.fresh(b)
         with patch("deep_ep.backends.clos.elastic._try_record_event", side_effect=lambda _: _Event()):
             _, _, _, _, event = b.dispatch(x, handle=h, topk_weights=w, async_with_compute_stream=True)
@@ -367,22 +546,22 @@ class ElasticApiTest(unittest.TestCase):
             {"transport": "mte", "udma_schedule": "token"},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
-                self.make(**options)
-        b = self.make(transport="udma", udma_schedule="token")
+                self.manual_make(**options)
+        b = self.manual_make(transport="udma", udma_schedule="token")
         self.assertTrue(b.runtime.v1_token_schedule)
         b.destroy()
 
     def test_transport_selection(self):
         with patch.dict(os.environ, {"ASCEND_DEEPEP_TRANSPORT": "udma"}):
-            b = self.make()
+            b = self.manual_make()
             self.assertEqual(b.transport, "udma")
             b.destroy()
-            b = self.make(transport="mte")
+            b = self.manual_make(transport="mte")
             self.assertEqual(b.transport, "mte")
             b.destroy()
 
     def test_foreign_handle_rejected(self):
-        b, other = self.make(), self.make()
+        b, other = self.manual_make(), self.manual_make()
         x, _, _, h, _ = self.fresh(b)
         with self.assertRaisesRegex(ValueError, "different ElasticBuffer"):
             other.combine(x, h)

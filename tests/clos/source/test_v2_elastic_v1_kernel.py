@@ -12,6 +12,17 @@ Run one mode at a time on a single node, for example::
 import argparse
 import json
 import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "benchmarks/clos"))
+from route_workloads import (
+    add_arguments as add_route_arguments,
+    options as route_options,
+    generate as generate_routes,
+    validate as validate_routes,
+)
 
 import torch
 import torch.distributed as dist
@@ -186,8 +197,13 @@ def check_single_source_combine(buffer, rank, args):
                 values = torch.arange(recv.size(0), dtype=torch.float32, device=device) / 128
                 bias = (torch.full_like(source, 1), torch.full_like(source, -1)) if repeat else None
                 outputs = []
-                for enabled in (False, True):
+                modes = [(False, False, 0), (True, False, 0), (True, True, 0)]
+                if args.aggregate_pipeline_chunk:
+                    modes.append((True, False, args.aggregate_pipeline_chunk))
+                for enabled, early, chunk in modes:
                     buffer._use_single_source_combine = enabled
+                    buffer._use_early_single_source_combine = early
+                    buffer._aggregate_pipeline_chunk_tokens = chunk
                     out, weights, event = buffer.combine(
                         expert_x,
                         h,
@@ -205,13 +221,26 @@ def check_single_source_combine(buffer, rank, args):
                     repeat,
                     torch.nonzero(outputs[0][0] != outputs[1][0])[:8].tolist(),
                 )
+                assert torch.equal(outputs[0][0], outputs[2][0]), (
+                    "early single-source bitwise mismatch",
+                    pattern,
+                    repeat,
+                )
                 if repeat:
                     torch.testing.assert_close(outputs[0][1], outputs[1][1], rtol=0, atol=0)
+                    torch.testing.assert_close(outputs[0][1], outputs[2][1], rtol=0, atol=0)
+                if args.aggregate_pipeline_chunk:
+                    assert torch.equal(outputs[0][0], outputs[3][0]), ("pipeline bitwise mismatch", pattern, repeat)
+                    if repeat:
+                        torch.testing.assert_close(outputs[0][1], outputs[3][1], rtol=0, atol=0)
                 checks += 1
                 _, _, _, cached, _ = buffer.dispatch(source, handle=h, do_expand=True, num_sms=args.num_aiv)
                 assert cached is h and cached._single_source_slots is table
                 check_public_handle_unchanged(h, snapshots)
     print(f"[rank {rank}] single-source combine checks passed: {checks}, BF16, fresh/cached", flush=True)
+    buffer._use_single_source_combine = True
+    buffer._use_early_single_source_combine = False
+    buffer._aggregate_pipeline_chunk_tokens = args.aggregate_pipeline_chunk
 
 
 def _source_x(source_rank, num_tokens, hidden, mode, delta=0):
@@ -228,28 +257,37 @@ def _source_x(source_rank, num_tokens, hidden, mode, delta=0):
     return payload, scales
 
 
-def _routes(source_rank, token, world_size, num_experts, num_topk, mode):
-    base = (source_rank + token) % world_size
-    experts_per_rank = num_experts // world_size
-    if mode == "expand":
-        return tuple(
-            ((base + (route // 2) % world_size) % world_size) * experts_per_rank
-            + (route // (2 * world_size)) * 2
-            + route % 2
-            for route in range(num_topk)
+def _topk(source_rank, num_tokens, world_size, num_experts, num_topk, mode, args):
+    # Mode changes output representation only, never the input routing.
+    key = (source_rank, num_tokens, world_size, num_experts, num_topk, args.seed, tuple(route_options(args).items()))
+    cache = vars(args).setdefault("_route_cache", {})
+    if key not in cache:
+        cache[key] = torch.tensor(
+            generate_routes(
+                source_rank,
+                num_tokens,
+                world_size,
+                num_experts // world_size,
+                num_topk,
+                args.seed,
+                **route_options(args),
+            ),
+            dtype=topk_idx_t,
         )
-    else:
-        return tuple(
-            ((base + route % world_size) % world_size) * experts_per_rank + route // world_size
-            for route in range(num_topk)
-        )
+    return cache[key]
 
 
-def _topk(source_rank, num_tokens, world_size, num_experts, num_topk, mode):
-    return torch.tensor(
-        [_routes(source_rank, token, world_size, num_experts, num_topk, mode) for token in range(num_tokens)],
-        dtype=topk_idx_t,
-    )
+def _routes(source_rank, token, world_size, num_experts, num_topk, mode, args):
+    return _topk(source_rank, _rank_num_tokens(source_rank, args), world_size, num_experts, num_topk, mode, args)[
+        token
+    ].tolist()
+
+
+def _route_weights(rank, args):
+    n = _rank_num_tokens(rank, args)
+    weights = _weights(n, args.num_topk)
+    routes = _topk(rank, n, args.ep_size, args.num_experts, args.num_topk, args.mode, args)
+    return weights.masked_fill(routes < 0, 0)
 
 
 def _weights(num_tokens, num_topk):
@@ -293,7 +331,7 @@ def _check_received(
         source_scales = source[1] if args.mode == "fp8" else None
         for row in range(previous_end, end):
             token = int(src_idx[row])
-            routes = _routes(source_rank, token, args.ep_size, args.num_experts, args.num_topk, args.mode)
+            routes = _routes(source_rank, token, args.ep_size, args.num_experts, args.num_topk, args.mode, args)
             for route, expert in enumerate(routes):
                 is_local = expert // experts_per_rank == rank
                 expected_weight = weight_scale * ((route + 1) / 4 + token / 1024)
@@ -330,7 +368,8 @@ def _expected_combine(rank, args, delta=0):
     for token in range(num_tokens):
         destinations = [
             expert // experts_per_rank
-            for expert in _routes(rank, token, args.ep_size, args.num_experts, args.num_topk, args.mode)
+            for expert in _routes(rank, token, args.ep_size, args.num_experts, args.num_topk, args.mode, args)
+            if expert >= 0
         ]
         if args.mode != "expand":
             # Non-expanded dispatch sends one copy per destination rank.
@@ -338,6 +377,62 @@ def _expected_combine(rank, args, delta=0):
         for dst in destinations:
             result[token] += source[token] + dst + 1
     return result.to(torch.bfloat16)
+
+
+def check_workspace_reuse(buffer, rank, args, handle, bias):
+    """Keep outputs alive across consecutive combines and cached dispatches.
+
+    Intentionally skew rank arrival and alternate weight presence (and hence
+    payload extent). No host readback/barrier between the two combine calls.
+    Expected tensors come only from CPU source/routing, never device outputs.
+    """
+    pending = []
+    n = _rank_num_tokens(rank, args)
+    for iteration in range(args.reuse_iterations):
+        delta = iteration % 4
+        source = _source_x(rank, n, args.hidden, args.mode, delta)
+        x = tuple(t.to("npu") for t in source) if isinstance(source, tuple) else source.to("npu")
+        scale = 1 + iteration % 2
+        received, _, weights, cached, _ = buffer.dispatch(
+            x,
+            handle=handle,
+            topk_weights=(_route_weights(rank, args) * scale).to("npu"),
+            num_sms=args.num_aiv,
+            do_expand=args.mode == "expand",
+        )
+        assert cached is handle
+        expert_x = _payload(received).to(torch.bfloat16) + rank + 1
+        expected = _expected_combine(rank, args, delta)
+        for weighted in (False, True):
+            if rank == (iteration + int(weighted)) % args.ep_size:
+                time.sleep(0.02)
+            output, out_weights, _ = buffer.combine(
+                expert_x, handle, topk_weights=weights if weighted else None, bias=bias, num_sms=args.num_aiv
+            )
+            # Queue an actual local consumer, and retain both original and copy.
+            # Next combine may not overwrite the previous reduction's inputs.
+            pending.append(
+                (
+                    output,
+                    output.clone(),
+                    out_weights,
+                    expected,
+                    _route_weights(rank, args) * scale if weighted else None,
+                )
+            )
+    for output, consumed, weights, expected, expected_weights in pending:
+        torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(consumed.cpu(), expected, rtol=0, atol=0)
+        if expected_weights is None:
+            assert weights is None
+        else:
+            torch.testing.assert_close(weights.cpu(), expected_weights, rtol=0, atol=0)
+    if args.reuse_iterations:
+        print(
+            f"[rank {rank}] workspace reuse passed: {args.reuse_iterations} cached dispatches, "
+            f"{2 * args.reuse_iterations} combines, delayed ranks, exact CPU golden",
+            flush=True,
+        )
 
 
 def run_rank(rank, args):
@@ -378,15 +473,22 @@ def run_rank(rank, args):
             shmem_ip_port=args.shmem_ip_port,
             transport=args.transport,
             udma_schedule=args.udma_schedule,
+            udma_auto_policy=False,
+            udma_dispatch_peer_order="rank",
+            udma_combine_peer_order="rank",
+            udma_workers_per_peer=args.udma_workers_per_peer,
+            udma_qps_per_worker=args.udma_qps_per_worker,
             udma_peers_per_worker=args.udma_peers_per_worker,
             udma_wqes_per_visit=args.udma_wqes_per_visit,
         )
+        buffer._aggregate_pipeline_chunk_tokens = args.aggregate_pipeline_chunk
+        print(f"[rank {rank}] aggregate pipeline chunk={args.aggregate_pipeline_chunk}", flush=True)
 
         # Fresh dispatch: check payload, routes, weights, and FP8 scales.
         source = _source_x(rank, local_tokens, args.hidden, args.mode)
         x = tuple(t.to("npu") for t in source) if isinstance(source, tuple) else source.to("npu")
-        topk_idx = _topk(rank, local_tokens, args.ep_size, args.num_experts, num_topk, args.mode).to("npu")
-        weights = _weights(local_tokens, num_topk).to("npu")
+        topk_idx = _topk(rank, local_tokens, args.ep_size, args.num_experts, num_topk, args.mode, args).to("npu")
+        weights = _route_weights(rank, args).to("npu")
         recv_x, recv_idx, recv_weights, handle, event = buffer.dispatch(
             x,
             topk_idx=topk_idx,
@@ -400,7 +502,7 @@ def run_rank(rank, args):
         assert handle.do_expand == (args.mode == "expand")
         assert (recv_idx is None) == (args.mode == "expand")
         routes_by_rank = [
-            _topk(p, _rank_num_tokens(p, args), args.ep_size, args.num_experts, num_topk, args.mode)
+            _topk(p, _rank_num_tokens(p, args), args.ep_size, args.num_experts, num_topk, args.mode, args)
             for p in range(args.ep_size)
         ]
         public_snapshot = check_public_handle(handle, routes_by_rank, rank)
@@ -438,7 +540,7 @@ def run_rank(rank, args):
         )
         assert combine_event.event is None
         torch.testing.assert_close(combined_x.cpu(), _expected_combine(rank, args), rtol=0, atol=0)
-        torch.testing.assert_close(combined_weights.cpu(), _weights(local_tokens, num_topk), rtol=0, atol=0)
+        torch.testing.assert_close(combined_weights.cpu(), _route_weights(rank, args), rtol=0, atol=0)
 
         # Cached dispatch/combine: reuse routing metadata with new payload and weights.
         cached_source = _source_x(rank, local_tokens, args.hidden, args.mode, delta=1)
@@ -482,7 +584,7 @@ def run_rank(rank, args):
         torch.testing.assert_close(cached_combined_x.cpu(), _expected_combine(rank, args, delta=1), rtol=0, atol=0)
         torch.testing.assert_close(
             cached_combined_weights.cpu(),
-            _weights(local_tokens, num_topk) * 2,
+            _route_weights(rank, args) * 2,
             rtol=0,
             atol=0,
         )
@@ -520,7 +622,9 @@ def run_rank(rank, args):
             delta=0,
         )
         torch.testing.assert_close(combined_x.cpu(), _expected_combine(rank, args), rtol=0, atol=0)
-        torch.testing.assert_close(combined_weights.cpu(), _weights(local_tokens, num_topk), rtol=0, atol=0)
+        torch.testing.assert_close(combined_weights.cpu(), _route_weights(rank, args), rtol=0, atol=0)
+
+        check_workspace_reuse(buffer, rank, args, handle, bias)
 
         if args.local_stage_checks:
             from test_local_expand_aggregate import check_local_stages
@@ -550,10 +654,20 @@ def run_rank(rank, args):
 
 def main():
     parser = argparse.ArgumentParser()
+    add_route_arguments(parser)
+    parser.add_argument("--seed", type=int, default=20260823)
     parser.add_argument("--transport", choices=("mte", "udma"), default="udma")
     parser.add_argument("--udma-schedule", choices=("peer", "token"), default="peer")
     parser.add_argument("--udma-peers-per-worker", type=int, choices=(1, 2, 4, 8), default=4)
     parser.add_argument("--udma-wqes-per-visit", type=int, choices=(4, 8, 16, 32), default=8)
+    parser.add_argument("--udma-workers-per-peer", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--udma-qps-per-worker", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--reuse-iterations",
+        type=int,
+        default=0,
+        help="stress consecutive weighted/unweighted combines with staggered rank arrival",
+    )
     parser.add_argument("--mode", choices=("bf16", "fp8", "expand"), required=True)
     parser.add_argument("--ep-size", type=int, default=4)
     parser.add_argument("--first-device", type=int, default=0)
@@ -565,6 +679,7 @@ def main():
     parser.add_argument("--num-aiv", type=int, default=8)
     parser.add_argument("--public-handle-edges", action="store_true")
     parser.add_argument("--single-source-checks", action="store_true")
+    parser.add_argument("--aggregate-pipeline-chunk", type=int, choices=(0, 32, 64), default=0)
     parser.add_argument(
         "--local-stage-checks",
         action="store_true",
@@ -573,6 +688,20 @@ def main():
     parser.add_argument("--dist-init-method", default="tcp://127.0.0.1:29500")
     parser.add_argument("--shmem-ip-port", default=None)
     args = parser.parse_args()
+    try:
+        validate_routes(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.aggregate_pipeline_chunk and (
+        args.transport != "udma"
+        or args.udma_schedule not in ("peer", "token")
+        or args.num_aiv not in (32, 64)
+        or args.mode != "expand"
+        or (args.udma_schedule == "token" and (args.num_aiv != 32 or args.ep_size > 8))
+    ):
+        parser.error("aggregate pipeline requires expanded peer UDMA and 32/64 AIV")
+    if args.reuse_iterations < 0:
+        parser.error("reuse-iterations must be nonnegative")
     if args.ep_size < 2 or args.num_tokens < 1 or args.hidden < 1:
         parser.error("ep-size must be >= 2; num-tokens and hidden must be positive")
     if args.single_source_checks and (
@@ -589,10 +718,6 @@ def main():
         parser.error("public-handle-edges needs capacity >= ep-size+8, topk >= 2 and >= 2 experts/rank")
     if not 1 <= args.num_topk <= min(128, args.num_experts):
         parser.error("num-topk must be between 1 and min(128, num-experts)")
-    if args.mode == "expand":
-        experts_per_rank = args.num_experts // args.ep_size
-        if args.num_topk > 2 * args.ep_size * (experts_per_rank // 2):
-            parser.error("expand requires two local experts per selected rank pair")
     mp.spawn(run_rank, args=(args,), nprocs=args.ep_size, join=True)
 
 

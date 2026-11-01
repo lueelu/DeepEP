@@ -58,15 +58,16 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispa
     const int32_t local_expert_stride =
         (num_local_experts + kNotifyInt32AlignElems - 1) / kNotifyInt32AlignElems * kNotifyInt32AlignElems;
 
-    // Notify owns the symmetric-memory prefix. Dispatch payload offsets begin
-    // after the host-reserved, 512-byte-aligned notify workspace.
+    // Notify starts after the fixed UDMA header (at byte zero for MTE).
+    // Payload follows the host-reserved, 512-byte-aligned notify workspace.
     const int32_t published_rank_prefix_offset = 0;
     const int32_t published_channel_prefix_offset = world_size * world_size;
     const int32_t rank_counts_offset = published_channel_prefix_offset + world_size * channel_stride;
     const int32_t expert_counts_offset = rank_counts_offset + rank_stride;
     const int32_t channel_values_offset = expert_counts_offset + expert_stride;
 
-    __gm__ int32_t* shmem_base = reinterpret_cast<__gm__ int32_t*>(symmetric_buffer);
+    __gm__ int32_t* shmem_base = reinterpret_cast<__gm__ int32_t*>(
+        symmetric_buffer + tiling.notify_workspace_offset);
     AscendC::GlobalTensor<int32_t> local_shmem_gm;
     AscendC::GlobalTensor<int32_t> channel_values_gm;
     AscendC::GlobalTensor<int32_t> published_rank_prefix_gm;
@@ -375,7 +376,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispa
     // Published channel rows were made visible by the earlier cross-rank
     // collective. The local SyncAll above also releases both scratch buffers.
     ascend_deepep::GatherRecvChannelPrefixes(
-        symmetric_buffer, recv_channel_prefix_matrix, published_channel_prefix_offset,
+        symmetric_buffer + tiling.notify_workspace_offset,
+        recv_channel_prefix_matrix, published_channel_prefix_offset,
         rank, world_size, num_channels, channel_stride, core_idx, core_num,
         temporary_ub, accumulator_ub);
 

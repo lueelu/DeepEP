@@ -119,9 +119,12 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
 
     aclrtStream stream = GetCurrentAclStream();
-    // Dispatch and combine reuse the same symmetric-memory payload region.
-    // Every launched AIV participates before combine starts overwriting it.
-    if (phase != CombinePhase::Reduction) {
+    // Ordinary UDMA combine resets only its fixed control header, then Begin()
+    // synchronizes every rank/AIV before any payload overwrite. The previous
+    // operation's local consumers and outgoing QPs have completed in stream
+    // order. Keep the separate entry barrier for all other communication paths.
+    const bool has_udma_begin = use_udma && (phase == CombinePhase::Fused || phase == CombinePhase::Communication);
+    if (!has_udma_begin && phase != CombinePhase::Reduction && phase != CombinePhase::Remaining) {
         cached_notify_combine_kernel_do(tiling.block_dim, stream, ffts_addr);
     }
     auto* combine_kernel_do = use_udma ? &v1_combine_udma_kernel_do : &v1_combine_kernel_do;
@@ -129,6 +132,15 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
         combine_kernel_do = use_udma ? &v1_combine_udma_comm_kernel_do : &v1_combine_comm_kernel_do;
     } else if (phase == CombinePhase::Reduction) {
         combine_kernel_do = use_udma ? &v1_combine_udma_reduce_kernel_do : &v1_combine_reduce_kernel_do;
+    } else if (phase == CombinePhase::Pipeline) {
+        TORCH_CHECK(use_udma, "aggregate pipeline requires UDMA");
+        combine_kernel_do = &v1_combine_udma_pipeline_kernel_do;
+    } else if (phase == CombinePhase::EarlySingles) {
+        TORCH_CHECK(use_udma, "early single-source combine requires UDMA");
+        combine_kernel_do = &v1_combine_udma_early_kernel_do;
+    } else if (phase == CombinePhase::Remaining) {
+        TORCH_CHECK(use_udma, "early single-source combine requires UDMA");
+        combine_kernel_do = &v1_combine_udma_remaining_kernel_do;
     }
     // Communication retains every original completion wait. Reduction reads
     // the same SHMEM slots on the same stream after the optional event wait.

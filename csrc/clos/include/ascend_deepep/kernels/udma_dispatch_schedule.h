@@ -10,14 +10,16 @@ constexpr uint32_t kListsOffset = kDispatchSenderBytes;
 static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
-template <class Resource>
-__aicore__ inline void DispatchRemote(
+template <uint32_t Capacity, uint32_t Qps, class Resource>
+__aicore__ inline void DispatchRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
     GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
 {
+    constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + kOutputRecordBytes) + 32;
+    static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= 216 * 1024);
     auto wq = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
-    auto lists = resource.ubBuf.template GetBufferByByte<int32_t>(kListsOffset);
-    DispatchSender sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()), workspace, x, scales);
+    auto lists = resource.ubBuf.template GetBufferByByte<int32_t>(sender_bytes);
+    DispatchSenderT<Capacity, Qps> sender(td, core, wq, workspace, x, scales);
     AscendC::GlobalTensor<int32_t> plan_gm;
     plan_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(plan));
     AscendC::GlobalTensor<int32_t> rank_gm, channel_gm;
@@ -28,10 +30,11 @@ __aicore__ inline void DispatchRemote(
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
     const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
     const uint32_t fields = td.has_x_scales && scale_bytes ? 2U : 1U;
-    for (uint32_t ch = 0; sender.Count() && ch < td.num_channels; ++ch) {
+    // Lanes own disjoint existing notify channels; destination row order is unchanged.
+    for (uint32_t ch = core % td.udma_workers_per_peer; sender.Count() && ch < td.num_channels; ch += td.udma_workers_per_peer) {
         const uint32_t begin = ch * channel_tokens < td.num_tokens ? ch * channel_tokens : td.num_tokens;
         const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
-        uint32_t row[kMaxPeers]{}, consumed[kMaxPeers]{}, total[kMaxPeers]{};
+        uint32_t row[Capacity]{}, consumed[Capacity]{}, total[Capacity]{};
         for (uint32_t p = 0; p < sender.Count(); ++p) {
             const uint32_t peer = sender.Rank(p);
             const uint32_t previous = ch ? channel_gm.GetValue(peer * td.num_channels + ch - 1) : 0;
@@ -41,7 +44,7 @@ __aicore__ inline void DispatchRemote(
         }
         for (uint32_t start = begin; start < end; start += max_tile) {
             const uint32_t size = end - start < max_tile ? end - start : max_tile;
-            uint32_t counts[kMaxPeers]{}, cursor[kMaxPeers]{}, field[kMaxPeers]{}, remaining = 0;
+            uint32_t counts[Capacity]{}, cursor[Capacity]{}, field[Capacity]{}, remaining = 0;
             // Keep the original input-token tile and peer visit boundaries.
             // A sorted list can contribute at most `size` hits to this tile.
             AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
@@ -70,6 +73,7 @@ __aicore__ inline void DispatchRemote(
             while (remaining) {
                 for (uint32_t p = 0; p < sender.Count(); ++p) {
                     uint32_t visit = td.udma_wqes_per_visit;
+                    if (cursor[p] < counts[p]) sender.BeginVisit(p);
                     while (visit && cursor[p] < counts[p]) {
                         const uint64_t base = (uint64_t(sender.Rank(p)) * td.num_channels + ch) * plan_stride;
                         const uint64_t index = base + consumed[p] - counts[p] + cursor[p];
@@ -88,13 +92,28 @@ __aicore__ inline void DispatchRemote(
             }
         }
     }
-    sender.Publish(workspace, td.udma_completion_signal_offset, td.rank);
-    WaitIncoming<true>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores);
+    sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
+    WaitIncoming<true>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores, td.udma_workers_per_peer * Qps);
     sender.Quiet();
     // SO markers cover payload only. Metadata AIVs can still be doing remote
     // SIMT stores on another rank; all ranks/cores must join before outputs are
     // read or the workspace is reused. The collective includes local sync.
     aclshmemi_sync_npu_v4<true>(0);
+}
+template <class Resource>
+__aicore__ inline void DispatchRemote(
+    Resource& r, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rp, GM_ADDR cp,
+    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
+{
+    if (td.udma_qps_per_worker == 2) {
+        if (td.udma_peer_order == kGroupRoundRobinOrder)
+            DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+        else
+            DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+    } else if (td.udma_peer_order == kGroupRoundRobinOrder)
+        DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+    else
+        DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
 }
 #endif
 } // namespace ascend_deepep::udma

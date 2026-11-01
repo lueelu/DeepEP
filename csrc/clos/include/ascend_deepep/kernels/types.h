@@ -77,6 +77,7 @@ struct alignas(8) DispatchTilingData {
     uint32_t reserved;
     uint64_t scale_token_stride;
     uint64_t scale_hidden_stride;
+    uint64_t notify_workspace_offset;
     uint64_t recv_channel_prefix_offset;
     uint64_t x_buffer_offset;
     uint64_t src_idx_buffer_offset;
@@ -86,14 +87,20 @@ struct alignas(8) DispatchTilingData {
     uint64_t x_scales_input_buffer_offset;
     uint64_t udma_completion_signal_offset;
     uint64_t dispatch_workspace_bytes;
+    uint32_t udma_peer_order;
+    uint32_t udma_ranks_per_group;
     uint32_t udma_peers_per_worker;
     uint32_t udma_wqes_per_visit;
     uint32_t udma_token_schedule;
+    uint32_t udma_workers_per_peer = 1;
+    uint32_t udma_qps_per_worker = 1;
     // Fresh V2 handle outputs; zero for V1 and cached dispatch.
     uint64_t v2_rank_prefix;
     uint64_t v2_expert_prefix;
     uint64_t v2_src_metadata;
     uint64_t v2_dst_slots;
+    // Buffer-owned symmetric address mailbox; never part of a cached handle.
+    uint64_t udma_output_control;
 };
 
 struct alignas(8) CombineTilingData {
@@ -117,12 +124,21 @@ struct alignas(8) CombineTilingData {
     uint64_t topk_weights_buffer_offset;
     uint64_t udma_completion_signal_offset;
     uint64_t combine_workspace_bytes;
+    uint32_t udma_peer_order;
+    uint32_t udma_ranks_per_group;
     uint32_t udma_peers_per_worker;
     uint32_t udma_wqes_per_visit;
     uint32_t udma_token_schedule;
     uint32_t num_expanded_tokens;
     uint64_t expanded_x;
     uint64_t single_source_slots;
+    uint64_t pipeline_mapping;
+    uint64_t pipeline_values;
+    uint64_t pipeline_ready;
+    uint32_t pipeline_chunk_tokens;
+    uint32_t pipeline_topk;
+    uint32_t udma_workers_per_peer = 1;
+    uint32_t udma_qps_per_worker = 1;
 };
 
 struct alignas(8) ExpandTilingData {

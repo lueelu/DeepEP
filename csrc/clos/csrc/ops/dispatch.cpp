@@ -29,7 +29,7 @@ constexpr int64_t kDispatchWorkspaceAlignment = 32;
 constexpr int64_t kNotifyWorkspaceAlignment = 512;
 constexpr int64_t kDispatchStageBytes = ascend_deepep::platform::kDispatchStageBytes;
 constexpr int64_t kMaxDispatchTopk = 128;
-constexpr int64_t kDispatchUdmaCompletionSignalBytes = 512;
+constexpr int64_t kDispatchUdmaCompletionSignalBytes = ascend_deepep::udma::kSignalBytes;
 constexpr auto kTopkIdxScalarType = c10::CppTypeToScalarType<ascend_deepep::topk_idx_t>::value;
 
 struct DispatchWorkspaceLayout {
@@ -140,16 +140,9 @@ DispatchWorkspaceLayout MakeDispatchWorkspaceLayout(int64_t base_offset, int64_t
         cursor = AppendWorkspaceRegion(cursor, scale_input_buffer_bytes, "dispatch input scale staging buffer");
     }
 
-    if (use_udma) {
-        cursor = AlignUpInt64(cursor, kDispatchUdmaCompletionSignalBytes);
-        layout.udma_completion_signal_offset = cursor;
-        const int64_t signal_slots = world_size;
-        cursor = AppendWorkspaceRegion(
-            cursor, CheckedMulInt64(signal_slots, kDispatchUdmaCompletionSignalBytes, "UDMA synchronization buffer"),
-            "UDMA synchronization buffer");
-    } else {
-        layout.udma_completion_signal_offset = cursor;
-    }
+    // UDMA markers live in the fixed header, outside notify and all payloads.
+    // Their location must not change with shape, weights, or operator kind.
+    layout.udma_completion_signal_offset = use_udma ? 0 : cursor;
 
     layout.total_bytes = cursor - base_offset;
     layout.end_offset = cursor;
@@ -272,9 +265,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            bool use_udma, ShmemInstance& shmem, void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
            c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
            c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
-           bool defer_public_expert_prefix)
+           bool defer_public_expert_prefix, void* dispatch_output_control)
 {
     V1Allocator allocator(allocation_stream_id);
+    TORCH_CHECK(!use_udma || dispatch_output_control != nullptr,
+                "UDMA dispatch requires its Buffer-owned output address control");
     allocator.Record({x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
                       cached_rank_prefix_matrix, cached_channel_prefix_matrix, cached_dispatch_plan});
     CheckNpuContiguous(x, "x");
@@ -376,6 +371,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
     const int64_t num_channels = resolved_num_aiv;
+    if (shmem.DispatchPeerOrder() == ascend_deepep::udma::kGroupRoundRobinOrder)
+        udma_peers_per_worker = shmem.PeersPerGroupPerWorker();
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
         TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
@@ -386,8 +383,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                     "udma_wqes_per_visit must be 4, 8, 16 or 32");
         const int64_t workers = shmem.TokenSchedule()
                                     ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
-                                    : (world_size - 1 + udma_peers_per_worker - 1) / udma_peers_per_worker;
-        TORCH_CHECK(workers <= resolved_num_aiv && workers <= ascend_deepep::udma::kQpCount,
+                                    : shmem.WorkersPerPeer() * ascend_deepep::udma::Workers(
+                                                                   world_size, udma_peers_per_worker,
+                                                                   shmem.DispatchPeerOrder(), shmem.RanksPerGroup());
+        TORCH_CHECK(workers <= resolved_num_aiv && workers * shmem.QpsPerWorker() <= ascend_deepep::udma::kQpCount,
                     "UDMA peer grouping exceeds the AIV or 32-QP pool budget");
     }
     const int64_t num_experts = num_tokens_per_expert.has_value() ? num_tokens_per_expert->numel() : 0;
@@ -424,8 +423,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         persistent_notify_elems + rank_stride + expert_stride + num_channels * rank_stride;
     const int64_t required_notify_bytes =
         (cached_mode ? persistent_notify_elems : normal_notify_elems) * static_cast<int64_t>(sizeof(int32_t));
-    // Notify owns the leading SHMEM region. Padding it to 512 bytes keeps the
-    // following dispatch payload base aligned without sharing cache lines.
+    // Keep the fixed UDMA control header separate from notify and payload.
+    const int64_t control_bytes =
+        use_udma ? CheckedMulInt64(world_size, kDispatchUdmaCompletionSignalBytes, "UDMA control header") : 0;
+    // Padding notify to 512 bytes also aligns the following payload base.
     const int64_t required_aligned_notify_bytes = AlignUpInt64(required_notify_bytes, kNotifyWorkspaceAlignment);
     TORCH_CHECK(notify_workspace_bytes <= static_cast<std::size_t>(std::numeric_limits<int64_t>::max()),
                 "Buffer notify workspace reservation exceeds int64");
@@ -433,11 +434,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     const int64_t reserved_notify_workspace_bytes =
         std::max(previous_notify_workspace_bytes, required_aligned_notify_bytes);
     const DispatchWorkspaceLayout dispatch_workspace = MakeDispatchWorkspaceLayout(
-        reserved_notify_workspace_bytes, world_size, num_channels, recv_buffer_tokens, hidden_bytes, num_topk,
-        topk_idx.has_value(), topk_weights.has_value(), scale_row_bytes,
+        CheckedAddInt64(control_bytes, reserved_notify_workspace_bytes, "dispatch workspace base"), world_size,
+        num_channels, recv_buffer_tokens, hidden_bytes, num_topk, topk_idx.has_value(), topk_weights.has_value(),
+        scale_row_bytes,
         CheckedMulInt64(
-            // The UDMA completion region follows this staging region, so
-            // its reservation must agree on every rank, including T=0.
+            // Reserve from capacity, including ranks with T=0.
             token_capacity, scale_row_bytes, "dispatch input scale staging buffer"),
         use_udma);
     TORCH_CHECK(dispatch_workspace.recv_channel_prefix_offset % kNotifyWorkspaceAlignment == 0,
@@ -545,6 +546,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.has_x_scales = x_scales.has_value() ? 1U : 0U;
     tiling.cached_mode = cached_mode ? 1U : 0U;
     tiling.num_channels = static_cast<uint32_t>(num_channels);
+    tiling.udma_peer_order = shmem.DispatchPeerOrder();
+    tiling.udma_ranks_per_group = shmem.RanksPerGroup();
+    tiling.udma_workers_per_peer = shmem.WorkersPerPeer();
+    tiling.udma_qps_per_worker = shmem.QpsPerWorker();
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
@@ -559,6 +564,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.scale_token_stride = static_cast<uint64_t>(scale_token_stride);
     tiling.scale_hidden_stride = static_cast<uint64_t>(scale_hidden_stride);
     tiling.needs_notify_entry_barrier = (symmetric_workspace_active || capturing) ? 1U : 0U;
+    tiling.notify_workspace_offset = static_cast<uint64_t>(control_bytes);
     tiling.recv_channel_prefix_offset = static_cast<uint64_t>(dispatch_workspace.recv_channel_prefix_offset);
     tiling.x_buffer_offset = static_cast<uint64_t>(dispatch_workspace.x_buffer_offset);
     tiling.src_idx_buffer_offset = static_cast<uint64_t>(dispatch_workspace.src_idx_buffer_offset);
@@ -567,6 +573,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.x_scales_buffer_offset = static_cast<uint64_t>(dispatch_workspace.x_scales_buffer_offset);
     tiling.x_scales_input_buffer_offset = static_cast<uint64_t>(dispatch_workspace.x_scales_input_buffer_offset);
     tiling.udma_completion_signal_offset = static_cast<uint64_t>(dispatch_workspace.udma_completion_signal_offset);
+    tiling.udma_output_control = use_udma ? reinterpret_cast<uint64_t>(dispatch_output_control) : 0;
     tiling.dispatch_workspace_bytes = static_cast<uint64_t>(dispatch_workspace.total_bytes);
 
     if (cached_mode) {

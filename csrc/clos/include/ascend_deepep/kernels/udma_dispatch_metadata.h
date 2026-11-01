@@ -128,10 +128,10 @@ template <class Resource>
 __aicore__ inline void DispatchMetadata(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR plan,
     GM_ADDR rank_prefix, GM_ADDR channel_prefix, GM_ADDR workspace, GM_ADDR send_head, const DispatchTilingData& td,
-    uint32_t core, uint32_t cores, uint32_t stage_bytes)
+    uint32_t core, uint32_t cores, uint32_t stage_bytes, GM_ADDR recv_x = nullptr, GM_ADDR recv_scales = nullptr)
 {
     const uint32_t first =
-        td.udma_token_schedule ? TokenWorkers(cores) : MetadataFirst(td.world_size, td.udma_peers_per_worker, cores);
+        td.udma_token_schedule ? TokenWorkers(cores) : MetadataFirst(td.world_size, td.udma_peers_per_worker, cores, td.udma_peer_order, td.udma_ranks_per_group, td.udma_workers_per_peer);
     if (core < first)
         return;
     const uint32_t worker = core - first;
@@ -144,13 +144,14 @@ __aicore__ inline void DispatchMetadata(
     auto* rank_ptr = reinterpret_cast<__gm__ int32_t*>(rank_prefix);
     auto* channel_ptr = reinterpret_cast<__gm__ int32_t*>(channel_prefix);
     AscendC::GlobalTensor<int32_t> ranks, channels, plan_gm;
-    AscendC::GlobalTensor<uint8_t> x_gm, scales_gm, local;
+    AscendC::GlobalTensor<uint8_t> x_gm, scales_gm, output_x, output_scales;
     ranks.SetGlobalBuffer(rank_ptr);
     channels.SetGlobalBuffer(channel_ptr);
     plan_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(plan));
     x_gm.SetGlobalBuffer(x);
     scales_gm.SetGlobalBuffer(scales);
-    local.SetGlobalBuffer(workspace);
+    output_x.SetGlobalBuffer(td.udma_output_control ? recv_x : workspace + td.x_buffer_offset);
+    output_scales.SetGlobalBuffer(td.udma_output_control ? recv_scales : workspace + td.x_scales_buffer_offset);
     AscendC::DataCopyPadExtParams<uint8_t> pad{false, 0, 0, 0};
 
     const uint32_t x_bytes = td.hidden * td.x_element_bytes;
@@ -191,6 +192,8 @@ __aicore__ inline void DispatchMetadata(
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
         const uint32_t previous = ch ? channels.GetValue(td.rank * td.num_channels + ch - 1) : 0;
         const uint32_t count = channels.GetValue(td.rank * td.num_channels + ch) - previous;
+        if (td.udma_output_control && (row > td.num_output_tokens || count > td.num_output_tokens - row))
+            trap();
         const uint64_t list_base = (uint64_t(td.rank) * td.num_channels + ch) * plan_stride;
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t token = plan_gm.GetValue(list_base + i);
@@ -201,7 +204,7 @@ __aicore__ inline void DispatchMetadata(
             AscendC::DataCopyPad(staging, x_gm[uint64_t(token) * x_bytes], copy, pad);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(x_event);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(x_event);
-            AscendC::DataCopyPad(local[td.x_buffer_offset + uint64_t(row) * x_bytes], staging, copy);
+            AscendC::DataCopyPad(output_x[uint64_t(row) * x_bytes], staging, copy);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(x_event);
             slot = (slot + 1) & slot_mask;
             if (td.has_x_scales && scale_bytes) {
@@ -213,7 +216,7 @@ __aicore__ inline void DispatchMetadata(
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
                 AscendC::DataCopyPad(
-                    local[td.x_scales_buffer_offset + uint64_t(row) * scale_bytes], staging, scale_copy);
+                    output_scales[uint64_t(row) * scale_bytes], staging, scale_copy);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
                 slot = (slot + 1) & slot_mask;
             }

@@ -195,6 +195,57 @@ ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
+ASCEND_DEEPEP_EXPORT void v1_combine_udma_early_kernel_do(
+    uint32_t block_dim,
+    void* stream,
+    uint8_t* x,
+    uint8_t* topk_weights,
+    uint8_t* bias_0,
+    uint8_t* bias_1,
+    uint8_t* src_idx,
+    uint8_t* rank_prefix_matrix,
+    uint8_t* channel_prefix_matrix,
+    uint8_t* send_head,
+    uint8_t* symmetric_buffer,
+    uint8_t* recv_x,
+    uint8_t* recv_topk_weights,
+    uint8_t* tiling_host,
+    uint64_t ffts_addr);
+
+ASCEND_DEEPEP_EXPORT void v1_combine_udma_pipeline_kernel_do(
+    uint32_t block_dim,
+    void* stream,
+    uint8_t* x,
+    uint8_t* topk_weights,
+    uint8_t* bias_0,
+    uint8_t* bias_1,
+    uint8_t* src_idx,
+    uint8_t* rank_prefix_matrix,
+    uint8_t* channel_prefix_matrix,
+    uint8_t* send_head,
+    uint8_t* symmetric_buffer,
+    uint8_t* recv_x,
+    uint8_t* recv_topk_weights,
+    uint8_t* tiling_host,
+    uint64_t ffts_addr);
+
+ASCEND_DEEPEP_EXPORT void v1_combine_udma_remaining_kernel_do(
+    uint32_t block_dim,
+    void* stream,
+    uint8_t* x,
+    uint8_t* topk_weights,
+    uint8_t* bias_0,
+    uint8_t* bias_1,
+    uint8_t* src_idx,
+    uint8_t* rank_prefix_matrix,
+    uint8_t* channel_prefix_matrix,
+    uint8_t* send_head,
+    uint8_t* symmetric_buffer,
+    uint8_t* recv_x,
+    uint8_t* recv_topk_weights,
+    uint8_t* tiling_host,
+    uint64_t ffts_addr);
+
 ASCEND_DEEPEP_EXPORT void v1_combine_udma_reduce_kernel_do(
     uint32_t block_dim,
     void* stream,

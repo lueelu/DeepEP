@@ -2,6 +2,16 @@
 
 import argparse
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "benchmarks/clos"))
+from route_workloads import (
+    add_arguments as add_route_arguments,
+    options as route_options,
+    generate as generate_routes,
+    validate as validate_routes,
+)
 from typing import Any, Callable, Tuple, Union
 
 import torch
@@ -186,38 +196,24 @@ class _V1StreamTestBuffer:
 
 
 def _make_topk_idx(rank: int, args) -> torch.Tensor:
-    key = (rank, args.ep_size, args.experts_per_rank, args.num_tokens, args.num_topk, args.seed, topk_idx_t)
+    opts = route_options(args)
+    key = (
+        rank,
+        args.ep_size,
+        args.experts_per_rank,
+        args.num_tokens,
+        args.num_topk,
+        args.seed,
+        tuple(opts.items()),
+        topk_idx_t,
+    )
     cache = vars(args).setdefault("_topk_reference_cache", {})
-    if key in cache:
-        return cache[key]
-    num_experts = args.ep_size * args.experts_per_rank
-    generator = torch.Generator().manual_seed(args.seed + rank)
-    rows = []
-    for token in range(args.num_tokens):
-        primary_rank = (token + 2 * rank) % args.ep_size
-        selected = []
-        preferred = (
-            primary_rank * args.experts_per_rank + token % args.experts_per_rank,
-            primary_rank * args.experts_per_rank + (token + 1) % args.experts_per_rank,
+    if key not in cache:
+        rows = generate_routes(
+            rank, args.num_tokens, args.ep_size, args.experts_per_rank, args.num_topk, args.seed, **opts
         )
-        for expert in preferred:
-            if expert not in selected and len(selected) < args.num_topk:
-                selected.append(expert)
-        if len(selected) < args.num_topk:
-            for expert in torch.randperm(num_experts, generator=generator).tolist():
-                if expert in selected:
-                    continue
-                selected.append(expert)
-                if len(selected) == args.num_topk:
-                    break
-        if token % 17 == 16:
-            selected = [-1] * args.num_topk
-        elif token % 3 == 0:
-            selected[-1] = -1
-        rows.append(selected)
-    result = torch.tensor(rows, dtype=topk_idx_t)
-    cache[key] = result
-    return result
+        cache[key] = torch.tensor(rows, dtype=topk_idx_t).reshape(args.num_tokens, args.num_topk)
+    return cache[key]
 
 
 DispatchX = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -587,7 +583,12 @@ def _profile_operator(
     args,
     operator: str,
     fn: Callable[[], Any],
+    *,
+    sample_callback=None,
+    guard_iters: int = 0,
 ) -> None:
+    if guard_iters < 0 or (guard_iters and sample_callback is None):
+        raise ValueError("profile guards require a sample callback and a nonnegative count")
     os.makedirs(args.profile_dir, exist_ok=True)
 
     for _ in range(args.profile_warmup):
@@ -630,16 +631,26 @@ def _profile_operator(
     )
 
     prof.start()
-    for _ in range(2):
-        for _ in range(args.profile_iters):
-            _consume_profile_result(fn())
+    for step in range(2):
+        guards = guard_iters if step == 1 and sample_callback is not None else 0
+        for sample in range(-guards, args.profile_iters + guards):
+            if step == 1 and sample_callback is not None:
+                sample_callback(sample, lambda: _consume_profile_result(fn()))
+            else:
+                _consume_profile_result(fn())
         torch_npu.npu.synchronize()
         prof.step()
     prof.stop()
     torch_npu.npu.synchronize()
 
     if rank == 0:
-        print(f"profile operator {operator} written to {args.profile_dir}: iters_per_step={args.profile_iters}")
+        detail = (
+            f"measured_iters={args.profile_iters}; guard_iters_per_side={guard_iters}; "
+            f"captured_iters={args.profile_iters + 2 * guard_iters}"
+            if sample_callback is not None
+            else f"iters_per_step={args.profile_iters}"
+        )
+        print(f"profile operator {operator} written to {args.profile_dir}: {detail}")
     raise _ProfileComplete
 
 
@@ -799,6 +810,11 @@ def run_rank(local_rank: int, args) -> None:
             num_nvl_bytes=args.num_bytes,
             transport=args.transport,
             udma_schedule=args.udma_schedule,
+            udma_auto_policy=False,
+            udma_dispatch_peer_order="rank",
+            udma_combine_peer_order="rank",
+            udma_workers_per_peer=1,
+            udma_qps_per_worker=1,
             explicitly_destroy=True,
             shmem_ip_port=args.shmem_ip_port,
         )
@@ -1432,6 +1448,7 @@ def run_rank(local_rank: int, args) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    add_route_arguments(parser)
     parser.add_argument("--ep-size", type=int, default=4)
     parser.add_argument("--allocate-on-comm-stream", action="store_true")
     parser.add_argument(
@@ -1543,6 +1560,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    validate_routes(args)
     if args.stream_lifetime and args.profile is not None:
         raise ValueError("--stream-lifetime cannot be combined with profiling")
     if args.ep_size < 2:

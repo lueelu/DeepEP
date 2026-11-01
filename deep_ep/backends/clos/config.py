@@ -66,8 +66,8 @@ class Config:
         num_max_rdma_chunked_send_tokens: int = 6,
         num_max_rdma_chunked_recv_tokens: int = 256,
         *,
-        udma_peers_per_worker: int = 4,
-        udma_wqes_per_visit: int = 8,
+        udma_peers_per_worker: int | None = None,
+        udma_wqes_per_visit: int | None = None,
         num_sms: int | None = None,
         num_max_shmem_chunked_send_tokens: int | None = None,
         num_max_shmem_chunked_recv_tokens: int | None = None,
@@ -95,10 +95,13 @@ class Config:
             "num_max_shmem_chunked_recv_tokens",
             num_max_shmem_chunked_recv_tokens,
         )
+        # Keep resolved legacy values while remembering explicit tuning for auto warnings and manual validation.
+        object.__setattr__(self, "_udma_peers_explicit", udma_peers_per_worker is not None)
+        object.__setattr__(self, "_udma_wqes_explicit", udma_wqes_per_visit is not None)
         values = {
             "num_aiv": num_aiv,
-            "udma_peers_per_worker": udma_peers_per_worker,
-            "udma_wqes_per_visit": udma_wqes_per_visit,
+            "udma_peers_per_worker": 4 if udma_peers_per_worker is None else udma_peers_per_worker,
+            "udma_wqes_per_visit": 8 if udma_wqes_per_visit is None else udma_wqes_per_visit,
             "num_max_nvl_chunked_send_tokens": num_max_nvl_chunked_send_tokens,
             "num_max_nvl_chunked_recv_tokens": num_max_nvl_chunked_recv_tokens,
             "num_max_rdma_chunked_send_tokens": num_max_rdma_chunked_send_tokens,
@@ -186,6 +189,9 @@ class Config:
             normal_notify_elems * _INT_BYTES,
             _NOTIFY_WORKSPACE_ALIGNMENT,
         )
+        # Fixed UDMA header: one 512-byte worker/QP marker array per source.
+        # Also covers MTE, which does not consume this header.
+        num_bytes += num_ranks * _UDMA_COMPLETION_SIGNAL_BYTES
 
         channel_prefix_row_bytes = num_channels * _INT_BYTES
         num_bytes = align_up(
@@ -220,15 +226,6 @@ class Config:
         # FP8 dispatch so all ranks retain identical SHMEM offsets.
         num_bytes = align_up(
             num_bytes + num_tokens * _MAX_SCALES_FOR_SIZE_HINT * _FLOAT_BYTES,
-            _WORKSPACE_ALIGNMENT,
-        )
-        # Reserve the optional UDMA completion slots as well, so one hint is
-        # valid for both MTE and UDMA Buffer transports.
-        # One incoming completion marker per source, independent of QP/worker count.
-        signal_slots = num_ranks
-        num_bytes = align_up(num_bytes, _UDMA_COMPLETION_SIGNAL_BYTES)
-        num_bytes = align_up(
-            num_bytes + signal_slots * _UDMA_COMPLETION_SIGNAL_BYTES,
             _WORKSPACE_ALIGNMENT,
         )
         return align_up(num_bytes, _SHMEM_ALLOCATION_ALIGNMENT)

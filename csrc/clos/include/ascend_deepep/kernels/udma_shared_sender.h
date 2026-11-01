@@ -26,11 +26,17 @@ __aicore__ inline __gm__ uint64_t* Signal(GM_ADDR base, uint64_t offset, uint32_
 }
 
 // Every launched core participates, including cores with no send peers. Separate
-// calls sharing a runtime must be serialized; the barrier protects marker reset.
+// calls sharing a runtime must be serialized. The fixed header is disjoint from
+// both notify and payload: a fast rank can reset its local receive markers while
+// a slower rank still consumes the previous payload. Quiet() in the preceding
+// operation has released this rank's outgoing marker source. When Begin is the
+// only entry barrier (ordinary combine), no payload writes may precede it.
+// Dispatch's pre-Begin scale packing/top-k initialization still needs notify.
 __aicore__ inline void Begin(
     GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t world, uint32_t core, uint32_t cores,
     AscendC::LocalTensor<uint64_t> scratch, uint32_t marker_count = 1)
 {
+    if (marker_count > kSignalBytes / sizeof(uint64_t)) { trap(); return; }
     for (uint32_t source = core; source < world; source += cores) {
         for (uint32_t worker = 0; worker < marker_count; ++worker)
             scratch.SetValue(worker, source == rank ? 1U : 0U);
@@ -78,36 +84,57 @@ __simt_vf__ __launch_bounds__(32) inline void BuildWqes(
 
 // Cache only for this kernel invocation. The SDK still owns admission, SQ
 // wrap, publication, and CQ accounting; every short batch requests one CQE.
-class Sender {
+template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
+class SenderT {
+    static_assert(Qps == 1 || Qps == 2);
 public:
-    __aicore__ Sender(
+    __aicore__ SenderT(
         uint32_t rank, uint32_t world, uint32_t owner, uint32_t group, __ubuf__ uint8_t* scratch, GM_ADDR workspace,
-        uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0)
-        : qp_(owner), scratch_(scratch), local_base_(reinterpret_cast<uint64_t>(workspace))
+        uint32_t peer_start = UINT32_MAX, uint32_t rotation = 0,
+        uint32_t peer_order = kRankOrder, uint32_t ranks_per_group = 0, uint32_t workers_per_peer = 1)
+        : qp_(owner * Qps), qp_base_(owner * Qps), scratch_(scratch), local_base_(reinterpret_cast<uint64_t>(workspace))
     {
         auto* info = aclshmemi_udma_qp_info_fetch();
         if (info->qp_num != kQpCount)
             trap();
+        const uint32_t peer_owner = owner / workers_per_peer;
         const uint32_t first = peer_start == UINT32_MAX ? owner * group : peer_start;
-        for (uint32_t i = 0; i < group && first + i < world - 1; ++i) {
-            const uint32_t peer = Peer(rank, world, (first + i + rotation) % (world - 1));
-            const uint32_t slot = aclshmemi_udma_compute_slot(peer, static_cast<uint32_t>(-1));
-            auto* ctx = aclshmemi_udma_get_qp_ctx(info, slot, qp_);
-            if (!ctx->state_addr || !ctx->buf_addr || ctx->depth != shm::UDMA_SQ_BASKBLK_CNT ||
-                ctx->wqe_size != kWqeBytes)
-                trap();
-            auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(workspace, peer));
-            if (!remote)
-                trap();
-            auto* memory = aclshmemi_udma_get_mem_info(info, slot, qp_);
-            auto* headers = scratch_ + kHeadersOffset + count_ * 2U * kWqeBytes;
-            aclshmemi_udma_fill_sqe_base_ctx<
-                uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kData>(
-                reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers), remote, memory, 0U);
-            aclshmemi_udma_fill_sqe_base_ctx<
-                uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kLast>(
-                reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers + kWqeBytes), remote, memory, 0U);
-            peers_[count_++] = {peer, slot, ctx->state_addr, reinterpret_cast<uint64_t>(remote), ctx};
+        const uint32_t count = peer_start == UINT32_MAX
+            ? WorkerCount(rank, world, peer_owner, group, peer_order, ranks_per_group)
+            : (first < world - 1 ? ((world - 1 - first < group) ? world - 1 - first : group) : 0);
+        if (count > Capacity) { trap(); return; }
+        count_ = count;
+        for (uint32_t lane = 0; lane < Qps; ++lane) {
+            const uint32_t qp = qp_base_ + lane;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t peer = peer_start == UINT32_MAX
+                    ? WorkerPeer(rank, world, peer_owner, group, i, peer_order, ranks_per_group)
+                    : Peer(rank, world, (first + i + rotation) % (world - 1));
+                const uint32_t slot = aclshmemi_udma_compute_slot(peer, static_cast<uint32_t>(-1));
+                auto* ctx = aclshmemi_udma_get_qp_ctx(info, slot, qp);
+                if (!ctx->state_addr || !ctx->buf_addr || ctx->depth != shm::UDMA_SQ_BASKBLK_CNT ||
+                    ctx->wqe_size != kWqeBytes)
+                    trap();
+                auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(workspace, peer));
+                if (!remote)
+                    trap();
+                auto* memory = aclshmemi_udma_get_mem_info(info, slot, qp);
+                const uint32_t index = lane * Capacity + i;
+                auto* headers = scratch_ + kHeadersOffset + index * 2U * kWqeBytes;
+                aclshmemi_udma_fill_sqe_base_ctx<
+                    uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kData>(
+                    reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers), remote, memory, 0U);
+                aclshmemi_udma_fill_sqe_base_ctx<
+                    uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kLast>(
+                    reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers + kWqeBytes), remote, memory, 0U);
+                peers_[index] = {peer, slot, ctx->state_addr, reinterpret_cast<uint64_t>(remote), ctx};
+                // Independent QP lanes must never alias the same SQ state, even
+                // when two peer endpoints within one lane share a Jetty.
+                if constexpr (Qps == 2) {
+                    if (lane) for (uint32_t before = 0; before < count; ++before)
+                        if (peers_[before].state == ctx->state_addr) trap();
+                }
+            }
         }
     }
     __aicore__ uint32_t Count() const
@@ -121,6 +148,7 @@ public:
 
     __aicore__ void Put(uint32_t p, __gm__ uint8_t* dst, __gm__ uint8_t* src, uint32_t bytes)
     {
+        p = QueuePeer(p);
         if (pending_ && active_state_ != peers_[p].state)
             Flush();
         if (!pending_) {
@@ -160,33 +188,42 @@ public:
     __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0)
     {
         Flush();
-        auto* one = Signal(base, offset, rank) + worker;
-        for (uint32_t p = 0; p < count_; ++p) {
-            aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kDone>(
-                one, one, reinterpret_cast<__ubuf__ uint64_t*>(scratch_), 1U, peers_[p].peer, qp_, EVENT_ID5);
+        for (uint32_t lane = 0; lane < Qps; ++lane) {
+            auto* one = Signal(base, offset, rank) + worker * Qps + lane;
+            for (uint32_t p = 0; p < count_; ++p) {
+                aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kDone>(
+                    one, one, reinterpret_cast<__ubuf__ uint64_t*>(scratch_), 1U,
+                    peers_[lane * Capacity + p].peer, qp_base_ + lane, EVENT_ID5);
+            }
         }
     }
     __aicore__ void Quiet()
     {
-        // Each qp_idx has one AIV writer, enforced by the host peer masks and
-        // SHMEM's cross-QP alias check. A qp_idx can still span several local
-        // EIDs, so drain every distinct state, not just the first peer.
-        for (uint32_t p = 0; p < count_; ++p) {
-            bool seen = false;
-            for (uint32_t before = 0; before < p; ++before)
-                seen |= peers_[before].state == peers_[p].state;
-            if (!seen)
-                aclshmemx_udma_qp_quiet(peers_[p].peer, qp_);
+        // Drain every distinct state in every owned QP. A qp_idx may span
+        // several EIDs; two different qp_idx values must not alias an SQ.
+        for (uint32_t lane = 0; lane < Qps; ++lane) {
+            for (uint32_t p = 0; p < count_; ++p) {
+                const auto& peer = peers_[lane * Capacity + p];
+                bool seen = false;
+                for (uint32_t before = 0; before < p; ++before)
+                    seen |= peers_[lane * Capacity + before].state == peer.state;
+                if (!seen) aclshmemx_udma_qp_quiet(peer.peer, qp_base_ + lane);
+            }
         }
     }
 
 protected:
-    PeerQueue peers_[kMaxPeers]{};
-    uint32_t qp_, count_ = 0, pending_ = 0;
+    // Caller must flush its WQE/span builder before switching lanes.
+    __aicore__ void SelectQp(uint32_t lane) { qp_ = qp_base_ + lane; }
+    __aicore__ uint32_t QueuePeer(uint32_t p) const { return (qp_ - qp_base_) * Capacity + p; }
+    PeerQueue peers_[Capacity * Qps]{};
+    uint32_t qp_, qp_base_, count_ = 0, pending_ = 0;
     __ubuf__ uint8_t* scratch_;
     uint64_t local_base_, active_state_ = 0;
     uint32_t last_ = 0;
 };
+
+using Sender = SenderT<>;
 
 // Ascend950's system counter is 1 GHz (1000 cycles/us), not the AIV core clock.
 inline constexpr uint64_t kIncomingCyclesPerUs = 1000ULL;

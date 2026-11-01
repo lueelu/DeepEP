@@ -18,6 +18,7 @@
 
 #include "csrc/common/check.h"
 #include "csrc/common/peer_mapping.h"
+#include "ascend_deepep/dispatch_output.h"
 #include "csrc/launcher.h"
 #include "csrc/ops/aggregate.h"
 #include "csrc/ops/combine.h"
@@ -69,7 +70,7 @@ void ValidateHugePageMode(bool use_1g_huge_pages, int64_t num_bytes, int64_t dat
     }
 }
 
-int64_t ValidateAndGetLocalMemSize(int64_t rank, int64_t num_ranks, int64_t num_bytes)
+int64_t ValidateAndGetLocalMemSize(int64_t rank, int64_t num_ranks, int64_t num_bytes, const std::string& transport)
 {
     if (rank < 0 || num_ranks < kMinimumEpWorldSize || rank >= num_ranks) {
         throw std::invalid_argument("Buffer requires 0 <= rank < num_ranks and num_ranks >= 2");
@@ -78,10 +79,15 @@ int64_t ValidateAndGetLocalMemSize(int64_t rank, int64_t num_ranks, int64_t num_
         throw std::invalid_argument("num_bytes must be greater than or equal to zero");
     }
     constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
-    if (num_bytes > kMax - kCommMetaBytes) {
+    TORCH_CHECK(num_ranks <= std::numeric_limits<uint32_t>::max(), "num_ranks must fit uint32");
+    const int64_t control_bytes =
+        transport == "udma"
+            ? static_cast<int64_t>(ascend_deepep::udma::OutputControlBytes(static_cast<uint32_t>(num_ranks)))
+            : 0;
+    if (num_bytes > kMax - kCommMetaBytes - control_bytes) {
         throw std::overflow_error("requested communication buffer size is too large");
     }
-    const int64_t required = num_bytes + kCommMetaBytes;
+    const int64_t required = num_bytes + kCommMetaBytes + control_bytes;
     if (required > kMax - (kDeviceLargePageBytes - 1)) {
         throw std::overflow_error("aligned communication buffer size is too large");
     }
@@ -102,17 +108,22 @@ int64_t GetDeviceNumAiv()
 BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes, const std::string& transport,
                              bool low_latency_mode, const std::string& ip_port, bool use_1g_huge_pages,
                              const std::vector<int64_t>& unique_id, const std::string& bootstrap_key,
-                             bool v1_shared_jetty, bool v1_token_schedule)
+                             bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
+                             int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
+                             int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
+                             int64_t udma_qps_per_worker)
     : rank_(rank),
       num_ranks_(num_ranks),
       num_bytes_(num_bytes),
-      local_mem_size_(ValidateAndGetLocalMemSize(rank, num_ranks, num_bytes)),
+      local_mem_size_(ValidateAndGetLocalMemSize(rank, num_ranks, num_bytes, transport)),
       transport_(transport),
       data_op_engine_type_(ResolveDataOpEngineType(transport)),
       low_latency_mode_(low_latency_mode),
       use_1g_huge_pages_(use_1g_huge_pages),
-      shmem_(std::make_shared<ShmemInstance>(rank, num_ranks, ip_port, data_op_engine_type_, use_1g_huge_pages,
-                                             unique_id, bootstrap_key, v1_shared_jetty, v1_token_schedule))
+      shmem_(std::make_shared<ShmemInstance>(
+          rank, num_ranks, ip_port, data_op_engine_type_, use_1g_huge_pages, unique_id, bootstrap_key, v1_shared_jetty,
+          v1_token_schedule, udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
+          udma_peers_per_group_per_worker, udma_workers_per_peer, udma_qps_per_worker))
 {
     TORCH_CHECK(v1_token_schedule_abi_3() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
                                               uint64_t(sizeof(ascend_deepep::CombineTilingData))),
@@ -122,9 +133,11 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
     num_device_aiv_ = GetDeviceNumAiv();
     try {
         if (use_1g_huge_pages_) {
-            // The fixed user-buffer prefix owns the whole kernel workspace. Keep only the 2 MiB
-            // allocatable tail requested by AllocateCommMeta(); SHMEM adds its own internal control space.
-            shmem_->Init(static_cast<int64_t>(kCommMetaBytes), num_bytes_);
+            // The fixed prefix owns the workspace; the tail owns comm metadata
+            // and, for UDMA, the independently-lived output address mailbox.
+            const auto control_bytes =
+                transport_ == "udma" ? ascend_deepep::udma::OutputControlBytes(static_cast<uint32_t>(num_ranks_)) : 0;
+            shmem_->Init(static_cast<int64_t>(kCommMetaBytes + control_bytes), num_bytes_);
         } else {
             shmem_->Init(local_mem_size_);
         }
@@ -315,7 +328,7 @@ BufferRuntime::IntranodeDispatchWithPlan(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan);
+        cached_dispatch_plan, nullptr, false, dispatch_output_control_);
     symmetric_workspace_active_ = true;
     return result;
 }
@@ -345,7 +358,7 @@ BufferRuntime::IntranodeDispatchWithHandle(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, &public_handle, defer_public_expert_prefix);
+        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_);
     symmetric_workspace_active_ = true;
     return {result, public_handle};
 }
@@ -377,10 +390,32 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
     int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
     c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, c10::optional<torch::Tensor> expanded_x,
-    c10::optional<torch::Tensor> single_source_slots)
+    c10::optional<torch::Tensor> single_source_slots, c10::optional<torch::Tensor> early_aggregate_map,
+    int64_t pipeline_chunk_tokens)
 {
     TORCH_CHECK(num_aiv <= num_device_aiv_, "combine num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
+    TORCH_CHECK(pipeline_chunk_tokens == 0 || pipeline_chunk_tokens == 32 || pipeline_chunk_tokens == 64,
+                "aggregate pipeline chunk must be 0, 32 or 64");
+    TORCH_CHECK(!pipeline_chunk_tokens || (RequireShmem().QpsPerWorker() == 1 && early_aggregate_map.has_value() &&
+                                           (!RequireShmem().TokenSchedule() || (num_aiv == 32 && num_ranks_ <= 8)) &&
+                                           (num_aiv == 32 || num_aiv == 64)),
+                "aggregate pipeline requires expanded peer-schedule UDMA with 32/64 AIV");
+    const auto original_values = topk_weights;
+    std::function<void()> aggregate;
+    if (early_aggregate_map.has_value()) {
+        TORCH_CHECK((data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0 && expanded_x.has_value() &&
+                        single_source_slots.has_value(),
+                    "early aggregate requires the expanded single-source UDMA path");
+        TORCH_CHECK(x.is_same(*expanded_x), "early aggregate must consume the original expanded tensor");
+        auto plan = ascend_deepep::ops::PrepareAggregate(x, c10::nullopt, topk_weights, *early_aggregate_map, num_aiv,
+                                                         RequireShmem().FftsAddr(), allocation_stream_id,
+                                                         single_source_slots, rank_prefix_matrix,
+                                                         static_cast<int>(rank_), static_cast<int>(num_ranks_));
+        x = plan.x;
+        topk_weights = plan.values;
+        if (!pipeline_chunk_tokens) aggregate = std::move(plan.launch);
+    }
     c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> epilogue;
     ascend_deepep::ops::V1Combine(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head, num_aiv,
@@ -388,7 +423,8 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
         static_cast<int>(num_ranks_), static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes),
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, &epilogue,
-        expanded_x, single_source_slots);
+        expanded_x, single_source_slots, aggregate, pipeline_chunk_tokens ? early_aggregate_map : c10::nullopt,
+        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens);
     symmetric_workspace_active_ = true;
     epilogue->SetOwner(c10::intrusive_ptr<BufferRuntime>::reclaim_copy(this));
     return epilogue;
@@ -510,6 +546,12 @@ void BufferRuntime::AllocateCommMeta()
         throw std::runtime_error("aclshmem_malloc failed for the 2 MiB communication metadata slot");
     }
     ASCEND_DEEPEP_CHECK_ACL(aclrtMemset(comm_meta_ptr_, kCommMetaBytes, 0, kCommMetaBytes));
+    if (transport_ == "udma") {
+        const auto bytes = ascend_deepep::udma::OutputControlBytes(static_cast<uint32_t>(num_ranks_));
+        dispatch_output_control_ = aclshmem_malloc(bytes);
+        TORCH_CHECK(dispatch_output_control_ != nullptr, "aclshmem_malloc failed for dispatch output addresses");
+        ASCEND_DEEPEP_CHECK_ACL(aclrtMemset(dispatch_output_control_, bytes, 0, bytes));
+    }
 }
 
 void BufferRuntime::AllocateWorkspace()
@@ -537,6 +579,10 @@ void BufferRuntime::FreeResources() noexcept
         workspace_ptr_ = nullptr;
     }
     if (comm_meta_ptr_ != nullptr) {
+        if (dispatch_output_control_ != nullptr) {
+            aclshmem_free(dispatch_output_control_);
+            dispatch_output_control_ = nullptr;
+        }
         aclshmem_free(comm_meta_ptr_);
         comm_meta_ptr_ = nullptr;
     }

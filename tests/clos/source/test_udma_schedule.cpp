@@ -6,6 +6,7 @@
 #endif
 #include "ascend_deepep/kernels/udma_dispatch_schedule.h"
 #include "ascend_deepep/kernels/udma_combine_schedule.h"
+#include "ascend_deepep/kernels/udma_token_combine_schedule.h"
 #include "ascend_deepep/kernels/udma_dispatch_metadata.h"
 #include "ascend_deepep/kernels/notify_recv_prefix.h"
 #include "ascend_deepep/kernels/notify_dispatch_plan.h"
@@ -20,23 +21,27 @@ using Entry = std::tuple<uint64_t, uint64_t, uint32_t>;
 using Expected = std::vector<std::vector<Entry>>;
 bool corrupt_oracle = false, corrupt_combine_oracle = false, corrupt_metadata_oracle = false;
 bool corrupt_notify_oracle = false;
-static_assert(sizeof(DispatchTilingData) == 232);
-static_assert(sizeof(CombineTilingData) == 128);
+unsigned pipeline_chunk_test = 0;
+static_assert(sizeof(DispatchTilingData) == 264);
+static_assert(sizeof(CombineTilingData) == 176);
 
 void CheckRequests(const Expected& expected, uint8_t* workspace, uint8_t* input, uint8_t* side, unsigned rank,
-                   unsigned world, unsigned core, unsigned group, uint64_t signal)
+                   unsigned world, unsigned core, unsigned group, uint64_t signal, unsigned order = 0,
+                   unsigned ranks_per_group = 0, unsigned lanes = 1, unsigned qps = 1)
 {
     std::vector<unsigned> position(world);
     std::set<uint64_t> queues;
     unsigned markers = 0;
     bool marked = false;
     for (const auto& r : model::sent) {
-        CHECK(r.peer != rank && Owner(rank, r.peer, world, group) == core && r.qp == core);
+        CHECK(r.peer != rank && Owner(rank, r.peer, world, group, order, ranks_per_group) == core / lanes &&
+              r.qp / qps == core);
         queues.insert(model::state(r));
         if (r.order == ACLSHMEMX_UDMA_ODR_SO) {
             marked = true;
             ++markers;
-            CHECK(r.dst == workspace + signal + rank * kSignalBytes && r.src == r.dst && r.bytes == 8);
+            CHECK(r.dst == workspace + signal + rank * kSignalBytes + ((core % lanes) * qps + r.qp % qps) * 8 &&
+                  r.src == r.dst && r.bytes == 8);
         } else {
             CHECK(!marked);
             auto& list = expected[r.peer];
@@ -48,9 +53,12 @@ void CheckRequests(const Expected& expected, uint8_t* workspace, uint8_t* input,
         }
     }
     for (unsigned p = 0; p < world; ++p)
-        if (p != rank && Owner(rank, p, world, group) == core) CHECK(position[p] == expected[p].size());
-    const unsigned count = core * group < world - 1 ? std::min(group, world - 1 - core * group) : 0;
-    CHECK(markers == count && model::quiesced.size() == queues.size());
+        if (p != rank && Owner(rank, p, world, group, order, ranks_per_group) == core / lanes)
+            CHECK(position[p] == expected[p].size());
+    unsigned count = 0;
+    for (unsigned peer = 0; peer < world; ++peer)
+        count += peer != rank && Owner(rank, peer, world, group, order, ranks_per_group) == core / lanes;
+    CHECK(markers == count * qps && model::quiesced.size() == queues.size());
     std::set<uint64_t> drained;
     for (auto [p, q] : model::quiesced) CHECK(drained.insert(model::contexts[p][q].state_addr).second);
     CHECK(drained == queues && model::staged.empty());
@@ -95,10 +103,55 @@ std::vector<int32_t> Plan(const std::vector<uint8_t>& routes, DispatchTilingData
     return list;
 }
 
+// Independent peer-list oracle for the production sender model.
+std::vector<unsigned> ReferencePeers(unsigned world, unsigned rank, unsigned peers, unsigned order, unsigned size)
+{
+    std::vector<unsigned> result;
+    if (!order) {
+        for (unsigned step = 1; step < world; ++step) result.push_back((rank + step) % world);
+        return result;
+    }
+    for (unsigned local = 0; local < size; ++local)
+        for (unsigned group = 1; group <= world / size; ++group) {
+            const unsigned peer = ((rank / size + group) % (world / size)) * size + (rank % size + local) % size;
+            if (peer != rank) result.push_back(peer);
+        }
+    if (order == 2)
+        for (unsigned first = 0; first < result.size(); first += peers) {
+            const unsigned count = std::min(peers, unsigned(result.size()) - first);
+            const unsigned shift = (rank % size + first / peers) % count;
+            std::rotate(result.begin() + first, result.begin() + first + shift, result.begin() + first + count);
+        }
+    return result;
+}
+
+std::vector<unsigned> ReferenceWorker(unsigned world, unsigned rank, unsigned count, unsigned order, unsigned size,
+                                      unsigned core)
+{
+    std::vector<unsigned> result;
+    if (order == 3) {
+        const unsigned workers = (size + count - 1) / count;
+        if (core >= workers) return result;
+        // Independent nested group/position enumeration, never compact self.
+        for (unsigned step = 1; step <= world / size; ++step)
+            for (unsigned local = core; local < size; local += workers) {
+                unsigned peer = ((rank / size + step) % (world / size)) * size + local;
+                if (peer != rank) result.push_back(peer);
+            }
+    } else {
+        auto all = ReferencePeers(world, rank, count, order, size);
+        for (unsigned i = core * count; i < std::min(unsigned(all.size()), (core + 1) * count); ++i)
+            result.push_back(all[i]);
+    }
+    return result;
+}
+
 void Case(unsigned world, unsigned rank, unsigned tokens, unsigned group, unsigned visit, bool auxiliary,
-          unsigned aliases)
+          unsigned aliases, unsigned dispatch_order = 0, unsigned combine_order = 0, unsigned ranks_per_group = 0,
+          unsigned lanes = 1, unsigned qps = 1)
 {
     constexpr unsigned channels = 32, xbytes = 16, sbytes = 8;
+
     std::vector<uint8_t> route(tokens * world), x(tokens * xbytes + 1), side(tokens * sbytes + 1);
     std::vector<int32_t> prefix(world * world), channel(world * channels);
     Expected expected(world);
@@ -141,50 +194,74 @@ void Case(unsigned world, unsigned rank, unsigned tokens, unsigned group, unsign
     d.scale_element_bytes = 4;
     d.x_scales_buffer_offset = 300000;
     d.udma_completion_signal_offset = 600000;
+    d.udma_peer_order = dispatch_order;
+    d.udma_ranks_per_group = ranks_per_group;
     d.udma_peers_per_worker = group;
     d.udma_wqes_per_visit = visit;
+    d.udma_workers_per_peer = lanes;
+    d.udma_qps_per_worker = qps;
     // This sender-only model supplies already-arrived remote markers. Dedicated
     // tests below exercise delayed and missing markers against the real wait.
     for (unsigned p = 0; p < world; ++p) {
         const uint64_t one = 1;
-        std::memcpy(workspace.data() + d.udma_completion_signal_offset + p * kSignalBytes, &one, sizeof(one));
+        for (unsigned lane = 0; lane < lanes * qps; ++lane)
+            std::memcpy(workspace.data() + d.udma_completion_signal_offset + p * kSignalBytes + lane * 8, &one,
+                        sizeof(one));
     }
     std::vector<int32_t> head(tokens * world, -777);
     auto list = Plan(route, d, head);
     for (unsigned core = 0; core < channels; ++core) {
         Resource resource;
         model::reset(aliases);
-        model::active_qp = core;
+        model::active_qp = core * qps;
+        model::active_qp_count = qps;
         DispatchRemote(resource, x.data(), side.data(), reinterpret_cast<uint8_t*>(list.data()),
                        reinterpret_cast<uint8_t*>(prefix.data()), reinterpret_cast<uint8_t*>(channel.data()),
                        workspace.data(), d, core, channels);
-        CheckRequests(expected, workspace.data(), x.data(), side.data(), rank, world, core, group, 600000);
+        Expected owned(world);
+        for (unsigned peer = 0; peer < world; ++peer)
+            for (const auto& e : expected[peer]) {
+                const uint64_t src = std::get<1>(e);
+                const unsigned token = (src & ~(uint64_t{1} << 63)) / ((src >> 63) ? sbytes : xbytes);
+                if ((token / ((tokens + channels - 1) / channels)) % lanes == core % lanes) owned[peer].push_back(e);
+            }
+        CheckRequests(owned, workspace.data(), x.data(), side.data(), rank, world, core, group, 600000, dispatch_order,
+                      ranks_per_group, lanes, qps);
+        const auto dispatch_peers = ReferenceWorker(world, rank, group, dispatch_order, ranks_per_group, core / lanes);
+        const unsigned dispatch_count = dispatch_peers.size();
         // Exact original input-tile / peer / field rotation, not just per-peer
         // contents. Build queues directly from the dense route matrix oracle.
-        std::vector<unsigned> wanted, actual;
-        for (unsigned ch = 0; ch < channels; ++ch) {
+        std::vector<unsigned> wanted, actual, wanted_qp, actual_qp, next_qp(world);
+        for (unsigned ch = core % lanes; ch < channels; ch += lanes) {
             unsigned begin = std::min(tokens, ch * ((tokens + channels - 1) / channels));
             unsigned end = std::min(tokens, (ch + 1) * ((tokens + channels - 1) / channels));
             unsigned tile = std::min(256U, 65536U / world);
             for (unsigned start = begin; start < end; start += tile) {
-                std::vector<unsigned> pending(group);
-                for (unsigned p = 0; p < group && core * group + p < world - 1; ++p) {
-                    unsigned peer = (rank + 1 + core * group + p) % world;
+                std::vector<unsigned> pending(dispatch_count);
+                for (unsigned p = 0; p < dispatch_count; ++p) {
+                    unsigned peer = dispatch_peers[p];
                     for (unsigned t = start; t < std::min(end, start + tile); ++t)
                         pending[p] += route[t * world + peer] * (auxiliary ? 2 : 1);
                 }
                 while (std::any_of(pending.begin(), pending.end(), [](unsigned n) { return n != 0; })) {
-                    for (unsigned p = 0; p < group; ++p) {
+                    for (unsigned p = 0; p < pending.size(); ++p) {
                         unsigned n = std::min(visit, pending[p]);
                         pending[p] -= n;
-                        for (unsigned j = 0; j < n; ++j) wanted.push_back((rank + 1 + core * group + p) % world);
+                        for (unsigned j = 0; j < n; ++j) {
+                            wanted.push_back(dispatch_peers[p]);
+                            wanted_qp.push_back(core * qps + next_qp[dispatch_peers[p]]);
+                        }
+                        if (n) next_qp[dispatch_peers[p]] = (next_qp[dispatch_peers[p]] + 1) % qps;
                     }
                 }
             }
         }
         for (const auto& request : model::sent)
-            if (request.order != ACLSHMEMX_UDMA_ODR_SO) actual.push_back(request.peer);
-        CHECK(actual == wanted);
+            if (request.order != ACLSHMEMX_UDMA_ODR_SO) {
+                actual.push_back(request.peer);
+                actual_qp.push_back(request.qp);
+            }
+        CHECK(actual == wanted && actual_qp == wanted_qp);
     }
     // Independent combine handle: ordered per-source rows and exclusive channel begins.
     expected = Expected(world);
@@ -230,64 +307,260 @@ void Case(unsigned world, unsigned rank, unsigned tokens, unsigned group, unsign
     c.topk_weights_row_stride = sbytes;
     c.topk_weights_buffer_offset = uint64_t(world) * tokens * xbytes;
     c.udma_completion_signal_offset = uint64_t(world) * tokens * (xbytes + sbytes);
+    c.udma_peer_order = combine_order;
+    c.udma_ranks_per_group = ranks_per_group;
     c.udma_peers_per_worker = group;
     c.udma_wqes_per_visit = visit;
+    c.udma_workers_per_peer = lanes;
+    c.udma_qps_per_worker = qps;
     for (unsigned p = 0; p < world; ++p) {
         const uint64_t one = 1;
-        std::memcpy(workspace.data() + c.udma_completion_signal_offset + p * kSignalBytes, &one, sizeof(one));
+        for (unsigned lane = 0; lane < lanes * qps; ++lane)
+            std::memcpy(workspace.data() + c.udma_completion_signal_offset + p * kSignalBytes + lane * 8, &one,
+                        sizeof(one));
     }
+    const unsigned chunks = (indices.size() + 31) / 32;
+    std::vector<uint64_t> ready((chunks + 1) * 64, 0);
+    c.pipeline_chunk_tokens = pipeline_chunk_test;
+    c.pipeline_ready = reinterpret_cast<uint64_t>(ready.data());
+    std::map<uint8_t*, unsigned> polls;
+    if (pipeline_chunk_test)
+        AscendC::on_invalidate = [&](uint8_t* address) {
+            const auto a = reinterpret_cast<uintptr_t>(address), base = reinterpret_cast<uintptr_t>(ready.data());
+            if (a >= base && a < base + ready.size() * 8) {
+                CHECK((a - base) % 512 == 0);
+                if (++polls[address] == 3) *reinterpret_cast<uint64_t*>(address) = 1;
+            }
+        };
     for (unsigned core = 0; core < channels; ++core) {
         Resource resource;
         model::reset(aliases);
-        model::active_qp = core;
-        CombineRemote(resource, x.data(), side.data(), reinterpret_cast<uint8_t*>(indices.data()),
-                      reinterpret_cast<uint8_t*>(prefix.data()), reinterpret_cast<uint8_t*>(channel.data()),
-                      workspace.data(), c, core);
-        CheckRequests(expected, workspace.data(), x.data(), side.data(), rank, world, core, group,
-                      c.udma_completion_signal_offset);
+        model::active_qp = core * qps;
+        model::active_qp_count = qps;
+        if (pipeline_chunk_test)
+            CombineRemote<3>(resource, x.data(), side.data(), reinterpret_cast<uint8_t*>(indices.data()),
+                             reinterpret_cast<uint8_t*>(prefix.data()), nullptr, workspace.data(), c, core);
+        else
+            CombineRemote(resource, x.data(), side.data(), reinterpret_cast<uint8_t*>(indices.data()),
+                          reinterpret_cast<uint8_t*>(prefix.data()), reinterpret_cast<uint8_t*>(channel.data()),
+                          workspace.data(), c, core);
+        Expected owned(world);
+        for (unsigned peer = 0; peer < world; ++peer) {
+            const unsigned fields = auxiliary ? 2 : 1, rows = expected[peer].size() / fields;
+            const unsigned begin = (uint64_t(rows) * (core % lanes) / lanes) * fields;
+            const unsigned end = (uint64_t(rows) * (core % lanes + 1) / lanes) * fields;
+            owned[peer].assign(expected[peer].begin() + begin, expected[peer].begin() + end);
+        }
+        CheckRequests(owned, workspace.data(), x.data(), side.data(), rank, world, core, group,
+                      c.udma_completion_signal_offset, combine_order, ranks_per_group, lanes, qps);
         // The public visit quota applies across channel/tile boundaries. Derive
         // the exact peer order from the independent per-peer request lists.
-        std::vector<unsigned> wanted, actual, pending(group);
-        for (unsigned p = 0; p < group && core * group + p < world - 1; ++p)
-            pending[p] = expected[(rank + 1 + core * group + p) % world].size();
+        const auto combine_peers = ReferenceWorker(world, rank, group, combine_order, ranks_per_group, core / lanes);
+        std::vector<unsigned> wanted, actual, wanted_qp, actual_qp, next_qp(world), pending(combine_peers.size());
+        for (unsigned p = 0; p < combine_peers.size(); ++p) pending[p] = owned[combine_peers[p]].size();
         while (std::any_of(pending.begin(), pending.end(), [](unsigned n) { return n != 0; })) {
-            for (unsigned p = 0; p < group; ++p) {
+            for (unsigned p = 0; p < pending.size(); ++p) {
                 const unsigned n = std::min(visit, pending[p]);
                 pending[p] -= n;
-                for (unsigned j = 0; j < n; ++j) wanted.push_back((rank + 1 + core * group + p) % world);
+                for (unsigned j = 0; j < n; ++j) {
+                    wanted.push_back(combine_peers[p]);
+                    wanted_qp.push_back(core * qps + next_qp[combine_peers[p]]);
+                }
+                if (n) next_qp[combine_peers[p]] = (next_qp[combine_peers[p]] + 1) % qps;
             }
         }
         for (const auto& request : model::sent)
-            if (request.order != ACLSHMEMX_UDMA_ODR_SO) actual.push_back(request.peer);
-        CHECK(actual == wanted);
+            if (request.order != ACLSHMEMX_UDMA_ODR_SO) {
+                actual.push_back(request.peer);
+                actual_qp.push_back(request.qp);
+            }
+        CHECK(actual == wanted && actual_qp == wanted_qp);
     }
+    AscendC::on_invalidate = {};
+}
+
+// Two-phase production schedules against an independent row/field oracle.
+void EarlySingleCases()
+{
+    unsigned cases = 0;
+    using Key = std::tuple<unsigned, unsigned, uint64_t, uint64_t, unsigned>;
+    for (bool token_schedule : {false, true})
+        for (unsigned world : {2U, 8U, 64U})
+            for (unsigned cores : {32U, 64U})
+                for (unsigned lanes : {1U, 2U})
+                    for (unsigned group : {1U, 2U, 4U, 8U}) {
+                        if ((token_schedule && lanes != 1) || (!token_schedule && Workers(world, group) * lanes > 32))
+                            continue;
+                        for (unsigned visit : {4U, 8U, 16U, 32U})
+                            for (unsigned pattern : {0U, 1U, 2U, 3U})
+                                for (bool aux : {false, true}) {
+                                    const unsigned rank = world / 2, tokens = pattern == 3 ? 0 : 273;
+                                    const unsigned xb = 16, wb = 8;
+                                    std::vector<int32_t> prefix(world * world), src, slots;
+                                    for (unsigned peer = 0; peer < world; ++peer) {
+                                        for (unsigned t = 0; t < tokens; ++t) {
+                                            if (peer % 7 == 3 || (t + peer) % 5 == 0) continue;
+                                            src.push_back(t);
+                                            slots.push_back(
+                                                pattern == 0 || (pattern == 2 && t % 3) ? int(src.size() * 2) : -1);
+                                        }
+                                        prefix[peer * world + rank] = src.size();
+                                    }
+                                    std::vector<uint8_t> x(src.size() * xb + 1), side(src.size() * wb + 1),
+                                        expanded((src.size() * 2 + 1) * xb + 1);
+                                    CombineTilingData td{};
+                                    td.rank = rank;
+                                    td.world_size = world;
+                                    td.num_channels = cores;
+                                    td.hidden = 8;
+                                    td.x_element_bytes = 2;
+                                    td.token_capacity = std::max(tokens, 1U);
+                                    td.num_topk = 2;
+                                    td.has_topk_weights = aux;
+                                    td.x_row_stride = xb;
+                                    td.topk_weights_row_stride = wb;
+                                    td.topk_weights_buffer_offset = uint64_t(world) * td.token_capacity * xb;
+                                    td.udma_completion_signal_offset = uint64_t(world) * td.token_capacity * (xb + wb);
+                                    td.udma_workers_per_peer = lanes;
+                                    td.udma_peers_per_worker = group;
+                                    td.udma_wqes_per_visit = visit;
+                                    td.expanded_x = reinterpret_cast<uint64_t>(expanded.data());
+                                    td.single_source_slots = reinterpret_cast<uint64_t>(slots.data());
+                                    td.num_expanded_tokens = src.size() * 2 + 1;
+                                    std::vector<uint8_t> workspace(td.udma_completion_signal_offset +
+                                                                   world * kSignalBytes);
+                                    for (unsigned peer = 0; peer < world; ++peer)
+                                        for (unsigned w = 0; w < (token_schedule ? TokenWorkers(cores) : lanes); ++w) {
+                                            uint64_t one = 1;
+                                            std::memcpy(workspace.data() + td.udma_completion_signal_offset +
+                                                            peer * kSignalBytes + w * 8,
+                                                        &one, 8);
+                                        }
+                                    std::set<Key> expected_early, expected_late, actual_early, actual_late;
+                                    unsigned begin = 0;
+                                    for (unsigned peer = 0; peer < world; ++peer) {
+                                        unsigned end = prefix[peer * world + rank];
+                                        if (peer != rank)
+                                            for (unsigned row = begin; row < end; ++row) {
+                                                unsigned owner =
+                                                    Owner(rank, peer, world, group) * lanes +
+                                                    unsigned(lanes == 2 && row >= begin + (end - begin) / 2);
+                                                if (token_schedule) {
+                                                    const unsigned workers = TokenWorkers(cores);
+                                                    owner = (row - begin + workers -
+                                                             peer * ((workers + world - 1) / world) % workers) %
+                                                            workers;
+                                                }
+                                                uint64_t dst = (uint64_t(rank) * td.token_capacity + src[row]) * xb;
+                                                uint64_t source =
+                                                    slots[row] >= 0
+                                                        ? reinterpret_cast<uint64_t>(expanded.data() + slots[row] * xb)
+                                                        : reinterpret_cast<uint64_t>(x.data() + row * xb);
+                                                (slots[row] >= 0 ? expected_early : expected_late)
+                                                    .emplace(peer, owner, dst, source, xb);
+                                                if (aux)
+                                                    expected_late.emplace(
+                                                        peer, owner,
+                                                        td.topk_weights_buffer_offset +
+                                                            (uint64_t(rank) * td.token_capacity + src[row]) * wb,
+                                                        reinterpret_cast<uint64_t>(side.data() + row * wb), wb);
+                                            }
+                                        begin = end;
+                                    }
+                                    for (unsigned core = 0; core < cores; ++core) {
+                                        model::reset(cases % 2 ? 1 : 3);
+                                        model::active_qp = core;
+                                        Resource resource;
+                                        const unsigned syncs = AscendC::local_syncs;
+                                        if (token_schedule)
+                                            CombineTokenRemote<1>(resource, x.data(), side.data(),
+                                                                  reinterpret_cast<uint8_t*>(src.data()),
+                                                                  reinterpret_cast<uint8_t*>(prefix.data()), nullptr,
+                                                                  workspace.data(), td, core);
+                                        else
+                                            CombineRemote<1>(resource, x.data(), side.data(),
+                                                             reinterpret_cast<uint8_t*>(src.data()),
+                                                             reinterpret_cast<uint8_t*>(prefix.data()), nullptr,
+                                                             workspace.data(), td, core);
+                                        CHECK(model::quiesced.empty() && AscendC::local_syncs == syncs);
+                                        AscendC::CheckDrained();
+                                        const size_t early = model::sent.size();
+                                        for (const auto& r : model::sent) {
+                                            CHECK(r.order == ACLSHMEMX_UDMA_ODR_RO);
+                                            CHECK(actual_early
+                                                      .emplace(r.peer, r.qp, r.dst - workspace.data(),
+                                                               reinterpret_cast<uint64_t>(r.src), r.bytes)
+                                                      .second);
+                                        }
+                                        // A fresh UB resource models kernel boundaries, but SQ state is
+                                        // intentionally retained. Final quiet must cover the early set.
+                                        Resource later;
+                                        if (token_schedule)
+                                            CombineTokenRemote<2>(later, x.data(), side.data(),
+                                                                  reinterpret_cast<uint8_t*>(src.data()),
+                                                                  reinterpret_cast<uint8_t*>(prefix.data()), nullptr,
+                                                                  workspace.data(), td, core);
+                                        else
+                                            CombineRemote<2>(later, x.data(), side.data(),
+                                                             reinterpret_cast<uint8_t*>(src.data()),
+                                                             reinterpret_cast<uint8_t*>(prefix.data()), nullptr,
+                                                             workspace.data(), td, core);
+                                        std::set<unsigned> marked;
+                                        std::set<uint64_t> states, drained;
+                                        for (size_t i = 0; i < model::sent.size(); ++i) {
+                                            const auto& r = model::sent[i];
+                                            states.insert(model::state(r));
+                                            if (r.order == ACLSHMEMX_UDMA_ODR_SO) {
+                                                CHECK(i >= early && marked.insert(r.peer).second);
+                                                continue;
+                                            }
+                                            CHECK(!marked.count(r.peer));
+                                            if (i >= early)
+                                                CHECK(actual_late
+                                                          .emplace(r.peer, r.qp, r.dst - workspace.data(),
+                                                                   reinterpret_cast<uint64_t>(r.src), r.bytes)
+                                                          .second);
+                                        }
+                                        for (auto [p, q] : model::quiesced)
+                                            drained.insert(model::contexts[p][q].state_addr);
+                                        CHECK(states == drained);
+                                        AscendC::CheckDrained();
+                                    }
+                                    CHECK(actual_early == expected_early && actual_late == expected_late);
+                                    ++cases;
+                                }
+                    }
+    std::cout << "PASS early_single_cases=" << cases << " (CPU model, no NPU)\n";
 }
 
 void SingleSourceWqeCases()
 {
-    for (uint32_t step : {1U, 2U}) {
-        int32_t indices[] = {5, 6, 7};
-        int32_t slots[] = {3, -1, -1};
-        uint64_t spans[] = {reinterpret_cast<uint64_t>(indices), uint64_t(4) << 32, 0, 0};
-        uint64_t headers[16]{}, bases[] = {0x100000}, wqes[32]{};
-        asc_vf_call<BuildCombineWqes>(dim3(32), wqes, spans, headers, bases, 0x200000, 0x300000, 0, 0x8000, 16, 8, 16,
-                                      8, 17, 2, 1, 4, step, 0x400000, reinterpret_cast<uint64_t>(slots), 4);
-        CHECK(wqes[7] == 0x400000 + 3 * 16);      // single: original expert GM
-        CHECK(wqes[15] == 0x300000);              // weights remain rank-row indexed
-        CHECK(wqes[23] == 0x200000 + step * 16);  // multi: materialized aggregate
-        CHECK(wqes[31] == 0x300000 + step * 8);
-        CHECK(wqes[5] == 0x100000 + 5 * 16);
-        CHECK(wqes[21] == 0x100000 + uint64_t(indices[step]) * 16);
-        slots[0] = 4;
-        bool rejected = false;
-        try {
+    for (uint32_t step : {1U, 2U})
+        for (uint32_t index_step : {1U, step}) {
+            int32_t indices[] = {5, 6, 7};
+            int32_t slots[] = {3, -1, -1};
+            uint64_t spans[] = {reinterpret_cast<uint64_t>(indices), uint64_t(4) << 32, 0, 0};
+            uint64_t headers[16]{}, bases[] = {0x100000}, wqes[32]{};
             asc_vf_call<BuildCombineWqes>(dim3(32), wqes, spans, headers, bases, 0x200000, 0x300000, 0, 0x8000, 16, 8,
-                                          16, 8, 17, 2, 1, 4, step, 0x400000, reinterpret_cast<uint64_t>(slots), 4);
-        } catch (const std::exception&) {
-            rejected = true;
+                                          16, 8, 17, 2, 1, 4, step, index_step, 0x400000,
+                                          reinterpret_cast<uint64_t>(slots), 4);
+            CHECK(wqes[7] == 0x400000 + 3 * 16);      // single: original expert GM
+            CHECK(wqes[15] == 0x300000);              // weights remain rank-row indexed
+            CHECK(wqes[23] == 0x200000 + step * 16);  // multi: materialized aggregate
+            CHECK(wqes[31] == 0x300000 + step * 8);
+            CHECK(wqes[5] == 0x100000 + 5 * 16);
+            CHECK(wqes[21] == 0x100000 + uint64_t(indices[index_step]) * 16);
+            slots[0] = 4;
+            bool rejected = false;
+            try {
+                asc_vf_call<BuildCombineWqes>(dim3(32), wqes, spans, headers, bases, 0x200000, 0x300000, 0, 0x8000, 16,
+                                              8, 16, 8, 17, 2, 1, 4, step, index_step, 0x400000,
+                                              reinterpret_cast<uint64_t>(slots), 4);
+            } catch (const std::exception&) {
+                rejected = true;
+            }
+            CHECK(rejected);
         }
-        CHECK(rejected);
-    }
 }
 
 void InvalidCombineIndexCases()
@@ -496,11 +769,12 @@ void MetadataCase(unsigned world, unsigned rank, unsigned tokens, unsigned group
 
 // Execute the production Notify gather against independently constructed route
 // counts. Neither the oracle nor the published rows call the gather helper.
-void NotifyPrefixCase(unsigned world, unsigned channels)
+void NotifyPrefixCase(unsigned world, unsigned channels, bool fixed_header = false)
 {
     const unsigned stride = (channels + 7) / 8 * 8;
     const size_t offset = size_t(world) * world;
-    const size_t bytes = (offset + world * stride + 8) * sizeof(int32_t);
+    const size_t header = fixed_header ? world * kSignalBytes : 0;
+    const size_t bytes = header + (offset + world * stride + 8) * sizeof(int32_t);
     const int32_t poison = -1234567;
     auto token_count = [](unsigned source) { return std::array<unsigned, 5>{0, 1, 17, 129, 257}[source % 5]; };
     auto routed = [](unsigned source, unsigned token, unsigned dest, unsigned round) {
@@ -518,7 +792,7 @@ void NotifyPrefixCase(unsigned world, unsigned channels)
                     for (unsigned token = std::min(ch * per_channel, tokens);
                          token < std::min((ch + 1) * per_channel, tokens); ++token)
                         sum += routed(source, token, dest, round);
-                    WriteValue(published[source], (offset + dest * stride + ch) * sizeof(int32_t), sum);
+                    WriteValue(published[source], header + (offset + dest * stride + ch) * sizeof(int32_t), sum);
                 }
             }
         const auto original = published;
@@ -551,8 +825,8 @@ void NotifyPrefixCase(unsigned world, unsigned channels)
                 std::fill(resource.ubBuf.bytes.begin(), resource.ubBuf.bytes.end(), 0xa7);
                 AscendC::copy_records.clear();
                 AscendC::record_copies = true;
-                GatherRecvChannelPrefixes(model::local_workspace, reinterpret_cast<uint8_t*>(output), offset, rank,
-                                          world, channels, stride, core, channels,
+                GatherRecvChannelPrefixes(model::local_workspace + header, reinterpret_cast<uint8_t*>(output), offset,
+                                          rank, world, channels, stride, core, channels,
                                           resource.ubBuf.GetBufferByByte<int32_t>(65536),
                                           resource.ubBuf.GetBufferByByte<int32_t>(0));
                 AscendC::CheckDrained();
@@ -568,7 +842,7 @@ void NotifyPrefixCase(unsigned world, unsigned channels)
                           (dst - base) % (channels * 4) == 0);
                     const size_t source = (dst - base) / (channels * 4);
                     CHECK(++visits[source] == 1);  // includes identical-value duplicate writes
-                    CHECK(load.src == published[source].data() + (offset + rank * stride) * 4);
+                    CHECK(load.src == published[source].data() + header + (offset + rank * stride) * 4);
                     for (size_t i = source * channels; i < (source + 1) * channels; ++i) {
                         auto& owner = line_owner[i / 8];
                         CHECK(owner == -1 || owner == int(core));  // no split cache-line writers
@@ -608,11 +882,12 @@ unsigned IncomingWaitCases()
         AscendC::on_invalidate = {};
     };
     unsigned cases = 0;
-    auto run = [&](unsigned rank, unsigned world, unsigned core, unsigned cores, bool timeout, unsigned source = 0) {
+    auto run = [&](unsigned rank, unsigned world, unsigned core, unsigned cores, bool timeout, unsigned source = 0,
+                   unsigned lanes = 1) {
         const unsigned syncs = AscendC::local_syncs;
         bool trapped = false;
         try {
-            WaitIncoming<IsDispatch>(workspace.data(), 0, rank, world, core, cores);
+            WaitIncoming<IsDispatch>(workspace.data(), 0, rank, world, core, cores, lanes);
         } catch (const std::runtime_error& e) {
             if (std::string(e.what()) != "device guard") throw;
             trapped = true;
@@ -667,6 +942,31 @@ unsigned IncomingWaitCases()
     };
     run(2, 3, 0, 1, true, 1);
     CHECK(AscendC::system_cycle == 11 * second);
+    // Lane 0 cannot satisfy completion of lane 1; no source payload is released early.
+    reset();
+    set(0, 1);
+    run(1, 2, 0, 1, true, 0, 2);
+    CHECK(AscendC::diagnostics[0].find("worker=1 ") != std::string::npos);
+    reset();
+    set(0, 1);
+    AscendC::on_invalidate = [&](uint8_t* p) {
+        if (p == workspace.data() + 8 && AscendC::system_cycle >= 4 * second) *reinterpret_cast<uint64_t*>(p) = 1;
+    };
+    run(1, 2, 0, 1, false, 0, 2);
+    // Reusing the slot clears both lanes; the unused signal region stays intact.
+    reset();
+    std::fill(workspace.begin(), workspace.end(), 0xa5);
+    for (unsigned core = 0; core < 2; ++core) {
+        Resource resource;
+        Begin(workspace.data(), 0, 1, 2, core, 2, resource.ubBuf.GetBufferByByte<uint64_t>(0), 2);
+        AscendC::CheckDrained();
+    }
+    for (unsigned source = 0; source < 2; ++source) {
+        for (unsigned lane = 0; lane < 2; ++lane)
+            CHECK(*reinterpret_cast<uint64_t*>(workspace.data() + source * kSignalBytes + lane * 8) ==
+                  unsigned(source == 1));
+        CHECK(workspace[source * kSignalBytes + 16] == 0xa5);
+    }
     // Unsigned elapsed arithmetic must survive a counter wrap.
     reset();
     AscendC::system_cycle = UINT64_MAX - 4 * second;
@@ -719,11 +1019,41 @@ void ParallelNotifyCases()
     }
 }
 
+void FixedControlHeaderCases()
+{
+    // Changing shape/weight presence must never move reset writes into a
+    // previous call's notify/payload. Exercise every marker through the
+    // maximum 64-entry slot and idle AIVs as well as strided source ownership.
+    for (unsigned world : {2, 8, 32, 128}) {
+        const unsigned header = world * kSignalBytes;
+        for (unsigned cores : {20, 32, 64}) {
+            for (unsigned markers : {1, 2, 4, 32, 64}) {
+                std::vector<uint8_t> workspace(header + 4096, 0xa5);
+                for (unsigned core = 0; core < cores; ++core) {
+                    Resource resource;
+                    Begin(workspace.data(), 0, world - 1, world, core, cores,
+                          resource.ubBuf.GetBufferByByte<uint64_t>(0), markers);
+                    AscendC::CheckDrained();
+                }
+                for (unsigned source = 0; source < world; ++source) {
+                    for (unsigned lane = 0; lane < markers; ++lane)
+                        CHECK(Signal(workspace.data(), 0, source)[lane] == unsigned(source == world - 1));
+                    for (unsigned byte = markers * 8; byte < kSignalBytes; ++byte)
+                        CHECK(workspace[source * kSignalBytes + byte] == 0xa5);
+                }
+                for (unsigned byte = header; byte < workspace.size(); ++byte) CHECK(workspace[byte] == 0xa5);
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv)
 try {
+    FixedControlHeaderCases();
     ParallelNotifyCases();
     InvalidCombineIndexCases();
     SingleSourceWqeCases();
+    EarlySingleCases();
     const unsigned incoming_wait_cases = IncomingWaitCases<true>() + IncomingWaitCases<false>();
     corrupt_oracle = argc > 1 && std::string(argv[1]) == "--corrupt-oracle";
     corrupt_combine_oracle = argc > 1 && std::string(argv[1]) == "--corrupt-combine-oracle";
@@ -761,6 +1091,63 @@ try {
     ++notify_cases;
     NotifyPrefixCase(257, 32);
     ++notify_cases;
+    for (unsigned world : {2, 8, 32, 128}) {
+        NotifyPrefixCase(world, 20, true);
+        ++notify_cases;
+    }
+    unsigned pipeline_cases = 0;
+    for (unsigned chunk : {32U, 64U}) {
+        pipeline_chunk_test = chunk;
+        for (unsigned group : {1U, 2U, 4U, 8U})
+            for (unsigned visit : {4U, 8U, 16U, 32U})
+                for (unsigned rows : {0U, 1U, 31U, 32U, 33U, 63U, 65U, 129U, 513U})
+                    for (bool weights : {false, true}) {
+                        Case(8, 4, rows, group, visit, weights, 3);
+                        ++pipeline_cases;
+                    }
+    }
+    pipeline_chunk_test = 0;
+    {
+        uint64_t never_ready = 0;
+        CombineTilingData td{};
+        td.pipeline_ready = reinterpret_cast<uint64_t>(&never_ready);
+        td.pipeline_chunk_tokens = 32;
+        AscendC::system_cycle = 0;
+        AscendC::cycle_step = kIncomingTimeoutCycles;
+        bool rejected = false;
+        try {
+            WaitAggregateReady(td, 0, 0);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        CHECK(rejected && !AscendC::diagnostics.empty());
+        CHECK(AscendC::diagnostics.back().find("stage=aggregate_ready") != std::string::npos);
+        AscendC::cycle_step = 0;
+        AscendC::system_cycle = 0;
+    }
+    std::cout << "PASS aggregate_pipeline_scheduler_cases=" << pipeline_cases << " timeout_rejection=1\n";
+    unsigned topology_cases = 0;
+    for (unsigned world : {2U, 8U, 16U, 32U, 64U, 128U})
+        for (unsigned size : {1U, 2U, 8U, 16U}) {
+            if (world % size) continue;
+            for (unsigned peers : {1U, 4U, 8U}) {
+                if (Workers(world, peers) > 32) continue;
+                for (unsigned dispatch = 0; dispatch <= 2; ++dispatch)
+                    for (unsigned combine = 0; combine <= 2; ++combine) {
+                        Case(world, world - 1, 17, peers, 4, true, 3, dispatch, combine, size);
+                        ++topology_cases;
+                    }
+            }
+        }
+    Case(8, 3, 0, 4, 8, false, 1, 2, 1, 8);
+    ++topology_cases;
+    Case(64, 31, 513, 4, 8, false, 3, 1, 2, 16);
+    ++topology_cases;
+    pipeline_chunk_test = 32;
+    Case(16, 7, 129, 4, 8, true, 1, 2, 2, 8);
+    ++topology_cases;
+    pipeline_chunk_test = 0;
+    std::cout << "PASS topology_production_sender_cases=" << topology_cases << "\n";
     uint64_t bindings = 0, cases = 0;
     for (unsigned world = 2; world <= 257; ++world)
         for (unsigned rank = 0; rank < world; ++rank) {
@@ -789,6 +1176,45 @@ try {
                             Case(world, world / 2, tokens, group, visit, aux, cases % 2 ? 1 : 3);
                             ++cases;
                         }
+    for (unsigned world : {8U, 16U, 32U, 64U, 128U})
+        for (unsigned size : {4U, 8U, 16U}) {
+            if (size > world) continue;
+            for (unsigned per : {1U, 2U, 4U}) {
+                if (per * (world / size) > 64) continue;
+                for (unsigned rank : {0U, size - 1, world - 1})
+                    for (bool aux : {false, true}) {
+                        Case(world, rank, 17, per, 8, aux, 3, 3, 3, size);
+                        ++cases;
+                    }
+            }
+        }
+    // One core drives two independent QPs. Dense-oracle WQEs must keep
+    // the original peer/row order while alternating lanes once per visit.
+    for (unsigned world : {8U, 16U, 32U})
+        for (unsigned order : {0U, 1U, 2U, 3U})
+            for (unsigned quota : {4U, 8U, 32U})
+                for (unsigned tokens : {0U, 1U, 17U, 513U})
+                    for (bool aux : {false, true}) {
+                        Case(world, world - 1, tokens, world == 32 ? 2 : 1, quota, aux, 3, order, order, 8, 1, 2);
+                        ++cases;
+                    }
+    Case(128, 17, 513, 1, 8, true, 1, 3, 3, 8, 1, 2);
+    ++cases;
+    Case(8, 7, 8193, 1, 8, true, 1, 0, 0, 0, 1, 2);
+    ++cases;
+    // Two independent QPs per ordered rank pair: empty, skew, tails and auxiliaries.
+    for (unsigned order : {0U, 1U, 2U, 3U})
+        for (unsigned tokens : {0U, 1U, 17U, 513U})
+            for (bool aux : {false, true}) {
+                Case(16, 7, tokens, 2, 8, aux, 3, order, order, 8, 2);
+                ++cases;
+            }
+    Case(128, 17, 513, 2, 8, true, 1, 3, 3, 16, 2);
+    pipeline_chunk_test = 32;
+    Case(16, 0, 513, 2, 8, true, 3, 3, 3, 8, 2);
+    pipeline_chunk_test = 0;
+    Case(128, 17, 513, 4, 8, true, 1, 3, 3, 8);
+    Case(48, 17, 513, 2, 8, true, 3, 3, 3, 3);
     Case(64, 0, 8193, 4, 4, true, 1);
     ++cases;
     Case(8, 7, 8193, 2, 8, true, 3);

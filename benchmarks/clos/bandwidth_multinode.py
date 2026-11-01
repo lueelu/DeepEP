@@ -1,4 +1,4 @@
-"""CPU-only coordination and bounded raw-file transfer for the two-node benchmark.
+"""CPU-only coordination and bounded raw-file transfer for bandwidth benchmarks.
 
 No SSH, shared filesystem, torch/NPU imports, or remote command execution.
 The socket carries JSON and file bytes only. Use a trusted benchmark network.
@@ -245,3 +245,113 @@ def collection_manifest(case_path, ranks):
             dict(relative=path.relative_to(root).as_posix(), size=identity["size"], sha256=identity["sha256"])
         )
     return result
+
+
+class PeerGroup:
+    """Node-0 coordinator for 2..8 nodes, using the existing bounded wire format.
+
+    Only rendezvous connections retry. A disconnected or failing job aborts the
+    whole group; no task is resubmitted. Raw files transfer one node at a time.
+    """
+
+    def __init__(self, peers, node_rank, nnodes):
+        self.peers, self.node_rank, self.nnodes = peers, node_rank, nnodes
+        self.connection = self  # run_case/collection use settimeout on this facade.
+
+    @classmethod
+    def connect(cls, address, port, node_rank, timeout, nnodes):
+        peers = {}
+        try:
+            if node_rank == 0:
+                deadline = time.monotonic() + timeout
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    listener.bind(("0.0.0.0", port))
+                    listener.listen(nnodes - 1)
+                    while len(peers) < nnodes - 1:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("not all benchmark nodes joined")
+                        listener.settimeout(remaining)
+                        connection, _ = listener.accept()
+                        peer = Peer(connection, 0, remaining)
+                        try:
+                            hello = peer.receive_json()
+                            rank = hello.get("node_rank")
+                            if (
+                                type(rank) is not int
+                                or not 1 <= rank < nnodes
+                                or rank in peers
+                                or hello.get("nnodes") != nnodes
+                            ):
+                                raise ValueError("invalid/duplicate benchmark node")
+                            peers[rank] = peer
+                        except BaseException:
+                            peer.close()
+                            raise
+            else:
+                peer = Peer.connect(address, port, 1, timeout)
+                peers[0] = peer
+                peer.send_json(dict(node_rank=node_rank, nnodes=nnodes))
+            group = cls(peers, node_rank, nnodes)
+            group.settimeout(timeout)
+            group.exchange_all("connected", node_rank)
+            group.settimeout(30)
+            return group
+        except BaseException:
+            for peer in peers.values():
+                peer.close()
+            raise
+
+    def settimeout(self, timeout):
+        for peer in self.peers.values():
+            peer.connection.settimeout(timeout)
+
+    def close(self):
+        for peer in self.peers.values():
+            peer.close()
+
+    def exchange_all(self, stage, value):
+        if self.node_rank == 0:
+            values = [value] + [None] * (self.nnodes - 1)
+            for rank in range(1, self.nnodes):
+                incoming = self.peers[rank].receive_json()
+                if incoming.get("stage") != stage:
+                    raise ValueError(f"node {rank}: stage mismatch at {stage}")
+                values[rank] = incoming["value"]
+            for peer in self.peers.values():
+                peer.send_json(dict(stage=stage, values=values))
+            return values
+        peer = self.peers[0]
+        peer.send_json(dict(stage=stage, value=value))
+        incoming = peer.receive_json()
+        if incoming.get("stage") != stage or len(incoming.get("values", [])) != self.nnodes:
+            raise ValueError(f"coordinator stage mismatch at {stage}")
+        return incoming["values"]
+
+    def exchange(self, stage, value):
+        """Aggregate run_case's exit/timeout snapshot across every node."""
+        values = self.exchange_all(stage, value)
+        failed = next((v["code"] for v in values if v["code"] not in (None, 0)), None)
+        return dict(
+            code=failed if failed is not None else (0 if all(v["code"] == 0 for v in values) else None),
+            timed_out=any(v["timed_out"] for v in values),
+        )
+
+    def require_both(self, stage, error=None):
+        errors = self.exchange_all(stage, error)
+        if any(errors):
+            raise RuntimeError(f"{stage}: node errors={errors}")
+
+    def collect(self, path, manifest, timeout):
+        # Idle nodes wait while another node transfers. Each transfer retains its
+        # own finite deadline and independently verifies every file's size/hash.
+        self.settimeout(timeout * self.nnodes)
+        for rank in range(1, self.nnodes):
+            self.require_both(f"collect/node{rank}/ready")
+            if self.node_rank == 0:
+                self.peers[rank].transfer(path, path / f"peer_node{rank}", None, timeout)
+            elif self.node_rank == rank:
+                self.peers[0].transfer(path, path, manifest, timeout)
+            self.require_both(f"collected/node{rank}")
+        self.settimeout(30)

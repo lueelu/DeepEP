@@ -7,7 +7,12 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def cpu_api_streams(request, monkeypatch):
-    if request.node.path.name not in {"test_public_api.py", "test_v2_elastic_api.py", "test_shmem_bootstrap.py"}:
+    if request.node.path.name not in {
+        "test_public_api.py",
+        "test_v2_elastic_api.py",
+        "test_shmem_bootstrap.py",
+        "test_udma_auto_policy.py",
+    }:
         return
     import torch
 

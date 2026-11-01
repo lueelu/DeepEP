@@ -40,8 +40,10 @@ def public_runtime(monkeypatch):
         def num_device_aiv(self):
             return 64
 
-    def bootstrap(*args):
+    def bootstrap(*args, **kwargs):
         calls.append(("bootstrap", args[5]))
+        if args[5] == "udma":
+            assert kwargs["udma_auto_options"][0] == "clos-v1"
         return [], "test"
 
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)
@@ -76,6 +78,12 @@ def test_machine_fixes_engine_before_bootstrap(
     try:
         assert detections == ([True] if automatic else [])
         assert instance.machine_type == machine and instance.transport == engine
+        if machine == "clos_only":
+            policy = instance._udma_auto_policy
+            assert (policy.peers_per_worker, policy.workers_per_peer, policy.wqes_per_visit) == (1, 2, 8)
+            assert policy.config(20).num_aiv == 20
+        else:
+            assert instance._udma_auto_policy is None
         assert calls == (
             [("bootstrap", engine), ("native", engine)]
             + ([("mapping",)] if machine == "card_4pmesh" else [])

@@ -34,7 +34,9 @@ def entry(monkeypatch):
 def test_public_entry_uses_auto_and_passes_no_engine_override(entry):
     namespace, public, _, calls = entry
     group = object()
-    result = namespace["buffer_entrypoints"](SimpleNamespace(public_auto=True, transport=None), group)
+    result = namespace["buffer_entrypoints"](
+        SimpleNamespace(public_auto=True, public_clos=False, transport=None), group
+    )
     assert result == (public.Buffer, public.ElasticBuffer, {})
     assert calls == [((), {"group": group})]
 
@@ -44,20 +46,33 @@ def test_public_entry_rejects_other_topologies_without_forcing_clos(entry, kind)
     namespace, _, selector, _ = entry
     selector.kind = kind
     with pytest.raises(RuntimeError, match="requires auto-detected clos_only"):
-        namespace["buffer_entrypoints"](SimpleNamespace(public_auto=True, transport=None), object())
+        namespace["buffer_entrypoints"](SimpleNamespace(public_auto=True, public_clos=False, transport=None), object())
 
 
 @pytest.mark.parametrize("transport", ["mte", "udma"])
 def test_public_entry_rejects_explicit_transport(entry, transport):
     namespace, _, _, calls = entry
     with pytest.raises(ValueError, match="omit --transport"):
-        namespace["buffer_entrypoints"](SimpleNamespace(public_auto=True, transport=transport), object())
+        namespace["buffer_entrypoints"](
+            SimpleNamespace(public_auto=True, public_clos=False, transport=transport), object()
+        )
     assert calls == []
 
 
 @pytest.mark.parametrize("transport", [None, "mte", "udma"])
 def test_direct_backend_entry_preserves_original_engine_default(entry, transport):
     namespace, _, _, calls = entry
-    result = namespace["buffer_entrypoints"](SimpleNamespace(public_auto=False, transport=transport), object())
+    result = namespace["buffer_entrypoints"](
+        SimpleNamespace(public_auto=False, public_clos=False, transport=transport), object()
+    )
     assert result == (namespace["Buffer"], namespace["ElasticBuffer"], {"transport": transport or "udma"})
+    assert calls == []
+
+
+def test_explicit_public_clos_is_separate_from_detection(entry):
+    namespace, public, _, calls = entry
+    result = namespace["buffer_entrypoints"](
+        SimpleNamespace(public_auto=False, public_clos=True, transport=None), object()
+    )
+    assert result == (public.Buffer, public.ElasticBuffer, {"machine_type": "clos_only"})
     assert calls == []

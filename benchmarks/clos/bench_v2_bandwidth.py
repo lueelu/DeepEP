@@ -1,6 +1,6 @@
 """One-command-per-node ElasticBuffer accuracy + stage/bandwidth benchmark.
 
-python benchmarks/bench_v2_bandwidth.py --output ./bandwidth_results
+python benchmarks/clos/bench_v2_bandwidth.py --output ./bandwidth_results
 
 Each dtype/expand/AIV configuration gets a fresh torchrun group. No kernel or
 public API instrumentation is installed. Precision is checked before profiling.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+from dataclasses import asdict
 import itertools
 import json
 import os
@@ -21,8 +22,18 @@ import sys
 import time
 import traceback
 
+from bandwidth_cache import L2CacheFlush, L2_CACHE_FLUSH_BYTES, ProfileSamples, PROFILE_GUARD_ITERS
+
+from route_workloads import (
+    DEFAULTS as ROUTE_DEFAULTS,
+    add_arguments as add_route_arguments,
+    validate as validate_routes,
+    statistics as route_statistics,
+)
+
 from stage_metrics import (
     LIMITS,
+    V1_LIMITS,
     byte_ledger,
     file_identity,
     parse_profile,
@@ -31,27 +42,52 @@ from stage_metrics import (
     write_csv,
     write_json,
 )
-from bandwidth_multinode import Peer, collection_manifest, content_identity, library_identity, safe_path, validate_peers
+from bandwidth_multinode import PeerGroup, collection_manifest, content_identity, library_identity, safe_path
 
 REPO = Path(__file__).resolve().parents[2]
 
 
-def arguments(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ep-size", type=int, choices=(2, 4, 8, 16), default=8)
-    p.add_argument("--nnodes", type=int, choices=(1, 2), default=1)
-    p.add_argument("--node-rank", type=int, choices=(0, 1), default=0)
-    p.add_argument("--master-addr", help="node 0 reachable IPv4 address/hostname; required for EP16")
-    p.add_argument(
-        "--master-port", type=int, default=29500, help="two-node coordination port; torchrun uses the next port"
+def arguments(argv=None, *, description=None, auto_policy=False):
+    p = argparse.ArgumentParser(
+        description=description or __doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--run-id", help="same unique suite name on both nodes; required for EP16")
+    p.set_defaults(udma_auto_policy=auto_policy)
+    p.add_argument(
+        "--flush-l2-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="evict L2 with a reusable 256 MB buffer before every timed API call (default: enabled)",
+    )
+    p.add_argument(
+        "--combine-bias",
+        choices=("none", "two"),
+        default="none",
+        help="bias inputs for weighted combine only (default: none; two reproduces older benchmarks)",
+    )
+    p.add_argument("--ep-size", type=int, choices=(4, 8, 16, 32) if auto_policy else (2, 4, 8, 16, 32, 64), default=8)
+    p.add_argument(
+        "--nnodes",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=None if auto_policy else 1,
+        help="equal local rank count on each node; at most 16 devices per node",
+    )
+    p.add_argument("--node-rank", type=int, choices=range(8), default=0)
+    p.add_argument("--master-addr", help="node 0 reachable IPv4 address/hostname; required for multi-node execution")
+    p.add_argument("--master-port", type=int, default=29500, help="node coordination port; torchrun uses the next port")
+    p.add_argument("--run-id", help="same unique suite name on all nodes; required for multi-node execution")
     p.add_argument("--rendezvous-timeout", type=int, default=300)
     p.add_argument("--collection-timeout", type=int, default=600)
     p.add_argument("--first-device", type=int, default=0)
-    p.add_argument("--aiv", type=int, choices=(32, 64), nargs="+", default=[32, 64])
-    p.add_argument("--dtypes", choices=("bf16", "fp8"), nargs="+", default=["bf16", "fp8"])
-    p.add_argument("--expand", type=int, choices=(0, 1), nargs="+", default=[0, 1])
+    p.add_argument(
+        "--aiv",
+        type=int,
+        choices=range(2, 65, 2) if auto_policy else (32, 64),
+        nargs="+",
+        default=[32] if auto_policy else [32, 64],
+    )
+    p.add_argument("--dtypes", choices=("bf16", "fp8"), nargs="+", default=["bf16"] if auto_policy else ["bf16", "fp8"])
+    p.add_argument("--expand", type=int, choices=(0, 1), nargs="+", default=[0] if auto_policy else [0, 1])
     for name, default in [
         ("num-tokens", 8192),
         ("hidden", 6144),
@@ -63,15 +99,51 @@ def arguments(argv=None):
         ("case-timeout", 1800),
     ]:
         p.add_argument("--" + name, type=int, default=default)
-    p.add_argument("--peers-per-worker", type=int, choices=(1, 2, 4, 8), default=1)
-    p.add_argument("--wqes-per-visit", type=int, choices=(4, 8, 16, 32), default=8)
+    p.add_argument("--peers-per-worker", type=int, choices=(1, 2, 4, 8), default=None if auto_policy else 1)
+    p.add_argument("--wqes-per-visit", type=int, choices=(4, 8, 16, 32), default=None if auto_policy else 8)
+    p.add_argument("--udma-schedule", choices=("peer", "token"), default="peer")
+    p.add_argument("--sweep-plan-sha256", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--dispatch-peer-order", choices=("rank", "group", "group_staggered", "group_round_robin"), default="rank"
+    )
+    p.add_argument(
+        "--combine-peer-order", choices=("rank", "group", "group_staggered", "group_round_robin"), default="rank"
+    )
+    p.add_argument("--workers-per-peer", type=int, choices=(1, 2), default=None if auto_policy else 1)
+    p.add_argument("--qps-per-worker", type=int, choices=(1, 2), default=None if auto_policy else 1)
+    p.add_argument("--peers-per-group-per-worker", type=int, choices=(1, 2, 4))
+    p.add_argument(
+        "--ranks-per-group", type=int, help="contiguous EP-local ranks per topology group; required for group orders"
+    )
     p.add_argument("--huge-pages", action="store_true", help="explicitly request 1 GiB SHMEM pages")
     p.add_argument(
         "--output", type=Path, default=Path("bandwidth_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     )
     p.add_argument("--report-only", type=Path, help="recompute an existing run; never launches NPU work")
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    add_route_arguments(p)
     args = p.parse_args(argv)
+    if args.nnodes is None:
+        args.nnodes = 2 if args.ep_size == 32 else 1
+    if auto_policy:
+        if any(
+            getattr(args, key) is not None
+            for key in (
+                "peers_per_worker",
+                "workers_per_peer",
+                "qps_per_worker",
+                "wqes_per_visit",
+                "ranks_per_group",
+                "peers_per_group_per_worker",
+            )
+        ) or (args.udma_schedule != "peer" or args.dispatch_peer_order != "rank" or args.combine_peer_order != "rank"):
+            p.error(
+                "automatic benchmark selects scheduling in ElasticBuffer; use bench_v2_bandwidth.py for manual tuning"
+            )
+    try:
+        validate_routes(args)
+    except ValueError as exc:
+        p.error(str(exc))
     if any(
         getattr(args, n) <= 0
         for n in (
@@ -86,6 +158,40 @@ def arguments(argv=None):
         )
     ):
         p.error("shape, iterations and timeout must be positive")
+    if args.ranks_per_group is not None and (
+        args.ranks_per_group <= 0 or args.ranks_per_group > args.ep_size or args.ep_size % args.ranks_per_group
+    ):
+        p.error("ranks-per-group must be a positive divisor of ep-size")
+    if (args.dispatch_peer_order != "rank" or args.combine_peer_order != "rank") and args.ranks_per_group is None:
+        p.error("group peer orders require ranks-per-group")
+    if args.udma_schedule == "token" and (
+        args.dispatch_peer_order != "rank" or args.combine_peer_order != "rank" or args.ranks_per_group is not None
+    ):
+        p.error("token schedule requires rank orders and no ranks-per-group")
+    if not auto_policy and args.qps_per_worker != 1 and (args.workers_per_peer != 1 or args.udma_schedule != "peer"):
+        p.error("two QPs per worker require peer schedule and workers-per-peer=1")
+    if args.udma_schedule == "token" and args.workers_per_peer != 1:
+        p.error("workers-per-peer applies only to peer schedule")
+    rr = "group_round_robin" in (args.dispatch_peer_order, args.combine_peer_order)
+    if args.peers_per_group_per_worker is not None and not rr:
+        p.error("peers-per-group-per-worker requires group_round_robin")
+    workers = []
+    for order in () if auto_policy else (args.dispatch_peer_order, args.combine_peer_order):
+        if order == "group_round_robin":
+            lanes = (args.ranks_per_group + (args.peers_per_group_per_worker or 1) - 1) // (
+                args.peers_per_group_per_worker or 1
+            )
+            if ((args.ranks_per_group + lanes - 1) // lanes) * (args.ep_size // args.ranks_per_group) > 64:
+                p.error("group_round_robin exceeds 64 peers per worker")
+            workers.append(lanes)
+        else:
+            workers.append((args.ep_size - 1 + args.peers_per_worker - 1) // args.peers_per_worker)
+    if args.udma_schedule == "peer" and any(
+        (w * args.workers_per_peer > aiv or w * args.workers_per_peer * args.qps_per_worker > 32)
+        for aiv in args.aiv
+        for w in workers
+    ):
+        p.error("peers-per-worker requires more sending workers than available AIV/QPs")
     if args.warmup < 0 or args.first_device < 0 or args.hidden % 128:
         p.error("warmup/first-device must be nonnegative; hidden must be a multiple of 128")
     if args.num_topk > min(128, args.ep_size * args.experts_per_rank):
@@ -93,19 +199,19 @@ def arguments(argv=None):
     if any(len(v) != len(set(v)) for v in (args.aiv, args.dtypes, args.expand)):
         p.error("duplicate configurations are not allowed")
     if not args.report_only:
-        if (args.ep_size == 16) != (args.nnodes == 2) or args.node_rank >= args.nnodes:
-            p.error("EP16 requires --nnodes 2 and node ranks 0/1; EP2/4/8 use one node")
+        if args.ep_size % args.nnodes or not 1 <= local_world_size(args) <= 16 or args.node_rank >= args.nnodes:
+            p.error("nnodes must divide ep-size with 1..16 local ranks; node-rank must be below nnodes")
         if not 1 <= args.master_port <= 65534:
             p.error("master-port must leave room for master-port + 1")
-        if args.nnodes == 2:
+        if args.nnodes > 1:
             if (
                 not args.master_addr
                 or args.master_addr.strip().lower() in ("localhost", "0.0.0.0", "::1")
                 or args.master_addr.startswith("127.")
             ):
-                p.error("EP16 needs a reachable node 0 --master-addr, not loopback")
+                p.error("multi-node execution needs a reachable node 0 --master-addr, not loopback")
             if not args.run_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.run_id):
-                p.error("EP16 needs the same --run-id (1..64 letters/digits/_/-) on both nodes")
+                p.error("multi-node execution needs the same --run-id (1..64 letters/digits/_/-) on all nodes")
     return args
 
 
@@ -119,13 +225,13 @@ def suite_contract(args):
     }
 
 
-def worker_command(args, case, path):
+def worker_command(args, case, path, *, entrypoint=None):
     command = [sys.executable, "-m", "torch.distributed.run", "--max-restarts=0"]
     if args.nnodes == 1:
         command.append("--standalone")
     else:
         command += [
-            "--nnodes=2",
+            f"--nnodes={args.nnodes}",
             f"--node-rank={args.node_rank}",
             "--rdzv-backend=static",
             f"--rdzv-id={args.run_id}_{case['name']}",
@@ -135,7 +241,7 @@ def worker_command(args, case, path):
         ]
     command += [
         f"--nproc-per-node={local_world_size(args)}",
-        str(Path(__file__).resolve()),
+        str(Path(entrypoint or __file__).resolve()),
         "--worker",
         "--aiv",
         str(case["aiv"]),
@@ -164,12 +270,32 @@ def worker_command(args, case, path):
         "rendezvous_timeout",
         "collection_timeout",
         "master_port",
+        "dispatch_peer_order",
+        "combine_peer_order",
+        "udma_schedule",
     ):
-        command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
-    if args.nnodes == 2:
+        value = getattr(args, key)
+        if value is not None:
+            command += ["--" + key.replace("_", "-"), str(value)]
+    for key in ROUTE_DEFAULTS:
+        value = getattr(args, key)
+        if value is not None:
+            command += ["--" + key.replace("_", "-"), str(value)]
+    if args.nnodes > 1:
         command += ["--master-addr", args.master_addr, "--run-id", args.run_id]
+    for key in ("workers_per_peer", "qps_per_worker"):
+        if getattr(args, key) is not None:
+            command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+    if args.peers_per_group_per_worker is not None:
+        command += ["--peers-per-group-per-worker", str(args.peers_per_group_per_worker)]
+    if args.ranks_per_group is not None:
+        command += ["--ranks-per-group", str(args.ranks_per_group)]
     if args.huge_pages:
         command.append("--huge-pages")
+    if args.sweep_plan_sha256:
+        command += ["--sweep-plan-sha256", args.sweep_plan_sha256]
+    command.append("--flush-l2-cache" if args.flush_l2_cache else "--no-flush-l2-cache")
+    command += ["--combine-bias", args.combine_bias]
     return command
 
 
@@ -234,9 +360,68 @@ def check_idle(text, first_device, ep_size):
             raise RuntimeError(f"NPU {device} is busy, unhealthy or cannot be verified; no job started")
 
 
+def v2_tuning_options(args):
+    # Omit manual defaults entirely so the library's auto policy is exercised.
+    if getattr(args, "udma_auto_policy", False):
+        return dict(udma_auto_policy=True)
+    return dict(
+        udma_auto_policy=False,
+        udma_peers_per_worker=args.peers_per_worker,
+        udma_wqes_per_visit=args.wqes_per_visit,
+        udma_workers_per_peer=args.workers_per_peer,
+        udma_qps_per_worker=args.qps_per_worker,
+    )
+
+
+def effective_udma_config(buffer, config=None):
+    """Report resolved runtime values rather than caller defaults (V1 uses Config)."""
+    result = {
+        name: getattr(buffer, name)
+        for name in (
+            "udma_schedule",
+            "udma_dispatch_peer_order",
+            "udma_combine_peer_order",
+            "udma_ranks_per_group",
+            "udma_peers_per_group_per_worker",
+            "udma_workers_per_peer",
+            "udma_qps_per_worker",
+        )
+    }
+    for name in ("udma_peers_per_worker", "udma_wqes_per_visit"):
+        result[name] = getattr(buffer if config is None else config, name)
+    result["udma_auto_policy"] = buffer.udma_auto_policy is not None
+    return result
+
+
+def parse_profile_collective(dist, error_path, *args, **kwargs):
+    """Every live rank reports parsing success/failure before caller timing.
+
+    This handles Python parsing errors, not a lost process/device. Preserve the
+    original traceback locally and report all failing ranks to every participant.
+    """
+    profile, error = None, None
+    try:
+        profile = parse_profile(*args, **kwargs)
+    except Exception:
+        error = traceback.format_exc()
+        try:
+            write_json(error_path, dict(rank=dist.get_rank(), traceback=error))
+        except Exception:
+            error += "\nFailed to save parse error:\n" + traceback.format_exc()
+    statuses = [None] * dist.get_world_size()
+    dist.all_gather_object(statuses, dict(rank=dist.get_rank(), error=error))
+    failures = [s for s in statuses if s["error"]]
+    if failures:
+        details = "\n".join(f"rank {s['rank']}: {s['error']}" for s in failures)
+        raise RuntimeError("profiler parsing failed across ranks; caller timing cancelled:\n" + details)
+    return profile
+
+
 def worker(args):
     # Imports follow argument handling so --help/report-only need no NPU runtime.
-    sys.path[:0] = [str(REPO), str(REPO / "tests/clos/source")]
+    # Use the installed wheel; prepending the checkout can hide its native
+    # extensions. Only the independent CPU reference comes from this tree.
+    sys.path.insert(0, str(REPO / "tests/clos/source"))
     import torch
     import torch.distributed as dist
     import torch_npu  # noqa: F401
@@ -257,6 +442,7 @@ def worker(args):
     args.num_aiv, args.dtype, expanded = args.aiv[0], args.dtypes[0], bool(args.expand[0])
     args.expert_alignment = 1
     args.profile_warmup, args.profile_iters = args.warmup, args.iterations
+    args.profile_sample_markers = True
     device = args.first_device + local_rank
     destination = args.output / f"rank{rank}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -267,6 +453,13 @@ def worker(args):
     )
     try:
         torch.set_num_threads(1)
+        routes = [golden._make_topk_idx(p, args) for p in range(args.ep_size)]
+        counts = route_counts([r.tolist() for r in routes], args.experts_per_rank)
+        write_json(
+            destination / "route_load.json",
+            route_statistics([r.tolist() for r in routes], args.experts_per_rank, args.route_group_size),
+        )
+        write_json(destination / "input_routes.json", routes[rank].tolist())
         torch.npu.set_device(device)
         dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=args.rendezvous_timeout))
         buffer = ElasticBuffer(
@@ -277,19 +470,26 @@ def worker(args):
             use_fp8_dispatch=args.dtype == "fp8",
             explicitly_destroy=True,
             transport="udma",
-            udma_schedule="peer",
-            udma_peers_per_worker=args.peers_per_worker,
-            udma_wqes_per_visit=args.wqes_per_visit,
+            udma_schedule=args.udma_schedule,
             use_1g_huge_pages=args.huge_pages,
+            udma_dispatch_peer_order=args.dispatch_peer_order,
+            udma_combine_peer_order=args.combine_peer_order,
+            udma_ranks_per_group=args.ranks_per_group,
+            udma_peers_per_group_per_worker=args.peers_per_group_per_worker,
+            **v2_tuning_options(args),
         )
+        args.effective_udma_config = effective_udma_config(buffer)
+        if rank == 0:
+            print("EFFECTIVE_UDMA_CONFIG", json.dumps(args.effective_udma_config, sort_keys=True), flush=True)
+        if getattr(args, "udma_auto_policy", False):
+            args.resolved_udma_policy = asdict(buffer.udma_auto_policy)
+            if rank == 0:
+                print("AUTO_POLICY", json.dumps(args.resolved_udma_policy, sort_keys=True), flush=True)
         identity = loaded_identity()
         identities = [None] * args.ep_size
         dist.all_gather_object(identities, library_identity(identity))
         if any(item != identities[0] for item in identities):
             raise RuntimeError("ranks loaded different library bytes or Python modules")
-        routes = [golden._make_topk_idx(p, args) for p in range(args.ep_size)]
-        counts = route_counts([r.tolist() for r in routes], args.experts_per_rank)
-        write_json(destination / "input_routes.json", routes[rank].tolist())
         idx = routes[rank].to("npu")
         x = golden._to_npu(golden._make_dispatch_x(rank, args))
         cached_x = golden._to_npu(golden._make_dispatch_x(rank, args, delta=1))
@@ -378,14 +578,16 @@ def worker(args):
         cached = wait(dispatch(cached_x, handle))
         check_dispatch(cached, delta=1, cached=True)
         del cached
-        bias0 = torch.full((args.num_tokens, args.hidden), 0.5, dtype=torch.bfloat16)
-        bias1 = (
-            torch.arange(args.num_tokens * args.hidden, dtype=torch.float32)
-            .remainder_(2048)
-            .reshape(args.num_tokens, args.hidden)
-            * 0.001
-        ).to(torch.bfloat16)
-        bias = (bias0.to("npu"), bias1.to("npu"))
+        bias0 = bias1 = bias = None
+        if args.combine_bias == "two":
+            bias0 = torch.full((args.num_tokens, args.hidden), 0.5, dtype=torch.bfloat16)
+            bias1 = (
+                torch.arange(args.num_tokens * args.hidden, dtype=torch.float32)
+                .remainder_(2048)
+                .reshape(args.num_tokens, args.hidden)
+                * 0.001
+            ).to(torch.bfloat16)
+            bias = (bias0.to("npu"), bias1.to("npu"))
 
         def combine(weighted):
             return buffer.combine(
@@ -402,7 +604,7 @@ def worker(args):
         for weighted in (False, True):
             result = wait(combine(weighted))
             expected = torch.zeros_like(source, dtype=torch.float32)
-            if weighted:
+            if weighted and bias is not None:
                 expected += bias0.float()
                 expected += bias1.float()
             for peer in range(args.ep_size):
@@ -429,10 +631,19 @@ def worker(args):
         torch.npu.synchronize()
         write_json(
             destination / "precision.json",
-            dict(passed=True, fresh=True, cached=True, combine_unweighted=True, combine_weighted_two_bias=True),
+            dict(
+                passed=True,
+                fresh=True,
+                cached=True,
+                combine_unweighted=True,
+                combine_weighted=True,
+                combine_bias=args.combine_bias,
+                combine_weighted_two_bias=args.combine_bias == "two",
+            ),
         )
         print(f"PRECISION_PASSED rank={rank}", flush=True)
         operators = {}
+        flush_cache = L2CacheFlush(torch, buffer, args.flush_l2_cache)
         functions = dict(
             dispatch=lambda: dispatch(x),
             **{"cached-dispatch": lambda: dispatch(cached_x, handle)},
@@ -444,18 +655,38 @@ def worker(args):
             print(f"PROFILE_BEGIN rank={rank} op={op}", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
-                golden._profile_operator(rank, args, op, fn)
+                golden._profile_operator(
+                    rank,
+                    args,
+                    op,
+                    flush_cache.wrap(fn),
+                    sample_callback=ProfileSamples(torch),
+                    guard_iters=PROFILE_GUARD_ITERS,
+                )
             except golden._ProfileComplete:
                 pass
-            profile = parse_profile(args.profile_dir, op, expanded, args.iterations, device, args.num_aiv)
+            profile = parse_profile_collective(
+                dist,
+                destination / op / "profile_error.json",
+                args.profile_dir,
+                op,
+                expanded,
+                args.iterations,
+                device,
+                args.num_aiv,
+                flush_l2_cache=args.flush_l2_cache,
+                sample_markers=True,
+            )
             # Independent caller-stream samples; do not subtract from profiler kernel times.
             dist.barrier()
             for _ in range(args.warmup):
+                flush_cache()
                 wait(fn())
             torch.npu.synchronize()
             caller = []
             for _ in range(args.iterations):
                 start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+                flush_cache()
                 start.record()
                 result = wait(fn())
                 end.record()
@@ -510,8 +741,9 @@ def worker(args):
 
 
 def rank_directory(case_path, rank, plan):
-    if plan["arguments"].get("nnodes", 1) == 2 and rank >= plan["arguments"]["ep_size"] // 2:
-        return case_path / "peer_node1" / f"rank{rank}"
+    node = rank // (plan["arguments"]["ep_size"] // plan["arguments"].get("nnodes", 1))
+    if node:
+        return case_path / f"peer_node{node}" / f"rank{rank}"
     return case_path / f"rank{rank}"
 
 
@@ -532,14 +764,21 @@ def verify_collection(root):
 def report(root):
     root = Path(root).resolve()
     plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
-    dual = plan["arguments"].get("nnodes", 1) == 2
+    api = plan.get("api", "v2")
+    if api not in ("v1", "v2"):
+        raise ValueError("unknown benchmark API")
+    limits = V1_LIMITS if api == "v1" else LIMITS
+    nnodes = plan["arguments"].get("nnodes", 1)
+    dual = nnodes > 1
     if dual and plan["arguments"]["node_rank"] != 0:
-        raise ValueError("the complete EP16 report is in the node0 output directory")
-    rows, raw_samples, artifacts, completed = [], [], [], []
+        raise ValueError("the complete report is in the node0 output directory")
+    rows, raw_samples, kernels, artifacts, completed = [], [], [], [], []
+    workloads, policies, effective_configs = {}, {}, {}
+    expected_route_hash = None
     for case in plan["cases"]:
         path = root / case["name"]
-        if dual:
-            verify_collection(path / "peer_node1")
+        for node in range(1, nnodes):
+            verify_collection(path / f"peer_node{node}")
         independent_counts = route_counts(
             [
                 json.loads((rank_directory(path, rank, plan) / "input_routes.json").read_text(encoding="utf-8"))
@@ -547,6 +786,18 @@ def report(root):
             ],
             plan["arguments"]["experts_per_rank"],
         )
+        raw_routes = [
+            json.loads((rank_directory(path, rank, plan) / "input_routes.json").read_text(encoding="utf-8"))
+            for rank in range(plan["arguments"]["ep_size"])
+        ]
+        workload = route_statistics(
+            raw_routes, plan["arguments"]["experts_per_rank"], plan["arguments"].get("route_group_size")
+        )
+        workloads[case["name"]] = workload
+        if "route_mode" in plan["arguments"]:
+            if expected_route_hash is not None and workload["route_sha256"] != expected_route_hash:
+                raise ValueError("routing changed between dtype/expand/AIV cases")
+            expected_route_hash = workload["route_sha256"]
         records = []
         for rank in range(plan["arguments"]["ep_size"]):
             rank_dir = rank_directory(path, rank, plan)
@@ -555,12 +806,45 @@ def report(root):
             if ex["code"] != 0 or not record["precision_passed"] or not record["destroyed"] or record["rank"] != rank:
                 raise ValueError(f"{rank_dir}: failed rank")
             config = record["config"]
+            effective = config.get("effective_udma_config")
+            if effective is not None:
+                if case["name"] in effective_configs and effective_configs[case["name"]] != effective:
+                    raise ValueError("ranks resolved different effective UDMA configurations")
+                effective_configs[case["name"]] = effective
+            for key in ROUTE_DEFAULTS:
+                if config.get(key) != plan["arguments"].get(key):
+                    raise ValueError(f"route configuration mismatch: {key}")
+            if config.get("api", "v2") != api:
+                raise ValueError("mixed V1/V2 rank results")
             if (config["num_aiv"], config["dtype"], config["expand"][0]) != (
                 case["aiv"],
                 case["dtype"],
                 case["expand"],
             ):
                 raise ValueError("case configuration mismatch")
+            for key, default in (
+                ("dispatch_peer_order", "rank"),
+                ("combine_peer_order", "rank"),
+                ("ranks_per_group", None),
+                ("peers_per_group_per_worker", None),
+                ("workers_per_peer", 1),
+                ("qps_per_worker", 1),
+                ("udma_schedule", "peer"),
+                ("sweep_plan_sha256", None),
+                ("udma_auto_policy", False),
+                ("flush_l2_cache", False),
+                ("combine_bias", "two"),
+                ("profile_sample_markers", False),
+            ):
+                if config.get(key, default) != plan["arguments"].get(key, default):
+                    raise ValueError(f"peer order configuration mismatch: {key}")
+            if plan["arguments"].get("udma_auto_policy", False):
+                resolved = config.get("resolved_udma_policy")
+                if not resolved or resolved.get("world_size") != plan["arguments"]["ep_size"]:
+                    raise ValueError("missing or invalid resolved automatic policy")
+                if case["name"] in policies and policies[case["name"]] != resolved:
+                    raise ValueError("ranks resolved different automatic policies")
+                policies[case["name"]] = resolved
             for key in (
                 "ep_size",
                 "num_tokens",
@@ -577,14 +861,14 @@ def report(root):
                 if config[key] != plan["arguments"][key]:
                     raise ValueError(f"rank configuration mismatch: {key}")
             if dual:
-                node = rank // 8
-                node_args = (plan if node == 0 else json.loads((root / "peer_plan.json").read_text(encoding="utf-8")))[
-                    "arguments"
-                ]
+                local_size = plan["arguments"]["ep_size"] // nnodes
+                node = rank // local_size
+                peer_plan = root / ("peer_plan.json" if node == 1 else f"peer_plan_node{node}.json")
+                node_args = (plan if node == 0 else json.loads(peer_plan.read_text(encoding="utf-8")))["arguments"]
                 if (
                     config["node_rank"] != node
                     or config["run_id"] != plan["arguments"]["run_id"]
-                    or record["device"] != node_args["first_device"] + rank % 8
+                    or record["device"] != node_args["first_device"] + rank % local_size
                 ):
                     raise ValueError("node/rank/device identity mismatch")
             actual_routes = file_identity(rank_dir / "input_routes.json")
@@ -620,6 +904,9 @@ def report(root):
                     config["iterations"],
                     record["device"],
                     case["aiv"],
+                    api=api,
+                    flush_l2_cache=config.get("flush_l2_cache", False),
+                    sample_markers=config.get("profile_sample_markers", False),
                 )
                 import_size = plan["topk_idx_bytes"]
                 expected = byte_ledger(
@@ -641,37 +928,133 @@ def report(root):
                 # derive it from verified raw routes, without rerunning NPU work.
                 data["bytes"] = expected
                 raw_samples.extend(dict(case=case["name"], rank=rank, op=op, **s) for s in data["profile"]["samples"])
+                kernels.extend(dict(case=case["name"], rank=rank, op=op, **s) for s in data["profile"]["kernels"])
             records.append(record)
-        for launcher in [path, path / "peer_node1"] if dual else [path]:
+        for launcher in [path] + [path / f"peer_node{node}" for node in range(1, nnodes)]:
             status = json.loads((launcher / "launcher_exit.json").read_text(encoding="utf-8"))
             if status["code"] != 0 or status.get("suite_aborted"):
                 raise ValueError("nonzero launcher exit")
         rows.extend(
-            dict(case=case["name"], aiv=case["aiv"], dtype=case["dtype"], expanded=case["expand"], **r)
+            dict(
+                case=case["name"],
+                aiv=case["aiv"],
+                dtype=case["dtype"],
+                expanded=case["expand"],
+                flush_l2_cache=plan["arguments"].get("flush_l2_cache", False),
+                l2_flush_bytes=L2_CACHE_FLUSH_BYTES if plan["arguments"].get("flush_l2_cache", False) else 0,
+                combine_bias=plan["arguments"].get("combine_bias", "two"),
+                bias_count=(
+                    2 if plan["arguments"].get("combine_bias", "two") == "two" and r["op"] == "combine_weighted" else 0
+                ),
+                route_sha256=workload["route_sha256"],
+                recv_max_over_mean=workload["recv_max_over_mean"],
+                single_contribution_fraction=workload["single_contribution_fraction"],
+                local_group_row_fraction=workload["local_group_row_fraction"],
+                **r,
+            )
             for r in summarize(records)
         )
         completed.append(case["name"])
     write_csv(root / "summary.csv", rows)
     write_csv(root / "samples.csv", raw_samples)
+    write_csv(root / "kernels.csv", kernels)
     write_csv(root / "artifacts.csv", artifacts)
-    write_json(root / "report.json", dict(passed=True, completed=completed, limits=LIMITS, summary=rows))
+    write_json(
+        root / "report.json",
+        dict(
+            passed=True,
+            api=api,
+            completed=completed,
+            limits=limits,
+            profile_sample_markers=plan["arguments"].get("profile_sample_markers", False),
+            flush_l2_cache=plan["arguments"].get("flush_l2_cache", False),
+            l2_flush_bytes=L2_CACHE_FLUSH_BYTES if plan["arguments"].get("flush_l2_cache", False) else 0,
+            combine_bias=plan["arguments"].get("combine_bias", "two"),
+            summary=rows,
+            route_statistics=workloads,
+            resolved_udma_policies=policies,
+            effective_udma_configs=effective_configs,
+        ),
+    )
+    for name, workload in workloads.items():
+        print(
+            "ROUTE_LOAD",
+            name,
+            json.dumps(
+                {
+                    k: workload[k]
+                    for k in (
+                        "route_sha256",
+                        "recv_max_over_mean",
+                        "single_contribution_fraction",
+                        "local_group_row_fraction",
+                        "rank_over_other_mean",
+                        "group_over_other_mean",
+                    )
+                },
+                sort_keys=True,
+            ),
+        )
+    print(
+        f"L2_CACHE_FLUSH enabled={plan['arguments'].get('flush_l2_cache', False)} "
+        f"bytes={L2_CACHE_FLUSH_BYTES if plan['arguments'].get('flush_l2_cache', False) else 0}; "
+        "before each full API call; excluded from all reported API times/bandwidth"
+    )
+    print(f"COMBINE_BIAS weighted={plan['arguments'].get('combine_bias', 'two')} unweighted=none")
     print(
         "Numerator: DeepEP-Ascend logical receive bytes INCLUDING self. "
         "Denominator: this implementation comm kernel (not identical official profiling)."
     )
-    print(
-        "rank (0=single rank, all=whole EP group) / case / operator / comm us / expand us / aggregate us / reduce us / "
-        "official-logical GB/s / remote-payload GB/s / full device sum us / algorithm GB/s"
-    )
+    if api == "v1":
+        print(
+            "V1 combine uses a fused transfer+reduce kernel. Its comm/reduce-only fields are N/A; "
+            "logical-fused GB/s INCLUDES reduce and is not official communication bandwidth."
+        )
+    columns = [
+        "comm_us",
+        "notify_us",
+        "expand_us",
+        "aggregate_us",
+        "reduce_us",
+        "official_logical_GBps",
+        "remote_payload_GBps",
+        "device_sum_us",
+        "algorithm_device_sum_GBps",
+    ]
+    if api == "v1":
+        columns += ["layout_us", "fused_combine_us", "combine_with_reduce_us", "logical_fused_combine_GBps"]
+    print("rank (0=single rank, all=whole EP group) / case / operator / " + " / ".join(columns))
     for row in rows:
         if row["rank"] in (0, "all"):
             print(
-                f"{row['rank']} / {row['case']} / {row['op']} / {row['comm_us']:.3f} / {row['expand_us']:.3f} / "
-                f"{row['aggregate_us']:.3f} / {row['reduce_us']:.3f} / "
-                f"{row['official_logical_GBps']:.3f} / {row['remote_payload_GBps']:.3f} / {row['device_sum_us']:.3f} / "
-                f"{row['algorithm_device_sum_GBps']:.3f}"
+                f"{row['rank']} / {row['case']} / {row['op']} / "
+                + " / ".join("N/A" if row[k] is None else f"{row[k]:.3f}" for k in columns)
             )
+    if policies:
+        print_auto_summary(rows, plan["arguments"]["ep_size"], policies)
     print(f"REPORT_PASSED {root / 'report.json'}")
+
+
+def print_auto_summary(rows, ep_size, policies):
+    print("\nAUTO V2: logical GB/s per rank equivalent = whole-EP logical GB/s / EP; includes self.")
+    print(
+        "Bandwidth denominator is comm_us only; notify/reduce are separate. "
+        "Times are mean of per-sample max-rank durations, in us; absent stages = 0."
+    )
+    for case, policy in policies.items():
+        print("AUTO_POLICY", case, json.dumps(policy, sort_keys=True))
+    print("case / operator / GBps_per_rank / comm_us / notify_us / reduce_us / layout_us / aggregate_us / expand_us")
+    for row in rows:
+        if row["rank"] != "all":
+            continue
+        bw = row["official_logical_GBps"]
+        values = [None if bw is None else bw / ep_size] + [
+            row[k] for k in ("comm_us", "notify_us", "reduce_us", "layout_us", "aggregate_us", "expand_us")
+        ]
+        print(
+            f"{row['case']} / {row['op']} / "
+            + " / ".join("N/A" if value is None else f"{value:.3f}" for value in values)
+        )
 
 
 def stop_child(child):
@@ -699,8 +1082,8 @@ def require_ready(peer, stage, error=None):
         raise RuntimeError(f"{stage}: {error}")
 
 
-def run_case(args, case, path, environment, peer):
-    command = worker_command(args, case, path)
+def run_case(args, case, path, environment, peer, *, entrypoint=None):
+    command = worker_command(args, case, path, entrypoint=entrypoint)
     write_json(path / "command.json", dict(argv=command, started=time.time()))
     print(f"RUN {case['name']} node={args.node_rank} (log: {path / 'run.log'})", flush=True)
     child = None
@@ -742,7 +1125,7 @@ def run_case(args, case, path, environment, peer):
     write_json(path / "launcher_exit.json", dict(code=0, ended=time.time()))
 
 
-def launch(args):
+def launch(args, *, entrypoint=None):
     if os.name != "posix":
         raise RuntimeError("NPU execution requires Linux; --report-only is platform independent")
     if os.environ.get("SHMEM_UID_SESSION_ID"):
@@ -763,10 +1146,9 @@ def launch(args):
     lock = open(Path(tempfile.gettempdir()) / f"deepep_bandwidth_{lock_name}.lock", "a+")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     args.output = args.output.resolve()
-    if args.nnodes == 2:
+    if args.nnodes > 1:
         args.output = args.output / f"node{args.node_rank}"
     args.output.mkdir(parents=True, exist_ok=False)
-    sys.path.insert(0, str(REPO))
     import torch
     from deep_ep import topk_idx_t
 
@@ -774,34 +1156,49 @@ def launch(args):
         dict(name=f"{dtype}_expand{expand}_aiv{aiv}", dtype=dtype, expand=expand, aiv=aiv)
         for dtype, expand, aiv in itertools.product(args.dtypes, args.expand, args.aiv)
     ]
+    api = getattr(args, "api", "v2")
+    args.profile_sample_markers = True
     plan = dict(
         format_version=2,
+        api=api,
         cases=cases,
         arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         identity=git_identity(),
         topk_idx_bytes=torch.empty((), dtype=topk_idx_t).element_size(),
-        limits=LIMITS,
+        limits=V1_LIMITS if api == "v1" else LIMITS,
     )
+    plan["source_identity"] = content_identity(plan["identity"], REPO)
     write_json(args.output / "plan.json", plan)
     environment = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     peer = None
     try:
-        if args.nnodes == 2:
+        if args.nnodes > 1:
             print(
                 f"WAIT node={args.node_rank} run={args.run_id} coordinator={args.master_addr}:{args.master_port}",
                 flush=True,
             )
-            peer = Peer.connect(args.master_addr, args.master_port, args.node_rank, args.rendezvous_timeout)
+            peer = PeerGroup.connect(
+                args.master_addr, args.master_port, args.node_rank, args.rendezvous_timeout, args.nnodes
+            )
             hello = dict(
                 node_rank=args.node_rank,
                 contract=suite_contract(args),
-                source=content_identity(plan["identity"], REPO),
+                source=plan["source_identity"],
                 topk_idx_bytes=plan["topk_idx_bytes"],
             )
-            other = peer.exchange("hello", hello)
-            validate_peers(hello, other)
-            other_plan = peer.exchange("plan", plan)
-            write_json(args.output / "peer_plan.json", other_plan)
+            hellos = peer.exchange_all("hello", hello)
+            for node, other in enumerate(hellos):
+                if other["node_rank"] != node:
+                    raise ValueError("node identity mismatch")
+                for key in ("contract", "source", "topk_idx_bytes"):
+                    if json.dumps(hello[key], sort_keys=True) != json.dumps(other[key], sort_keys=True):
+                        raise ValueError(f"node {node} {key} mismatch; no NPU job started")
+            plans = peer.exchange_all("plan", plan)
+            for node, other_plan in enumerate(plans):
+                if node != args.node_rank:
+                    write_json(
+                        args.output / ("peer_plan.json" if node == 1 else f"peer_plan_node{node}.json"), other_plan
+                    )
         for case in cases:
             path = args.output / case["name"]
             error = None
@@ -814,7 +1211,7 @@ def launch(args):
                 error = traceback.format_exc()
             # Both machines must be ready before either launches NPU workers.
             require_ready(peer, case["name"] + "/preflight", error)
-            run_case(args, case, path, environment, peer)
+            run_case(args, case, path, environment, peer, entrypoint=entrypoint)
             if peer:
                 peer.connection.settimeout(args.collection_timeout)
                 error, manifest = None, None
@@ -824,7 +1221,7 @@ def launch(args):
                 except Exception:
                     error = traceback.format_exc()
                 require_ready(peer, case["name"] + "/collection_ready", error)
-                peer.transfer(path, path / "peer_node1", manifest, args.collection_timeout)
+                peer.collect(path, manifest, args.collection_timeout)
                 peer.require_both(case["name"] + "/collected")
                 peer.connection.settimeout(30)
         error = None
@@ -839,8 +1236,8 @@ def launch(args):
         write_json(
             args.output / "suite_exit.json", dict(code=0, completed=[c["name"] for c in cases], ended=time.time())
         )
-        if args.node_rank == 1:
-            print("SUITE_PASSED: node 0 has the complete EP16 report and copied raw artifacts", flush=True)
+        if args.node_rank != 0:
+            print("SUITE_PASSED: node 0 has the complete report and copied raw artifacts", flush=True)
     except BaseException:
         write_json(args.output / "suite_exit.json", dict(code=1, traceback=traceback.format_exc(), ended=time.time()))
         raise

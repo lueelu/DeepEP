@@ -20,6 +20,7 @@ from .buffer import (
     _resolve_group_or_comm,
     _try_record_event,
     _use_comm_stream,
+    _validate_udma_peer_order,
 )
 from .config import Config
 from .config import (
@@ -29,6 +30,7 @@ from .config import (
 )
 from .dtypes import topk_idx_bytes, topk_idx_t
 from .event import EventHandle, EventOverlap
+from .udma_policy import resolve_udma_policy
 
 
 _ELASTIC_BUFFER_ALIGNMENT = 2 * 1024 * 1024
@@ -100,6 +102,9 @@ class EPHandle:
 class ElasticBuffer:
     """DeepEP V2 intranode buffer with an API independent from V1 ``Buffer``.
 
+    UDMA defaults to automatic peer/rank host tuning without
+    changing num_sms selection or the existing EPHandle core-count contract.
+
     Dispatch and combine share the optimized V1 backend. V2 keeps EPHandle,
     optional expert expansion and independently allocated GM outputs. UDMA
     uses the same shared-Jetty scheduler as V1; MTE retains its own transport.
@@ -129,12 +134,49 @@ class ElasticBuffer:
         *,
         shmem_ip_port: Optional[str] = None,
         transport: Optional[str] = None,
-        udma_schedule: str = "peer",
-        udma_peers_per_worker: int = 4,
-        udma_wqes_per_visit: int = 8,
+        udma_schedule: Optional[str] = None,
+        udma_dispatch_peer_order: Optional[str] = None,
+        udma_combine_peer_order: Optional[str] = None,
+        udma_ranks_per_group: Optional[int] = None,
+        udma_peers_per_group_per_worker: Optional[int] = None,
+        udma_workers_per_peer: Optional[int] = None,
+        udma_qps_per_worker: Optional[int] = None,
+        udma_peers_per_worker: Optional[int] = None,
+        udma_wqes_per_visit: Optional[int] = None,
+        udma_auto_policy: bool = True,
     ) -> None:
         rank, num_ranks, resolved_group = _resolve_group_or_comm(group, None)
         transport = _normalize_transport(transport or os.environ.get("ASCEND_DEEPEP_TRANSPORT", "auto"))
+        self._udma_auto_policy = resolve_udma_policy(
+            udma_auto_policy,
+            num_ranks,
+            transport,
+            udma_schedule,
+            udma_dispatch_peer_order,
+            udma_combine_peer_order,
+            udma_ranks_per_group,
+            udma_peers_per_group_per_worker,
+            udma_workers_per_peer,
+            udma_qps_per_worker,
+            udma_peers_per_worker,
+            udma_wqes_per_visit,
+            rank=rank,
+        )
+        if self._udma_auto_policy is not None:
+            udma_schedule = "peer"
+            udma_dispatch_peer_order = udma_combine_peer_order = "rank"
+            udma_ranks_per_group = udma_peers_per_group_per_worker = None
+            policy = self._udma_auto_policy
+            udma_workers_per_peer, udma_qps_per_worker = policy.workers_per_peer, policy.qps_per_worker
+            udma_peers_per_worker, udma_wqes_per_visit = policy.peers_per_worker, policy.wqes_per_visit
+        else:
+            udma_workers_per_peer = 1 if udma_workers_per_peer is None else udma_workers_per_peer
+            udma_qps_per_worker = 1 if udma_qps_per_worker is None else udma_qps_per_worker
+            udma_peers_per_worker = 4 if udma_peers_per_worker is None else udma_peers_per_worker
+            udma_wqes_per_visit = 8 if udma_wqes_per_visit is None else udma_wqes_per_visit
+        udma_schedule = "peer" if udma_schedule is None else udma_schedule
+        udma_dispatch_peer_order = "rank" if udma_dispatch_peer_order is None else udma_dispatch_peer_order
+        udma_combine_peer_order = "rank" if udma_combine_peer_order is None else udma_combine_peer_order
         if udma_schedule not in ("peer", "token"):
             raise ValueError("udma_schedule must be 'peer' or 'token'")
         if udma_schedule == "token" and transport != "udma":
@@ -144,6 +186,23 @@ class ElasticBuffer:
             udma_wqes_per_visit=udma_wqes_per_visit,
         )
         self._udma_schedule = udma_schedule
+        peer_options = _validate_udma_peer_order(
+            transport,
+            udma_schedule,
+            num_ranks,
+            udma_dispatch_peer_order,
+            udma_combine_peer_order,
+            udma_ranks_per_group,
+            udma_peers_per_group_per_worker,
+            udma_workers_per_peer,
+            udma_qps_per_worker,
+        )
+        self._udma_dispatch_peer_order = udma_dispatch_peer_order
+        self._udma_combine_peer_order = udma_combine_peer_order
+        self._udma_ranks_per_group = udma_ranks_per_group
+        self._udma_peers_per_group_per_worker = (peer_options[3] or None) if len(peer_options) >= 4 else None
+        self._udma_workers_per_peer = udma_workers_per_peer
+        self._udma_qps_per_worker = udma_qps_per_worker
         _validate_elastic_constructor(
             rank=rank,
             num_ranks=num_ranks,
@@ -225,6 +284,11 @@ class ElasticBuffer:
         self.transport = transport
         # Internal baseline switch; not part of the public ElasticBuffer API.
         self._use_single_source_combine = True
+        # Private experimental A/B switch. Keep the serial path as the default;
+        # both choices retain peer/QP ownership and final completion semantics.
+        self._use_early_single_source_combine = False
+        # Experimental aggregate/send pipeline. 0 retains the serial baseline.
+        self._aggregate_pipeline_chunk_tokens = 0
         _validate_group_consensus(resolved_group, "udma_peers_per_worker", udma_peers_per_worker)
         _validate_group_consensus(resolved_group, "udma_wqes_per_visit", udma_wqes_per_visit)
         native_type = get_native_class("BufferRuntime")
@@ -240,6 +304,12 @@ class ElasticBuffer:
                 shmem_ip_port,
                 num_max_tokens_per_rank or None,
                 udma_schedule,
+                peer_options,
+                **(
+                    {"udma_auto_options": self._udma_auto_policy.signature()}
+                    if self._udma_auto_policy is not None
+                    else {}
+                ),
             )
             self._native = native_type(
                 rank,
@@ -253,6 +323,7 @@ class ElasticBuffer:
                 bootstrap_key,
                 True,
                 udma_schedule == "token",
+                *peer_options,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -266,6 +337,47 @@ class ElasticBuffer:
         # Match the V2 initialization visibility contract on the communication
         # stream. The native barrier kernel is reused from the V1 resource layer.
         self.barrier(use_comm_stream=True, with_cpu_sync=True)
+
+    @property
+    def udma_auto_policy(self):
+        """Resolved immutable tuning parameters, or None. Does not bind core counts."""
+        return self._udma_auto_policy
+
+    @property
+    def udma_schedule(self) -> str:
+        return self._udma_schedule
+
+    @property
+    def udma_peers_per_worker(self) -> int:
+        return self._udma_config.udma_peers_per_worker
+
+    @property
+    def udma_wqes_per_visit(self) -> int:
+        return self._udma_config.udma_wqes_per_visit
+
+    @property
+    def udma_dispatch_peer_order(self) -> str:
+        return self._udma_dispatch_peer_order
+
+    @property
+    def udma_combine_peer_order(self) -> str:
+        return self._udma_combine_peer_order
+
+    @property
+    def udma_ranks_per_group(self) -> Optional[int]:
+        return self._udma_ranks_per_group
+
+    @property
+    def udma_workers_per_peer(self) -> int:
+        return self._udma_workers_per_peer
+
+    @property
+    def udma_qps_per_worker(self) -> int:
+        return self._udma_qps_per_worker
+
+    @property
+    def udma_peers_per_group_per_worker(self) -> Optional[int]:
+        return self._udma_peers_per_group_per_worker
 
     @staticmethod
     def get_buffer_size_hint(
@@ -370,13 +482,9 @@ class ElasticBuffer:
             name="dispatch workspace",
         )
 
-        # Both optimized UDMA kernels use one incoming marker per source.
-        dispatch_signal_slots = num_ranks
-        dispatch_body = _checked_add(
-            _checked_align(dispatch_body, 512, "dispatch UDMA signal base"),
-            _checked_mul(dispatch_signal_slots, 512, "dispatch UDMA signal bytes"),
-            name="dispatch with UDMA",
-        )
+        # Shared fixed header, before notify and either operator's payload.
+        # Each source owns a 512-byte array of worker/QP completion markers.
+        control_bytes = _checked_mul(num_ranks, 512, "UDMA control header")
 
         # Combine reserves one partial for each source rank and original token.
         combine_slots = _checked_mul(num_max_tokens_per_rank, num_ranks, "combine partial slots")
@@ -390,17 +498,8 @@ class ElasticBuffer:
             name="combine partial row",
         )
         combine_body = _checked_mul(combine_slots, combine_partial_row, "combine partials")
-        combine_body = _checked_add(
-            _checked_align(combine_body, 512, "combine UDMA signal base"),
-            _checked_mul(
-                num_ranks,
-                512,
-                "combine UDMA signal bytes",
-            ),
-            name="combine with UDMA",
-        )
-
         total = _checked_add(
+            control_bytes,
             notify_bytes,
             max(dispatch_body, combine_body),
             name="elastic buffer",
@@ -667,6 +766,8 @@ class ElasticBuffer:
                 f"{self.num_bytes}"
             )
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
+        if self._udma_auto_policy is not None:
+            self._udma_auto_policy.validate_num_aiv(resolved_num_sms)
         _validate_bool("do_handle_copy", do_handle_copy)
         _validate_bool("do_cpu_sync", resolved_do_cpu_sync)
         if not cached_mode and self.num_max_tokens_per_rank == 0:
@@ -911,6 +1012,8 @@ class ElasticBuffer:
             raise NotImplementedError("intranode V2 does not use RDMA QPs")
         resolved_num_sms = handle.num_sms if num_sms == 0 else num_sms
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
+        if self._udma_auto_policy is not None:
+            self._udma_auto_policy.validate_num_aiv(resolved_num_sms)
         if resolved_num_sms != handle.num_sms:
             raise ValueError("combine num_sms must match dispatch EPHandle")
         bias_0, bias_1 = self._unpack_bias(bias)
@@ -928,6 +1031,22 @@ class ElasticBuffer:
             send_head,
         ) = handle._dispatch_layout
 
+        pipeline_chunk = self._aggregate_pipeline_chunk_tokens if handle.do_expand else 0
+        if pipeline_chunk:
+            if self._udma_qps_per_worker != 1:
+                raise ValueError("aggregate pipeline requires udma_qps_per_worker=1")
+            if pipeline_chunk not in (32, 64):
+                raise ValueError("aggregate pipeline chunk must be 32 or 64")
+            if (
+                self.transport != "udma"
+                or self._udma_schedule not in ("peer", "token")
+                or resolved_num_sms not in (32, 64)
+                or not self._use_single_source_combine
+                or self._use_early_single_source_combine
+            ):
+                raise ValueError("aggregate pipeline requires expanded UDMA, 32/64 AIV and serial baseline selection")
+            if self._udma_schedule == "token" and (resolved_num_sms != 32 or self.num_ranks > 8):
+                raise ValueError("self-send aggregate pipeline requires 32 AIV and EP <= 8")
         dependency = previous_event or _try_record_event(None)
         with _use_stream_after_event(self._communication_stream, dependency):
             combine_x, combine_topk_weights = x, topk_weights
@@ -936,7 +1055,10 @@ class ElasticBuffer:
                 if handle.do_expand and self.transport == "udma" and self._use_single_source_combine
                 else None
             )
-            if handle.do_expand:
+            early_aggregate_map = None
+            if single_source_slots is not None and (self._use_early_single_source_combine or pipeline_chunk):
+                _, _, early_aggregate_map, _ = handle._expand_layout
+            elif handle.do_expand:
                 _, _, recv_to_expanded_idx, _ = handle._expand_layout
                 # Preserve combine's separate weight output. Passing these as
                 # aggregate's route weights would multiply them into x.
@@ -968,6 +1090,8 @@ class ElasticBuffer:
                 config.udma_wqes_per_visit,
                 x if single_source_slots is not None else None,
                 single_source_slots,
+                early_aggregate_map,
+                pipeline_chunk,
             )
             if previous_event_before_epilogue is not None:
                 previous_event_before_epilogue.current_stream_wait()

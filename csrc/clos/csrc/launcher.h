@@ -34,7 +34,7 @@ void LaunchV1DispatchKernel(
     torch::Tensor send_head, const c10::optional<torch::Tensor>& dispatch_plan,
     const ascend_deepep::DispatchTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr, bool use_udma);
 
-enum class CombinePhase { Fused, Communication, Reduction };
+enum class CombinePhase { Fused, Communication, Reduction, EarlySingles, Remaining, Pipeline };
 
 void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& topk_weights,
                            const c10::optional<torch::Tensor>& bias_0, const c10::optional<torch::Tensor>& bias_1,

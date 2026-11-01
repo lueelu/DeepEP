@@ -42,6 +42,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt, int64_t udma_peers_per_worker = 4,
     int64_t udma_wqes_per_visit = 8, c10::intrusive_ptr<CombineEpilogue>* epilogue = nullptr,
     c10::optional<torch::Tensor> expanded_x = c10::nullopt,
-    c10::optional<torch::Tensor> single_source_slots = c10::nullopt);
+    c10::optional<torch::Tensor> single_source_slots = c10::nullopt, std::function<void()> aggregate = {},
+    c10::optional<torch::Tensor> pipeline_mapping = c10::nullopt,
+    c10::optional<torch::Tensor> pipeline_values = c10::nullopt, int64_t pipeline_chunk_tokens = 0);
 
 }  // namespace ascend_deepep::ops

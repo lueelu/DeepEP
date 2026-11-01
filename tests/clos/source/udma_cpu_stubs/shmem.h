@@ -55,11 +55,14 @@ inline aclshmemi_udma_queue_state_t states[32][3];
 inline QpContext contexts[257][32];
 inline MemoryInfo memory[257][32];
 inline bool corrupt_wqe = false;
+inline bool direct_output = false;
+inline std::function<void(unsigned, size_t)> on_metadata_store;
 inline uint64_t decoded_wqes = 0;
 inline std::vector<Request> staged, sent;
 inline std::vector<unsigned> batches;
 inline std::vector<std::pair<unsigned, unsigned>> quiesced;
 inline unsigned active_qp = 0;
+inline unsigned active_qp_count = 1;
 inline unsigned cross_syncs = 0;
 inline uint8_t* local_workspace = nullptr;
 inline size_t workspace_bytes = 0;
@@ -69,6 +72,7 @@ inline size_t metadata_store_bytes = 0;
 inline void reset(unsigned groups)
 {
     alias_groups = groups;
+    active_qp_count = 1;
     staged.clear();
     sent.clear();
     batches.clear();
@@ -86,7 +90,7 @@ inline uint64_t state(const Request& r)
 template <class T, const aclshmemx_udma_op_config_t& C>
 Request request(T* d, T* s, uint32_t n, uint32_t p, uint32_t q)
 {
-    CHECK(q == active_qp && n > 0);
+    CHECK(q >= active_qp && q < active_qp + active_qp_count && n > 0);
     return {reinterpret_cast<uint8_t*>(d), reinterpret_cast<uint8_t*>(s), n * uint32_t(sizeof(T)), p, q, C.order};
 }
 }  // namespace model
@@ -149,7 +153,8 @@ inline void* aclshmem_ptr(uint8_t* ptr, unsigned peer)
 inline void aclshmemi_udma_flush_aggregate_wqes(uint8_t* ub, QpContext* context, unsigned slot, unsigned qp, unsigned,
                                                 unsigned count, unsigned size)
 {
-    CHECK(count > 0 && count <= 32 && size == 64 && qp == model::active_qp);
+    CHECK(count > 0 && count <= 32 && size == 64 && qp >= model::active_qp &&
+          qp < model::active_qp + model::active_qp_count);
     CHECK(context == &model::contexts[slot][qp] && model::staged.empty());
     auto* words = reinterpret_cast<uint64_t*>(ub);
     if (model::corrupt_wqe) words[4] ^= 1;
@@ -164,8 +169,8 @@ inline void aclshmemi_udma_flush_aggregate_wqes(uint8_t* ub, QpContext* context,
         CHECK(w[4] == 0x1234567800000000ULL + peer * 17);
         CHECK(model::contexts[peer][qp].state_addr == context->state_addr);
         CHECK(w[6] > 0 && w[6] <= UINT32_MAX);
-        CHECK(!model::local_workspace);
-        auto* dst = reinterpret_cast<uint8_t*>(w[5] - (uint64_t(peer + 1) << 40));
+        auto* dst = reinterpret_cast<uint8_t*>(
+            w[5] - (model::direct_output || model::local_workspace ? 0 : (uint64_t(peer + 1) << 40)));
         model::sent.push_back({dst, reinterpret_cast<uint8_t*>(w[7]), unsigned(w[6]), peer, qp, ACLSHMEMX_UDMA_ODR_RO});
         ++model::decoded_wqes;
     }
@@ -181,12 +186,17 @@ void scalar_put(T* ptr, T value, unsigned peer)
     auto* dst = static_cast<uint8_t*>(::aclshmem_ptr(reinterpret_cast<uint8_t*>(ptr), peer));
     std::memcpy(dst, &value, sizeof(T));
     model::metadata_store_bytes += sizeof(T);
+    if (model::on_metadata_store) model::on_metadata_store(peer, offset);
 }
 inline void aclshmem_int32_p(int32_t* p, int32_t v, int pe)
 {
     scalar_put(p, v, pe);
 }
 inline void aclshmem_int64_p(int64_t* p, int64_t v, int pe)
+{
+    scalar_put(p, v, pe);
+}
+inline void aclshmem_uint64_p(uint64_t* p, uint64_t v, int pe)
 {
     scalar_put(p, v, pe);
 }
@@ -198,7 +208,7 @@ inline void aclshmem_float_p(float* p, float v, int pe)
 inline void aclshmem_uint64_wait_until(uint64_t*, int, unsigned) {}
 inline void aclshmemx_udma_qp_quiet(unsigned p, unsigned q)
 {
-    CHECK(q == model::active_qp && model::staged.empty());
+    CHECK(q >= model::active_qp && q < model::active_qp + model::active_qp_count && model::staged.empty());
     model::quiesced.emplace_back(p, q);
 }
 template <class T, int, const aclshmemx_udma_op_config_t& C>

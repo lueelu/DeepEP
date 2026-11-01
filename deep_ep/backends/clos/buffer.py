@@ -15,6 +15,7 @@ from .config import Config, _MAX_NUM_AIV
 from .event import EventHandle, EventOverlap
 from .expand import ExpandHandle
 from .resources import Handle, Slot, SlotState
+from .udma_policy import resolve_udma_policy, validate_manual_config
 
 
 _ORPHANED_NATIVE_RESOURCES: list[tuple[Any, ...]] = []
@@ -39,6 +40,9 @@ def _is_blackwell() -> bool:
 class Buffer:
     """Own one CANN SHMEM communication session and symmetric workspace.
 
+    UDMA defaults to automatic peer/rank host tuning. Core counts
+    still come from Config/set_num_sms; insufficient AIV budgets raise before submission.
+
     ``num_bytes`` is the usable communication-workspace capacity. The native
     runtime maps it into one CANN SHMEM heap together with its metadata.
     ``transport`` selects the CANN SHMEM data-operation engine; ``auto`` uses
@@ -48,6 +52,10 @@ class Buffer:
     ``"token"`` assigns input channels/return rows to half the AIVs (at most 32),
     each with its own QP to all peers. All ranks must select the same schedule
     and launch configuration; changing schedule requires a new Buffer.
+    ``udma_dispatch_peer_order`` and ``udma_combine_peer_order`` select immutable
+    ``rank`` (default), ``group``, ``group_staggered`` or ``group_round_robin`` traversal in peer mode.
+    Group orders require ``udma_ranks_per_group``, a positive divisor of EP size;
+    groups are contiguous EP-local ranks, not automatically discovered servers.
     ``use_1g_huge_pages`` registers the workspace as one caller-owned CANN VMM
     buffer backed by 1 GiB HBM pages. It is disabled by default.
     ``shmem_ip_port=None`` selects UID bootstrap within the EP group. An
@@ -78,7 +86,14 @@ class Buffer:
         *,
         num_bytes: Optional[int] = None,
         transport: str = "auto",
-        udma_schedule: str = "peer",
+        udma_schedule: Optional[str] = None,
+        udma_dispatch_peer_order: Optional[str] = None,
+        udma_combine_peer_order: Optional[str] = None,
+        udma_ranks_per_group: Optional[int] = None,
+        udma_peers_per_group_per_worker: Optional[int] = None,
+        udma_workers_per_peer: Optional[int] = None,
+        udma_qps_per_worker: Optional[int] = None,
+        udma_auto_policy: bool = True,
         use_1g_huge_pages: bool = False,
         shmem_ip_port: Optional[str] = None,
         num_max_tokens_per_rank: Optional[int] = None,
@@ -93,6 +108,32 @@ class Buffer:
         rank, resolved_num_ranks, resolved_group = _resolve_group_or_comm(group, comm)
         resolved_num_bytes, resolved_nvl_bytes = _resolve_workspace_bytes(num_nvl_bytes, num_bytes)
         resolved_transport = _normalize_transport(transport)
+        self._udma_auto_policy = resolve_udma_policy(
+            udma_auto_policy,
+            resolved_num_ranks,
+            resolved_transport,
+            udma_schedule,
+            udma_dispatch_peer_order,
+            udma_combine_peer_order,
+            udma_ranks_per_group,
+            udma_peers_per_group_per_worker,
+            udma_workers_per_peer,
+            udma_qps_per_worker,
+            rank=rank,
+            operation_config=True,
+        )
+        if self._udma_auto_policy is not None:
+            udma_schedule = "peer"
+            udma_dispatch_peer_order = udma_combine_peer_order = "rank"
+            udma_ranks_per_group = udma_peers_per_group_per_worker = None
+            udma_workers_per_peer = self._udma_auto_policy.workers_per_peer
+            udma_qps_per_worker = self._udma_auto_policy.qps_per_worker
+        else:
+            udma_workers_per_peer = 1 if udma_workers_per_peer is None else udma_workers_per_peer
+            udma_qps_per_worker = 1 if udma_qps_per_worker is None else udma_qps_per_worker
+        udma_schedule = "peer" if udma_schedule is None else udma_schedule
+        udma_dispatch_peer_order = "rank" if udma_dispatch_peer_order is None else udma_dispatch_peer_order
+        udma_combine_peer_order = "rank" if udma_combine_peer_order is None else udma_combine_peer_order
         if udma_schedule not in ("peer", "token"):
             raise ValueError("udma_schedule must be 'peer' or 'token'")
         if udma_schedule == "token" and resolved_transport != "udma":
@@ -123,6 +164,23 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.transport = resolved_transport
         self._udma_schedule = udma_schedule
+        peer_options = _validate_udma_peer_order(
+            resolved_transport,
+            udma_schedule,
+            resolved_num_ranks,
+            udma_dispatch_peer_order,
+            udma_combine_peer_order,
+            udma_ranks_per_group,
+            udma_peers_per_group_per_worker,
+            udma_workers_per_peer,
+            udma_qps_per_worker,
+        )
+        self._udma_dispatch_peer_order = udma_dispatch_peer_order
+        self._udma_combine_peer_order = udma_combine_peer_order
+        self._udma_ranks_per_group = udma_ranks_per_group
+        self._udma_peers_per_group_per_worker = (peer_options[3] or None) if len(peer_options) >= 4 else None
+        self._udma_workers_per_peer = udma_workers_per_peer
+        self._udma_qps_per_worker = udma_qps_per_worker
         self.low_latency_mode = low_latency_mode
         self.use_1g_huge_pages = use_1g_huge_pages
         self.num_qps_per_rank = num_qps_per_rank
@@ -148,6 +206,12 @@ class Buffer:
                 resolved_ip_port,
                 num_max_tokens_per_rank,
                 udma_schedule,
+                peer_options,
+                **(
+                    {"udma_auto_options": self._udma_auto_policy.signature()}
+                    if self._udma_auto_policy is not None
+                    else {}
+                ),
             )
             self._native = native_type(
                 rank,
@@ -161,6 +225,7 @@ class Buffer:
                 bootstrap_key,
                 True,  # V1 requests shared Jetty when the resolved transport is UDMA.
                 udma_schedule == "token",
+                *peer_options,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -169,6 +234,35 @@ class Buffer:
         # session. The native runtime owns the symmetric workspace itself.
         self._slot = Slot(0, owner=self, native_resources=self._native)
         self._communication_stream = _create_communication_stream()
+
+    @property
+    def udma_auto_policy(self):
+        """Resolved immutable tuning parameters, or None. Does not bind core counts."""
+        return self._udma_auto_policy
+
+    @property
+    def udma_dispatch_peer_order(self) -> str:
+        return self._udma_dispatch_peer_order
+
+    @property
+    def udma_combine_peer_order(self) -> str:
+        return self._udma_combine_peer_order
+
+    @property
+    def udma_ranks_per_group(self) -> Optional[int]:
+        return self._udma_ranks_per_group
+
+    @property
+    def udma_workers_per_peer(self) -> int:
+        return self._udma_workers_per_peer
+
+    @property
+    def udma_qps_per_worker(self) -> int:
+        return self._udma_qps_per_worker
+
+    @property
+    def udma_peers_per_group_per_worker(self) -> Optional[int]:
+        return self._udma_peers_per_group_per_worker
 
     @property
     def udma_schedule(self) -> str:
@@ -411,7 +505,14 @@ class Buffer:
             capacity = self.num_max_tokens_per_rank if self.num_max_tokens_per_rank is not None else x_tensor.size(0)
             if num_worst_tokens != self.group_size * capacity:
                 raise ValueError("fixed dispatch output requires num_worst_tokens == group_size * capacity")
-        config = self.get_dispatch_config(self.group_size) if config is None else config
+        if self._udma_auto_policy is not None:
+            config = self._udma_auto_policy.resolve_config(config, Buffer.num_sms, rank=self.rank)
+        elif self.transport == "udma":
+            validate_manual_config(
+                config, self.udma_schedule, self.udma_dispatch_peer_order, self.udma_combine_peer_order
+            )
+        elif config is None:
+            config = self.get_dispatch_config(self.group_size)
         num_aiv, nvl_send, nvl_recv = _config_to_native_args(config)
         del num_tokens_per_rdma_rank
 
@@ -574,7 +675,14 @@ class Buffer:
         _validate_operation_flags(async_finish, allocate_on_comm_stream)
         allocation_stream_id = _get_allocation_stream_id(allocate_on_comm_stream)
         _validate_previous_event(previous_event)
-        config = self.get_combine_config(self.group_size) if config is None else config
+        if self._udma_auto_policy is not None:
+            config = self._udma_auto_policy.resolve_config(config, Buffer.num_sms, rank=self.rank)
+        elif self.transport == "udma":
+            validate_manual_config(
+                config, self.udma_schedule, self.udma_dispatch_peer_order, self.udma_combine_peer_order
+            )
+        elif config is None:
+            config = self.get_combine_config(self.group_size)
         num_aiv, nvl_send, nvl_recv = _config_to_native_args(config)
         if isinstance(handle, _V1Handle) and handle._buffer_owner is not self:
             raise ValueError("V1 handle belongs to a different Buffer")
@@ -1060,6 +1168,65 @@ def _bootstrap_all_gather(group: Any, comm: Any, size: int, value: Any) -> list:
     return values
 
 
+def _validate_udma_peer_order(
+    transport,
+    schedule,
+    size,
+    dispatch_order,
+    combine_order,
+    ranks_per_group,
+    peers_per_group_per_worker=None,
+    workers_per_peer=1,
+    qps_per_worker=1,
+):
+    """Validate immutable EP-local topology and return native enum values."""
+    orders = ("rank", "group", "group_staggered", "group_round_robin")
+    if dispatch_order not in orders or combine_order not in orders:
+        raise ValueError("UDMA peer order must be rank, group, group_staggered or group_round_robin")
+    topology = dispatch_order != "rank" or combine_order != "rank"
+    if ranks_per_group is not None:
+        if isinstance(ranks_per_group, bool) or not isinstance(ranks_per_group, int):
+            raise TypeError("udma_ranks_per_group must be an integer or None")
+        if ranks_per_group <= 0 or ranks_per_group > size or size % ranks_per_group:
+            raise ValueError("udma_ranks_per_group must be a positive divisor of the EP group size")
+    if topology and ranks_per_group is None:
+        raise ValueError("group peer order requires udma_ranks_per_group")
+    if (topology or ranks_per_group is not None) and (transport != "udma" or schedule != "peer"):
+        raise ValueError("UDMA peer order/group size requires transport='udma' and udma_schedule='peer'")
+    if isinstance(workers_per_peer, bool) or not isinstance(workers_per_peer, int) or workers_per_peer not in (1, 2):
+        raise ValueError("udma_workers_per_peer must be 1 or 2")
+    if isinstance(qps_per_worker, bool) or not isinstance(qps_per_worker, int) or qps_per_worker not in (1, 2):
+        raise ValueError("udma_qps_per_worker must be 1 or 2")
+    if qps_per_worker != 1 and (workers_per_peer != 1 or transport != "udma" or schedule != "peer"):
+        raise ValueError("two QPs per worker require UDMA peer schedule and workers_per_peer=1")
+    qp_lanes = workers_per_peer * qps_per_worker
+    if workers_per_peer != 1 and (transport != "udma" or schedule != "peer"):
+        raise ValueError("multiple workers per peer require transport='udma' and udma_schedule='peer'")
+    if (
+        qp_lanes != 1
+        and (dispatch_order != "group_round_robin" or combine_order != "group_round_robin")
+        and ((size - 1 + 7) // 8) * qp_lanes > 32
+    ):
+        raise ValueError("no peer configuration fits the 32 sending QP limit")
+    result = (orders.index(dispatch_order), orders.index(combine_order), ranks_per_group or 0)
+    if "group_round_robin" in (dispatch_order, combine_order):
+        count = 1 if peers_per_group_per_worker is None else peers_per_group_per_worker
+        if isinstance(count, bool) or not isinstance(count, int) or count not in (1, 2, 4):
+            raise ValueError("udma_peers_per_group_per_worker must be 1, 2 or 4")
+        workers = (ranks_per_group + count - 1) // count
+        capacity = ((ranks_per_group + workers - 1) // workers) * (size // ranks_per_group)
+        if workers * qp_lanes > 32 or capacity > 64:
+            raise ValueError("group_round_robin exceeds 32 workers or 64 peers per worker")
+        if qps_per_worker != 1:
+            return result + (count, workers_per_peer, qps_per_worker)
+        return result + (count,) + ((workers_per_peer,) if workers_per_peer != 1 else ())
+    if peers_per_group_per_worker is not None:
+        raise ValueError("udma_peers_per_group_per_worker requires group_round_robin")
+    if qps_per_worker != 1:
+        return result + (0, workers_per_peer, qps_per_worker)
+    return result + ((0, workers_per_peer) if workers_per_peer != 1 else ())
+
+
 def _prepare_shmem_bootstrap(
     group,
     comm,
@@ -1071,6 +1238,8 @@ def _prepare_shmem_bootstrap(
     ip_port,
     num_max_tokens_per_rank=None,
     udma_schedule="peer",
+    udma_peer_options=(0, 0, 0),
+    udma_auto_options=None,
 ):
     native = load_native_module()
     options = (
@@ -1081,7 +1250,10 @@ def _prepare_shmem_bootstrap(
         os.environ.get("SHMEM_UID_SESSION_ID") if ip_port is None else None,
         num_max_tokens_per_rank,
         udma_schedule,
+        udma_peer_options,
     )
+    if udma_auto_options is not None:
+        options += (udma_auto_options,)
     # This key is compared only within this process. Buffer retains group, so
     # its identity cannot be recycled while the associated runtime is alive.
     key = repr((id(group), options))

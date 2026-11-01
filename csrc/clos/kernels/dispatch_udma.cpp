@@ -112,17 +112,23 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             rank_prefix_gm.GetValue((world_size - 1) * world_size + rank), num_output_tokens);
         ascend_deepep::udma::InitializeDispatchTopk(resource, symmetric_buffer, tiling, rows, core_idx, core_num);
     }
-    // Clears incoming payload markers and publishes top-k initialization before
-    // any remote sparse stores. Every launched AIV participates, even if empty.
+    if (tiling.udma_output_control && core_idx == 0) {
+        ascend_deepep::udma::PrepareDispatchOutput(resource, tiling.udma_output_control, rank, world_size,
+            recv_x, recv_x_scales, tiling.num_output_tokens,
+            static_cast<uint32_t>(rank_prefix_gm.GetValue((world_size - 1) * world_size + rank)),
+            hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0);
+    }
+    // Clears incoming payload markers and publishes this invocation's output
+    // addresses/top-k initialization before remote writes. Every AIV participates.
     ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
         core_idx, core_num, resource.ubBuf.template GetBufferByByte<uint64_t>(0),
-        tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : 1U);
+        tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
 
     // With spare cores, payload owners skip this helper and immediately start
     // UDMA while the other cores build metadata and copy self channels.
     ascend_deepep::udma::DispatchMetadata(resource, x, dispatch_scales, topk_idx, topk_weights,
         dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head,
-        tiling, core_idx, core_num, kDispatchStageBytes);
+        tiling, core_idx, core_num, kDispatchStageBytes, recv_x, recv_x_scales);
     if (tiling.udma_token_schedule) {
         ascend_deepep::udma::DispatchTokenRemote(resource, x, dispatch_scales,
             dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num);
@@ -182,17 +188,19 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 
-    // Materialize each AIV's disjoint receive interval after transport completion.
-    // Equal output/SHMEM pointers preserve the zero-copy path without a copy.
-    ascend_deepep::CopyDispatchRecvToGm(
-        recv_x, symmetric_buffer, tiling.x_buffer_offset,
-        static_cast<uint64_t>(recv_token_begin) * hidden_bytes,
-        static_cast<uint64_t>(worker_tokens) * hidden_bytes, staging_pingpong_ub, staging_capacity);
-    if (tiling.has_x_scales != 0) {
+    // Mailbox-enabled payload/scales are already in their final storage. Keep
+    // the internal staging baseline and the SIMT metadata materialization here.
+    if (!tiling.udma_output_control) {
         ascend_deepep::CopyDispatchRecvToGm(
-            recv_x_scales, symmetric_buffer, tiling.x_scales_buffer_offset,
-            static_cast<uint64_t>(recv_token_begin) * scale_row_bytes,
-            static_cast<uint64_t>(worker_tokens) * scale_row_bytes, staging_pingpong_ub, staging_capacity);
+            recv_x, symmetric_buffer, tiling.x_buffer_offset,
+            static_cast<uint64_t>(recv_token_begin) * hidden_bytes,
+            static_cast<uint64_t>(worker_tokens) * hidden_bytes, staging_pingpong_ub, staging_capacity);
+        if (tiling.has_x_scales != 0) {
+            ascend_deepep::CopyDispatchRecvToGm(
+                recv_x_scales, symmetric_buffer, tiling.x_scales_buffer_offset,
+                static_cast<uint64_t>(recv_token_begin) * scale_row_bytes,
+                static_cast<uint64_t>(worker_tokens) * scale_row_bytes, staging_pingpong_ub, staging_capacity);
+        }
     }
     if (num_topk > 0) {
         ascend_deepep::CopyDispatchRecvToGm(

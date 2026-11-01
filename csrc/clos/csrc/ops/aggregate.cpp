@@ -41,11 +41,11 @@ int64_t ResolveNumAiv(int64_t num_aiv)
 
 namespace ascend_deepep::ops {
 
-std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Aggregate(
-    torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> expanded_values,
-    torch::Tensor recv_to_expanded_idx, int64_t num_aiv, uint64_t ffts_addr,
-    c10::optional<int64_t> allocation_stream_id, c10::optional<torch::Tensor> single_source_slots,
-    c10::optional<torch::Tensor> rank_prefix_matrix, int rank, int world_size)
+AggregatePlan PrepareAggregate(torch::Tensor x, c10::optional<torch::Tensor> topk_weights,
+                               c10::optional<torch::Tensor> expanded_values, torch::Tensor recv_to_expanded_idx,
+                               int64_t num_aiv, uint64_t ffts_addr, c10::optional<int64_t> allocation_stream_id,
+                               c10::optional<torch::Tensor> single_source_slots,
+                               c10::optional<torch::Tensor> rank_prefix_matrix, int rank, int world_size)
 {
     V1Allocator allocator(allocation_stream_id);
     allocator.Record({x, topk_weights, expanded_values, recv_to_expanded_idx, single_source_slots, rank_prefix_matrix});
@@ -119,9 +119,26 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Aggregate(
     tiling.x_dtype = x.scalar_type() == torch::kBFloat16 ? kAggregateDtypeBfloat16 : kAggregateDtypeFloat16;
     tiling.x_element_bytes = static_cast<uint32_t>(x.element_size());
 
-    LaunchAggregateKernel(x, topk_weights, expanded_values, recv_to_expanded_idx, aggregated_x, aggregated_values,
-                          tiling, ffts_addr);
-    return {aggregated_x, aggregated_values};
+    auto launch = [=] {
+        // Retain owners of addresses embedded in the tiling.
+        (void)single_source_slots;
+        (void)rank_prefix_matrix;
+        LaunchAggregateKernel(x, topk_weights, expanded_values, recv_to_expanded_idx, aggregated_x, aggregated_values,
+                              tiling, ffts_addr);
+    };
+    return {aggregated_x, aggregated_values, std::move(launch)};
+}
+
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Aggregate(
+    torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> expanded_values,
+    torch::Tensor recv_to_expanded_idx, int64_t num_aiv, uint64_t ffts_addr,
+    c10::optional<int64_t> allocation_stream_id, c10::optional<torch::Tensor> single_source_slots,
+    c10::optional<torch::Tensor> rank_prefix_matrix, int rank, int world_size)
+{
+    auto plan = PrepareAggregate(x, topk_weights, expanded_values, recv_to_expanded_idx, num_aiv, ffts_addr,
+                                 allocation_stream_id, single_source_slots, rank_prefix_matrix, rank, world_size);
+    plan.launch();
+    return {plan.x, plan.values};
 }
 
 }  // namespace ascend_deepep::ops

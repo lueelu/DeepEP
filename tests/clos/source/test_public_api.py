@@ -57,6 +57,12 @@ class _FakeBufferRuntime:
         bootstrap_key,
         v1_shared_jetty,
         v1_token_schedule=False,
+        udma_dispatch_peer_order=0,
+        udma_combine_peer_order=0,
+        udma_ranks_per_group=0,
+        udma_peers_per_group_per_worker=0,
+        udma_workers_per_peer=1,
+        udma_qps_per_worker=1,
     ):
         self.args = (
             rank,
@@ -73,6 +79,13 @@ class _FakeBufferRuntime:
         self.bootstrap_key = bootstrap_key
         self.v1_shared_jetty = v1_shared_jetty
         self.v1_token_schedule = v1_token_schedule
+        self.udma_peer_options = (udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group)
+        if udma_peers_per_group_per_worker or udma_workers_per_peer != 1 or udma_qps_per_worker != 1:
+            self.udma_peer_options += (udma_peers_per_group_per_worker,)
+        if udma_workers_per_peer != 1 or udma_qps_per_worker != 1:
+            self.udma_peer_options += (udma_workers_per_peer,)
+        if udma_qps_per_worker != 1:
+            self.udma_peer_options += (udma_qps_per_worker,)
 
     def is_initialized(self):
         return self.initialized
@@ -418,6 +431,19 @@ def _make_buffer(**kwargs):
         return Buffer(**parameters)
 
 
+def _make_manual_buffer(**kwargs):
+    options = dict(
+        udma_auto_policy=False,
+        udma_schedule="peer",
+        udma_dispatch_peer_order="rank",
+        udma_combine_peer_order="rank",
+        udma_workers_per_peer=1,
+        udma_qps_per_worker=1,
+    )
+    options.update(kwargs)
+    return _make_buffer(**options)
+
+
 class ConfigTest(unittest.TestCase):
     def test_shared_udma_tuning_validation(self):
         for peers in (1, 2, 4, 8):
@@ -564,21 +590,21 @@ class ConfigTest(unittest.TestCase):
     def test_size_hint_covers_shared_udma_workspace(self):
         # Native layout byte counts for BF16 H6144, K8 (int64 indices),
         # six experts/rank, ordinary dispatch, without FP8 scales.
-        # These include notify, payload and synchronization regions before
+        # These include the fixed control header, notify and payload before
         # SHMEM allocation rounding; do not derive them from the Python hint.
         cases = (
-            (2, 32, 129, 3198976),
-            (8, 32, 129, 12792320),
-            (16, 32, 129, 25585152),
-            (32, 32, 1, 430592),
-            (34, 32, 1, 458752),
-            (48, 32, 1, 648704),
-            (64, 16, 1, 856576),
-            (64, 18, 1, 859648),
-            (64, 32, 1, 868864),
-            (64, 48, 1, 881152),
-            (64, 64, 1, 893440),
-            (64, 32, 129, 102351360),
+            (2, 32, 129, 3198944),
+            (8, 32, 129, 12792096),
+            (16, 32, 129, 25584704),
+            (32, 32, 1, 430208),
+            (34, 32, 1, 458336),
+            (48, 32, 1, 648384),
+            (64, 16, 1, 856320),
+            (64, 18, 1, 859392),
+            (64, 32, 1, 868608),
+            (64, 48, 1, 880896),
+            (64, 64, 1, 893184),
+            (64, 32, 129, 102351104),
             (128, 32, 1, 1769472),
             (128, 32, 129, 204734464),
         )
@@ -989,6 +1015,189 @@ class EnvsCompatibilityTest(unittest.TestCase):
 
 
 class BufferConstructionTest(unittest.TestCase):
+    def test_multi_qp_options(self):
+        from deep_ep.backends.clos.buffer import _validate_udma_peer_order
+
+        self.assertEqual(_validate_udma_peer_order("udma", "peer", 16, "rank", "rank", None, None, 2), (0, 0, 0, 0, 2))
+        self.assertEqual(
+            _validate_udma_peer_order("udma", "peer", 128, "group_round_robin", "group_round_robin", 16, 1, 2),
+            (3, 3, 16, 1, 2),
+        )
+        for value in (0, 3, True, 2.0):
+            with self.assertRaises(ValueError):
+                _validate_udma_peer_order("udma", "peer", 8, "rank", "rank", None, None, value)
+        for transport, schedule in (("mte", "peer"), ("udma", "token")):
+            with self.assertRaises(ValueError):
+                _validate_udma_peer_order(transport, schedule, 8, "rank", "rank", None, None, 2)
+        with self.assertRaises(ValueError):
+            _validate_udma_peer_order("udma", "peer", 128, "group_round_robin", "group_round_robin", 32, 1, 2)
+        b = _make_manual_buffer(transport="udma", udma_workers_per_peer=2)
+        self.assertEqual(b.native.udma_peer_options, (0, 0, 0, 0, 2))
+        self.assertEqual(b.udma_workers_per_peer, 2)
+        with self.assertRaises(AttributeError):
+            b.udma_workers_per_peer = 1
+        b.destroy()
+        from deep_ep.backends.clos.buffer import _prepare_shmem_bootstrap
+
+        native = Mock()
+        native.get_shmem_bootstrap.return_value = (0, [])
+
+        def gather(group, comm, size, value):
+            options, state, uid = value
+            changed = (*options[:-1], (0, 0, 0, 0, 1))
+            return [value, (changed, state, uid)]
+
+        with (
+            patch("deep_ep.backends.clos.buffer.load_native_module", return_value=native),
+            patch("deep_ep.backends.clos.buffer._bootstrap_all_gather", side_effect=gather),
+            self.assertRaisesRegex(ValueError, "all EP ranks"),
+        ):
+            _prepare_shmem_bootstrap(_Group(), None, 0, 2, 1024, "udma", False, None, udma_peer_options=(0, 0, 0, 0, 2))
+        native.get_shmem_unique_id.assert_not_called()
+
+    def test_two_qps_per_worker(self):
+        from deep_ep.backends.clos.buffer import _validate_udma_peer_order
+
+        for value in (0, 3, True, 1.5):
+            with self.assertRaises(ValueError):
+                _validate_udma_peer_order("udma", "peer", 8, "rank", "rank", None, None, 1, value)
+        for transport, schedule, lanes in (("mte", "peer", 1), ("udma", "token", 1), ("udma", "peer", 2)):
+            with self.assertRaises(ValueError):
+                _validate_udma_peer_order(transport, schedule, 8, "rank", "rank", None, None, lanes, 2)
+        with self.assertRaises(ValueError):
+            _validate_udma_peer_order("udma", "peer", 64, "group_round_robin", "group_round_robin", 32, 1, 1, 2)
+        b = _make_manual_buffer(transport="udma", udma_qps_per_worker=2)
+        self.assertEqual(b.native.udma_peer_options, (0, 0, 0, 0, 1, 2))
+        self.assertEqual(b.udma_qps_per_worker, 2)
+        with self.assertRaises(AttributeError):
+            b.udma_qps_per_worker = 1
+        b.destroy()
+
+    def test_group_round_robin_options_and_consensus(self):
+        from deep_ep.backends.clos.buffer import _validate_udma_peer_order, _prepare_shmem_bootstrap
+
+        for count in (1, 2, 4):
+            b = _make_manual_buffer(
+                group=_Group(size=128),
+                transport="udma",
+                udma_dispatch_peer_order="group_round_robin",
+                udma_combine_peer_order="group_round_robin",
+                udma_ranks_per_group=16,
+                udma_peers_per_group_per_worker=count,
+            )
+            self.assertEqual(b.native.udma_peer_options, (3, 3, 16, count))
+            self.assertEqual(b.udma_peers_per_group_per_worker, count)
+            with self.assertRaises(AttributeError):
+                b.udma_peers_per_group_per_worker = 2
+            b.destroy()
+        for count in (0, 3, 8, True, "2"):
+            with self.assertRaises(ValueError):
+                _validate_udma_peer_order("udma", "peer", 128, "group_round_robin", "rank", 16, count)
+        for size, group, count in ((256, 4, 4), (128, 128, 1)):
+            with self.assertRaises(ValueError):
+                _validate_udma_peer_order("udma", "peer", size, "group_round_robin", "rank", group, count)
+        with self.assertRaises(ValueError):
+            _validate_udma_peer_order("udma", "peer", 8, "rank", "rank", None, 2)
+        native = Mock()
+        native.get_shmem_bootstrap.return_value = (0, [])
+
+        def gather(group, comm, size, value):
+            options, state, uid = value
+            changed = (*options[:-1], (3, 3, 16, 2))
+            return [value, (changed, state, uid)]
+
+        with (
+            patch("deep_ep.backends.clos.buffer.load_native_module", return_value=native),
+            patch("deep_ep.backends.clos.buffer._bootstrap_all_gather", side_effect=gather),
+            self.assertRaisesRegex(ValueError, "all EP ranks"),
+        ):
+            _prepare_shmem_bootstrap(_Group(), None, 0, 2, 1024, "udma", False, None, udma_peer_options=(3, 3, 16, 1))
+        native.get_shmem_unique_id.assert_not_called()
+
+    def test_peer_orders_are_immutable_and_forwarded(self):
+        for dispatch in ("rank", "group", "group_staggered"):
+            for combine in ("rank", "group", "group_staggered"):
+                b = _make_manual_buffer(
+                    group=_Group(size=16),
+                    transport="udma",
+                    udma_dispatch_peer_order=dispatch,
+                    udma_combine_peer_order=combine,
+                    udma_ranks_per_group=8,
+                )
+                try:
+                    orders = ("rank", "group", "group_staggered")
+                    self.assertEqual(b.native.udma_peer_options, (orders.index(dispatch), orders.index(combine), 8))
+                    for name, value in (
+                        ("udma_dispatch_peer_order", dispatch),
+                        ("udma_combine_peer_order", combine),
+                        ("udma_ranks_per_group", 8),
+                    ):
+                        self.assertEqual(getattr(b, name), value)
+                        with self.assertRaises(AttributeError):
+                            setattr(b, name, value)
+                finally:
+                    b.destroy()
+        b = _make_buffer()
+        self.assertEqual(b.native.udma_peer_options, (0, 0, 0))
+        b.destroy()
+
+    def test_peer_order_bootstrap_consensus_before_uid(self):
+        from deep_ep.backends.clos.buffer import _prepare_shmem_bootstrap
+
+        native = Mock()
+        native.get_shmem_bootstrap.return_value = (0, [])
+        for changed_field in range(3):
+
+            def gather(group, comm, size, value):
+                options, state, uid = value
+                peer_options = list(options[-1])
+                peer_options[changed_field] += 1
+                return [value, ((*options[:-1], tuple(peer_options)), state, uid)]
+
+            with (
+                patch("deep_ep.backends.clos.buffer.load_native_module", return_value=native),
+                patch("deep_ep.backends.clos.buffer._bootstrap_all_gather", side_effect=gather),
+                self.assertRaisesRegex(ValueError, "all EP ranks"),
+            ):
+                _prepare_shmem_bootstrap(_Group(), None, 0, 2, 1024, "udma", False, None, udma_peer_options=(1, 2, 1))
+        native.get_shmem_unique_id.assert_not_called()
+
+    def test_peer_order_validation_precedes_native_bootstrap(self):
+        invalid = [
+            {"udma_dispatch_peer_order": "unknown"},
+            {"udma_combine_peer_order": "unknown"},
+            {"udma_dispatch_peer_order": "group"},
+            *({"udma_ranks_per_group": size} for size in (0, -1, 3, 32, True, 1.5, "8")),
+            {"transport": "mte", "udma_ranks_per_group": 8},
+            {"transport": "auto", "udma_ranks_per_group": 8},
+            {"udma_schedule": "token", "udma_ranks_per_group": 8},
+        ]
+        for options in invalid:
+            with (
+                self.subTest(options=options),
+                patch("deep_ep.backends.clos.buffer.get_native_class") as native,
+                patch("deep_ep.backends.clos.buffer._prepare_shmem_bootstrap") as bootstrap,
+                self.assertRaises((ValueError, TypeError)),
+            ):
+                Buffer(
+                    _Group(size=16),
+                    num_nvl_bytes=64 * 1024**2,
+                    **(
+                        {
+                            "transport": "udma",
+                            "udma_auto_policy": False,
+                            "udma_schedule": "peer",
+                            "udma_dispatch_peer_order": "rank",
+                            "udma_combine_peer_order": "rank",
+                            "udma_workers_per_peer": 1,
+                            "udma_qps_per_worker": 1,
+                        }
+                        | options
+                    ),
+                )
+            native.assert_not_called()
+            bootstrap.assert_not_called()
+
     def test_bootstrap_mode_is_selected_only_by_constructor_argument(self):
         # Exercise the real constructor -> bootstrap -> native argument path.
         # Only the distributed exchange and native runtime are CPU substitutes.
@@ -1156,6 +1365,13 @@ class BufferConstructionTest(unittest.TestCase):
                 "num_bytes",
                 "transport",
                 "udma_schedule",
+                "udma_dispatch_peer_order",
+                "udma_combine_peer_order",
+                "udma_ranks_per_group",
+                "udma_peers_per_group_per_worker",
+                "udma_workers_per_peer",
+                "udma_qps_per_worker",
+                "udma_auto_policy",
                 "use_1g_huge_pages",
                 "shmem_ip_port",
                 "num_max_tokens_per_rank",
@@ -1178,7 +1394,7 @@ class BufferConstructionTest(unittest.TestCase):
 
     def test_token_schedule_is_explicit_and_immutable(self):
         for schedule in ("peer", "token"):
-            buffer = _make_buffer(transport="udma", udma_schedule=schedule)
+            buffer = _make_manual_buffer(transport="udma", udma_schedule=schedule)
             try:
                 self.assertEqual(buffer.udma_schedule, schedule)
                 self.assertEqual(buffer.native.v1_token_schedule, schedule == "token")

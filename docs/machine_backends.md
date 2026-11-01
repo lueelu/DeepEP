@@ -1,9 +1,9 @@
 # POD、全 Clos 与 PR 机型
 
 一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
-`4dd80e2129da42bd773982c2bb3758af1ed0bba8`。POD 保留本仓已有的 HT、LL、
-实验组件和接口限制。全 Clos 实现来自 ascend_deepep 的 `deepep` 分支
-`c09040328c853a011dfe37c74463c44723db4476`，包含 V1 Buffer、V2 ElasticBuffer、
+`836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7`。POD 保留本仓已有的 HT、LL、
+实验组件和接口限制。全 Clos 实现从 ascend_deepep 的初始导入 `c0904032`
+更新至 `v1-shared-jetty-scheduler` 分支 `6f9d8c9ef9403a302724ce42cf55810843ffebc3`，包含 V1 Buffer、V2 ElasticBuffer、
 MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及原有资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
 PR（`CARD_4PMESH`，board `0x6c`）复用迁入实现的 MTE kernel，不另建一份 SHMEM。
@@ -107,6 +107,52 @@ buffer = deep_ep.Buffer(
 V2 的 `get_buffer_size_hint(..., machine_type=...)` 也须选择同一后端；容量查询是
 非 collective，不增加跨 rank 同步。直接让构造函数按 shape 计算可避免选错 hint。
 POD 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `shmem_ip_port` 方式。
+
+## 全 Clos 的默认调度与手动调优
+
+V1/V2 在 UDMA 下默认 `udma_auto_policy=True`，fresh/cached dispatch 与 combine
+采用相同的 peer 调度参数。机型识别与此策略是两层逻辑：先选通信实现，再选 Clos 调度。
+
+| EP | peers/worker | workers/peer | QPs/worker | WQEs/visit | peer 顺序 |
+| --- | --- | --- | --- | --- | --- |
+| 2–8 | 1 | 2 | 1 | 8 | rank |
+| 9–16 | 1 | 1 | 1 | 8 | rank |
+| 17–128 | 4 | 1 | 1 | 32 | rank |
+| 129–256 | 8 | 1 | 1 | 32 | rank |
+
+后两档是在 32 个 QP 预算内的推广，不代表所有 EP、核数和路由均已有性能测量。
+策略不修改用户指定的核数：V1 通过 `Config(num_sms=...)`，V2 在 dispatch/combine
+传 `num_sms=...`。核数须为合法偶数，且不少于 `ceil((EP-1)/peers_per_worker) * workers_per_peer`；
+不足会报错。例如 EP128 自动策略需要 32 个发送 AIV，不能使用 20 核。
+省略核数或传 0 时沿用 32 核缺省语义。
+
+自动模式下显式传入的策略参数不改变结果；与有效值不同会在 rank 0 记录 warning。
+要调优，请在构造 Buffer 时设 `udma_auto_policy=False`，完整指定所用策略参数。例如 V2：
+
+```python
+buffer = deep_ep.ElasticBuffer(
+    group=ep_group, num_max_tokens_per_rank=8192, hidden=6144, num_topk=8,
+    machine_type="clos_only", explicitly_destroy=True,
+    udma_auto_policy=False, udma_schedule="peer",
+    udma_dispatch_peer_order="rank", udma_combine_peer_order="rank",
+    udma_peers_per_worker=4, udma_workers_per_peer=1,
+    udma_qps_per_worker=1, udma_wqes_per_visit=32,
+)
+```
+
+V1 的 peers/worker 和 WQEs/visit 放在每次调用的 `Config` 中，其余参数在 Buffer 构造时设置。
+group 顺序还需 `udma_ranks_per_group`；group_round_robin 还需
+`udma_peers_per_group_per_worker`。MTE 不启用 UDMA 自动策略。
+
+UDMA 控制区固定在工作区开头，每个源 rank 保留 512 字节（256 字节对齐），
+dispatch/combine 数据区与容量计算同步后移。普通 combine 省去前置 cached-notify，
+但保留 kernel Begin 的跨 rank 同步、接收完成等待和发送 Quiet，避免上一轮读写尚未结束就复用数据。
+cached dispatch、MTE 和需要独立初始化的实验路径保留对应 notify。
+这些改动需要整体重编 Python/native/device 库，不能只替换 Python 文件。
+
+带宽入口位于 `benchmarks/clos/bench_v2_auto_bandwidth.py`；支持可选 L2 清理和
+`--combine-bias none`，逐项打印通信带宽及独立的 notify/reduce 耗时。
+通信带宽分母仅为通信 kernel 耗时，不能直接当作完整 API 吞吐。
 
 ## PR：四卡 Mesh 与跨域 PCIe
 

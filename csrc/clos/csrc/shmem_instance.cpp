@@ -87,7 +87,10 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
 
 ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_port, int64_t data_op_engine_type,
                              bool use_1g_huge_pages, std::vector<int64_t> unique_id, std::string bootstrap_key,
-                             bool v1_shared_jetty, bool v1_token_schedule)
+                             bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
+                             int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
+                             int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
+                             int64_t udma_qps_per_worker)
     : rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -108,6 +111,55 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
       workspace_ptr_(nullptr),
       ffts_addr_(0)
 {
+    if (udma_dispatch_peer_order < 0 || udma_dispatch_peer_order > 3 || udma_combine_peer_order < 0 ||
+        udma_combine_peer_order > 3) {
+        throw std::invalid_argument("invalid UDMA peer order");
+    }
+    const bool topology_order = udma_dispatch_peer_order != 0 || udma_combine_peer_order != 0;
+    if (udma_ranks_per_group < 0 || udma_ranks_per_group > world_size ||
+        (udma_ranks_per_group != 0 && world_size % udma_ranks_per_group != 0) ||
+        (topology_order && udma_ranks_per_group == 0)) {
+        throw std::invalid_argument("UDMA ranks_per_group must divide the EP group size");
+    }
+    if ((topology_order || udma_ranks_per_group != 0) && (!shared_jetty_ || token_schedule_)) {
+        throw std::invalid_argument("UDMA peer order/group size requires explicit shared-Jetty UDMA peer schedule");
+    }
+    dispatch_peer_order_ = static_cast<uint32_t>(udma_dispatch_peer_order);
+    combine_peer_order_ = static_cast<uint32_t>(udma_combine_peer_order);
+    ranks_per_group_ = static_cast<uint32_t>(udma_ranks_per_group);
+    if (udma_workers_per_peer != 1 && udma_workers_per_peer != 2)
+        throw std::invalid_argument("udma_workers_per_peer must be 1 or 2");
+    if (udma_workers_per_peer != 1 && (!shared_jetty_ || token_schedule_))
+        throw std::invalid_argument("multiple workers per peer require shared-Jetty UDMA peer schedule");
+    workers_per_peer_ = static_cast<uint32_t>(udma_workers_per_peer);
+    if (udma_qps_per_worker != 1 && udma_qps_per_worker != 2)
+        throw std::invalid_argument("udma_qps_per_worker must be 1 or 2");
+    if (udma_qps_per_worker != 1 && (workers_per_peer_ != 1 || !shared_jetty_ || token_schedule_))
+        throw std::invalid_argument(
+            "two QPs per worker require shared-Jetty UDMA peer schedule and one worker per peer");
+    qps_per_worker_ = static_cast<uint32_t>(udma_qps_per_worker);
+    const uint32_t qp_lanes = workers_per_peer_ * qps_per_worker_;
+    if (qp_lanes != 1 &&
+        (dispatch_peer_order_ != ascend_deepep::udma::kGroupRoundRobinOrder ||
+         combine_peer_order_ != ascend_deepep::udma::kGroupRoundRobinOrder) &&
+        ascend_deepep::udma::Workers(world_size, ascend_deepep::udma::kMaxPeers) * qp_lanes >
+            ascend_deepep::udma::kQpCount)
+        throw std::invalid_argument("no peer configuration fits the 32 sending QP limit");
+    const bool round_robin = dispatch_peer_order_ == ascend_deepep::udma::kGroupRoundRobinOrder ||
+                             combine_peer_order_ == ascend_deepep::udma::kGroupRoundRobinOrder;
+    if (round_robin) {
+        if (udma_peers_per_group_per_worker != 1 && udma_peers_per_group_per_worker != 2 &&
+            udma_peers_per_group_per_worker != 4)
+            throw std::invalid_argument("group_round_robin requires peers per group per worker in 1,2,4");
+        const uint64_t lanes =
+            (udma_ranks_per_group + udma_peers_per_group_per_worker - 1) / udma_peers_per_group_per_worker;
+        const uint64_t count = (udma_ranks_per_group + lanes - 1) / lanes * (world_size / udma_ranks_per_group);
+        if (lanes * qp_lanes > ascend_deepep::udma::kQpCount || count > ascend_deepep::udma::kGroupPeerCapacity)
+            throw std::invalid_argument("group_round_robin exceeds 32 workers or 64 peers per worker");
+    } else if (udma_peers_per_group_per_worker != 0) {
+        throw std::invalid_argument("peers per group per worker requires group_round_robin");
+    }
+    peers_per_group_per_worker_ = static_cast<uint32_t>(udma_peers_per_group_per_worker);
     if (token_schedule_ && !shared_jetty_) {
         throw std::invalid_argument("token schedule requires V1 shared-Jetty UDMA");
     }
@@ -311,8 +363,12 @@ void ShmemInstance::InitRuntime()
             if (shared_jetty_) {
                 std::vector<uint64_t> masks(world_size_);
                 for (int peer = 0; peer < world_size_; ++peer)
-                    masks[peer] = token_schedule_ ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
-                                                  : ascend_deepep::udma::PeerMask(rank_, peer, world_size_);
+                    masks[peer] = token_schedule_
+                                      ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
+                                      : ascend_deepep::udma::PeerMask(rank_, peer, world_size_, dispatch_peer_order_,
+                                                                      combine_peer_order_, ranks_per_group_,
+                                                                      peers_per_group_per_worker_,
+                                                                      workers_per_peer_ * qps_per_worker_);
                 ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(masks.data(), masks.size()));
             } else {
                 ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(nullptr, 0));

@@ -23,13 +23,15 @@ import test_v1_intranode as golden
 
 
 def buffer_entrypoints(args, group):
-    if not args.public_auto:
+    if not (args.public_auto or args.public_clos):
         return Buffer, ElasticBuffer, {"transport": args.transport or "udma"}
     if args.transport is not None:
         raise ValueError("--public-auto selects the engine from topology; omit --transport")
     from deep_ep import Buffer as PublicBuffer, ElasticBuffer as PublicElasticBuffer
     from deep_ep._machine import select
 
+    if args.public_clos:
+        return PublicBuffer, PublicElasticBuffer, {"machine_type": "clos_only"}
     # This golden checks the Clos layout. Fail collectively before constructing
     # a Buffer if the node belongs to another backend; never force Clos here.
     selection = select(group=group)
@@ -129,21 +131,38 @@ def run_rank(rank, args):
     config = Config(
         args.num_aiv, udma_peers_per_worker=args.udma_peers_per_worker, udma_wqes_per_visit=args.udma_wqes_per_visit
     )
+    if args.auto_policy:
+        config = Config(args.num_aiv)
     num_experts = args.ep_size * args.experts_per_rank
     group = dist.group.WORLD
     buffer_type, elastic_type, engine_options = buffer_entrypoints(args, group)
     # The same workspace capacity for both APIs avoids allocation-size confounds.
     capacity = max(
         config.get_nvl_buffer_size_hint(args.hidden * 2, args.ep_size, args.num_tokens),
-        elastic_type.get_buffer_size_hint(group, args.num_tokens, args.hidden, args.num_topk),
+        elastic_type.get_buffer_size_hint(
+            group,
+            args.num_tokens,
+            args.hidden,
+            args.num_topk,
+            **({"machine_type": "clos_only"} if args.public_clos else {}),
+        ),
     )
     common = dict(
         explicitly_destroy=True,
         shmem_ip_port=args.shmem_ip_port,
-        udma_schedule="peer",
         num_max_tokens_per_rank=args.num_tokens,
         **engine_options,
     )
+    manual = dict(
+        udma_schedule="peer",
+        udma_auto_policy=False,
+        udma_dispatch_peer_order="rank",
+        udma_combine_peer_order="rank",
+        udma_workers_per_peer=1,
+        udma_qps_per_worker=1,
+    )
+    if not args.auto_policy:
+        common.update(manual)
     if args.api == "v1":
         buffer = buffer_type(group, num_nvl_bytes=capacity, **common)
     else:
@@ -152,11 +171,17 @@ def run_rank(rank, args):
             num_bytes=capacity,
             hidden=args.hidden,
             num_topk=args.num_topk,
-            udma_peers_per_worker=args.udma_peers_per_worker,
-            udma_wqes_per_visit=args.udma_wqes_per_visit,
+            **(
+                {}
+                if args.auto_policy
+                else dict(
+                    udma_peers_per_worker=args.udma_peers_per_worker,
+                    udma_wqes_per_visit=args.udma_wqes_per_visit,
+                )
+            ),
             **common,
         )
-    if args.public_auto:
+    if args.public_auto or args.public_clos:
         selection = buffer.machine_selection
         print(
             "MACHINE_SELECTION "
@@ -171,7 +196,8 @@ def run_rank(rank, args):
             ),
             flush=True,
         )
-        assert selection["machine_type"] == "clos_only" and selection["source"] != "explicit"
+        assert selection["machine_type"] == "clos_only"
+        assert (selection["source"] == "explicit") == args.public_clos
         assert buffer.transport == "udma"
     x = golden._make_x(rank, args).to("npu")
     idx_cpu = golden._make_topk_idx(rank, args)
@@ -314,7 +340,7 @@ def run_rank(rank, args):
         buffer = None
         if success:
             dist.destroy_process_group()
-    if args.public_auto:
+    if args.public_auto or args.public_clos:
         print(f"PUBLIC_PRECISION_PASSED api={args.api} rank={rank}", flush=True)
 
 
@@ -331,10 +357,17 @@ def main():
     p.add_argument("--udma-peers-per-worker", type=int, default=1)
     p.add_argument("--udma-wqes-per-visit", type=int, default=8)
     p.add_argument("--transport", choices=("udma", "mte"), default=None)
-    p.add_argument(
+    public = p.add_mutually_exclusive_group()
+    public.add_argument(
         "--public-auto",
         action="store_true",
         help="Use public V1/V2 with automatic topology selection; requires a clos_only machine",
+    )
+    public.add_argument(
+        "--public-clos", action="store_true", help="Explicit public Clos backend; does not test topology detection"
+    )
+    p.add_argument(
+        "--auto-policy", action="store_true", help="Use the default UDMA scheduling policy and only set AIV count"
     )
     p.add_argument("--seed", type=int, default=20260823)
     p.add_argument("--dist-init-method", default="tcp://127.0.0.1:29500")
@@ -348,7 +381,7 @@ def main():
     p.add_argument("--profile-warmup", type=int, default=10)
     p.add_argument("--profile-iters", type=int, default=30)
     args = p.parse_args()
-    if args.public_auto and args.transport is not None:
+    if (args.public_auto or args.public_clos) and args.transport is not None:
         p.error("--public-auto selects the engine from topology; omit --transport")
     if args.profile and args.fixed_capacity:
         p.error("matched performance uses exact receive counts, not padded outputs")
