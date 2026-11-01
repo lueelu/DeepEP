@@ -1605,8 +1605,8 @@ def worker(local_rank, args):
     info = json.loads(Path(deep_ep.__file__).with_name("_build_info.json").read_text())
     if "elastic-dispatch-expanded-v1" not in info.get("capabilities", []):
         raise RuntimeError("Installed wheel does not contain payload dispatch")
-    if "elastic-notify-metadata-v6" not in info.get("capabilities", []):
-        raise RuntimeError("Rebuild/install the wheel with Notify metadata v6")
+    if "elastic-notify-metadata-v7" not in info.get("capabilities", []):
+        raise RuntimeError("Rebuild/install the wheel with Notify metadata v7")
     torch.npu.set_device(local_rank)
     modes = _ROUTES if args.route == "all" else (args.route,)
     dtypes = (False, True) if args.dtype == "both" else (args.dtype == "fp8",)
