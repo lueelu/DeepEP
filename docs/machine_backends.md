@@ -68,7 +68,7 @@ DCMI board 规则；DCMI 查询超时为 5 秒，不重试。未知 board、缺�
 显式选择 Clos 的 V1 示例：
 
 ```python
-config = deep_ep.Config(num_sms=32)  # 本项目仍按 AIV 数量解释
+config = deep_ep.Config(num_sms=32)
 num_bytes = config.get_nvl_buffer_size_hint(6144 * 2, ep_group.size(), 8192)
 buffer = deep_ep.Buffer(
     ep_group, num_nvl_bytes=num_bytes, explicitly_destroy=True,
@@ -106,20 +106,7 @@ SHMEM 初始化后、DeepEP 算子启动前，逐 peer 查询 metadata/workspace
 映射存在不等于物理链路健康或已验证性能。PR 域内 EP4、跨域 EP8/EP16、多组 EP4 的
 NPU 精度与稳定性尚待实机验证；不能将 POD 环境结果视为 PR 验证通过。
 
-## 参数与生命周期
-
-公开签名、文档和示例使用上游名称 `num_sms`、`num_gpu_timeout_secs`、`num_nvl_bytes`、
-`num_rdma_bytes` 和 `get_nvl_buffer_size_hint`。已有的昇腾名称仍作为兼容别名接受，
-映射见 [API 命名表](api.md#上游兼容与平台命名)。同一参数用两种名称给出不同值时抛错，
-位置参数顺序和默认值不变。别名不会让某后端原本不支持的参数变得可用。
-
-`num_sms` 在本项目始终表示 **AIV 数量**，`32` 仍为 32 个 AIV，`64` 仍为 64 个 AIV；
-不进行二倍换算。DeepEP-Ascend 官方 EPBuffer 的 `num_sms` 按 AI core 计数，其 A5
-配置中 32 AI core 对应 64 AIV，不能直接照搬相同数值。这里对齐的是公开命名风格，
-保留 V1 Buffer/旧版 V2 ElasticBuffer 的接口和行为，不宣称与官方最新 EPBuffer/V2.5 完全一致。
-
-NVLink/NVSHMEM 相关旧名字不代表使用 NVIDIA 硬件或库；两个实现继续共用 CANN SHMEM。
-事件依赖、机型选择、QP/peer 调度和 kernel 同步不因名称变更而改变。
+## 生命周期
 
 同一进程不能并存 POD 和 Clos SHMEM 会话。初始化/销毁使用共享锁，native 端检查
 SDK 初始化状态，禁止覆盖另一后端的 QP/heap 配置。必须在整个 EP group 中按相同顺序

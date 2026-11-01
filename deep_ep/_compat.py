@@ -1,4 +1,17 @@
-"""Explicit keyword aliases; the wrapped implementation retains its defaults."""
+"""Public parameter naming and compatibility policy.
+
+Public signatures retain upstream spellings; existing Ascend spellings remain
+accepted as aliases. Explicit mappings live beside the wrapped APIs.
+``num_sms`` and its ``num_compute_units`` alias count AIVs in this project;
+Config also accepts ``num_aiv``. A value of 32 means 32 AIVs, with no AI-core
+conversion. This also applies to the corresponding setters and core-count queries.
+``nvl``/``rdma`` names retain their communication-domain and capacity meanings;
+they do not select physical links or NVIDIA libraries. Both backends use CANN
+SHMEM, and aliases do not enable otherwise unsupported backend features.
+
+Aliases preserve values, positional argument order and defaults. Conflicting
+alias values raise TypeError; normal Python duplicate-argument rules still apply.
+"""
 
 import functools
 import inspect

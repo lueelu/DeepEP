@@ -7,7 +7,7 @@ Modified by Joyce_An 2026
 
 `deep_ep.ElasticBuffer` 提供 V2 dispatch/combine。高吞吐（HT）和低时延（LL）使用相同方法，输入、权重、布局及路径选择见 [Elastic 接口](elastic.md)。本页说明核心 `deep_ep` 的公共对象、初始化、资源生命周期和兼容范围。MegaMoE 的 `SymmBuffer/StoreGroup` 和 EpGmmFused 的 UDMA 域使用独立接口，分别见 [MegaMoE](../experiments/megamoe/README.md)与 [EpGmmFused](../experiments/ep_gmm_fused/README.md)。
 
-本页原有能力表与参数限制描述 POD 路径。新增 Clos V1/V2、自动选择和兼容别名见
+本页原有能力表与参数限制描述 POD 路径。新增 Clos V1/V2、自动选择和使用方式见
 [机型后端说明](machine_backends.md)，不能把 POD 的限制套到 Clos 路径。
 
 ## 公共对象
@@ -76,38 +76,10 @@ Modified by Joyce_An 2026
 
 HT 的 `async_with_compute_stream=True` 不在返回前为计算流添加输出依赖，调用方通过返回事件连接后续计算。fresh Notify 仍回读计数；cached Dispatch 支持 `do_cpu_sync=False`，复用 handle 的计数。Dispatch 控制区首次使用或布局变化时仍有原生 Host 同步，开启 `debug_collectives` 也会增加 Host 等待。cached Combine 复用 handle 的计数和布局，通过通信流上的 barrier 保护工作区，不保证所有调用均无 Host 阻塞。LL 只接受默认流选项。`ElasticBuffer.barrier()` 只支持显式 `with_cpu_sync=True, sequential=True` 的同步用法。
 
-## 上游兼容与平台命名
+## 接口兼容范围
 
 接口参考固定到 [DeepSeek DeepEP a56d6156](https://github.com/deepseek-ai/DeepEP/tree/a56d6156febcd9976e55adc85b5155bfac9f28f8)。[机器可读契约](../tests/api/api_contract.json)保存所选对象的参数、默认值、参考源码及哈希；它描述经过平台适配的接口，不代表上游全部 API 或行为均受支持。
 
-采用 DeepEP-Ascend 的兼容命名风格：公开签名和示例保留上游名称，已有的昇腾名称作为别名接受。
-完整签名以机器可读契约为准；兼容别名不在签名中重复展示。两种名称同时指定不同值时抛错，
-相同值可以共存；位置参数顺序、默认值与后端支持范围保持不变。
-
-本项目 `num_sms` 的单位仍是 **AIV**，与 `num_compute_units` 完全相同，不做二倍换算。
-官方 DeepEP-Ascend EPBuffer 的 `num_sms` 表示 AI core，其 A5 配置中 32 AI core 对应
-64 AIV。相同参数名不意味着两边相同数值占用相同硬件资源。
-`nvl/rdma` 等名称保留通信域/容量语义，不保证某种物理链路；实际通信使用 CANN SHMEM。
-
-| 公开名称 | 仍接受的兼容别名 |
-| --- | --- |
-| `num_sms` | `num_compute_units` |
-| `set_num_sms(new_num_sms=...)` | `set_num_compute_units(new_num_compute_units=...)` |
-| `num_gpu_timeout_secs` | `num_device_timeout_secs` |
-| `num_max_nvl_chunked_send_tokens/recv_tokens` | `num_max_scaleup_chunked_send_tokens/recv_tokens` |
-| `num_max_rdma_chunked_send_tokens/recv_tokens` | `num_max_scaleout_chunked_send_tokens/recv_tokens` |
-| `num_nvl_bytes/num_rdma_bytes` | `num_scaleup_bytes/num_scaleout_bytes` |
-| `get_nvl_buffer_size_hint/get_rdma_buffer_size_hint` | `get_scaleup_buffer_size_hint/get_scaleout_buffer_size_hint` |
-| `get_low_latency_rdma_size_hint` | `get_low_latency_scaleout_size_hint` |
-| `num_tokens_per_rdma_rank` | `num_tokens_per_scaleout_rank` |
-| `get_theoretical_num_sms()` | `get_theoretical_num_compute_units()` |
-| `rdma_gbs/nvlink_gbs`（核数估算参数） | `scaleout_gbs/scaleup_gbs` |
-| `sm_read_gbs/sm_write_gbs` | `compute_read_gbs/compute_write_gbs`，或 `compute_unit_read_gbs/compute_unit_write_gbs` |
-| `allow_nvlink_for_low_latency_mode/allow_mnnvl` | `allow_memory_transport_for_low_latency_mode/allow_multinode_memory_transport` |
-| `use_tma_aligned_col_major_sf` | `use_aligned_col_major_sf` |
-
-Config 还接受 `num_aiv` 和已有的 SHMEM chunk 别名。POD/Clos/PR 各自原有参数校验继续生效，
-名称兼容不会新增 TMA、低时延或其他后端能力。事件依赖仍按本项目语义执行，不忽略已有等待。
 这里保留 V1 Buffer 与旧版 V2 ElasticBuffer，不是升级为官方最新的 EPBuffer/V2.5。
 
 容量和开关名称不承诺同名对象属性，也不代表对应通信路径已启用。V1 的 `num_qps_per_rank` 仅接受默认值 24；Elastic 构造接受 `num_allocated_qps=0/6`，HT 调用接受 `num_qps=0/2`，LL 调用只接受 0。QP 不作为所有 DMA 引擎的统一资源计数。

@@ -5,10 +5,6 @@ Modified by Joyce_An 2026
 
 # DeepEP
 
-Public interfaces retain upstream names such as `num_sms`; existing Ascend names
-remain accepted as compatibility aliases. In this project `num_sms` still counts
-AIVs, with no conversion to AI cores. See [API naming](docs/api.md#上游兼容与平台命名).
-
 ---
 
 [简体中文](README.md) | English

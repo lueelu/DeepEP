@@ -48,7 +48,7 @@ combine 根据 `handle.is_low_latency` 执行匹配路径，不改变 handle 的
 | 编码与容量 | `P*T*K < 2**31`；dst 使用 int64，实际接收/gather 行数还须通过布局检查 |
 | 输入 | BF16 `[T,H]`，或 `(FP8 E4M3FN [T,H], FP32 scales [T,H/128])` |
 | 路由 | int64 `topk_idx [T,K]`；可选 FP32 `topk_weights [T,K]` |
-| 调度 | BF16 dispatch：`num_sms=0/32`；FP8 dispatch 和 combine：`0/64`；单位为 AIV；`num_qps=0/2` |
+| 调度 | BF16 dispatch：`num_sms=0/32`；FP8 dispatch 和 combine：`0/64`；`num_qps=0/2` |
 | 构造配置 | `num_allocated_qps=0/6`；0 使用固定配置 |
 | 同步 | fresh Dispatch：`do_cpu_sync=None/True`；cached Dispatch 也接受 `False`；支持 `previous_event` 和 `async_with_compute_stream=True` |
 
