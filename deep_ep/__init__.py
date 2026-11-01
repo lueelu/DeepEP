@@ -8,7 +8,8 @@ Without the extension, runtime calls fail explicitly. See docs/api.md.
 """
 
 from ._config import Config
-from .buffers import Buffer, ElasticBuffer, EPHandle
+from .buffer import Buffer
+from .buffers.elastic import ElasticBuffer, EPHandle
 from .utils import EventHandle, EventOverlap
 
 __all__ = ["Buffer", "ElasticBuffer", "EPHandle", "Config", "EventHandle", "EventOverlap"]
@@ -17,7 +18,7 @@ __all__ = ["Buffer", "ElasticBuffer", "EPHandle", "Config", "EventHandle", "Even
 def __getattr__(name):
     # Keep package import metadata-only; Clos helpers load Torch on demand.
     if name in {"topk_idx_t", "ExpandHandle", "Handle", "Slot", "SlotState"}:
-        import ascend_deepep
+        from .backends import clos
 
-        return getattr(ascend_deepep, name)
+        return getattr(clos, name)
     raise AttributeError(name)

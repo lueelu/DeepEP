@@ -136,7 +136,8 @@ def test_card_requires_same_host_and_group(card, monkeypatch):
 def test_public_card_construction_checks_before_device_barrier(kind, fault, card, monkeypatch):
     pytest.importorskip("torch")
     import deep_ep
-    from deep_ep.buffers import legacy, elastic as public_elastic
+    from deep_ep import buffer as legacy
+    from deep_ep.buffers import elastic as public_elastic
     from ascend_deepep import buffer as source_v1, elastic as source_v2
 
     calls = []

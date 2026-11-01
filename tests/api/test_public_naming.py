@@ -7,7 +7,16 @@ import pytest
 
 import deep_ep
 from deep_ep import _compat, _machine
-from deep_ep.buffers import elastic, legacy
+from deep_ep.backends.pod import elastic, buffer as legacy
+
+
+@pytest.fixture(autouse=True)
+def public_native_gate(monkeypatch):
+    from deep_ep import buffer
+    from deep_ep.buffers import elastic as public_elastic
+
+    monkeypatch.setattr(buffer, "require_native", lambda _: None)
+    monkeypatch.setattr(public_elastic, "require_native", lambda _: None)
 
 
 def test_upstream_signature_preserves_defaults_positions_and_events(monkeypatch):

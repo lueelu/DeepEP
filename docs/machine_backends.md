@@ -8,6 +8,12 @@ MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及原有资源接口�
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
 PR（`CARD_4PMESH`，board `0x6c`）复用迁入实现的 MTE kernel，不另建一份 SHMEM。
 
+V1 的统一入口为 `deep_ep/buffer.py`，V2 的统一入口为
+`deep_ep/buffers/elastic.py`；POD 与 Clos 的实现分别位于
+`deep_ep/backends/pod/` 和 `deep_ep/backends/clos/`。构造时选择一次后端，
+后续 dispatch/combine 直接调用对应实现。`ascend_deepep` 和 V1 的
+`deep_ep.buffers.legacy` 仅保留兼容导入，不存放另一份算子实现。
+
 ## 构建
 
 继续使用本仓的[编译安装流程](build.md)，同一 Python 环境需有匹配的 Torch/torch_npu。

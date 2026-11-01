@@ -21,8 +21,12 @@ def select_existing_pod_backend(monkeypatch):
     # These are the original POD runtime fault-injection tests. Real selection
     # and mixed-rank rejection are tested independently in test_machine_selection.
     from deep_ep import _machine
+    from deep_ep import buffer
+    from deep_ep.buffers import elastic
 
     monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "pod", "source": "test"})
+    monkeypatch.setattr(buffer, "require_native", lambda _: None)
+    monkeypatch.setattr(elastic, "require_native", lambda _: None)
 
 
 class FakeEvent:
@@ -169,7 +173,7 @@ def test_unreadable_host_boot_id_returns_collective_failure_marker(monkeypatch):
     ],
 )
 def test_unsupported_constructor_before_runtime(monkeypatch, cls, options):
-    module = importlib.import_module(cls.__module__)
+    module = importlib.import_module(cls.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda operation: None)
 
     def forbidden(*args):
@@ -201,7 +205,7 @@ def test_close_failure_retains_owner(monkeypatch):
 
 
 def test_scaleup_capacity_reaches_runtime_without_translation(monkeypatch):
-    module = importlib.import_module(deep_ep.Buffer.__module__)
+    module = importlib.import_module(deep_ep.Buffer.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda operation: None)
     calls = []
     resource = SimpleNamespace(closed=True)
@@ -219,7 +223,7 @@ def test_scaleup_capacity_reaches_runtime_without_translation(monkeypatch):
 
 @pytest.mark.parametrize("option, expected", [({}, True), ({"use_1g_huge_pages": False}, False)])
 def test_elastic_huge_page_default_and_opt_out(monkeypatch, option, expected):
-    module = importlib.import_module(deep_ep.ElasticBuffer.__module__)
+    module = importlib.import_module(deep_ep.ElasticBuffer.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda _: None)
     calls = []
     monkeypatch.setattr(module, "Runtime", lambda *a, **kw: calls.append(kw) or SimpleNamespace(closed=True))
@@ -229,7 +233,7 @@ def test_elastic_huge_page_default_and_opt_out(monkeypatch, option, expected):
 
 
 def test_elastic_debug_collectives_reaches_runtime(monkeypatch):
-    module = importlib.import_module(deep_ep.ElasticBuffer.__module__)
+    module = importlib.import_module(deep_ep.ElasticBuffer.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda _: None)
     calls = []
     monkeypatch.setattr(module, "Runtime", lambda *a, **kw: calls.append(kw) or SimpleNamespace(closed=True))

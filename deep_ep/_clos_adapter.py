@@ -1,7 +1,7 @@
 """Upstream-named interfaces with compatibility aliases over the Clos backend."""
 
-from ascend_deepep.buffer import Buffer as SourceBuffer
-from ascend_deepep.elastic import ElasticBuffer as SourceElasticBuffer
+from .backends.clos.buffer import Buffer as SourceBuffer
+from .backends.clos.elastic import ElasticBuffer as SourceElasticBuffer
 from ._compat import keyword_aliases
 
 

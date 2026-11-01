@@ -13,7 +13,8 @@ def public_runtime(monkeypatch):
     pytest.importorskip("torch")
     import deep_ep
     from deep_ep import _card_adapter
-    from deep_ep.buffers import elastic, legacy
+    from deep_ep import buffer as legacy
+    from deep_ep.buffers import elastic
     from ascend_deepep import buffer as source_v1, elastic as source_v2
 
     calls = []

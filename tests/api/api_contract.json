@@ -153,8 +153,8 @@
   },
   "objects": {
     "Buffer": {
-      "module": "deep_ep.buffers.legacy",
-      "source": "deep_ep/buffers/legacy.py",
+      "module": "deep_ep.buffer",
+      "source": "deep_ep/buffer.py",
       "methods": {
         "__init__": {
           "kind": "method",

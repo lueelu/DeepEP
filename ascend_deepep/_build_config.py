@@ -1,11 +1,7 @@
-"""Build settings replaced in the installed package by setup.py."""
+"""Compatibility import for :mod:`deep_ep.backends.clos._build_config`."""
 
-NUM_TOPK_IDX_BITS = 64
-TARGET_ARCH = "a5"
-CATLASS_ARCH = 3510
+import importlib
+import sys
 
-__all__ = [
-    "NUM_TOPK_IDX_BITS",
-    "TARGET_ARCH",
-    "CATLASS_ARCH",
-]
+# Alias the module itself so legacy imports share classes and native state.
+sys.modules[__name__] = importlib.import_module("deep_ep.backends.clos._build_config")

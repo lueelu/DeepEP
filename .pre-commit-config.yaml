@@ -62,6 +62,6 @@ repos:
       # 检查文档、代码和文本配置中的常见拼写错误，不改写数据与图稿。
       - id: codespell
         files: \.(md|rst|txt|py|c|h|cpp|hpp|cc|hh|cxx|hxx|asc|ya?ml|toml)$
-        exclude: ^(third-party/(?!README\.md$)|csrc/clos/|ascend_deepep/|tests/clos/|benchmarks/clos/)
+        exclude: ^(third-party/(?!README\.md$)|csrc/clos/|deep_ep/backends/clos/|ascend_deepep/|tests/clos/|benchmarks/clos/)
         # AGRS、CANN、Clos、ND 布局，以及代码中的 Te、sav、aActual 标识符；EnQue 是 SDK API 名。
         args: ["--ignore-words-list=agrs,cann,clos,nd,te,sav,aactual,EnQue"]

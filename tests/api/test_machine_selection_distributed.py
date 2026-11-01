@@ -32,7 +32,8 @@ def _selection_worker(rank, store, result_dir):
         assert _machine.select("pod", group)["machine_type"] == "pod"
         results.append("collective_order_preserved")
         import deep_ep
-        from deep_ep.buffers import elastic, legacy
+        from deep_ep import buffer as legacy
+        from deep_ep.buffers import elastic
 
         # An old argument on just one rank must stop both before any backend
         # initializes. Matching/None values are removed arguments too.

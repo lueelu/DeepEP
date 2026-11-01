@@ -291,7 +291,7 @@ class MachineSelector(type):
 
 class HandleSelector(type):
     def __instancecheck__(cls, instance):
-        module = sys.modules.get("ascend_deepep.elastic")
+        module = sys.modules.get("deep_ep.backends.clos.elastic")
         if module is not None and isinstance(instance, module.EPHandle):
             return True
         return super().__instancecheck__(instance)

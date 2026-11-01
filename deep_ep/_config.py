@@ -22,7 +22,7 @@ class Config:
         udma_peers_per_worker: int = 4,
         udma_wqes_per_visit: int = 8,
     ) -> None:
-        from ascend_deepep.config import Config as ClosConfig
+        from .backends.clos.config import Config as ClosConfig
 
         values = [
             num_compute_units,

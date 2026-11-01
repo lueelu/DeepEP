@@ -1,44 +1,13 @@
-"""Internal implementation and legacy import path for deep_ep on Ascend."""
+"""Compatibility exports for the Clos implementation now under deep_ep.backends."""
 
-from __future__ import annotations
+from deep_ep.backends import clos as _implementation
 
-from ._native import get_native_class
-from .buffer import Buffer
-from .config import Config
-from .dtypes import topk_idx_t
-from .elastic import EPHandle, ElasticBuffer
-from .event import EventHandle, EventOverlap
-from .expand import ExpandHandle
-from .resources import Handle, Slot, SlotState
+__all__ = _implementation.__all__
 
 
-_NATIVE_EXPORTS = frozenset(("BufferRuntime", "ShmemInstance"))
-
-
-def __getattr__(name: str):
-    if name in _NATIVE_EXPORTS:
-        native_class = get_native_class(name)
-        globals()[name] = native_class
-        return native_class
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def __getattr__(name):
+    return getattr(_implementation, name)
 
 
 def __dir__():
-    return sorted(set(globals()) | _NATIVE_EXPORTS)
-
-
-__all__ = [
-    "Config",
-    "Buffer",
-    "ElasticBuffer",
-    "EPHandle",
-    "topk_idx_t",
-    "EventHandle",
-    "EventOverlap",
-    "ExpandHandle",
-    "Handle",
-    "Slot",
-    "SlotState",
-    "BufferRuntime",
-    "ShmemInstance",
-]
+    return sorted(set(globals()) | set(dir(_implementation)))

@@ -41,7 +41,7 @@ def test_public_exports_and_type_identity():
 def test_public_methods_have_no_undeclared_aliases(name, spec):
     public = {
         key
-        for key, value in vars(getattr(deep_ep, name)).items()
+        for key, value in inspect.getmembers(getattr(deep_ep, name))
         if not key.startswith("_") and (callable(value) or isinstance(value, staticmethod))
     }
     assert public == {key for key in spec["methods"] if not key.startswith("_")}
