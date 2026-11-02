@@ -7,15 +7,14 @@ updates now track branch `v1-shared-jetty-scheduler`, commit
 The imported implementation is licensed under CANN Open Software License
 Agreement Version 2.0; see `third-party/ascend-deepep.LICENSE` at repository root.
 
-`upstream.json` records the original kernel/include hashes and the minimal
-CATLASS/TLA resource-header dependency closure. The latter is pinned to
-`48f7461afcff7c9282c6372c19d8768d9c6e0d9d` and retains its CANN license notices.
-It does not replace the existing MegaMoE CATLASS submodule.
-Local header comments differ; the recorded hashes describe upstream originals.
+`upstream.json` records the original kernel/include hashes. Local adaptations
+replace the imported resource wrapper with native AscendC UB allocation and
+rename the architecture build define; UB offsets and capacity are preserved.
+Local header comments also differ; recorded hashes describe upstream originals.
 
-Device sources and layouts match that updated source revision. Both backends
-use the target repository's SHMEM `836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7`,
-including the MIX barrier fix, instead of the source revision's `4dd80e2`.
+Both backends use the target repository's SHMEM
+`836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7`, including the MIX barrier fix,
+instead of the source revision's `4dd80e2`.
 Host integration adds
 the cross-backend SHMEM ownership check. Python adaptation adds platform keyword
 aliases, backend selection, event compatibility and a shared lifetime lock.

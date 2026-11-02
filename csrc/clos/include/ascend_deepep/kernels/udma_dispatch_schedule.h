@@ -17,8 +17,8 @@ __aicore__ inline void DispatchRemoteImpl(
 {
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + kOutputRecordBytes) + 32;
     static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= 216 * 1024);
-    auto wq = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
-    auto lists = resource.ubBuf.template GetBufferByByte<int32_t>(sender_bytes);
+    auto wq = resource.template GetBufferByByte<uint8_t>(0);
+    auto lists = resource.template GetBufferByByte<int32_t>(sender_bytes);
     DispatchSenderT<Capacity, Qps> sender(td, core, wq, workspace, x, scales);
     AscendC::GlobalTensor<int32_t> plan_gm;
     plan_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(plan));

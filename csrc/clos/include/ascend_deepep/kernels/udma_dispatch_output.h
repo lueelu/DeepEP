@@ -52,7 +52,7 @@ __aicore__ inline void PrepareDispatchOutput(
     Resource& resource, uint64_t control, uint32_t rank, uint32_t world, GM_ADDR x, GM_ADDR scales, uint32_t rows,
     uint32_t actual_rows, uint32_t x_bytes, uint32_t scale_bytes)
 {
-    auto epoch = resource.ubBuf.template GetBufferByByte<uint64_t>(0);
+    auto epoch = resource.template GetBufferByByte<uint64_t>(0);
     asc_vf_call<AdvanceDispatchEpoch>(
         dim3(1), reinterpret_cast<__gm__ uint64_t*>(control), reinterpret_cast<__ubuf__ uint64_t*>(epoch.GetPhyAddr()));
     AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);

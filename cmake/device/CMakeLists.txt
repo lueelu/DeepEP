@@ -68,8 +68,8 @@ get_target_property(_clos_options deepep_kernels COMPILE_OPTIONS)
 get_target_property(_clos_includes deepep_kernels INCLUDE_DIRECTORIES)
 target_compile_options(deepep_clos_kernels PRIVATE ${_clos_options} -Xhost-start -ftrapv -Xhost-end)
 target_include_directories(deepep_clos_kernels PRIVATE ${_clos_includes}
-    "${_clos}/include" "${_clos}/kernels" "${_clos}/vendor")
-target_compile_definitions(deepep_clos_kernels PRIVATE CATLASS_ARCH=3510 EP_NUM_TOPK_IDX_BITS=64 USE_SIMT L2_CACHE_HINT
+    "${_clos}/include" "${_clos}/kernels")
+target_compile_definitions(deepep_clos_kernels PRIVATE ASCEND_DEEPEP_ARCH=3510 EP_NUM_TOPK_IDX_BITS=64 USE_SIMT L2_CACHE_HINT
     ASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS=1)
 target_link_options(deepep_clos_kernels PRIVATE --cce-fatobj-link)
 target_link_libraries(deepep_clos_kernels PRIVATE ascend_runtime ascendcl shmem ${CMAKE_DL_LIBS})

@@ -1,10 +1,9 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/launch.h"
 #include "ascend_deepep/kernels/types.h"
 
@@ -61,15 +60,15 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_lay
         AlignUpBytes(expert_count_offset_bytes + expert_stride * kInt32Bytes, kUbAlignBytes);
     const int32_t is_token_in_rank_ub_bytes = AlignUpBytes(world_size, kUbAlignBytes);
 
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     AscendC::LocalTensor<int32_t> rank_count_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(static_cast<uint32_t>(rank_count_offset_bytes));
+        resource.template GetBufferByByte<int32_t>(static_cast<uint32_t>(rank_count_offset_bytes));
     AscendC::LocalTensor<int32_t> expert_count_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(static_cast<uint32_t>(expert_count_offset_bytes));
+        resource.template GetBufferByByte<int32_t>(static_cast<uint32_t>(expert_count_offset_bytes));
     AscendC::LocalTensor<uint8_t> is_token_in_rank_ub =
-        resource.ubBuf.template GetBufferByByte<uint8_t>(static_cast<uint32_t>(is_token_in_rank_offset_bytes));
+        resource.template GetBufferByByte<uint8_t>(static_cast<uint32_t>(is_token_in_rank_offset_bytes));
     AscendC::LocalTensor<uint32_t> is_token_in_rank_zero_ub =
-        resource.ubBuf.template GetBufferByByte<uint32_t>(static_cast<uint32_t>(is_token_in_rank_offset_bytes));
+        resource.template GetBufferByByte<uint32_t>(static_cast<uint32_t>(is_token_in_rank_offset_bytes));
 
     __gm__ int32_t* scratch_gm = reinterpret_cast<__gm__ int32_t*>(scratch_buffer);
     AscendC::GlobalTensor<ascend_deepep::topk_idx_t> topk_gm;
@@ -139,9 +138,9 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_lay
     const int32_t reduce_acc_offset_bytes = 0;
     const int32_t reduce_tmp_offset_bytes = AlignUpBytes(kMaxReduceCols * kInt32Bytes, kUbAlignBytes);
     AscendC::LocalTensor<int32_t> reduce_acc_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(static_cast<uint32_t>(reduce_acc_offset_bytes));
+        resource.template GetBufferByByte<int32_t>(static_cast<uint32_t>(reduce_acc_offset_bytes));
     AscendC::LocalTensor<int32_t> reduce_tmp_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(static_cast<uint32_t>(reduce_tmp_offset_bytes));
+        resource.template GetBufferByByte<int32_t>(static_cast<uint32_t>(reduce_tmp_offset_bytes));
     AscendC::DataCopyPadExtParams<int32_t> reduce_pad_params{false, 0, 0, 0};
 
     if ((core_idx & 1) != 0) {

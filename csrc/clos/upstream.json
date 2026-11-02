@@ -3,21 +3,6 @@
   "branch": "v1-shared-jetty-scheduler",
   "revision": "6f9d8c9ef9403a302724ce42cf55810843ffebc3",
   "shmem_revision": "836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7",
-  "catlass_resource_headers": {
-    "revision": "48f7461afcff7c9282c6372c19d8768d9c6e0d9d",
-    "sha256": {
-      "catlass/arch/arch.hpp": "f9f730ef9dee785d90fb4a824421a3d514eb44d333abc7ec29efc44e40aa44a1",
-      "catlass/catlass.hpp": "6722651eac0dcdd20d802da02c2076ad02b052896a7fa4c0cc2f4b426afb3e92",
-      "catlass/detail/macros.hpp": "95cc548b250fd7de952e1cc2a557340d1ee62481b9906ceaef2f9ebfb2cf3e33",
-      "catlass/detail/dependent_false.hpp": "2678c7f4c1b4785bd275e45ac08f089aea153cd20ca94e9175dd455e77b20bb9",
-      "catlass/detail/alignment.hpp": "93d763a5a933d238587a2e97110b3ca1111c2106c235b1d1915b33a9b8abf5c7",
-      "catlass/arch/resource.hpp": "e7d2962ed6e8b04f90473cae103c1b061586b45993e00785b72842e2254f06d0",
-      "catlass/arch/local_tensor_buffer.hpp": "94bbbd9ace9e2427eea2097ef1c6f9f1ff4e419d866f76380cb7a3569c58e4a6",
-      "tla/numeric/integral_constant.hpp": "3395c6b668811639c4839c644f8b5f6d61374a3c9c8ae35b306c955fecd608d3",
-      "tla/numeric/math.hpp": "32deb37000c9a349ee5b9001360869947b5223bfa769635e13eedab5f93a59f1",
-      "tla/type_traits.hpp": "714913600b3bd37a208519dc539b0ef2bc72476b178bf400d67c40eeecf2da1a"
-    }
-  },
   "kernel_sha256": {
     "include/ascend_deepep/dispatch_output.h": "4f4e736390a0ba56301babb977e053e675349a4ec58a13324310ccf03f99d051",
     "include/ascend_deepep/kernels/aggregate_impl.h": "458886dfa3df0aae4a178f0efbc3d25d0eebc5ababdc7dff46a967e899dbbd96",

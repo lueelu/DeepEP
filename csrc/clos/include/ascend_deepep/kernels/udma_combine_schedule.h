@@ -14,8 +14,8 @@ __aicore__ inline void CombineRemoteImpl(
 {
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
     static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= 216 * 1024);
-    auto wq = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
-    auto indices = resource.ubBuf.template GetBufferByByte<int32_t>(sender_bytes);
+    auto wq = resource.template GetBufferByByte<uint8_t>(0);
+    auto indices = resource.template GetBufferByByte<int32_t>(sender_bytes);
     const bool simt_weights = Phase == 0 && CombineSimtWeightsEnabled(td);
     if (simt_weights)
         CombineRemoteWeights(weights, src_idx, rank_prefix, workspace, td, core);

@@ -150,7 +150,7 @@ void Markers()
     std::vector<uint8_t> bytes(world * kSignalBytes, 0xa5);
     for (unsigned core = 0; core < cores; ++core) {
         Resource r;
-        Begin(bytes.data(), 0, rank, world, core, cores, r.ubBuf.GetBufferByByte<uint64_t>(0), workers);
+        Begin(bytes.data(), 0, rank, world, core, cores, r.GetBufferByByte<uint64_t>(0), workers);
     }
     for (unsigned p = 0; p < world; ++p) {
         for (unsigned w = 0; w < workers; ++w) CHECK(Signal(bytes.data(), 0, p)[w] == unsigned(p == rank));

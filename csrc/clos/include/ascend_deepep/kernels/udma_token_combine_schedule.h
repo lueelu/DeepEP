@@ -19,8 +19,8 @@ __aicore__ inline void CombineTokenRemote(
     Resource& resource, GM_ADDR x, GM_ADDR weights, GM_ADDR src_idx, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
     GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
 {
-    auto wq = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
-    auto indices = resource.ubBuf.template GetBufferByByte<int32_t>(kCombineSenderBytes);
+    auto wq = resource.template GetBufferByByte<uint8_t>(0);
+    auto indices = resource.template GetBufferByByte<int32_t>(kCombineSenderBytes);
     const uint32_t workers = TokenWorkers(td.num_channels);
     if (core < workers)
         for (uint32_t first = 0; first < td.world_size - 1; first += kMaxPeers) {

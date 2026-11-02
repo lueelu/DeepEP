@@ -1,10 +1,9 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/launch.h"
 #include "ascend_deepep/kernels/types.h"
 #include "ascend_deepep/kernels/udma_combine_schedule.h"
@@ -101,17 +100,17 @@ __aicore__ inline void V1CombineUdmaImpl(
         recv_topk_weights_gm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(recv_topk_weights));
     }
 
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     const uint32_t communication_ub_offset = kCombineUdmaWqeScratchBytes;
     AscendC::LocalTensor<uint8_t> staging_ub =
-        resource.ubBuf.template GetBufferByByte<uint8_t>(communication_ub_offset);
+        resource.template GetBufferByByte<uint8_t>(communication_ub_offset);
     AscendC::DataCopyPadExtParams<uint8_t> uint8_pad_params{false, 0, 0, 0};
     AscendC::DataCopyPadExtParams<int32_t> int32_pad_params{false, 0, 0, 0};
     AscendC::DataCopyPadExtParams<float> float_pad_params{false, 0, 0, 0};
 
     if constexpr (DoCommunication && Phase == 1) {
         ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-            core_idx, num_channels, resource.ubBuf.template GetBufferByByte<uint64_t>(0),
+            core_idx, num_channels, resource.template GetBufferByByte<uint64_t>(0),
             tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
         if (tiling.udma_token_schedule) {
             ascend_deepep::udma::CombineTokenRemote<1>(resource, x, topk_weights, src_idx, rank_prefix_matrix,
@@ -142,14 +141,14 @@ __aicore__ inline void V1CombineUdmaImpl(
             static_cast<int32_t>(
                 src_idx_available_bytes / kCombineAlignmentBytes * (kCombineAlignmentBytes / sizeof(int32_t))));
         const uint32_t src_idx_ub_offset = src_idx_buffer_elements > 0 ? communication_ub_offset + staging_bytes : 0;
-        AscendC::LocalTensor<int32_t> src_idx_ub = resource.ubBuf.template GetBufferByByte<int32_t>(src_idx_ub_offset);
+        AscendC::LocalTensor<int32_t> src_idx_ub = resource.template GetBufferByByte<int32_t>(src_idx_ub_offset);
         int32_t staging_buffer_idx = 0;
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 
         if constexpr (Phase == 0) {
             ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-                core_idx, num_channels, resource.ubBuf.template GetBufferByByte<uint64_t>(0),
+                core_idx, num_channels, resource.template GetBufferByByte<uint64_t>(0),
                 tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
         }
 
@@ -255,12 +254,12 @@ __aicore__ inline void V1CombineUdmaImpl(
     if constexpr (DoReduction) {
         // Communication is complete, so the reduction phase reuses UB from zero.
         AscendC::LocalTensor<uint8_t> input_pingpong_bytes_ub =
-            resource.ubBuf.template GetBufferByByte<uint8_t>(kCombineInputOffset);
-        AscendC::LocalTensor<float> temporary_ub = resource.ubBuf.template GetBufferByByte<float>(kCombineTemporaryOffset);
+            resource.template GetBufferByByte<uint8_t>(kCombineInputOffset);
+        AscendC::LocalTensor<float> temporary_ub = resource.template GetBufferByByte<float>(kCombineTemporaryOffset);
         AscendC::LocalTensor<float> accumulator_ub =
-            resource.ubBuf.template GetBufferByByte<float>(kCombineAccumulatorOffset);
+            resource.template GetBufferByByte<float>(kCombineAccumulatorOffset);
         AscendC::LocalTensor<uint8_t> output_bytes_ub =
-            resource.ubBuf.template GetBufferByByte<uint8_t>(kCombineOutputOffset);
+            resource.template GetBufferByByte<uint8_t>(kCombineOutputOffset);
         AscendC::LocalTensor<T> output_ub = output_bytes_ub.ReinterpretCast<T>();
 
         const int32_t tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
@@ -346,10 +345,10 @@ __aicore__ inline void V1CombineUdmaImpl(
         if (tiling.has_topk_weights != 0) {
             // X reduction is drained, so top-k reduction also starts at UB offset 0.
             AscendC::LocalTensor<uint8_t> weight_input_bytes_ub =
-                resource.ubBuf.template GetBufferByByte<uint8_t>(kCombineTopkInputOffset);
+                resource.template GetBufferByByte<uint8_t>(kCombineTopkInputOffset);
             AscendC::LocalTensor<float> weight_input_ub = weight_input_bytes_ub.ReinterpretCast<float>();
             AscendC::LocalTensor<float> weight_accumulator_ub =
-                resource.ubBuf.template GetBufferByByte<float>(kCombineTopkAccumulatorOffset);
+                resource.template GetBufferByByte<float>(kCombineTopkAccumulatorOffset);
             const int32_t aligned_num_topk = CombineAlignUpElements(num_topk, 8);
             // EVENT_ID3 protects the single input buffer; EVENT_ID5 protects output.
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);

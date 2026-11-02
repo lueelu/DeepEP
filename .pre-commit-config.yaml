@@ -12,10 +12,8 @@ repos:
       # 清理行尾空白，保留 Markdown 的双空格换行。
       - id: trailing-whitespace
         args: [--markdown-linebreak-ext=md]
-        exclude: ^csrc/clos/vendor/
       # 确保非空文本文件以一个换行符结束。
       - id: end-of-file-fixer
-        exclude: ^csrc/clos/vendor/
       # 检查 YAML 语法及重复键。
       - id: check-yaml
       # 检查 JSON 语法及重复键。
@@ -53,7 +51,7 @@ repos:
         types_or: []
         files: \.(c|h|cpp|hpp|cc|hh|cxx|hxx|asc)$
         args: [--style=file]
-        exclude: ^(third-party/|csrc/clos/(kernels|include|vendor)/)
+        exclude: ^(third-party/|csrc/clos/(kernels|include)/)
 
   # 英文拼写检查。
   - repo: https://github.com/codespell-project/codespell

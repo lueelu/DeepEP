@@ -1,11 +1,10 @@
 #pragma once
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "simt_api/device_sync_functions.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/launch.h"
 #include "ascend_deepep/kernels/types.h"
 
@@ -86,17 +85,17 @@ __aicore__ inline void AggregateRange(
     const int32_t hidden = static_cast<int32_t>(tiling.hidden);
 
     AscendC::LocalTensor<int32_t> mapping_tile_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(Ub::kAggregateMappingOffset);
+        resource.template GetBufferByByte<int32_t>(Ub::kAggregateMappingOffset);
     AscendC::LocalTensor<float> route_weight_ub =
-        resource.ubBuf.template GetBufferByByte<float>(Ub::kAggregateRouteWeightOffset);
+        resource.template GetBufferByByte<float>(Ub::kAggregateRouteWeightOffset);
     AscendC::LocalTensor<uint8_t> input_bytes_ub =
-        resource.ubBuf.template GetBufferByByte<uint8_t>(Ub::kAggregateInputOffset);
+        resource.template GetBufferByByte<uint8_t>(Ub::kAggregateInputOffset);
     AscendC::LocalTensor<float> temporary_ub =
-        resource.ubBuf.template GetBufferByByte<float>(Ub::kAggregateTemporaryOffset);
+        resource.template GetBufferByByte<float>(Ub::kAggregateTemporaryOffset);
     AscendC::LocalTensor<float> accumulator_ub =
-        resource.ubBuf.template GetBufferByByte<float>(Ub::kAggregateAccumulatorOffset);
+        resource.template GetBufferByByte<float>(Ub::kAggregateAccumulatorOffset);
     AscendC::LocalTensor<uint8_t> output_bytes_ub =
-        resource.ubBuf.template GetBufferByByte<uint8_t>(Ub::kAggregateOutputOffset);
+        resource.template GetBufferByByte<uint8_t>(Ub::kAggregateOutputOffset);
     AscendC::LocalTensor<T> output_ub = output_bytes_ub.ReinterpretCast<T>();
 
     AscendC::GlobalTensor<uint8_t> x_bytes_gm;

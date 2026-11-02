@@ -12,7 +12,7 @@ __aicore__ inline void AggregateImpl(
     const int32_t rows = static_cast<int32_t>(tiling.num_recv_tokens);
     const int32_t per_core = (rows + cores - 1) / cores;
     const int32_t begin = AggregateMin(core * per_core, rows);
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     AggregateRange<T>(resource, x, topk_weights, expanded_values, recv_to_expanded_idx,
         aggregated_x, aggregated_values, tiling, begin, AggregateMin(begin + per_core, rows));
 }

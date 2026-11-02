@@ -10,7 +10,7 @@ __aicore__ inline void CopyAggregateSelf(
     Resource& resource, GM_ADDR x, GM_ADDR weights, GM_ADDR src_idx, GM_ADDR workspace,
     const CombineTilingData& td, uint32_t begin, uint32_t end)
 {
-    auto staging = resource.ubBuf.template GetBufferByByte<uint8_t>(ReservedUbBytes);
+    auto staging = resource.template GetBufferByByte<uint8_t>(ReservedUbBytes);
     AscendC::GlobalTensor<uint8_t> input, values, output;
     AscendC::GlobalTensor<int32_t> indices;
     input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(x));
@@ -59,11 +59,11 @@ __aicore__ inline void CombineSelfPipelineImpl(
         (td.pipeline_chunk_tokens != 32 && td.pipeline_chunk_tokens != 64)) trap();
     constexpr uint32_t reserved = kCombineSenderBytes + kMaxPeers * kTileTokens * sizeof(int32_t);
     static_assert(reserved % 32 == 0);
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
-    auto flag = resource.ubBuf.template GetBufferByByte<uint64_t>(reserved);
+    ascend_deepep::UbWorkspace resource;
+    auto flag = resource.template GetBufferByByte<uint64_t>(reserved);
     Begin(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores, flag, cores);
-    auto wq = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
-    auto indices = resource.ubBuf.template GetBufferByByte<int32_t>(kCombineSenderBytes);
+    auto wq = resource.template GetBufferByByte<uint8_t>(0);
+    auto indices = resource.template GetBufferByByte<int32_t>(kCombineSenderBytes);
     CombineSender sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()),
         workspace, x, weights, 0, core);
     AscendC::GlobalTensor<int32_t> prefix, original;
@@ -167,8 +167,8 @@ __aicore__ inline void CombinePipelineImpl(
     if (cores != td.num_channels || senders >= cores || td.udma_token_schedule ||
         (td.pipeline_chunk_tokens != 32 && td.pipeline_chunk_tokens != 64)) trap();
     const uint32_t chunks = (td.num_recv_tokens + td.pipeline_chunk_tokens - 1) / td.pipeline_chunk_tokens;
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
-    auto flag = resource.ubBuf.template GetBufferByByte<uint64_t>(0);
+    ascend_deepep::UbWorkspace resource;
+    auto flag = resource.template GetBufferByByte<uint64_t>(0);
     for (uint32_t chunk = core; chunk < chunks; chunk += cores)
         StoreAggregateReady(td.pipeline_ready, chunk, 0, flag);
     // The existing Begin collective also orders ready-slot reset. No new

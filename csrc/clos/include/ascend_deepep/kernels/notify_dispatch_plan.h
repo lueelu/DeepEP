@@ -85,9 +85,9 @@ template <class Resource>
 __aicore__ inline void BuildDispatchPlan(
     Resource& resource, GM_ADDR routes, GM_ADDR plan, GM_ADDR head, const DispatchTilingData& td, uint32_t channel)
 {
-    auto counts = resource.ubBuf.template GetBufferByByte<int32_t>(0);
-    auto tile = resource.ubBuf.template GetBufferByByte<uint8_t>(kPlanCountBytes);
-    auto chunks = resource.ubBuf.template GetBufferByByte<int32_t>(kPlanChunksOffset);
+    auto counts = resource.template GetBufferByByte<int32_t>(0);
+    auto tile = resource.template GetBufferByByte<uint8_t>(kPlanCountBytes);
+    auto chunks = resource.template GetBufferByByte<int32_t>(kPlanChunksOffset);
     AscendC::GlobalTensor<uint8_t> input;
     input.SetGlobalBuffer(routes);
     const uint32_t length = (td.num_tokens + td.num_channels - 1) / td.num_channels;

@@ -1,10 +1,9 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/dispatch_scale_pack.h"
 #include "ascend_deepep/kernels/dispatch_recv_copy.h"
 #include "ascend_deepep/kernels/v2_handle.h"
@@ -165,26 +164,26 @@ __aicore__ inline void V1DispatchMteKernelImpl(
     const int32_t staging_buffer_num = staging_buffer_stride * 2U <= staging_capacity ? 2 : 1;
     const int32_t staging_buffer_mask = staging_buffer_num - 1;
 
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     AscendC::LocalTensor<uint8_t> staging_pingpong_ub =
-        resource.ubBuf.template GetBufferByByte<uint8_t>(staging_buffer_base);
-    AscendC::LocalTensor<int32_t> src_idx_rank_base_ub = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        resource.template GetBufferByByte<uint8_t>(staging_buffer_base);
+    AscendC::LocalTensor<int32_t> src_idx_rank_base_ub = resource.template GetBufferByByte<int32_t>(0);
     AscendC::LocalTensor<int32_t> src_idx_values_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kSrcIdxValuesUbOffset);
+        resource.template GetBufferByByte<int32_t>(kSrcIdxValuesUbOffset);
     AscendC::LocalTensor<int32_t> recv_position_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kRecvPositionUbOffset);
+        resource.template GetBufferByByte<int32_t>(kRecvPositionUbOffset);
     AscendC::LocalTensor<int32_t> send_ordinal_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kSendOrdinalUbOffset);
+        resource.template GetBufferByByte<int32_t>(kSendOrdinalUbOffset);
     AscendC::LocalTensor<int32_t> send_head_row_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kSendHeadRowUbOffset);
+        resource.template GetBufferByByte<int32_t>(kSendHeadRowUbOffset);
     AscendC::LocalTensor<ascend_deepep::topk_idx_t> topk_idx_ub =
-        resource.ubBuf.template GetBufferByByte<ascend_deepep::topk_idx_t>(kTopkIdxUbOffset);
+        resource.template GetBufferByByte<ascend_deepep::topk_idx_t>(kTopkIdxUbOffset);
     AscendC::LocalTensor<uint8_t> topk_idx_bytes_ub = topk_idx_ub.ReinterpretCast<uint8_t>();
-    AscendC::LocalTensor<float> topk_weights_ub = resource.ubBuf.template GetBufferByByte<float>(kTopkWeightsUbOffset);
+    AscendC::LocalTensor<float> topk_weights_ub = resource.template GetBufferByByte<float>(kTopkWeightsUbOffset);
     AscendC::LocalTensor<uint8_t> topk_weights_bytes_ub = topk_weights_ub.ReinterpretCast<uint8_t>();
-    AscendC::LocalTensor<int32_t> scalar_ub = resource.ubBuf.template GetBufferByByte<int32_t>(kScalarUbOffset);
+    AscendC::LocalTensor<int32_t> scalar_ub = resource.template GetBufferByByte<int32_t>(kScalarUbOffset);
     AscendC::LocalTensor<int32_t> send_head_scalar_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kSendHeadScalarUbOffset);
+        resource.template GetBufferByByte<int32_t>(kSendHeadScalarUbOffset);
     AscendC::DataCopyPadExtParams<uint8_t> uint8_pad_params{false, 0, 0, 0};
 
     {

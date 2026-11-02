@@ -1,10 +1,9 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "simt_api/device_sync_functions.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/launch.h"
 #include "ascend_deepep/kernels/types.h"
 #include "ascend_deepep/kernels/v2_handle.h"
@@ -130,18 +129,18 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void expand_kerne
     const int32_t token_begin = ExpandMin(core_idx * tokens_per_core, num_recv_tokens);
     const int32_t token_end = ExpandMin(token_begin + tokens_per_core, num_recv_tokens);
 
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
-    AscendC::LocalTensor<int32_t> count_ub = resource.ubBuf.template GetBufferByByte<int32_t>(kExpandCountOffset);
-    AscendC::LocalTensor<int32_t> tail_ub = resource.ubBuf.template GetBufferByByte<int32_t>(kExpandTailOffset);
+    ascend_deepep::UbWorkspace resource;
+    AscendC::LocalTensor<int32_t> count_ub = resource.template GetBufferByByte<int32_t>(kExpandCountOffset);
+    AscendC::LocalTensor<int32_t> tail_ub = resource.template GetBufferByByte<int32_t>(kExpandTailOffset);
     AscendC::LocalTensor<int32_t> expert_offsets_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kExpandExpertOffsetsOffset);
-    AscendC::LocalTensor<uint8_t> normal_topk_tile_bytes_ub = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
+        resource.template GetBufferByByte<int32_t>(kExpandExpertOffsetsOffset);
+    AscendC::LocalTensor<uint8_t> normal_topk_tile_bytes_ub = resource.template GetBufferByByte<uint8_t>(0);
     AscendC::LocalTensor<ascend_deepep::topk_idx_t> normal_topk_tile_ub =
-        resource.ubBuf.template GetBufferByByte<ascend_deepep::topk_idx_t>(0);
+        resource.template GetBufferByByte<ascend_deepep::topk_idx_t>(0);
     AscendC::LocalTensor<int32_t> normal_mapping_tile_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kExpandNormalMappingTileOffset);
-    AscendC::LocalTensor<int32_t> cached_mapping_tile_ub = resource.ubBuf.template GetBufferByByte<int32_t>(0);
-    AscendC::LocalTensor<uint8_t> stage_ub = resource.ubBuf.template GetBufferByByte<uint8_t>(kExpandStageOffset);
+        resource.template GetBufferByByte<int32_t>(kExpandNormalMappingTileOffset);
+    AscendC::LocalTensor<int32_t> cached_mapping_tile_ub = resource.template GetBufferByByte<int32_t>(0);
+    AscendC::LocalTensor<uint8_t> stage_ub = resource.template GetBufferByByte<uint8_t>(kExpandStageOffset);
 
     AscendC::GlobalTensor<uint8_t> x_bytes_gm;
     AscendC::GlobalTensor<uint8_t> x_scales_bytes_gm;

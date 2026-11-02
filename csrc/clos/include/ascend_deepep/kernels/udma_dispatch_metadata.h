@@ -93,8 +93,8 @@ __aicore__ inline void InitializeDispatchTopk(
     if (count == 0 || td.num_topk == 0)
         return;
     constexpr uint32_t fill_bytes = 32 * 1024;
-    auto fill = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
-    auto fill_int32 = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+    auto fill = resource.template GetBufferByByte<uint8_t>(0);
+    auto fill_int32 = resource.template GetBufferByByte<int32_t>(0);
     AscendC::GlobalTensor<uint8_t> local;
     local.SetGlobalBuffer(workspace);
     for (uint32_t field = 0; field < (td.has_topk_weights ? 2U : 1U); ++field) {
@@ -140,7 +140,7 @@ __aicore__ inline void DispatchMetadata(
     const uint32_t world = td.world_size;
     const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
-    auto staging_ub = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
+    auto staging_ub = resource.template GetBufferByByte<uint8_t>(0);
     auto* rank_ptr = reinterpret_cast<__gm__ int32_t*>(rank_prefix);
     auto* channel_ptr = reinterpret_cast<__gm__ int32_t*>(channel_prefix);
     AscendC::GlobalTensor<int32_t> ranks, channels, plan_gm;

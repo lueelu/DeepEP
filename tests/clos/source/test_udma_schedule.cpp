@@ -86,7 +86,7 @@ std::vector<int32_t> Plan(const std::vector<uint8_t>& routes, DispatchTilingData
         BuildDispatchPlan(resource, const_cast<uint8_t*>(routes.data()), reinterpret_cast<uint8_t*>(list.data()),
                           reinterpret_cast<uint8_t*>(head.data()), d, ch);
         AscendC::CheckDrained();
-        auto actual = resource.ubBuf.GetBufferByByte<int32_t>(0);
+        auto actual = resource.GetBufferByByte<int32_t>(0);
         for (unsigned p = 0; p < d.rank_stride; ++p)
             CHECK(actual.GetValue(p) == (p < d.world_size ? counts[p * d.num_channels + ch] : 0));
     }
@@ -822,13 +822,13 @@ void NotifyPrefixCase(unsigned world, unsigned channels, bool fixed_header = fal
             const unsigned syncs = model::cross_syncs, local_syncs = AscendC::local_syncs;
             for (unsigned core = channels; core-- > 0;) {
                 Resource resource;
-                std::fill(resource.ubBuf.bytes.begin(), resource.ubBuf.bytes.end(), 0xa7);
+                std::fill(resource.bytes.begin(), resource.bytes.end(), 0xa7);
                 AscendC::copy_records.clear();
                 AscendC::record_copies = true;
                 GatherRecvChannelPrefixes(model::local_workspace + header, reinterpret_cast<uint8_t*>(output), offset,
                                           rank, world, channels, stride, core, channels,
-                                          resource.ubBuf.GetBufferByByte<int32_t>(65536),
-                                          resource.ubBuf.GetBufferByByte<int32_t>(0));
+                                          resource.GetBufferByByte<int32_t>(65536),
+                                          resource.GetBufferByByte<int32_t>(0));
                 AscendC::CheckDrained();
                 AscendC::record_copies = false;
                 CHECK(AscendC::copy_records.size() % 2 == 0);
@@ -958,7 +958,7 @@ unsigned IncomingWaitCases()
     std::fill(workspace.begin(), workspace.end(), 0xa5);
     for (unsigned core = 0; core < 2; ++core) {
         Resource resource;
-        Begin(workspace.data(), 0, 1, 2, core, 2, resource.ubBuf.GetBufferByByte<uint64_t>(0), 2);
+        Begin(workspace.data(), 0, 1, 2, core, 2, resource.GetBufferByByte<uint64_t>(0), 2);
         AscendC::CheckDrained();
     }
     for (unsigned source = 0; source < 2; ++source) {
@@ -988,7 +988,7 @@ void ParallelNotifyCases()
         for (unsigned channels : {2, 16, 64}) {
             if (channels * rank_stride > 16384) continue;
             Resource resource;
-            auto values = resource.ubBuf.GetBufferByByte<int32_t>(65536);
+            auto values = resource.GetBufferByByte<int32_t>(65536);
             std::vector<int32_t> expected(channels * rank_stride);
             for (unsigned p = 0; p < rank_stride; ++p) {
                 int32_t sum = 0;
@@ -1031,8 +1031,8 @@ void FixedControlHeaderCases()
                 std::vector<uint8_t> workspace(header + 4096, 0xa5);
                 for (unsigned core = 0; core < cores; ++core) {
                     Resource resource;
-                    Begin(workspace.data(), 0, world - 1, world, core, cores,
-                          resource.ubBuf.GetBufferByByte<uint64_t>(0), markers);
+                    Begin(workspace.data(), 0, world - 1, world, core, cores, resource.GetBufferByByte<uint64_t>(0),
+                          markers);
                     AscendC::CheckDrained();
                 }
                 for (unsigned source = 0; source < world; ++source) {

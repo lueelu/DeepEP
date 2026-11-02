@@ -1,10 +1,9 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/dispatch_scale_pack.h"
 #include "ascend_deepep/kernels/dispatch_recv_copy.h"
 #include "ascend_deepep/kernels/v2_handle.h"
@@ -103,8 +102,8 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
 
     const uint32_t staging_capacity = kDispatchStageBytes;
     const int32_t staging_buffer_mask = staging_buffer_stride * 2U <= staging_capacity ? 1 : 0;
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
-    auto staging_pingpong_ub = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
+    ascend_deepep::UbWorkspace resource;
+    auto staging_pingpong_ub = resource.template GetBufferByByte<uint8_t>(0);
     AscendC::DataCopyPadExtParams<uint8_t> uint8_pad_params{false, 0, 0, 0};
 
     if (num_topk > 0) {
@@ -121,7 +120,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     // Clears incoming payload markers and publishes this invocation's output
     // addresses/top-k initialization before remote writes. Every AIV participates.
     ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-        core_idx, core_num, resource.ubBuf.template GetBufferByByte<uint64_t>(0),
+        core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
         tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
 
     // With spare cores, payload owners skip this helper and immediately start
@@ -275,7 +274,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         // Metadata/payload work has finished. Keep the invalid top-k row
         // outside the zero-filled staging region while both feed MTE3.
         auto topk_idx_ub =
-            resource.ubBuf.template GetBufferByByte<ascend_deepep::topk_idx_t>(kDispatchPaddingTopkOffset);
+            resource.template GetBufferByByte<ascend_deepep::topk_idx_t>(kDispatchPaddingTopkOffset);
         auto topk_idx_bytes_ub = topk_idx_ub.ReinterpretCast<uint8_t>();
         if (num_topk > 0) {
             for (int32_t topk = 0; topk < num_topk; ++topk) {

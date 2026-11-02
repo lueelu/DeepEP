@@ -168,10 +168,10 @@ void Run(unsigned world, unsigned cores, unsigned tokens, bool scales, bool toke
                 model::reset(1);
                 model::active_qp = 0;
                 if (qps == 2) {
-                    DispatchSenderT<kGroupPeerCapacity, 2> sender(d, 0, resource.ubBuf.GetBufferByByte<uint8_t>(0),
+                    DispatchSenderT<kGroupPeerCapacity, 2> sender(d, 0, resource.GetBufferByByte<uint8_t>(0),
                                                                   workspace.data(), x.data(), side.data());
                 } else {
-                    DispatchSender sender(d, 0, resource.ubBuf.GetBufferByByte<uint8_t>(0), workspace.data(), x.data(),
+                    DispatchSender sender(d, 0, resource.GetBufferByByte<uint8_t>(0), workspace.data(), x.data(),
                                           side.data());
                 }
             });
@@ -214,8 +214,7 @@ void CheckWideOffsetsAndBounds()
     model::active_qp = 0;
     {
         Resource resource;
-        DispatchSender sender(d, 0, resource.ubBuf.GetBufferByByte<uint8_t>(0), workspace.data(), x.data(),
-                              scales.data());
+        DispatchSender sender(d, 0, resource.GetBufferByByte<uint8_t>(0), workspace.data(), x.data(), scales.data());
         CHECK(sender.PutRows(0, indices, rows - 2, 0, 4) == 4);
         sender.Flush();
         sender.Quiet();
@@ -231,7 +230,7 @@ void CheckWideOffsetsAndBounds()
         Reject([&] {
             Resource resource;
             model::reset(1);
-            DispatchSender sender(d, 0, resource.ubBuf.GetBufferByByte<uint8_t>(0), workspace.data(), x.data(),
+            DispatchSender sender(d, 0, resource.GetBufferByByte<uint8_t>(0), workspace.data(), x.data(),
                                   scales.data());
             sender.PutRows(0, indices, row, 0, 4);
             sender.Flush();

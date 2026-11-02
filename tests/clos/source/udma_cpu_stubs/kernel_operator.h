@@ -169,13 +169,11 @@ void asc_vf_call(dim3 threads, A... args)
     for (threadIdx.x = 0; threadIdx.x < threads.x; ++threadIdx.x) F(args...);
 }
 struct Resource {
-    struct UB {
-        alignas(64) std::array<uint8_t, 216 * 1024> bytes{};
-        template <class T>
-        AscendC::LocalTensor<T> GetBufferByByte(size_t offset)
-        {
-            CHECK(offset < bytes.size() && offset % 32 == 0);
-            return {reinterpret_cast<T*>(bytes.data() + offset)};
-        }
-    } ubBuf;
+    alignas(64) std::array<uint8_t, 216 * 1024> bytes{};
+    template <class T>
+    AscendC::LocalTensor<T> GetBufferByByte(size_t offset)
+    {
+        CHECK(offset < bytes.size() && offset % 32 == 0);
+        return {reinterpret_cast<T*>(bytes.data() + offset)};
+    }
 };

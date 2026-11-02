@@ -1,13 +1,12 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 #include "simt_api/common_functions.h"
 #include "simt_api/device_atomic_functions.h"
 #include "simt_api/device_sync_functions.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/launch.h"
 #include "ascend_deepep/kernels/types.h"
 
@@ -29,7 +28,7 @@ constexpr uint32_t kInvalidPowerOfTwoShift = 32U;
 
 // Exchange 开始后 Count/Pack 的 UB 已失效，尾部空间复用为两个本地 GM 搬运槽。
 static_assert(
-    kNotifyCopyUbOffset + kNotifyCopyBufferCount * kNotifyCopyTileBytes <= ascend_deepep::KernelArch::UB_SIZE);
+    kNotifyCopyUbOffset + kNotifyCopyBufferCount * kNotifyCopyTileBytes <= ascend_deepep::platform::kKernelUbBytes);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 inline constexpr aclshmemx_udma_op_config_t kNotifyDataConfig{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
@@ -1054,8 +1053,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dup_server_n
 
     const uint32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const uint32_t core_num = get_block_num() * get_subblockdim();
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
-    AscendC::LocalTensor<uint64_t> signal_ub = resource.ubBuf.template GetBufferByByte<uint64_t>(0U);
+    ascend_deepep::UbWorkspace resource;
+    AscendC::LocalTensor<uint64_t> signal_ub = resource.template GetBufferByByte<uint64_t>(0U);
 
     uint64_t profile_start = 0U;
     uint64_t profile_local_clear_done = 0U;
@@ -1120,28 +1119,28 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dup_server_n
     const NotifyRuntime runtime{
         token_begin, token_end, NotifySimtThreads(MaxU32(tiling.num_experts, tiling.pack_workers))};
 
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     __ubuf__ uint8_t* udma_wqe_buffer =
-        reinterpret_cast<__ubuf__ uint8_t*>(resource.ubBuf.template GetBufferByByte<uint8_t>(0).GetPhyAddr());
-    AscendC::LocalTensor<uint64_t> signal_ub = resource.ubBuf.template GetBufferByByte<uint64_t>(kNotifySignalUbOffset);
+        reinterpret_cast<__ubuf__ uint8_t*>(resource.template GetBufferByByte<uint8_t>(0).GetPhyAddr());
+    AscendC::LocalTensor<uint64_t> signal_ub = resource.template GetBufferByByte<uint64_t>(kNotifySignalUbOffset);
     AscendC::LocalTensor<uint8_t> communication_staging_ub =
-        resource.ubBuf.template GetBufferByByte<uint8_t>(kNotifyCopyUbOffset);
-    AscendC::LocalTensor<int32_t> expert_ub = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+        resource.template GetBufferByByte<uint8_t>(kNotifyCopyUbOffset);
+    AscendC::LocalTensor<int32_t> expert_ub = resource.template GetBufferByByte<int32_t>(0);
     AscendC::LocalTensor<int32_t> server_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(tiling.expert_stride * sizeof(int32_t));
-    AscendC::LocalTensor<int32_t> server_route_base_ub = resource.ubBuf.template GetBufferByByte<int32_t>(
+        resource.template GetBufferByByte<int32_t>(tiling.expert_stride * sizeof(int32_t));
+    AscendC::LocalTensor<int32_t> server_route_base_ub = resource.template GetBufferByByte<int32_t>(
         (tiling.expert_stride + tiling.server_stride) * sizeof(int32_t));
     AscendC::LocalTensor<int32_t> histogram_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(state_elems * sizeof(int32_t));
+        resource.template GetBufferByByte<int32_t>(state_elems * sizeof(int32_t));
     AscendC::LocalTensor<uint64_t> local_server_mask_ub =
-        resource.ubBuf.template GetBufferByByte<uint64_t>(ub_layout.source_server_mask_offset);
+        resource.template GetBufferByByte<uint64_t>(ub_layout.source_server_mask_offset);
     const uint32_t topk_ub_offset = tiling.inputs_in_ub != 0U ? ub_layout.stage_base_bytes : 0U;
     const uint32_t weight_ub_offset = tiling.inputs_in_ub != 0U && tiling.has_topk_weights != 0U ?
                                           ub_layout.stage_base_bytes + ub_layout.topk_slot_bytes :
                                           0U;
     AscendC::LocalTensor<ascend_deepep::topk_idx_t> topk_ub =
-        resource.ubBuf.template GetBufferByByte<ascend_deepep::topk_idx_t>(topk_ub_offset);
-    AscendC::LocalTensor<float> weight_ub = resource.ubBuf.template GetBufferByByte<float>(weight_ub_offset);
+        resource.template GetBufferByByte<ascend_deepep::topk_idx_t>(topk_ub_offset);
+    AscendC::LocalTensor<float> weight_ub = resource.template GetBufferByByte<float>(weight_ub_offset);
 
     AscendC::GlobalTensor<ascend_deepep::topk_idx_t> topk_idx_gm;
     AscendC::GlobalTensor<float> topk_weights_gm;

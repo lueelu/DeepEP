@@ -15,8 +15,8 @@ __aicore__ inline void DispatchTokenRemote(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
     GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
 {
-    auto wq = resource.ubBuf.template GetBufferByByte<uint8_t>(0);
-    auto lists = resource.ubBuf.template GetBufferByByte<int32_t>(kTokenListsOffset);
+    auto wq = resource.template GetBufferByByte<uint8_t>(0);
+    auto lists = resource.template GetBufferByByte<int32_t>(kTokenListsOffset);
     const uint32_t workers = TokenWorkers(cores);
     if (core < workers)
         for (uint32_t first = 0; first < td.world_size - 1; first += kMaxPeers) {

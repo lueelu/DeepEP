@@ -1,10 +1,9 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/launch.h"
 #include "ascend_deepep/kernels/types.h"
 
@@ -73,12 +72,12 @@ constexpr uint64_t kWaitTimeoutCycles = kWaitCyclesPerMicrosecond * kWaitTimeout
 // A scale-up AIV uses the UB head either for remote GET WQEs or for two DataCopyPad payload tiles.
 // Per-source chunk cursors, route cursors, cached segment ends, and one route-position scan tile follow
 // the two reserved payload tiles. Timer mode writes compact receiver trace records to local GM.
-static_assert(kSignalUbOffset + kSignalUbBytes <= ascend_deepep::KernelArch::UB_SIZE);
-static_assert(kQp1WqeOffset + kUdmaWqeBufferBytes <= ascend_deepep::KernelArch::UB_SIZE);
-static_assert(kRemoteGetRoutePositionUbOffset + kRoutePositionTileBytes <= ascend_deepep::KernelArch::UB_SIZE);
-static_assert(kTokenIdUbOffset + kTokenIdTileElements * sizeof(int32_t) <= ascend_deepep::KernelArch::UB_SIZE);
+static_assert(kSignalUbOffset + kSignalUbBytes <= ascend_deepep::platform::kKernelUbBytes);
+static_assert(kQp1WqeOffset + kUdmaWqeBufferBytes <= ascend_deepep::platform::kKernelUbBytes);
+static_assert(kRemoteGetRoutePositionUbOffset + kRoutePositionTileBytes <= ascend_deepep::platform::kKernelUbBytes);
+static_assert(kTokenIdUbOffset + kTokenIdTileElements * sizeof(int32_t) <= ascend_deepep::platform::kKernelUbBytes);
 static_assert(kRemoteGetBlockDim == 16U);
-static_assert(kDirectGetSegmentUbOffset + kDirectGetSegmentUbBytes <= ascend_deepep::KernelArch::UB_SIZE);
+static_assert(kDirectGetSegmentUbOffset + kDirectGetSegmentUbBytes <= ascend_deepep::platform::kKernelUbBytes);
 static_assert(kDirectGetSegmentUbOffset % kUbAlignment == 0U);
 static_assert(kRemoteGetRoutePositionUbOffset % kUbAlignment == 0U);
 static_assert(kGateTxRelease + 4U <= 4U * kGateLinesPerOwner);
@@ -1588,8 +1587,8 @@ __aicore__ inline void DupServerNotifyScaleOut(
 {
     const uint32_t core_idx = AscendC::GetBlockIdx();
     const uint32_t core_num = AscendC::GetBlockNum();
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
-    AscendC::LocalTensor<uint64_t> signal_ub = resource.ubBuf.template GetBufferByByte<uint64_t>(0);
+    ascend_deepep::UbWorkspace resource;
+    AscendC::LocalTensor<uint64_t> signal_ub = resource.template GetBufferByByte<uint64_t>(0);
 
     // Do not clear receiver-owned signals while a slower rank may still consume the previous dispatch.
     aclshmemi_sync_npu_v4<true>(0);
@@ -1824,11 +1823,11 @@ __aicore__ inline void DupServerDispatchSourceLane(
         copy_to_experts ? core_num - tiling.ranks_per_server - 1U : (tiling.num_servers > 1U ? core_num : 0U);
     const uint32_t producer_count = remote_producer_count + (copy_to_experts ? 1U : 0U);
 
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     __ubuf__ uint8_t* udma_wqe_buffer =
-        reinterpret_cast<__ubuf__ uint8_t*>(resource.ubBuf.template GetBufferByByte<uint8_t>(0).GetPhyAddr());
-    AscendC::LocalTensor<uint64_t> signal_ub = resource.ubBuf.template GetBufferByByte<uint64_t>(kSignalUbOffset);
-    AscendC::LocalTensor<int32_t> token_ids_ub = resource.ubBuf.template GetBufferByByte<int32_t>(kTokenIdUbOffset);
+        reinterpret_cast<__ubuf__ uint8_t*>(resource.template GetBufferByByte<uint8_t>(0).GetPhyAddr());
+    AscendC::LocalTensor<uint64_t> signal_ub = resource.template GetBufferByByte<uint64_t>(kSignalUbOffset);
+    AscendC::LocalTensor<int32_t> token_ids_ub = resource.template GetBufferByByte<int32_t>(kTokenIdUbOffset);
     uint64_t role_start_cycle = 0U;
     uint64_t role_end_cycle = 0U;
     uint64_t cross_server_cycles = 0U;
@@ -1849,7 +1848,7 @@ __aicore__ inline void DupServerDispatchSourceLane(
     if (copy_to_experts) {
         if (core_idx == remote_producer_count) {
             AscendC::LocalTensor<uint8_t> staging_pingpong_ub =
-                resource.ubBuf.template GetBufferByByte<uint8_t>(kCopyUbOffset);
+                resource.template GetBufferByByte<uint8_t>(kCopyUbOffset);
             if (tiling.enable_timer != 0U) {
                 role_start_cycle = static_cast<uint64_t>(AscendC::GetSystemCycle());
             }
@@ -1872,15 +1871,15 @@ __aicore__ inline void DupServerDispatchSourceLane(
             const uint32_t route_position_ub_offset = segment_end_ub_offset + segment_end_ub_bytes;
 
             AscendC::LocalTensor<uint8_t> staging_pingpong_ub =
-                resource.ubBuf.template GetBufferByByte<uint8_t>(kCopyUbOffset);
+                resource.template GetBufferByByte<uint8_t>(kCopyUbOffset);
             AscendC::LocalTensor<uint32_t> next_chunk_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(next_chunk_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(next_chunk_ub_offset);
             AscendC::LocalTensor<uint32_t> route_cursor_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(route_cursor_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(route_cursor_ub_offset);
             AscendC::LocalTensor<uint32_t> segment_end_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(segment_end_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(segment_end_ub_offset);
             AscendC::LocalTensor<int32_t> route_position_ub =
-                resource.ubBuf.template GetBufferByByte<int32_t>(route_position_ub_offset);
+                resource.template GetBufferByByte<int32_t>(route_position_ub_offset);
             const uint32_t worker_idx = core_idx - producer_count;
             const uint32_t gateway_lane =
                 (worker_idx + tiling.rank % tiling.ranks_per_server) % tiling.ranks_per_server;
@@ -1927,11 +1926,11 @@ __aicore__ inline void DupServerDispatchSourceLaneRemoteGet(
 {
     const uint32_t core_idx = AscendC::GetBlockIdx();
     const uint32_t source_server = tiling.rank / tiling.ranks_per_server;
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     __ubuf__ uint8_t* ub_base =
-        reinterpret_cast<__ubuf__ uint8_t*>(resource.ubBuf.template GetBufferByByte<uint8_t>(0).GetPhyAddr());
-    AscendC::LocalTensor<uint64_t> signal_ub = resource.ubBuf.template GetBufferByByte<uint64_t>(kSignalUbOffset);
-    AscendC::LocalTensor<int32_t> token_ids_ub = resource.ubBuf.template GetBufferByByte<int32_t>(kTokenIdUbOffset);
+        reinterpret_cast<__ubuf__ uint8_t*>(resource.template GetBufferByByte<uint8_t>(0).GetPhyAddr());
+    AscendC::LocalTensor<uint64_t> signal_ub = resource.template GetBufferByByte<uint64_t>(kSignalUbOffset);
+    AscendC::LocalTensor<int32_t> token_ids_ub = resource.template GetBufferByByte<int32_t>(kTokenIdUbOffset);
     const uint64_t role_start = tiling.enable_timer != 0U ? static_cast<uint64_t>(AscendC::GetSystemCycle()) : 0U;
     uint32_t direct_get_rows = 0U;
 
@@ -1956,7 +1955,7 @@ __aicore__ inline void DupServerDispatchSourceLaneRemoteGet(
     } else if (core_idx < kRemoteGetReceiverBegin) {
         const uint32_t publisher_idx = core_idx - kRemoteGetProducerCount;
         AscendC::LocalTensor<uint8_t> staging_pingpong_ub =
-            resource.ubBuf.template GetBufferByByte<uint8_t>(kCopyUbOffset);
+            resource.template GetBufferByByte<uint8_t>(kCopyUbOffset);
         PublishAllLocalTokens(x, symmetric_buffer, tiling, publisher_idx, staging_pingpong_ub, signal_ub);
         const uint32_t local_expert_begin =
             static_cast<uint64_t>(tiling.num_local_experts) * publisher_idx / kRemoteGetPublisherCount;
@@ -1972,13 +1971,13 @@ __aicore__ inline void DupServerDispatchSourceLaneRemoteGet(
             const uint32_t segment_end_ub_offset = route_cursor_ub_offset + route_cursor_ub_bytes;
             const uint32_t route_position_ub_offset = segment_end_ub_offset + route_cursor_ub_bytes;
             AscendC::LocalTensor<uint32_t> next_chunk_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(next_chunk_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(next_chunk_ub_offset);
             AscendC::LocalTensor<uint32_t> route_cursor_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(route_cursor_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(route_cursor_ub_offset);
             AscendC::LocalTensor<uint32_t> segment_end_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(segment_end_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(segment_end_ub_offset);
             AscendC::LocalTensor<int32_t> route_position_ub =
-                resource.ubBuf.template GetBufferByByte<int32_t>(route_position_ub_offset);
+                resource.template GetBufferByByte<int32_t>(route_position_ub_offset);
             AscendC::GlobalTensor<uint64_t> unused_trace_gm;
             unused_trace_gm.SetGlobalBuffer(
                 reinterpret_cast<__gm__ uint64_t*>(
@@ -2008,15 +2007,15 @@ __aicore__ inline void DupServerDispatchSourceLaneRemoteGet(
             const uint32_t segment_end_ub_offset = route_cursor_ub_offset + route_cursor_ub_bytes;
             const uint32_t route_position_ub_offset = segment_end_ub_offset + route_cursor_ub_bytes;
             AscendC::LocalTensor<uint8_t> staging_pingpong_ub =
-                resource.ubBuf.template GetBufferByByte<uint8_t>(kCopyUbOffset);
+                resource.template GetBufferByByte<uint8_t>(kCopyUbOffset);
             AscendC::LocalTensor<uint32_t> next_chunk_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(next_chunk_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(next_chunk_ub_offset);
             AscendC::LocalTensor<uint32_t> route_cursor_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(route_cursor_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(route_cursor_ub_offset);
             AscendC::LocalTensor<uint32_t> segment_end_ub =
-                resource.ubBuf.template GetBufferByByte<uint32_t>(segment_end_ub_offset);
+                resource.template GetBufferByByte<uint32_t>(segment_end_ub_offset);
             AscendC::LocalTensor<int32_t> route_position_ub =
-                resource.ubBuf.template GetBufferByByte<int32_t>(route_position_ub_offset);
+                resource.template GetBufferByByte<int32_t>(route_position_ub_offset);
             const uint64_t trace_events_per_core = static_cast<uint64_t>(tiling.num_servers) * tiling.chunk_capacity;
             AscendC::GlobalTensor<uint64_t> receiver_trace_gm;
             receiver_trace_gm.SetGlobalBuffer(
@@ -2039,9 +2038,9 @@ __aicore__ inline void DupServerDispatchSourceLaneRemoteGet(
     // returns that PUT's owner, so one peer/QP is never controlled by two different AIVs.
     if (core_idx < kRemoteGetProducerCount) {
         AscendC::LocalTensor<int32_t> route_position_ub =
-            resource.ubBuf.template GetBufferByByte<int32_t>(kRemoteGetRoutePositionUbOffset);
+            resource.template GetBufferByByte<int32_t>(kRemoteGetRoutePositionUbOffset);
         AscendC::LocalTensor<int32_t> segment_pairs_ub =
-            resource.ubBuf.template GetBufferByByte<int32_t>(kDirectGetSegmentUbOffset);
+            resource.template GetBufferByByte<int32_t>(kDirectGetSegmentUbOffset);
         for (uint32_t remote_index = 0U; remote_index < tiling.remote_get_servers; ++remote_index) {
             if (DirectGetOwnerCore(tiling, source_server, remote_index) != core_idx) {
                 continue;

@@ -10,12 +10,12 @@
 
 // Ascend950 accepts the dynamic UB byte count as the second launch argument.
 // On dav-c220 (Ascend 910C), that argument is a stream-mode descriptor.
-#if CATLASS_ARCH == 3510
+#if ASCEND_DEEPEP_ARCH == 3510
 #define ASCEND_DEEPEP_KERNEL_LAUNCH_UB(bytes) (bytes)
-#elif CATLASS_ARCH == 2201
+#elif ASCEND_DEEPEP_ARCH == 2201
 #define ASCEND_DEEPEP_KERNEL_LAUNCH_UB(bytes) nullptr
 #else
-#error "Unsupported CATLASS_ARCH for ascend-deepep kernel launch"
+#error "Unsupported ASCEND_DEEPEP_ARCH for ascend-deepep kernel launch"
 #endif
 
 extern "C" {

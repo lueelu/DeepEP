@@ -1,10 +1,9 @@
 #include <cstdint>
 
-#include "catlass/arch/resource.hpp"
+#include "ascend_deepep/kernels/ub_workspace.h"
 #include "kernel_operator.h"
 #include "shmem.h"
 
-#include "ascend_deepep/kernels/arch.h"
 #include "ascend_deepep/kernels/notify_recv_prefix.h"
 #include "ascend_deepep/kernels/notify_dispatch_plan.h"
 #include "ascend_deepep/kernels/v2_handle.h"
@@ -91,12 +90,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispa
     local_expert_counts_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(num_tokens_per_expert));
     is_token_in_rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(is_token_in_rank));
 
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
-    AscendC::LocalTensor<int32_t> accumulator_ub = resource.ubBuf.template GetBufferByByte<int32_t>(0);
+    ascend_deepep::UbWorkspace resource;
+    AscendC::LocalTensor<int32_t> accumulator_ub = resource.template GetBufferByByte<int32_t>(0);
     AscendC::LocalTensor<int32_t> temporary_ub =
-        resource.ubBuf.template GetBufferByByte<int32_t>(kMaxVectorTileElems * kNotifyInt32Bytes);
-    AscendC::LocalTensor<uint8_t> route_row_ub = resource.ubBuf.template GetBufferByByte<uint8_t>(kRouteRowUbOffset);
-    AscendC::LocalTensor<half> route_half_ub = resource.ubBuf.template GetBufferByByte<half>(kRouteHalfUbOffset);
+        resource.template GetBufferByByte<int32_t>(kMaxVectorTileElems * kNotifyInt32Bytes);
+    AscendC::LocalTensor<uint8_t> route_row_ub = resource.template GetBufferByByte<uint8_t>(kRouteRowUbOffset);
+    AscendC::LocalTensor<half> route_half_ub = resource.template GetBufferByByte<half>(kRouteHalfUbOffset);
     AscendC::DataCopyPadExtParams<int32_t> int32_pad_params{false, 0, 0, 0};
     AscendC::DataCopyPadExtParams<uint8_t> route_pad_params{
         true, 0, static_cast<uint8_t>(rank_stride - world_size), static_cast<uint8_t>(0)};
@@ -424,7 +423,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void cached_dispa
 {
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC { return; }
-    Catlass::Arch::Resource<ascend_deepep::KernelArch> resource;
+    ascend_deepep::UbWorkspace resource;
     const uint32_t channel = get_block_idx() * get_subblockdim() + get_subblockid();
     ascend_deepep::BuildDispatchPlan(resource, routes, plan, head, td, channel);
 }
