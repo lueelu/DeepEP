@@ -2,8 +2,8 @@
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
-#include "ascend_deepep/kernels/udma_token_dispatch_schedule.h"
-#include "ascend_deepep/kernels/udma_token_combine_schedule.h"
+#include "kernels/dispatch/udma_token_dispatch_schedule.h"
+#include "kernels/combine/udma_token_combine_schedule.h"
 #include <set>
 #include <tuple>
 #include <iostream>

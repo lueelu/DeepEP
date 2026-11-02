@@ -19,12 +19,20 @@ def test_mte_mapping_range_failures(tmp_path):
 constexpr int ACL_SUCCESS = 0;
 int aclrtMemGetAddressRange(void*, void**, std::size_t*);
 """)
+    # Compile the actual helper after it was folded into BufferRuntime, without
+    # pulling Torch/NPU runtime dependencies into this CPU boundary test.
+    runtime = (root / "csrc/clos/runtime/buffer_runtime.cpp").read_text(encoding="utf-8")
+    begin = runtime.index("inline std::string MteMappingError(")
+    end = runtime.index("\n}\n", begin) + 3
+    (tmp_path / "mapping_check.h").write_text(
+        "#include <acl/acl.h>\n#include <cstdint>\n#include <string>\n" + runtime[begin:end],
+        encoding="utf-8",
+    )
     source = tmp_path / "check.cpp"
     source.write_text("""
-#include "csrc/common/peer_mapping.h"
+#include "mapping_check.h"
 #include <cassert>
 #include <limits>
-using ascend_deepep::runtime::MteMappingError;
 int status = 0, calls = 0;
 uintptr_t range_base = 4096;
 std::size_t range_size = 8192;

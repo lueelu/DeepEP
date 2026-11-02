@@ -1,4 +1,4 @@
-#include "ascend_deepep/udma_schedule.h"
+#include "common/udma_schedule.h"
 #include <algorithm>
 #include <cassert>
 #include <iostream>

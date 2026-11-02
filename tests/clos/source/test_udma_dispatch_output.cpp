@@ -1,8 +1,8 @@
 // CPU model: same build flags as test_udma_schedule.cpp. This checks the real
 // publication, sender and self-copy code, not hardware memory-coherence behavior.
-#include "ascend_deepep/kernels/udma_dispatch_schedule.h"
-#include "ascend_deepep/kernels/udma_token_dispatch_schedule.h"
-#include "ascend_deepep/kernels/udma_dispatch_metadata.h"
+#include "kernels/dispatch/udma_dispatch_schedule.h"
+#include "kernels/dispatch/udma_token_dispatch_schedule.h"
+#include "kernels/dispatch/udma_dispatch_metadata.h"
 #include <iostream>
 #include <set>
 #include <tuple>

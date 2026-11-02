@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "benchmarks/clos"))
 from stage_metrics import byte_ledger, file_identity, parse_profile, route_counts, summarize, write_json
 from bench_v2_bandwidth import arguments, check_idle, local_world_size, report, run_case, suite_contract, worker_command
 from bandwidth_multinode import Peer, collection_manifest, library_identity, safe_path, validate_peers
-from bandwidth_cache import L2_FLUSH_RANGE, PROFILE_SAMPLE_RANGE
+from stage_metrics import L2_FLUSH_RANGE, PROFILE_SAMPLE_RANGE
 
 
 class StageMetricsTest(unittest.TestCase):

@@ -1,7 +1,7 @@
 // CPU arithmetic/ownership test; hardware visibility is covered by NPU tests.
 // g++ -std=c++17 -O2 -D__CCE_KT_TEST__ -DASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS=1
 //   -Itest/udma_cpu_stubs -Iinclude test/test_udma_combine_weights.cpp -o /tmp/test_combine_weights
-#include "ascend_deepep/kernels/udma_combine_schedule.h"
+#include "kernels/combine/udma_combine_schedule.h"
 #include <iostream>
 #include <set>
 #include <tuple>

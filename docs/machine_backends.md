@@ -175,8 +175,14 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 32 --nnodes 2 --node-rank
     --master-addr <NODE0_IP> --run-id clos_v2_ep32 --output clos_v2_ep32_node0
 ```
 
-两个入口共用 `bandwidth_multinode.py`、`route_workloads.py`、`bandwidth_cache.py`
-和 `stage_metrics.py`，分别负责启动与结果收集、路由生成、采样和阶段计时。
+两个入口共用 `bandwidth_multinode.py`、`route_workloads.py` 和 `stage_metrics.py`，
+分别负责多机协调与结果收集、路由生成、采样和阶段计时。
+
+CLOS 原生实现集中在 `csrc/clos/`：`bindings/` 提供 Python 注册，`runtime/`
+管理 Buffer 和 SHMEM，`ops/` 处理参数、tensor 分配和 kernel 下发，`common/`
+存放 host/device 共用定义。设备实现位于 `kernels/`，按 dispatch、combine、notify、
+expand、aggregate 分组。`ops/stream_allocator.h` 由 V1/V2 共用，保持分配流与
+执行流的生命周期约束。CLOS 仅保留本后端及 CARD MTE 复用的实现。
 
 ## PR：四卡 Mesh 与跨域 PCIe
 

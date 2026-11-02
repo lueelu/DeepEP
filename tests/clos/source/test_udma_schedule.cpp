@@ -4,12 +4,12 @@
 #ifdef NDEBUG
 #undef NDEBUG  // The CPU oracle must remain active in optimized builds.
 #endif
-#include "ascend_deepep/kernels/udma_dispatch_schedule.h"
-#include "ascend_deepep/kernels/udma_combine_schedule.h"
-#include "ascend_deepep/kernels/udma_token_combine_schedule.h"
-#include "ascend_deepep/kernels/udma_dispatch_metadata.h"
-#include "ascend_deepep/kernels/notify_recv_prefix.h"
-#include "ascend_deepep/kernels/notify_dispatch_plan.h"
+#include "kernels/dispatch/udma_dispatch_schedule.h"
+#include "kernels/combine/udma_combine_schedule.h"
+#include "kernels/combine/udma_token_combine_schedule.h"
+#include "kernels/dispatch/udma_dispatch_metadata.h"
+#include "kernels/notify/notify_recv_prefix.h"
+#include "kernels/notify/notify_dispatch_plan.h"
 #include <iostream>
 #include <tuple>
 #include <set>

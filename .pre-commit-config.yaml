@@ -51,7 +51,7 @@ repos:
         types_or: []
         files: \.(c|h|cpp|hpp|cc|hh|cxx|hxx|asc)$
         args: [--style=file]
-        exclude: ^(third-party/|csrc/clos/(kernels|include)/)
+        exclude: ^(third-party/|csrc/clos/(kernels|common)/)
 
   # 英文拼写检查。
   - repo: https://github.com/codespell-project/codespell

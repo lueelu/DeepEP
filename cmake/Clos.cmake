@@ -18,13 +18,12 @@ find_library(_platform NAMES platform PATHS "${ASCEND_HOME_PATH}/lib64" REQUIRED
 
 set(_clos_root "${CMAKE_SOURCE_DIR}/csrc/clos")
 pybind11_add_module(_clos_C NO_EXTRAS
-    "${_clos_root}/csrc/pybind.cpp" "${_clos_root}/csrc/torch_classes.cpp"
-    "${_clos_root}/csrc/launcher.cpp" "${_clos_root}/csrc/shmem_instance.cpp"
-    "${_clos_root}/csrc/buffer_runtime.cpp"
-    "${_clos_root}/csrc/ops/aggregate.cpp" "${_clos_root}/csrc/ops/combine.cpp"
-    "${_clos_root}/csrc/ops/dispatch.cpp" "${_clos_root}/csrc/ops/expand.cpp"
-    "${_clos_root}/csrc/ops/dup_server.cpp")
-target_include_directories(_clos_C PRIVATE "${_clos_root}" "${_clos_root}/include" "${_clos_root}/csrc"
+    "${_clos_root}/bindings/pybind.cpp" "${_clos_root}/bindings/torch_classes.cpp"
+    "${_clos_root}/ops/launcher.cpp" "${_clos_root}/runtime/shmem_instance.cpp"
+    "${_clos_root}/runtime/buffer_runtime.cpp"
+    "${_clos_root}/ops/aggregate.cpp" "${_clos_root}/ops/combine.cpp"
+    "${_clos_root}/ops/dispatch.cpp" "${_clos_root}/ops/expand.cpp")
+target_include_directories(_clos_C PRIVATE "${_clos_root}"
     ${TORCH_INCLUDE_DIRS} "${_torch_npu_root}/include" "${_torch_npu_root}/.."
     "${ASCEND_HOME_PATH}/include" "${ASCEND_HOME_PATH}/include/experiment/runtime"
     "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src")

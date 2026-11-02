@@ -58,17 +58,16 @@ set_target_properties(deepep_kernels PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
 # Separate translation units and library preserve both backends' device ABI.
 set(_clos "${DEEPEP_SOURCE_DIR}/csrc/clos")
 add_library(deepep_clos_kernels SHARED
-    "${_clos}/kernels/dispatch_layout.cpp" "${_clos}/kernels/notify_dispatch.cpp"
-    "${_clos}/kernels/dispatch.cpp" "${_clos}/kernels/dispatch_udma.cpp"
-    "${_clos}/kernels/notify_combine.cpp" "${_clos}/kernels/combine.cpp"
-    "${_clos}/kernels/combine_udma.cpp" "${_clos}/kernels/expand.cpp"
-    "${_clos}/kernels/aggregate.cpp" "${_clos}/kernels/dup_server_notify.cpp"
-    "${_clos}/kernels/dup_server_dispatch.cpp")
+    "${_clos}/kernels/dispatch/dispatch_layout.cpp" "${_clos}/kernels/notify/notify_dispatch.cpp"
+    "${_clos}/kernels/dispatch/dispatch.cpp" "${_clos}/kernels/dispatch/dispatch_udma.cpp"
+    "${_clos}/kernels/notify/notify_combine.cpp" "${_clos}/kernels/combine/combine.cpp"
+    "${_clos}/kernels/combine/combine_udma.cpp" "${_clos}/kernels/expand/expand.cpp"
+    "${_clos}/kernels/aggregate/aggregate.cpp")
 get_target_property(_clos_options deepep_kernels COMPILE_OPTIONS)
 get_target_property(_clos_includes deepep_kernels INCLUDE_DIRECTORIES)
 target_compile_options(deepep_clos_kernels PRIVATE ${_clos_options} -Xhost-start -ftrapv -Xhost-end)
 target_include_directories(deepep_clos_kernels PRIVATE ${_clos_includes}
-    "${_clos}/include" "${_clos}/kernels")
+    "${_clos}")
 target_compile_definitions(deepep_clos_kernels PRIVATE ASCEND_DEEPEP_ARCH=3510 EP_NUM_TOPK_IDX_BITS=64 USE_SIMT L2_CACHE_HINT
     ASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS=1)
 target_link_options(deepep_clos_kernels PRIVATE --cce-fatobj-link)
@@ -78,7 +77,6 @@ set_target_properties(deepep_clos_kernels PROPERTIES BUILD_WITH_INSTALL_RPATH TR
 # Preserve the source build's translation-unit grouping. In particular its
 # local expand/aggregate helpers share the SHMEM/SIMT setup from notify.
 set_source_files_properties(
-    "${_clos}/kernels/dispatch.cpp" "${_clos}/kernels/dispatch_udma.cpp"
-    "${_clos}/kernels/dup_server_notify.cpp" "${_clos}/kernels/dup_server_dispatch.cpp"
-    "${_clos}/kernels/combine.cpp" "${_clos}/kernels/combine_udma.cpp"
+    "${_clos}/kernels/dispatch/dispatch.cpp" "${_clos}/kernels/dispatch/dispatch_udma.cpp"
+    "${_clos}/kernels/combine/combine.cpp" "${_clos}/kernels/combine/combine_udma.cpp"
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)

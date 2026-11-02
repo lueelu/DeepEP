@@ -25,7 +25,7 @@ import sys
 import time
 import traceback
 
-from bandwidth_cache import L2CacheFlush, L2_CACHE_FLUSH_BYTES, ProfileSamples, PROFILE_GUARD_ITERS
+from stage_metrics import L2CacheFlush, L2_CACHE_FLUSH_BYTES, ProfileSamples, PROFILE_GUARD_ITERS
 
 from route_workloads import (
     DEFAULTS as ROUTE_DEFAULTS,

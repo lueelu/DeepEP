@@ -1,5 +1,5 @@
 // CPU-only: c++ -std=c++17 -O2 -Iinclude test/test_udma_peer_order.cpp -o peer_order
-#include "ascend_deepep/udma_schedule.h"
+#include "common/udma_schedule.h"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
