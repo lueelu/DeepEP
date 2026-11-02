@@ -1,78 +1,66 @@
-# Clos backend regression tests
+# Clos basic validation
 
-The imported tests follow `v1-shared-jetty-scheduler` at `6f9d8c9`, preserving its CPU
-references, routes, tolerances, and kernel expectations. Backend tests use `deep_ep.backends.clos` explicitly so that
-running them on a POD development machine does not silently test the POD path.
-Public selection, naming, event compatibility and EP16 sizing tests are in
-`tests/api/test_machine_selection.py` and `test_clos_integration.py`.
+The Clos test directory keeps two files:
 
-CPU API and golden checks (matching Torch/torch_npu required, no NPU launch):
+| File | Purpose |
+| --- | --- |
+| `source/test_v1_v2_shared_backend.py` | Basic V1/V2 public-interface precision and event checks |
+| `source/test_v1_intranode.py` | Shared CPU golden and profiling helpers used by the basic checks and both bandwidth scripts; also a standalone V1 precision entrypoint |
 
-```bash
-python -m pytest tests/clos/source/test_public_api.py \
-    tests/clos/source/test_v2_elastic_api.py \
-    tests/clos/source/test_shmem_bootstrap.py \
-    tests/clos/source/test_stage_metrics.py
-```
+Standalone stage tests, scheduling models, CPU CANN stubs, and specialized
+regression scripts are not included. Shared public-API and topology tests remain
+in `tests/api/`. No CPU stub result is a substitute for device precision checks.
 
-Automatic-policy validation and profiler contracts are also covered by
-`test_udma_auto_policy.py`, `test_bandwidth_cache.py`,
-`test_v1_bandwidth.py`, `test_v2_bandwidth.py`, and `test_route_workloads.py`.
-Run with `PYTHONPATH=tests/clos/source` when invoking these files separately.
+## Machine/topology detection
 
-The old source repository's build-identity test is superseded by
-`tests/runtime/test_build.py`, `test_loader.py` and the shared SDK manifest checks.
-NPU precision scripts remain manual commands; do not use a busy node:
-
-```bash
-python tests/clos/source/test_v1_intranode.py --ep-size 8 --transport udma \
-    --num-tokens 129 --hidden 6144 --dtype bf16 --num-aiv 32
-python tests/clos/source/test_v2_elastic_v1_kernel.py --mode expand --ep-size 8 --num-aiv 32
-```
-
-For the combine workspace reuse change, add `--reuse-iterations 20` to the V2
-kernel precision script. It alternates weighted/unweighted combines and delays
-rank arrival while checking each output against the CPU reference. Passing a
-single run is evidence for that case, not proof for all schedules or EP sizes.
-
-To check the installed public interface and automatic selection on a Clos node,
-first run the CPU-only topology check, then run each API separately on idle cards:
+Check the installed package without launching communication kernels:
 
 ```bash
 python -I scripts/check_machine.py --physical-devices 0 1 2 3 4 5 6 7 --expect clos_only
-python tests/clos/source/test_v1_v2_shared_backend.py --api v1 --public-auto \
-    --ep-size 8 --num-tokens 129 --hidden 6144 --num-topk 8 \
-    --experts-per-rank 32 --num-aiv 32 --check-events
-python tests/clos/source/test_v1_v2_shared_backend.py --api v2 --public-auto \
-    --ep-size 8 --num-tokens 129 --hidden 6144 --num-topk 8 \
-    --experts-per-rank 32 --num-aiv 32 --check-events
 ```
 
-`--expect clos_only` checks the detection result; it does not force the backend.
-`--public-auto` uses the installed public Buffer/ElasticBuffer with the default
-automatic selection and no transport override. It rejects other topologies
-before Buffer construction because this test uses the Clos CPU golden.
-Each rank prints `MACHINE_SELECTION` with the actual Buffer selection and engine.
-`PUBLIC_PRECISION_PASSED` is printed only after BF16 fresh/cached dispatch,
-combine with/without weights and bias, event dependencies, retained output after
-destroy, and process-group cleanup succeed. Require all eight rank markers and
-a zero launcher exit code. Keep an external job timeout when running these tests.
+`--expect` checks the detected topology; it does not force a backend. Use `pod`
+or `card_4pmesh` for those machines. This checks classification, not link health
+or SHMEM initialization.
 
-`--auto-policy` omits manual scheduler defaults to exercise the default Clos
-policy while preserving `--num-aiv`. For explicit backend validation on a
-development node, use `--public-clos` instead of `--public-auto`; this selects
-`machine_type="clos_only"` and is not evidence that topology auto-detection or
-a different physical topology has been qualified.
+## Basic functional validation
 
-`benchmarks/clos/bench_v1_bandwidth.py` and `bench_v2_bandwidth.py` are the two
-Clos precision/profiling entrypoints. Both use the default library policy;
-manual scheduling and sweep entrypoints are not included. Each defaults to
-32 AIVs and BF16/FP8 × expanded/non-expanded coverage, checking fresh/cached
-dispatch and weighted/unweighted combine before measuring them. Workload shape,
-routing, core count, and multi-node options remain configurable.
-The original POD benchmarks stay in their
-original paths. Separate runs are needed to qualify each backend and topology;
-compilation or CPU tests alone do not establish NPU correctness/performance.
-Install the wheel built from this revision first. Benchmarks load that installed
-package and record loaded library hashes; only the CPU reference comes from the
-checkout. Do not put an unbuilt checkout ahead of the wheel in `PYTHONPATH`.
+Install the wheel built from the revision being checked, load the CANN/SHMEM
+environment, and run on idle cards. On a Clos machine:
+
+```bash
+for api in v1 v2; do
+    timeout -k 30s 900s python tests/clos/source/test_v1_v2_shared_backend.py \
+        --api "$api" --public-auto --auto-policy \
+        --ep-size 8 --num-tokens 129 --hidden 6144 --num-topk 8 \
+        --experts-per-rank 32 --num-aiv 32 --check-events
+done
+```
+
+This checks BF16 fresh/cached dispatch, payload and route weights, combine
+with/without weights and bias, event dependencies, and retained output after
+destroy against the CPU golden. Require `PUBLIC_PRECISION_PASSED` for every
+rank and a zero launcher exit code. `--auto-policy` uses the default scheduler
+while preserving the requested AIV count.
+
+For forced Clos validation on a development machine, replace `--public-auto`
+with `--public-clos`. This does not qualify that machine's automatic Clos
+selection. The basic launcher is single-node; `--ep-size` is its local process
+count. Use the bandwidth entrypoints below for multi-node precision checks.
+
+## Additional dtype/layout coverage and profiling
+
+The existing `benchmarks/clos/bench_v1_bandwidth.py` and
+`benchmarks/clos/bench_v2_bandwidth.py` check precision before measuring
+fresh/cached dispatch and weighted/unweighted combine. Their defaults cover
+BF16/FP8 and expanded/non-expanded layouts using the default scheduling policy.
+They retain configurable shapes, routing, AIV count and multi-node EP32/64
+launching; see [backend usage](../../docs/machine_backends.md).
+
+Both scripts depend on `source/test_v1_intranode.py`; keep it with the benchmark
+checkout. They load the installed package and record its library identity, while
+the CPU reference comes from the checkout. Do not put an unbuilt checkout ahead
+of the wheel in `PYTHONPATH`.
+
+Passing these basic cases does not establish graph, subgroup, stress, or every
+EP/shape combination. Qualify additional scenarios before relying on them.

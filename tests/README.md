@@ -13,6 +13,7 @@ Modified by Joyce_An 2026
 | --- | --- |
 | `api/` | 公开导出、签名、参数默认值和未支持操作的错误 |
 | `runtime/` | 构建预检、SDK/安装身份、资源和事件生命周期、故障传播 |
+| [`clos/`](clos/README.md) | CLOS V1/V2 基础精度与事件验证、共享 CPU Golden；机型识别使用 `scripts/check_machine.py` |
 | `elastic/test_dispatch.py` | HT Notify 元数据、BF16/FP8 payload、权重、fresh/cached 和路由 |
 | `elastic/test_combine.py` | HT dispatch → 专家输出 → BF16 combine、独立权重回传、重复调用及输出生命周期 |
 | `elastic/test_ep_low_latency.py` | LL 返回、精度、重复 combine，以及 profiler kernel 耗时 |
