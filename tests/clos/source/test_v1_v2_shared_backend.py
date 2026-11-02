@@ -1,10 +1,7 @@
-"""Matched V1/V2 BF16 precision and kernel profiling on the same routing.
+"""Basic V1/V2 BF16 precision and event validation on identical routing.
 
-Run each API in a separate process group; shared-Jetty Buffers are exclusive
-within a process. Both APIs use independent GM outputs, identical routes,
-alignment=1, and the same AIV/peer tuning. V2 fresh dispatch includes layout;
-V1's measured fresh call explicitly includes get_dispatch_layout as well.
-The existing V1 CPU golden is reused without changing its seed or arithmetic.
+Run each API in a separate process group. Expected values use the shared CPU
+reference; performance measurement lives in benchmarks/clos.
 """
 
 import argparse
@@ -12,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 
 import torch
 import torch.distributed as dist
@@ -20,7 +18,9 @@ import torch_npu  # noqa: F401
 
 from deep_ep import EventHandle, EventOverlap
 from deep_ep.backends.clos import Buffer, Config, ElasticBuffer
-import test_v1_intranode as golden
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import common as golden
 
 
 def buffer_entrypoints(args, group):
@@ -306,22 +306,6 @@ def run_rank(rank, args):
             f"rank {rank} shared backend precision passed: api={args.api}, fixed_capacity={args.fixed_capacity}",
             flush=True,
         )
-        if args.profile:
-            # Never time CPU golden or preparation clones. Capture the same
-            # complete fresh API work in both interfaces, including layout.
-            profile_root = args.profile_dir
-            functions = {
-                "dispatch": lambda: dispatch(x),
-                "cached-dispatch": lambda: dispatch(cached_x, handle),
-                "combine_unweighted": lambda: combine(owned, handle),
-                "combine_weighted": lambda: combine(owned, handle, recv_weights, (bias0, bias1)),
-            }
-            for name, fn in functions.items():
-                args.profile_dir = str(Path(profile_root) / name)
-                try:
-                    golden._profile_operator(rank, args, name, fn)
-                except golden._ProfileComplete:
-                    pass
         membership = golden._layout_reference(idx_cpu, args)[2]
         record = dict(
             api=args.api,
@@ -382,15 +366,9 @@ def main():
     p.add_argument("--fixed-capacity", action="store_true")
     p.add_argument("--inject-error", action="store_true")
     p.add_argument("--check-events", action="store_true")
-    p.add_argument("--profile", action="store_true")
-    p.add_argument("--profile-dir", default="profiles_v1_v2")
-    p.add_argument("--profile-warmup", type=int, default=10)
-    p.add_argument("--profile-iters", type=int, default=30)
     args = p.parse_args()
     if (args.public_auto or args.public_clos) and args.transport is not None:
         p.error("--public-auto selects the engine from topology; omit --transport")
-    if args.profile and args.fixed_capacity:
-        p.error("matched performance uses exact receive counts, not padded outputs")
     args.dtype, args.expert_alignment = "bf16", 1
     mp.spawn(run_rank, args=(args,), nprocs=args.ep_size, join=True)
 

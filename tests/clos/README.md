@@ -5,7 +5,7 @@ The Clos test directory keeps two files:
 | File | Purpose |
 | --- | --- |
 | `source/test_v1_v2_shared_backend.py` | Basic V1/V2 public-interface precision and event checks |
-| `source/test_v1_intranode.py` | Shared CPU golden and profiling helpers used by the basic checks and both bandwidth scripts; also a standalone V1 precision entrypoint |
+| `common.py` | Shared independent CPU golden and precision helpers used by the basic checks and both bandwidth scripts; no test launcher or profiling |
 
 Standalone stage tests, scheduling models, CPU CANN stubs, and specialized
 regression scripts are not included. Shared public-API and topology tests remain
@@ -57,8 +57,10 @@ BF16/FP8 and expanded/non-expanded layouts using the default scheduling policy.
 They retain configurable shapes, routing, AIV count and multi-node EP32/64
 launching; see [backend usage](../../docs/machine_backends.md).
 
-Both scripts depend on `source/test_v1_intranode.py`; keep it with the benchmark
-checkout. They load the installed package and record its library identity, while
+Both scripts depend on `tests/clos/common.py` for precision checks and share
+`benchmarks/clos/profiling.py` for measurement. The basic test has no profiling
+options. Keep these helpers with the benchmark checkout.
+The benchmarks load the installed package and record its library identity, while
 the CPU reference comes from the checkout. Do not put an unbuilt checkout ahead
 of the wheel in `PYTHONPATH`.
 

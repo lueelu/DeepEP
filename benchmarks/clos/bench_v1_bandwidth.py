@@ -95,14 +95,15 @@ class V1Operations:
 
 def worker(args):
     # --help and --report-only must work without torch, torch_npu or a device.
-    sys.path.insert(0, str(REPO / "tests/clos/source"))
+    sys.path.insert(0, str(REPO / "tests/clos"))
     import torch
     import torch.distributed as dist
     import torch_npu  # noqa: F401
     from deep_ep._clos_adapter import Buffer
     from deep_ep import topk_idx_t
     from deep_ep.backends.clos import Config
-    import test_v1_intranode as golden
+    import common as golden
+    import profiling
 
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
     if (
@@ -174,7 +175,7 @@ def worker(args):
         operations = V1Operations(buffer, config, idx, weights, args.ep_size * args.experts_per_rank, expanded)
 
         def wait(result):
-            golden._consume_profile_result(result)
+            profiling._consume_profile_result(result)
             return result
 
         def check_dispatch(result, delta=0, cached=False, check_storage=True):
@@ -312,7 +313,7 @@ def worker(args):
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
-                golden._profile_operator(
+                profiling._profile_operator(
                     rank,
                     args,
                     op,
@@ -322,7 +323,7 @@ def worker(args):
                     synchronize_each_iteration=True,
                     before_iteration=before_iteration,
                 )
-            except golden._ProfileComplete:
+            except profiling._ProfileComplete:
                 pass
             profile = shared.parse_profile_collective(
                 dist,

@@ -231,7 +231,7 @@ def git_identity():
     return dict(
         revision=git("rev-parse", "HEAD"),
         dirty=git("status", "--porcelain"),
-        golden=file_identity(REPO / "tests/clos/source/test_v1_intranode.py"),
+        golden=file_identity(REPO / "tests/clos/common.py"),
         sources=[
             file_identity(p)
             for folder in ("deep_ep", "csrc", "kernels", "include", "benchmarks")
@@ -336,13 +336,14 @@ def worker(args):
     # Imports follow argument handling so --help/report-only need no NPU runtime.
     # Use the installed wheel; prepending the checkout can hide its native
     # extensions. Only the independent CPU reference comes from this tree.
-    sys.path.insert(0, str(REPO / "tests/clos/source"))
+    sys.path.insert(0, str(REPO / "tests/clos"))
     import torch
     import torch.distributed as dist
     import torch_npu  # noqa: F401
     from deep_ep._clos_adapter import ElasticBuffer
     from deep_ep import topk_idx_t
-    import test_v1_intranode as golden
+    import common as golden
+    import profiling
 
     rank = int(os.environ["RANK"])
     if int(os.environ["WORLD_SIZE"]) != args.ep_size:
@@ -419,7 +420,7 @@ def worker(args):
             raise ValueError("logical row-byte formula does not match actual dispatch input tensors")
 
         def wait(result):
-            golden._consume_profile_result(result)
+            profiling._consume_profile_result(result)
             return result
 
         def dispatch(value, handle=None):
@@ -571,7 +572,7 @@ def worker(args):
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
-                golden._profile_operator(
+                profiling._profile_operator(
                     rank,
                     args,
                     op,
@@ -581,7 +582,7 @@ def worker(args):
                     synchronize_each_iteration=True,
                     before_iteration=before_iteration,
                 )
-            except golden._ProfileComplete:
+            except profiling._ProfileComplete:
                 pass
             profile = parse_profile_collective(
                 dist,
