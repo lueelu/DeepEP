@@ -12,7 +12,9 @@
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
 SHMEM 固定到 `cann/shmem` 的 dev 提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
 两个子仓库的许可证均为 CANN Open Software License Agreement Version 2.0，原文保留在各自的 `LICENSE` 中。
-MegaMoE 源文件中的 CANN 版权和许可声明保留，许可全文归档于 [cann.LICENSE](cann.LICENSE)，并随启用 MegaMoE 的 wheel 分发。
+全 Clos 后端导入的 Ascend DeepEP 实现采用 CANN Open Software License Agreement Version 2.0。
+该许可与 MegaMoE 使用的 CANN 许可文本相同，统一归档于 [cann.LICENSE](cann.LICENSE)，随 wheel 分发。
+MegaMoE 源文件中的 CANN 版权和许可声明保留。
 第三方许可适用于对应来源内容，不替代项目自身的发行许可；引入依赖时遵循[贡献指南](../CONTRIBUTING.md#许可证)。
 
 基础包按[构建说明](../docs/build.md)准备 SDK 并构建；MegaMoE 的便利入口见[实验使用说明](../experiments/megamoe/README.md)。

@@ -45,7 +45,6 @@ setup(
     license_files=[
         "LICENSE",
         "third-party/deepseek-deepep.LICENSE",
-        "third-party/ascend-deepep.LICENSE",
         "third-party/cann.LICENSE",
     ],
     python_requires=">=3.11",

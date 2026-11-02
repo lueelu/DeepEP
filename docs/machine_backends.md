@@ -2,8 +2,7 @@
 
 一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
 `836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7`。POD 保留本仓已有的 HT、LL、
-实验组件和接口限制。全 Clos 实现从 ascend_deepep 的初始导入 `c0904032`
-更新至 `v1-shared-jetty-scheduler` 分支 `6f9d8c9ef9403a302724ce42cf55810843ffebc3`，包含 V1 Buffer、V2 ElasticBuffer、
+实验组件和接口限制。全 Clos 实现包含 V1 Buffer、V2 ElasticBuffer、
 MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及原有资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
 PR（`CARD_4PMESH`，board `0x6c`）复用迁入实现的 MTE kernel，不另建一份 SHMEM。
@@ -17,7 +16,7 @@ V1 的 `deep_ep.buffers.legacy` 仅保留兼容导入，不存放另一份算子
 ## 构建
 
 继续使用本仓的[编译安装流程](build.md)，同一 Python 环境需有匹配的 Torch/torch_npu。
-不额外安装第二份 SHMEM，不运行原 ascend_deepep 的安装脚本。
+POD 和 Clos 共用一份 SHMEM SDK。
 构建产物包括 `_C`、`_clos_C` 和各自的 device library；二者加载同一 SDK 的 `libshmem.so`。
 本迁移构建面向 Ascend950，统一使用 64-bit top-k 索引。
 

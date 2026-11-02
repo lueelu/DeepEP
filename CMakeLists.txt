@@ -55,7 +55,6 @@ file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/capabilities.json" CONTENT [=[
     "pod": {"module": "deep_ep._C", "device_library": "libdeepep_kernels.so"},
     "clos_only": {
       "module": "deep_ep._clos_C", "device_library": "libdeepep_clos_kernels.so",
-      "source_revision": "c09040328c853a011dfe37c74463c44723db4476",
       "interfaces": ["Buffer", "ElasticBuffer"],
       "topk_index_bits": 64
     }
