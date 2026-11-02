@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -273,8 +274,11 @@ def build_configuration(environment=None):
         raise RuntimeError("pybind11 version differs from dependencies.lock.json")
     version_file = Path(result["ASCEND_HOME_PATH"]) / "compiler/version.info"
     versions = dict(line.split("=", 1) for line in version_file.read_text().splitlines() if "=" in line)
-    if versions.get("Version") != lock["cann_version"]:
-        raise RuntimeError(f"This runtime build requires the CANN {lock['cann_version']} qualification baseline")
+    actual = versions.get("Version", "")
+    release = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[.+-].*)?", actual)
+    minimum = tuple(int(part) for part in lock["cann_version"].split("."))
+    if release is None or tuple(map(int, release.groups())) <= minimum:
+        raise RuntimeError(f"This runtime build requires CANN > {lock['cann_version']}; detected {actual!r}")
     result["cann"] = {
         "version": versions["Version"],
         "timestamp": versions.get("timestamp", "unknown"),

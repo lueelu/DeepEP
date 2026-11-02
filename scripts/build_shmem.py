@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,8 +27,11 @@ def cann_version(expected):
     version = dict(
         line.split("=", 1) for line in (Path(cann) / "compiler/version.info").read_text().splitlines() if "=" in line
     )
-    if version.get("Version") != expected:
-        raise RuntimeError(f"This build requires CANN {expected}")
+    actual = version.get("Version", "")
+    release = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[.+-].*)?", actual)
+    minimum = tuple(int(part) for part in expected.split("."))
+    if release is None or tuple(map(int, release.groups())) <= minimum:
+        raise RuntimeError(f"This build requires CANN > {expected}; detected {actual!r}")
     return version
 
 
