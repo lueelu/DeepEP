@@ -764,8 +764,7 @@ class ElasticBuffer:
                 f"{self.num_bytes}"
             )
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
-        if self._udma_auto_policy is not None:
-            self._udma_auto_policy.validate_num_aiv(resolved_num_sms)
+        policy = self._udma_auto_policy.for_num_aiv(resolved_num_sms) if self._udma_auto_policy is not None else None
         _validate_bool("do_handle_copy", do_handle_copy)
         _validate_bool("do_cpu_sync", resolved_do_cpu_sync)
         if not cached_mode and self.num_max_tokens_per_rank == 0:
@@ -809,8 +808,8 @@ class ElasticBuffer:
                 channel_prefix_matrix = None
             config = Config(
                 num_aiv=resolved_num_sms,
-                udma_peers_per_worker=self._udma_config.udma_peers_per_worker,
-                udma_wqes_per_visit=self._udma_config.udma_wqes_per_visit,
+                udma_peers_per_worker=policy.peers_per_worker if policy else self._udma_config.udma_peers_per_worker,
+                udma_wqes_per_visit=policy.wqes_per_visit if policy else self._udma_config.udma_wqes_per_visit,
             )
             dispatch_args = (
                 x_tensor,
@@ -938,6 +937,7 @@ class ElasticBuffer:
             )
             _record_recv_outputs_on_current_stream(*public_handle)
             handle._buffer_token = self._handle_token
+            handle._udma_policy = policy
             handle._dispatch_layout = dispatch_layout
             handle._dispatch_plan = dispatch_plan
             handle._expand_layout = expand_layout
@@ -1010,15 +1010,14 @@ class ElasticBuffer:
             raise NotImplementedError("intranode V2 does not use RDMA QPs")
         resolved_num_sms = handle.num_sms if num_sms == 0 else num_sms
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
-        if self._udma_auto_policy is not None:
-            self._udma_auto_policy.validate_num_aiv(resolved_num_sms)
+        policy = self._udma_auto_policy.for_num_aiv(resolved_num_sms) if self._udma_auto_policy is not None else None
         if resolved_num_sms != handle.num_sms:
             raise ValueError("combine num_sms must match dispatch EPHandle")
         bias_0, bias_1 = self._unpack_bias(bias)
         config = Config(
             num_aiv=resolved_num_sms,
-            udma_peers_per_worker=self._udma_config.udma_peers_per_worker,
-            udma_wqes_per_visit=self._udma_config.udma_wqes_per_visit,
+            udma_peers_per_worker=policy.peers_per_worker if policy else self._udma_config.udma_peers_per_worker,
+            udma_wqes_per_visit=policy.wqes_per_visit if policy else self._udma_config.udma_wqes_per_visit,
         )
         (
             rank_prefix_matrix,

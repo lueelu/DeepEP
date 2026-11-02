@@ -284,7 +284,7 @@ def check_idle(text, first_device, ep_size):
             raise RuntimeError(f"NPU {device} is busy, unhealthy or cannot be verified; no job started")
 
 
-def effective_udma_config(buffer, config=None):
+def effective_udma_config(buffer, config=None, *, num_aiv=None):
     """Report resolved runtime values rather than caller defaults (V1 uses Config)."""
     result = {
         name: getattr(buffer, name)
@@ -298,10 +298,15 @@ def effective_udma_config(buffer, config=None):
             "udma_qps_per_worker",
         )
     }
+    policy = buffer.udma_auto_policy
+    if policy is not None:
+        if num_aiv is None:
+            num_aiv = config.num_aiv if config is not None else 32
+        policy = policy.for_num_aiv(num_aiv)
     for name in ("udma_peers_per_worker", "udma_wqes_per_visit"):
         result[name] = (
-            getattr(buffer.udma_auto_policy, name.removeprefix("udma_"))
-            if buffer.udma_auto_policy is not None
+            getattr(policy, name.removeprefix("udma_"))
+            if policy is not None
             else getattr(buffer if config is None else config, name)
         )
     result["udma_auto_policy"] = buffer.udma_auto_policy is not None
@@ -388,11 +393,11 @@ def worker(args):
             transport="udma",
             use_1g_huge_pages=args.huge_pages,
         )
-        args.effective_udma_config = effective_udma_config(buffer)
+        args.effective_udma_config = effective_udma_config(buffer, num_aiv=args.num_aiv)
         if rank == 0:
             print("EFFECTIVE_UDMA_CONFIG", json.dumps(args.effective_udma_config, sort_keys=True), flush=True)
         if getattr(args, "udma_auto_policy", False):
-            args.resolved_udma_policy = asdict(buffer.udma_auto_policy)
+            args.resolved_udma_policy = asdict(buffer.udma_auto_policy.for_num_aiv(args.num_aiv))
             if rank == 0:
                 print("AUTO_POLICY", json.dumps(args.resolved_udma_policy, sort_keys=True), flush=True)
         identity = loaded_identity()

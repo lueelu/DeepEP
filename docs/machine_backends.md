@@ -131,8 +131,19 @@ V1/V2 在 UDMA 下默认 `udma_auto_policy=True`，fresh/cached dispatch 与 com
 
 后两档是在 32 个 QP 预算内的推广，不代表所有 EP、核数和路由均已有性能测量。
 策略不修改用户指定的核数：V1 通过 `Config(num_sms=...)`，V2 在 dispatch/combine
-传 `num_sms=...`。核数须为合法偶数，且不少于 `ceil((EP-1)/peers_per_worker) * workers_per_peer`；
-不足会报错。例如 EP128 自动策略需要 32 个发送 AIV，不能使用 20 核。
+传 `num_sms=...`。上表为初始策略；核数不足时，自动将 peers/worker 按 1、2、4、8
+逐档增加，直到 `ceil((EP-1)/peers_per_worker) * workers_per_peer` 不超过核数及 32-QP
+预算。workers/peer、QPs/worker 和 WQEs/visit 保持不变；核数仍须为合法正偶数。
+例如 8 核下 EP4/8/16/32 的 peers/worker 分别为 1/2/2/4；EP128 的 20 核使用
+8 peers/worker、16 个发送 worker。P=8 仍放不下时在下发前报错，例如 EP32 的 2 核。
+
+QP 资源初始化已覆盖上述所有 peer 分组，无需为低核数重建 Buffer。每次调用从不可变的
+初始策略与核数推导有效策略，不改变其他 handle；V2 cached dispatch/combine 沿用
+handle 核数，因此得到同一策略。`buffer.udma_auto_policy` 返回初始策略，
+`.for_num_aiv(n)` 返回指定核数的有效策略；带宽报告记录后者，版本为 `clos-v2`。
+手动模式不做自动调整。这里的核数约束作用于通信、notify 及对应 expand/reduce；
+fresh dispatch 前的独立 layout 仍按专家数和设备能力选核，不受该参数限制。
+实验性的 aggregate pipeline 仍要求 32/64 核。
 V1 未传 `Config` 时使用 `set_num_sms` 设置的当前核数，初始值为 32，不按 handle
 自动继承核数。V2 fresh dispatch 的 `num_sms=0` 使用 32 核；cached dispatch/combine
 的 0 沿用 handle 核数，显式值必须与 handle 一致。`get_theoretical_num_sms()`

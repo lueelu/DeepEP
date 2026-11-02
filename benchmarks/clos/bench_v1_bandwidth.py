@@ -145,7 +145,7 @@ def worker(args):
             transport="udma",
             use_1g_huge_pages=args.huge_pages,
         )
-        args.resolved_udma_policy = asdict(buffer.udma_auto_policy)
+        args.resolved_udma_policy = asdict(buffer.udma_auto_policy.for_num_aiv(config.num_aiv))
         args.effective_udma_config = shared.effective_udma_config(buffer, config)
         if rank == 0:
             print("EFFECTIVE_UDMA_CONFIG", json.dumps(args.effective_udma_config, sort_keys=True), flush=True)

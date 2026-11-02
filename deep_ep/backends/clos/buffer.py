@@ -41,7 +41,8 @@ class Buffer:
     """Own one CANN SHMEM communication session and symmetric workspace.
 
     UDMA defaults to automatic peer/rank host tuning. Core counts
-    still come from Config/set_num_sms; insufficient AIV budgets raise before submission.
+    still come from Config/set_num_sms; fewer cores group more peers per worker.
+    Budgets that cannot fit even eight peers per worker raise before submission.
 
     ``num_bytes`` is the usable communication-workspace capacity. The native
     runtime maps it into one CANN SHMEM heap together with its metadata.

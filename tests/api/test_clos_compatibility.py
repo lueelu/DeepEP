@@ -131,7 +131,7 @@ def test_v1_public_config_reaches_native_argument_conversion(operation):
 
 
 @pytest.mark.parametrize("operation", ["fresh", "cached", "combine"])
-@pytest.mark.parametrize("requested", [None, 0, 32, 64])
+@pytest.mark.parametrize("requested", [None, 0, 8, 32, 64])
 def test_v2_core_defaults_and_handle_inheritance(operation, requested):
     run_host(f"""
         from deep_ep.backends.clos import elastic as m
@@ -141,9 +141,9 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
         class ReadyForDevice(Exception): pass
         counts = []
         policy = resolve_udma_policy(True, 8, 'udma', None, None, None, None, None)
-        def validate(count):
-            policy.validate_num_aiv(count)
+        def resolve(count):
             counts.append(count)
+            return policy.for_num_aiv(count)
         @contextmanager
         def stop_before_device(*args):
             raise ReadyForDevice
@@ -163,11 +163,11 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
             use_fp8_dispatch=False, num_max_tokens_per_rank=129, num_ranks=8, hidden=6144, num_topk=8,
             get_buffer_size_hint=lambda *a: 0, group=None, allow_hybrid_mode=True,
             num_bytes=1, num_device_aiv=64, get_theoretical_num_sms=no_estimate,
-            _udma_auto_policy=SimpleNamespace(validate_num_aiv=validate), transport='udma',
+            _udma_auto_policy=SimpleNamespace(for_num_aiv=resolve), transport='udma',
             _communication_stream=None, _unpack_bias=lambda _: (None, None),
             _udma_config=SimpleNamespace(udma_peers_per_worker=1, udma_wqes_per_visit=8))
         requested = {requested!r}
-        mismatch = {operation!r} != 'fresh' and requested == 32
+        mismatch = {operation!r} != 'fresh' and requested in (8, 32)
         kwargs = {{}} if requested is None else {{'num_sms': requested}}
         try:
             if {operation!r} == 'combine':
@@ -183,4 +183,91 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
             assert mismatch and 'must match' in str(exc), str(exc)
         else:
             raise AssertionError('did not stop at native submission boundary')
+    """)
+
+
+@pytest.mark.parametrize(
+    "ep,cores,peers,workers",
+    [
+        (4, 2, 4, 2),
+        (8, 2, 8, 2),
+        (8, 8, 2, 2),
+        (16, 2, 8, 1),
+        (16, 8, 2, 1),
+        (32, 4, 8, 1),
+        (32, 8, 4, 1),
+        (64, 8, 8, 1),
+        (128, 20, 8, 1),
+    ],
+)
+def test_low_core_policy_preserves_core_count_and_runtime_qp_lanes(ep, cores, peers, workers):
+    run_host(f"""
+        import deep_ep
+        from dataclasses import FrozenInstanceError
+        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
+        base = resolve_udma_policy(True, {ep}, 'udma', None, None, None, None, None)
+        before = base.signature()
+        selected = base.for_num_aiv({cores})
+        assert (selected.peers_per_worker, selected.workers_per_peer) == ({peers}, {workers})
+        assert selected.workers_per_peer == base.workers_per_peer
+        assert selected.qps_per_worker == base.qps_per_worker == 1
+        assert selected.wqes_per_visit == base.wqes_per_visit
+        assert selected.send_workers <= {cores}
+        for config in (deep_ep.Config({cores}), base.config({cores})):
+            effective = base.resolve_config(config, 32)
+            assert effective.num_aiv == {cores}
+            assert effective.udma_peers_per_worker == {peers}
+        assert base.signature() == before  # A later handle cannot change earlier handles' schedule.
+        assert base.for_num_aiv({cores}) == selected
+        assert base.for_num_aiv(32) == base
+        assert base.for_num_aiv(64) == base
+        try: selected.peers_per_worker = 1
+        except FrozenInstanceError: pass
+        else: raise AssertionError('policy is mutable')
+    """)
+
+
+def test_auto_policy_budget_boundaries_and_manual_opt_out():
+    run_host("""
+        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
+        for ep in range(2, 257):
+            base = resolve_udma_policy(True, ep, 'udma', None, None, None, None, None)
+            for cores in range(2, 65, 2):
+                feasible = ((ep - 1 + 7) // 8) * base.workers_per_peer <= min(cores, 32)
+                try: chosen = base.for_num_aiv(cores)
+                except ValueError:
+                    assert not feasible, (ep, cores)
+                else:
+                    assert feasible and chosen.send_workers <= min(cores, 32), (ep, cores)
+                    assert chosen.peers_per_worker in (1, 2, 4, 8)
+                    assert chosen.config(cores).num_aiv == cores
+        base = resolve_udma_policy(True, 32, 'udma', None, None, None, None, None)
+        assert base.for_num_aiv(0) == base
+        for bad in (False, True, 8.0, -2, 1, 3, 66, 2):
+            try: base.for_num_aiv(bad)
+            except (TypeError, ValueError): pass
+            else: raise AssertionError(('invalid/unrepresentable budget accepted', bad))
+        assert base.for_num_aiv(0) == base
+        assert resolve_udma_policy(False, 16, 'udma', 'peer', 'rank', 'rank', None, None,
+                                   workers=1, qps=1, peers=1, wqes=8) is None
+    """)
+
+
+def test_bandwidth_reports_the_operation_policy_not_the_buffer_default():
+    run_host("""
+        sys.path.insert(0, 'benchmarks/clos')
+        from bench_v2_bandwidth import effective_udma_config
+        from deep_ep.backends.clos.config import Config
+        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
+        base = resolve_udma_policy(True, 8, 'udma', None, None, None, None, None)
+        buffer = SimpleNamespace(udma_auto_policy=base, udma_schedule='peer',
+            udma_dispatch_peer_order='rank', udma_combine_peer_order='rank',
+            udma_ranks_per_group=None, udma_peers_per_group_per_worker=None,
+            udma_workers_per_peer=2, udma_qps_per_worker=1)
+        for config in (effective_udma_config(buffer, num_aiv=8), effective_udma_config(buffer, Config(8))):
+            assert config['udma_peers_per_worker'] == 2
+            assert config['udma_workers_per_peer'] == 2
+            assert config['udma_wqes_per_visit'] == 8
+        assert effective_udma_config(buffer, num_aiv=32)['udma_peers_per_worker'] == 1
+        assert base.peers_per_worker == 1
     """)
