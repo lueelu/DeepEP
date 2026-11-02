@@ -586,6 +586,7 @@ def _profile_operator(
     *,
     sample_callback=None,
     guard_iters: int = 0,
+    synchronize_each_iteration: bool = False,
 ) -> None:
     if guard_iters < 0 or (guard_iters and sample_callback is None):
         raise ValueError("profile guards require a sample callback and a nonnegative count")
@@ -593,6 +594,8 @@ def _profile_operator(
 
     for _ in range(args.profile_warmup):
         _consume_profile_result(fn())
+        if synchronize_each_iteration:
+            torch_npu.npu.synchronize()
     torch_npu.npu.synchronize()
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
@@ -638,6 +641,12 @@ def _profile_operator(
                 sample_callback(sample, lambda: _consume_profile_result(fn()))
             else:
                 _consume_profile_result(fn())
+            # Stream waits only order device work. Drain each invocation on the
+            # host as well so released large outputs can be reused instead of
+            # accumulating while Python queues subsequent iterations. Keep this
+            # outside the callback's end marker and all measured kernel times.
+            if synchronize_each_iteration:
+                torch_npu.npu.synchronize()
         torch_npu.npu.synchronize()
         prof.step()
     prof.stop()
@@ -650,7 +659,10 @@ def _profile_operator(
             if sample_callback is not None
             else f"iters_per_step={args.profile_iters}"
         )
-        print(f"profile operator {operator} written to {args.profile_dir}: {detail}")
+        print(
+            f"profile operator {operator} written to {args.profile_dir}: "
+            f"{detail}; host_sync_each_iteration={synchronize_each_iteration}"
+        )
     raise _ProfileComplete
 
 

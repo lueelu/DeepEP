@@ -39,5 +39,9 @@
   },
   "kernel_hash_format": "Original imported Git blob bytes (LF), keyed by current paths; local integration and kernel adaptations may differ.",
   "original_import_revision": "c09040328c853a011dfe37c74463c44723db4476",
-  "source_shmem_revision": "4dd80e2129da42bd773982c2bb3758af1ed0bba8"
+  "source_shmem_revision": "4dd80e2129da42bd773982c2bb3758af1ed0bba8",
+  "source_patch_revisions": {
+    "dispatch_count_readback_and_initialization": "15d1872e7c00e95d58ca40681e52ec119f680ae6",
+    "profiling_iteration_completion": "8417f47891b794f51769318ce52d47abe1088cfa"
+  }
 }

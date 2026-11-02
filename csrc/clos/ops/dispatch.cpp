@@ -27,6 +27,8 @@ constexpr int64_t kDeepEpLayoutRanksPerWorker = 8;
 constexpr int64_t kMaxDispatchAiv = ascend_deepep::platform::kMaxNumAiv;
 constexpr int64_t kDispatchWorkspaceAlignment = 32;
 constexpr int64_t kNotifyWorkspaceAlignment = 512;
+// Keep both Notify outputs aligned while copying their shared storage once.
+constexpr int64_t kNotifyExpertCountsOffset = kDispatchWorkspaceAlignment / sizeof(int32_t);
 constexpr int64_t kDispatchStageBytes = ascend_deepep::platform::kDispatchStageBytes;
 constexpr int64_t kMaxDispatchTopk = 128;
 constexpr int64_t kDispatchUdmaCompletionSignalBytes = ascend_deepep::udma::kSignalBytes;
@@ -231,7 +233,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
     auto num_tokens_per_expert_storage = allocator.Empty({expert_stride}, int_options);
     auto num_tokens_per_rank = num_tokens_per_rank_storage.narrow(0, 0, world_size);
     auto num_tokens_per_expert = num_tokens_per_expert_storage.narrow(0, 0, num_experts);
-    auto is_token_in_rank = allocator.Zeros({num_tokens, world_size}, bool_options);
+    // Layout writes every route row, including all-invalid rows.
+    auto is_token_in_rank = allocator.Empty({num_tokens, world_size}, bool_options);
     auto scratch_buffer =
         allocator.Empty({static_cast<int64_t>(block_dim) * (rank_stride + expert_stride)}, int_options);
 
@@ -452,10 +455,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     auto int_options = is_token_in_rank.options().dtype(torch::kInt32);
     auto rank_prefix_matrix = cached_rank_prefix_matrix.has_value()
                                   ? *cached_rank_prefix_matrix
-                                  : allocator.Zeros({world_size, world_size}, int_options);
+                                  : allocator.Empty({world_size, world_size}, int_options);
     auto channel_prefix_matrix = cached_channel_prefix_matrix.has_value()
                                      ? *cached_channel_prefix_matrix
-                                     : allocator.Zeros({world_size, num_channels}, int_options);
+                                     : allocator.Empty({world_size, num_channels}, int_options);
     TORCH_CHECK(rank_prefix_matrix.dim() == 2 && rank_prefix_matrix.size(0) == world_size &&
                     rank_prefix_matrix.size(1) == world_size,
                 "rank_prefix_matrix must have shape [world_size, world_size]");
@@ -469,7 +472,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // is known. Normal Notify writes every element; cached dispatch reuses
     // the caller's existing handle and does not gather a new prefix matrix.
     auto recv_channel_prefix_matrix =
-        cached_mode ? allocator.Empty({0}, int_options) : allocator.Zeros({world_size, num_channels}, int_options);
+        cached_mode ? allocator.Empty({0}, int_options) : allocator.Empty({world_size, num_channels}, int_options);
 
     // Notify produces send_head and the private stable token lists for UDMA.
     // The low-level cached+topk API needs a temporary head; ordinary Python
@@ -503,10 +506,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     }
 
     // Only fresh notify produces counts. Cached calls use the handle counts.
-    torch::Tensor notify_num_recv_tokens, notify_num_recv_tokens_per_expert;
+    torch::Tensor notify_counts, notify_num_recv_tokens, notify_num_recv_tokens_per_expert;
     if (!cached_mode) {
-        notify_num_recv_tokens = allocator.Zeros({1}, int_options);
-        notify_num_recv_tokens_per_expert = allocator.Zeros({local_expert_stride}, int_options);
+        // Notify overwrites both outputs, including expert stride padding.
+        // Views retain storage for V2 handles and share its stream record.
+        // No consumer interprets the alignment gap.
+        notify_counts = allocator.Empty({kNotifyExpertCountsOffset + local_expert_stride}, int_options);
+        notify_num_recv_tokens = notify_counts.narrow(0, 0, 1);
+        notify_num_recv_tokens_per_expert = notify_counts.narrow(0, kNotifyExpertCountsOffset, local_expert_stride);
     }
     if (public_handle != nullptr) {
         TORCH_CHECK(!cached_mode && topk_idx.has_value(), "public handle is fresh-dispatch only");
@@ -593,12 +600,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     } else if (num_worst_tokens > 0) {
         num_recv_tokens = num_worst_tokens;
     } else {
-        auto recv_tokens_cpu = notify_num_recv_tokens.cpu();
-        num_recv_tokens = static_cast<int64_t>(recv_tokens_cpu.item<int32_t>());
+        // One blocking readback supplies the exact output size and expert counts.
+        // Fixed-capacity and cached paths still skip this readback.
+        auto recv_counts_cpu = notify_counts.cpu();
+        const int32_t* recv_counts = recv_counts_cpu.data_ptr<int32_t>();
+        num_recv_tokens = static_cast<int64_t>(recv_counts[0]);
         TORCH_CHECK(num_recv_tokens >= 0, "notify_dispatch returned a negative receive count");
 
-        auto recv_expert_counts_cpu = notify_num_recv_tokens_per_expert.cpu();
-        const int32_t* recv_expert_counts = recv_expert_counts_cpu.data_ptr<int32_t>();
+        const int32_t* recv_expert_counts = recv_counts + kNotifyExpertCountsOffset;
         num_recv_tokens_per_expert_list.reserve(static_cast<std::size_t>(num_local_experts));
         // The notify kernel returns raw counts; the public list is aligned here.
         for (int64_t expert = 0; expert < num_local_experts; ++expert) {
@@ -643,8 +652,9 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         }
     }
 
-    auto recv_src_idx =
-        cached_mode ? allocator.Empty({0}, int_options) : allocator.Zeros({num_recv_tokens}, int_options);
+    // Dispatch writes every valid source index. Fixed-capacity tails are
+    // unspecified; consumers select valid rows by rank/channel prefixes.
+    auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
                            num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
                            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,

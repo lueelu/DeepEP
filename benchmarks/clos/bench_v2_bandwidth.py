@@ -561,7 +561,7 @@ def worker(args):
         )
         for op, fn in functions.items():
             dist.barrier()
-            print(f"PROFILE_BEGIN rank={rank} op={op}", flush=True)
+            print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
                 golden._profile_operator(
@@ -571,6 +571,7 @@ def worker(args):
                     flush_cache.wrap(fn),
                     sample_callback=ProfileSamples(torch),
                     guard_iters=PROFILE_GUARD_ITERS,
+                    synchronize_each_iteration=True,
                 )
             except golden._ProfileComplete:
                 pass
@@ -587,10 +588,12 @@ def worker(args):
                 sample_markers=True,
             )
             # Independent caller-stream samples; do not subtract from profiler kernel times.
+            profile["sampling"]["host_sync_each_iteration"] = True
             dist.barrier()
             for _ in range(args.warmup):
                 flush_cache()
                 wait(fn())
+                torch.npu.synchronize()
             torch.npu.synchronize()
             caller = []
             for _ in range(args.iterations):

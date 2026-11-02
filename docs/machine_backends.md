@@ -178,6 +178,11 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 32 --nnodes 2 --node-rank
 两个入口共用 `bandwidth_multinode.py`、`route_workloads.py` 和 `stage_metrics.py`，
 分别负责多机协调与结果收集、路由生成、采样和阶段计时。
 
+V1/V2 带宽脚本在每轮预热和 profiling 调用后等待本卡 NPU 执行完成，再提交下一轮，
+避免未完成输出和分配持续积压。该 Host 等待位于采样结束标记之外，不计入 kernel
+带宽分母；报告通过 `sampling.host_sync_each_iteration=true` 记录此测量方式。
+这不是逐轮全卡 barrier，也不保证各 rank 同时启动 kernel。
+
 CLOS 原生实现集中在 `csrc/clos/`：`bindings/` 提供 Python 注册，`runtime/`
 管理 Buffer 和 SHMEM，`ops/` 处理参数、tensor 分配和 kernel 下发，`common/`
 存放 host/device 共用定义。设备实现位于 `kernels/`，按 dispatch、combine、notify、

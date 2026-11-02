@@ -4,6 +4,7 @@ import contextlib
 import ast
 import os
 import tempfile
+from itertools import product
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -34,15 +35,19 @@ class BandwidthCacheTest(unittest.TestCase):
             body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
             type_ignores=[],
         )
-        for guarded in (False, True):
-            with self.subTest(guarded=guarded), tempfile.TemporaryDirectory() as tmp:
+        for guarded, synchronize in product((False, True), repeat=2):
+            with self.subTest(guarded=guarded, synchronize=synchronize), tempfile.TemporaryDirectory() as tmp:
                 profiler = Mock()
                 prof = Mock()
                 profiler.profile.return_value = prof
-                consume, invoke = Mock(), Mock()
+                calls = []
+                consume = Mock(side_effect=lambda _: calls.append("consume"))
+                invoke = Mock(side_effect=lambda: calls.append("invoke"))
+                npu = Mock()
+                npu.synchronize.side_effect = lambda: calls.append("sync")
                 env = dict(
                     os=os,
-                    torch_npu=SimpleNamespace(profiler=profiler, npu=Mock()),
+                    torch_npu=SimpleNamespace(profiler=profiler, npu=npu),
                     _consume_profile_result=consume,
                     _ProfileComplete=RuntimeError,
                 )
@@ -51,10 +56,14 @@ class BandwidthCacheTest(unittest.TestCase):
 
                 def sample(index, callback):
                     ids.append(index)
+                    calls.append("sample_start")
                     callback()
+                    calls.append("sample_end")
 
                 args = SimpleNamespace(profile_dir=tmp, profile_warmup=3, profile_iters=30)
                 options = dict(sample_callback=sample, guard_iters=PROFILE_GUARD_ITERS) if guarded else {}
+                if synchronize:
+                    options["synchronize_each_iteration"] = True
                 with self.assertRaises(RuntimeError):
                     env["_profile_operator"](1, args, "cached-dispatch", invoke, **options)
                 self.assertEqual(invoke.call_count, 63 + (4 if guarded else 0))
@@ -62,6 +71,17 @@ class BandwidthCacheTest(unittest.TestCase):
                 self.assertEqual(ids, list(range(-2, 32)) if guarded else [])
                 self.assertEqual(prof.step.call_count, 2)
                 prof.stop.assert_called_once()
+                self.assertEqual(npu.synchronize.call_count, 4 + (invoke.call_count if synchronize else 0))
+                if synchronize:
+                    # No next invocation may be submitted until the previous
+                    # one is consumed and host-drained; active end markers must
+                    # precede that wait so it stays outside the sample.
+                    for i, call in enumerate(calls):
+                        if call == "consume":
+                            tail = calls[i + 1 :]
+                            if tail[0] == "sample_end":
+                                tail = tail[1:]
+                            self.assertEqual(tail[0], "sync")
 
     def test_sample_markers_bracket_completion_without_host_sync(self):
         calls = []

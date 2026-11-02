@@ -266,6 +266,11 @@ def run_rank(rank, args):
         golden._assert_equal("src_idx", layout[3][:count], ref["recv_src_idx"])
         golden._assert_equal("send_head", layout[5], ref["send_head"])
         golden._assert_equal("recv_channel_prefix", layout[2], ref["recv_channel_prefix"])
+        if args.fixed_capacity and count < layout[3].numel():
+            # Poison unused capacity: cached dispatch and both combines must
+            # select valid rows by prefixes, never by a zero/sentinel tail.
+            layout[3][count:].fill_(torch.iinfo(torch.int32).min)
+            torch_npu.npu.synchronize()
         owned = recv.clone()
         bias0 = torch.full_like(x, 0.5)
         bias1 = (
