@@ -7,7 +7,7 @@ Modified by Joyce_An 2026
 
 `deep_ep.ElasticBuffer` 提供 V2 dispatch/combine。高吞吐（HT）和低时延（LL）使用相同方法，输入、权重、布局及路径选择见 [Elastic 接口](elastic.md)。本页说明核心 `deep_ep` 的公共对象、初始化、资源生命周期和兼容范围。MegaMoE 的 `SymmBuffer/StoreGroup` 和 EpGmmFused 的 UDMA 域使用独立接口，分别见 [MegaMoE](../experiments/megamoe/README.md)与 [EpGmmFused](../experiments/ep_gmm_fused/README.md)。
 
-本页原有能力表与参数限制描述 POD 路径。新增 Clos V1/V2、自动选择和使用方式见
+下文初始化方式与算子参数限制描述 POD 路径；公共对象表注明后端差异。新增 Clos V1/V2、自动选择和使用方式见
 [机型后端说明](machine_backends.md)，不能把 POD 的限制套到 Clos 路径。
 
 ## 公共对象
@@ -15,8 +15,8 @@ Modified by Joyce_An 2026
 | 对象 | 导入路径 | 用途 |
 | --- | --- | --- |
 | `ElasticBuffer`、`EPHandle` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.elastic` | V2 通信资源、dispatch/combine 及配对路由信息 |
-| `Buffer` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.legacy` | V1 资源构造、通信流、事件与销毁；V1 通信方法不在本版本支持范围内 |
-| `Config` | `deep_ep` | 保留配置签名；构造和容量查询报 `NotImplementedError` |
+| `Buffer` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.legacy` | 按机型选择 V1 后端；Clos/CARD 支持高吞吐 dispatch/combine，POD 仅支持资源构造、通信流、事件与销毁 |
+| `Config` | `deep_ep` | Clos V1 的核数、分块配置与容量查询，默认 32 AIV；不表示 POD 已支持 V1 通信 |
 | `EventHandle`、`EventOverlap` | `deep_ep`、`deep_ep.utils`、`deep_ep.utils.event` | 记录 NPU 事件、建立流依赖和保留相关 Tensor |
 
 同一对象的不同导入路径指向同一个类。普通 `import deep_ep` 不加载 Torch、torch_npu 或原生扩展；通信运行时调用按需加载当前安装目录的扩展并校验 SHMEM 库身份。普通导入成功不表示运行环境、算法或设备验证通过。

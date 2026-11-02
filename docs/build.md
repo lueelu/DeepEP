@@ -12,7 +12,9 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
 ## 前置条件
 
 - Linux、Python ≥3.11、C++17 编译器、CMake ≥3.20，以及 Make 或 Ninja；构建工具须在 PATH 中。
-- CANN 9.2.0 与配套驱动/框架，目标 Ascend950；构建仅接受该 CANN 版本与目标架构。
+- CANN 版本须大于 9.2.0（例如 9.2.1），并配套匹配的驱动/框架，目标 Ascend950。
+  SHMEM 构建脚本和运行时构建均检查主、次、补丁版本号；9.2.0 本身不通过检查。
+  通过版本检查不等于该环境已完成编译与设备验证。
 - 同一构建 Python 环境安装匹配的 Torch/torch_npu；迁入的 Clos Host 扩展需要其头文件和库，构建指纹记录框架版本及 C++ ABI。
 - 由本仓子模块构建或使用外部固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。

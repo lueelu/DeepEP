@@ -18,9 +18,10 @@ V1 的 `deep_ep.buffers.legacy` 仅保留兼容导入，不存放另一份算子
 另一份原生库，也不恢复已移除的参数。安装时同一 Python 环境只保留一种 DeepEP
 发行包；官方 DeepEP 与本仓共享 `deep_ep` 导入名，应使用独立环境。
 
-Clos 的公开 Config 和 fresh dispatch 默认使用 32 AIV；显式核数继续校验。
-cached dispatch 和 combine 未指定核数时沿用 handle 中的核数，包括显式 64 核的
-handle。POD 的调度不受这一默认值调整影响。
+公开 Config 默认使用 32 AIV。Clos V1 未传 Config 时使用 `set_num_sms` 设置的
+当前核数，初始值为 32；V2 fresh dispatch 的默认核数为 32，cached dispatch 和
+combine 未指定核数时沿用 handle 中的核数，包括显式 64 核的 handle。
+显式核数继续校验；POD 的调度不受这一默认值调整影响。
 
 ## 构建
 
@@ -132,9 +133,11 @@ V1/V2 在 UDMA 下默认 `udma_auto_policy=True`，fresh/cached dispatch 与 com
 策略不修改用户指定的核数：V1 通过 `Config(num_sms=...)`，V2 在 dispatch/combine
 传 `num_sms=...`。核数须为合法偶数，且不少于 `ceil((EP-1)/peers_per_worker) * workers_per_peer`；
 不足会报错。例如 EP128 自动策略需要 32 个发送 AIV，不能使用 20 核。
-V1 保留 `Config` / `set_num_sms` 的缺省语义；V2 fresh dispatch 的 `num_sms=0`
-保留原 `get_theoretical_num_sms()` 估算，cached dispatch/combine 的 0 沿用 handle 核数。
-自动带宽脚本默认显式传 32 核，这与库的缺省核数选择不同。
+V1 未传 `Config` 时使用 `set_num_sms` 设置的当前核数，初始值为 32，不按 handle
+自动继承核数。V2 fresh dispatch 的 `num_sms=0` 使用 32 核；cached dispatch/combine
+的 0 沿用 handle 核数，显式值必须与 handle 一致。`get_theoretical_num_sms()`
+仍可供调用方查询，但不参与 fresh dispatch 的默认选核。
+带宽脚本默认显式传 32 核，与 V2 fresh dispatch 的库默认值一致。
 
 自动模式下显式传入的策略参数不改变结果；与有效值不同会在 rank 0 记录 warning。
 要调优，请在构造 Buffer 时设 `udma_auto_policy=False`，完整指定所用策略参数。例如 V2：
@@ -235,5 +238,7 @@ SDK 初始化状态，禁止覆盖另一后端的 QP/heap 配置。必须在整�
 可作为 Clos 的 previous_event/epilogue 依赖，等待语义和原有 stream 顺序保留。
 
 业务代码通过 `deep_ep.Buffer` / `deep_ep.ElasticBuffer` 选择后端。
-后端专用测试直接导入 `deep_ep.backends.clos`，不会受开发机的自动分类影响。
+Clos 带宽入口通过 `deep_ep._clos_adapter` 使用固定的 Clos 后端，不经过公开入口的
+自动机型选择；`check_machine.py` 的检查结果不会改变这些脚本的后端。
+后端专用测试也可直接导入 `deep_ep.backends.clos`。
 导入、CPU 契约检查、编译成功都不等于 NPU 精度或性能验证通过。
