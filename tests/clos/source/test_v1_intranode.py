@@ -587,12 +587,15 @@ def _profile_operator(
     sample_callback=None,
     guard_iters: int = 0,
     synchronize_each_iteration: bool = False,
+    before_iteration=None,
 ) -> None:
     if guard_iters < 0 or (guard_iters and sample_callback is None):
         raise ValueError("profile guards require a sample callback and a nonnegative count")
     os.makedirs(args.profile_dir, exist_ok=True)
 
     for _ in range(args.profile_warmup):
+        if before_iteration is not None:
+            before_iteration()
         _consume_profile_result(fn())
         if synchronize_each_iteration:
             torch_npu.npu.synchronize()
@@ -637,6 +640,9 @@ def _profile_operator(
     for step in range(2):
         guards = guard_iters if step == 1 and sample_callback is not None else 0
         for sample in range(-guards, args.profile_iters + guards):
+            # Keep rank alignment outside sample markers, including warmup and guards.
+            if before_iteration is not None:
+                before_iteration()
             if step == 1 and sample_callback is not None:
                 sample_callback(sample, lambda: _consume_profile_result(fn()))
             else:

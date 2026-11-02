@@ -35,8 +35,11 @@ class BandwidthCacheTest(unittest.TestCase):
             body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
             type_ignores=[],
         )
-        for guarded, synchronize in product((False, True), repeat=2):
-            with self.subTest(guarded=guarded, synchronize=synchronize), tempfile.TemporaryDirectory() as tmp:
+        for guarded, synchronize, align in product((False, True), repeat=3):
+            with (
+                self.subTest(guarded=guarded, synchronize=synchronize, align=align),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
                 profiler = Mock()
                 prof = Mock()
                 profiler.profile.return_value = prof
@@ -64,6 +67,9 @@ class BandwidthCacheTest(unittest.TestCase):
                 options = dict(sample_callback=sample, guard_iters=PROFILE_GUARD_ITERS) if guarded else {}
                 if synchronize:
                     options["synchronize_each_iteration"] = True
+                before_iteration = Mock(side_effect=lambda: calls.append("rank_barrier"))
+                if align:
+                    options["before_iteration"] = before_iteration
                 with self.assertRaises(RuntimeError):
                     env["_profile_operator"](1, args, "cached-dispatch", invoke, **options)
                 self.assertEqual(invoke.call_count, 63 + (4 if guarded else 0))
@@ -72,6 +78,11 @@ class BandwidthCacheTest(unittest.TestCase):
                 self.assertEqual(prof.step.call_count, 2)
                 prof.stop.assert_called_once()
                 self.assertEqual(npu.synchronize.call_count, 4 + (invoke.call_count if synchronize else 0))
+                self.assertEqual(before_iteration.call_count, invoke.call_count if align else 0)
+                if align:
+                    for i, call in enumerate(calls):
+                        if call == "sample_start" or (call == "invoke" and calls[i - 1] != "sample_start"):
+                            self.assertEqual(calls[i - 1], "rank_barrier")
                 if synchronize:
                     # No next invocation may be submitted until the previous
                     # one is consumed and host-drained; active end markers must

@@ -181,7 +181,12 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 32 --nnodes 2 --node-rank
 V1/V2 带宽脚本在每轮预热和 profiling 调用后等待本卡 NPU 执行完成，再提交下一轮，
 避免未完成输出和分配持续积压。该 Host 等待位于采样结束标记之外，不计入 kernel
 带宽分母；报告通过 `sampling.host_sync_each_iteration=true` 记录此测量方式。
-这不是逐轮全卡 barrier，也不保证各 rank 同时启动 kernel。
+Combine 的预热、profiling（含边界保护轮次）及独立 Event 计时还会在每次调用前，
+先等待本卡 NPU 完成，再通过 Buffer 的 Host SHMEM barrier 对齐所有 rank。
+V1 使用 `buffer.barrier()`，V2 使用 `buffer.runtime.barrier()`；该对齐位于采样标记、
+Event 起点及可选缓存清理之前，不计入耗时，也不改变算子内部同步。
+SHMEM Host barrier 内部的设备 barrier kernel 仅在采样区间之外排除，原始 profiler 仍保留它。
+它减少 rank 间的启动偏差，但不保证 kernel 同时启动；不同对齐条件下的性能需区分比较。
 
 CLOS 原生实现集中在 `csrc/clos/`：`bindings/` 提供 Python 注册，`runtime/`
 管理 Buffer 和 SHMEM，`ops/` 处理参数、tensor 分配和 kernel 下发，`common/`

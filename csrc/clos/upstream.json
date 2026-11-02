@@ -42,6 +42,7 @@
   "source_shmem_revision": "4dd80e2129da42bd773982c2bb3758af1ed0bba8",
   "source_patch_revisions": {
     "dispatch_count_readback_and_initialization": "15d1872e7c00e95d58ca40681e52ec119f680ae6",
-    "profiling_iteration_completion": "8417f47891b794f51769318ce52d47abe1088cfa"
+    "profiling_iteration_completion": "8417f47891b794f51769318ce52d47abe1088cfa",
+    "profiling_combine_rank_alignment": "57897da81bbd5a6836262ace88cecb922c9012d3"
   }
 }

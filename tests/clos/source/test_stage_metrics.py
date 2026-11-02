@@ -229,6 +229,53 @@ class StageMetricsTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         parse_profile(root, op, expanded, 2, 0, 32, api=api, flush_l2_cache=flush)
 
+    def test_shmem_alignment_excludes_only_known_combine_barriers_outside_samples(self):
+        barrier = "_Z24barrier_on_stream_kernelim"
+        for api in ("v1", "v2"):
+            sequence = (
+                ["v1_combine_udma_kernel"]
+                if api == "v1"
+                else ["v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+            )
+            for damage in (None, "unknown", "device", "step", "crossing"):
+                with self.subTest(api=api, damage=damage), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.make_guarded_profile(root, sequence)
+                    baseline = parse_profile(root, "combine_unweighted", False, 2, 0, 32, api=api, sample_markers=True)
+                    path = root / "kernel_details.csv"
+                    with path.open(encoding="utf-8-sig") as f:
+                        rows = list(csv.DictReader(f))
+                    gap = dict(rows[0], Name=barrier)
+                    gap["Start Time(us)"] = "185"
+                    if damage == "unknown":
+                        gap["Name"] = "unexpected_kernel"
+                    if damage == "device":
+                        gap["Device_id"] = "1"
+                    if damage == "step":
+                        gap["Step Id"] = "2"
+                    if damage == "crossing":
+                        gap["Duration(us)"] = "20"
+                    rows.append(gap)
+                    with path.open("w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=rows[0])
+                        writer.writeheader()
+                        writer.writerows(rows)
+                    if damage:
+                        with self.assertRaises(ValueError):
+                            parse_profile(root, "combine_unweighted", False, 2, 0, 32, api=api, sample_markers=True)
+                    else:
+                        result = parse_profile(
+                            root, "combine_unweighted", False, 2, 0, 32, api=api, sample_markers=True
+                        )
+                        self.assertEqual(result["samples"], baseline["samples"])
+                        self.assertEqual(result["kernels"], baseline["kernels"])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.make_guarded_profile(root, [barrier, "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"])
+            result = parse_profile(root, "combine_unweighted", False, 2, 0, 32, sample_markers=True)
+            self.assertIn(barrier, result["kernel_sequence"])
+            self.assertEqual(float(result["samples"][0]["other_us"]), 2.125)
+
     def test_guarded_capture_rejects_missing_markers_and_interior_damage(self):
         for damage in ("marker", "flow", "duplicate", "interior", "shift", "overlap"):
             with self.subTest(damage=damage), tempfile.TemporaryDirectory() as tmp:

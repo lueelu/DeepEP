@@ -212,7 +212,7 @@ def byte_ledger(counts, rank, *, tokens, hidden, topk, dtype, idx_bytes, op):
     )
 
 
-def select_profile_samples(rows, trace, iterations, device):
+def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barrier=False):
     """Select fixed IDs 0..N-1 using caller-stream device events, not row count.
 
     Guards may be clipped by capture boundaries. A missing marker/kernel in a
@@ -300,6 +300,16 @@ def select_profile_samples(rows, trace, iterations, device):
         if not overlap:
             if begin < intervals[0][0] or begin >= intervals[-1][1]:
                 continue  # explicitly outside the fixed measured interval
+            # CANN SHMEM's blocking Host barrier launches this device kernel.
+            # Only benchmark alignment in a gap is excluded; an in-sample
+            # barrier is retained, and unknown/out-of-device tasks still fail.
+            if (
+                allow_shmem_barrier
+                and row["Name"] == "_Z24barrier_on_stream_kernelim"
+                and str(row["Device_id"]).strip() == str(device)
+                and str(row["Step Id"]).strip() == "1"
+            ):
+                continue
             raise ValueError("unassigned kernel between measured samples")
         if len(overlap) != 1:
             raise ValueError("kernel spans profile samples")
@@ -428,7 +438,7 @@ def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flus
     sample_intervals, sample_host_ranges, discarded = [], None, 0
     if sample_markers:
         rows, sample_intervals, sample_host_ranges, discarded = select_profile_samples(
-            rows, traces[0], iterations, device
+            rows, traces[0], iterations, device, allow_shmem_barrier=op.startswith("combine")
         )
     flush_intervals, flush_kernels = [], []
     if flush_l2_cache:

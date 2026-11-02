@@ -300,8 +300,15 @@ def worker(args):
             combine_unweighted=lambda: combine(False),
             combine_weighted=lambda: combine(True),
         )
+
+        def align_combine_ranks():
+            # Host SHMEM rendezvous after local device completion; outside all timers.
+            torch.npu.synchronize()
+            buffer.barrier()
+
         for op, fn in functions.items():
             dist.barrier()
+            before_iteration = align_combine_ranks if op.startswith("combine") else None
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
@@ -313,6 +320,7 @@ def worker(args):
                     sample_callback=shared.ProfileSamples(torch),
                     guard_iters=shared.PROFILE_GUARD_ITERS,
                     synchronize_each_iteration=True,
+                    before_iteration=before_iteration,
                 )
             except golden._ProfileComplete:
                 pass
@@ -332,6 +340,8 @@ def worker(args):
             profile["sampling"]["host_sync_each_iteration"] = True
             dist.barrier()
             for _ in range(args.warmup):
+                if before_iteration is not None:
+                    before_iteration()
                 flush_cache()
                 wait(fn())
                 torch.npu.synchronize()
@@ -339,6 +349,8 @@ def worker(args):
             caller = []
             for _ in range(args.iterations):
                 start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+                if before_iteration is not None:
+                    before_iteration()
                 flush_cache()
                 start.record()
                 result = wait(fn())
