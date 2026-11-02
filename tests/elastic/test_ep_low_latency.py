@@ -629,7 +629,7 @@ def measure(invoke, args, operation, profile_dir, progress=None):
     for _ in range(args.warmup):
         completion_boundary(args)
         output = trace_call(args, f"{operation}.invoke", invoke)
-        trace_call(args, f"{operation}.event.wait", output[-1].current_stream_wait)
+        assert output[-1].event is None
         trace_call(args, "device.synchronize", torch.npu.synchronize)
         del output
     completion_boundary(args)
@@ -755,7 +755,7 @@ def run_case(buffer, args, rank, world, m, mode):
     progress("dispatch.check")
     completion_boundary(args)
     recv, recv_idx, recv_weights, handle, event = trace_call(args, "dispatch.invoke", dispatch)
-    trace_call(args, "dispatch.event.wait", event.current_stream_wait)
+    assert event.event is None
     trace_call(args, "device.synchronize", torch.npu.synchronize)
 
     def check_backend():
@@ -804,7 +804,7 @@ def run_case(buffer, args, rank, world, m, mode):
         out, returned_weights, completed = trace_call(
             args, "combine.invoke", buffer.combine, expert_output, handle, topk_weights=None
         )
-        trace_call(args, "combine.event.wait", completed.current_stream_wait)
+        assert completed.event is None
         trace_call(args, "device.synchronize", torch.npu.synchronize)
 
         def check_combine():
@@ -836,7 +836,7 @@ def run_case(buffer, args, rank, world, m, mode):
         progress("dispatch.refresh")
         completion_boundary(args)
         recv, _, _, handle, event = trace_call(args, "dispatch.invoke", dispatch)
-        trace_call(args, "dispatch.event.wait", event.current_stream_wait)
+        assert event.event is None
         trace_call(args, "device.synchronize", torch.npu.synchronize)
         expert_output = prepare_experts(recv, counts, rank, args.num_experts, world, expert_dtype)
         result["combine"] = measure(

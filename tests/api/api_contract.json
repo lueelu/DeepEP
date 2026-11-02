@@ -1320,6 +1320,15 @@
               "kind": "POSITIONAL_OR_KEYWORD"
             }
           ]
+        },
+        "wait": {
+          "kind": "method",
+          "parameters": [
+            {
+              "name": "self",
+              "kind": "POSITIONAL_OR_KEYWORD"
+            }
+          ]
         }
       }
     },

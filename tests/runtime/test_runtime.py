@@ -60,7 +60,7 @@ def test_record_wait_hook_and_release(event_backend):
         log.append("body")
     assert log == [("record", "consumer"), "body", ("wait", "consumer"), "hook"]
     assert wrapper.event is None
-    with pytest.raises(RuntimeError, match="released"):
+    with pytest.raises(AssertionError):
         wrapper.current_stream_wait()
 
 
@@ -79,7 +79,7 @@ def test_event_failure_does_not_drop_resources_or_hook(event_backend):
     wrapper.event._event.wait = fail
     with pytest.raises(RuntimeError, match="wait fault"):
         wrapper.current_stream_wait(release_handle=True)
-    assert wrapper.event is not None and wrapper._hook is hook
+    assert wrapper.event is not None and wrapper.hook_after_wait is hook
 
 
 def test_context_wait_runs_on_body_exception(event_backend):
@@ -93,17 +93,14 @@ def test_context_wait_runs_on_body_exception(event_backend):
 
 def test_empty_event_wrong_device_and_hooks(event_backend):
     _, npu = event_backend
-    with pytest.raises(ValueError, match="recorded"):
-        events.EventOverlap(None)
+    assert events.EventOverlap(None).event is None
     handle = events.EventHandle()
     npu.current_device = lambda: 1
     with pytest.raises(RuntimeError, match="another"):
         handle.current_stream_wait()
     wrapper = events.EventOverlap(handle)
-    with pytest.raises(TypeError):
-        wrapper.register_hook_after_wait(42)
     wrapper.register_hook_after_wait(lambda: None)
-    with pytest.raises(RuntimeError, match="already"):
+    with pytest.raises(AssertionError, match="already"):
         wrapper.register_hook_after_wait(lambda: None)
 
 
@@ -120,16 +117,56 @@ def test_explicit_stream_is_recorded_and_cross_device_is_rejected(event_backend)
     assert len(log) == 2
 
 
-def test_internal_sync_result_is_not_a_waitable_event():
-    with pytest.raises(ValueError, match="recorded"):
-        events.EventOverlap()
-    result = events.EventOverlap._empty()
+@pytest.mark.parametrize("factory", [lambda: events.EventOverlap(), lambda: events.EventOverlap(None)])
+def test_empty_wrapper_matches_upstream(factory):
+    result = factory()
+    calls = []
+    result.register_hook_after_wait(lambda: calls.append("hook"))
     with result(True):
         assert result.event is None
-    with pytest.raises(RuntimeError, match="no event"):
+    assert calls == []
+    with pytest.raises(AssertionError):
         result.current_stream_wait()
-    with pytest.raises(RuntimeError):
-        result.register_hook_after_wait(lambda: None)
+    with pytest.raises(AssertionError):
+        result.wait()
+
+
+def test_duck_typed_event_release_and_hook_result():
+    log = []
+    event = SimpleNamespace(current_stream_wait=lambda: log.append("wait"))
+    retained = (object(),)
+    overlap = events.EventOverlap(event, retained)
+    overlap.register_hook_after_wait(lambda: 42)
+    assert overlap.wait() == 42
+    assert overlap.wait() is None
+    assert log == ["wait", "wait"]
+    overlap.current_stream_wait(release_handle=True)
+    assert overlap.event is None and overlap.extra_tensors is retained
+    with overlap:
+        pass  # A released wrapper is also an empty wrapper upstream.
+    with pytest.raises(AssertionError):
+        overlap.current_stream_wait()
+    invalid = events.EventOverlap(object())
+    with pytest.raises(AttributeError):
+        invalid.wait()
+
+
+def test_failed_hook_is_retained_for_retry():
+    overlap = events.EventOverlap(SimpleNamespace(current_stream_wait=lambda: None))
+    calls = []
+
+    def hook():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError("epilogue failed")
+        return 7
+
+    overlap.register_hook_after_wait(hook)
+    with pytest.raises(ValueError):
+        overlap.current_stream_wait(True)
+    assert overlap.event is not None and overlap.hook_after_wait is hook
+    assert overlap.current_stream_wait(True) == 7
+    assert overlap.event is None and overlap.hook_after_wait is None
 
 
 def test_resources_track_both_streams_before_release(event_backend, monkeypatch):
@@ -151,8 +188,6 @@ def test_resources_track_both_streams_before_release(event_backend, monkeypatch)
     tensor, owner = Tensor(), Owner()
     owner_ref, tensor_ref = weakref.ref(owner), weakref.ref(tensor)
     event = events.EventHandle()
-    with pytest.raises(ValueError, match="NPU tensors"):
-        events.EventOverlap(event, (owner,))
     overlap = events.EventOverlap._from_resources(event, (tensor, owner))
     del tensor, owner
     gc.collect()

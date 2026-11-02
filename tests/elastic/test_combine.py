@@ -1034,6 +1034,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                 expert, handle, topk_weights=weights, previous_event=before, async_with_compute_stream=True
             )
             log(f"{context} combine.return (async; device completion not yet confirmed)")
+            assert completed.event is not None
             completed.current_stream_wait()
             args.combine_reuse = bool(getattr(buffer, "_combine_last_reuse_tokens", 0))
             log(f"{context} combine_golden.begin (CPU)")
@@ -1047,7 +1048,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                     buffer._combine_reuse_tokens = 0
                     buffer._combine_capacity_limit = buffer._runtime.capacity // 2
                     full, full_weights, done = buffer.combine(expert, handle, topk_weights=weights)
-                    done.current_stream_wait()
+                    assert done.event is None
                     assert buffer._combine_last_reuse_tokens == 0
                     _notify["assert_bytes"](output, full.cpu(), f"{context} reuse versus full", progress=log)
                     if weights is not None:
@@ -1097,13 +1098,13 @@ def run_case(buffer, args, rank, world, info, log, references):
             log(f"{context} repeated_combine.enter")
             again, no_weights, completed = buffer.combine(expert, handle)
             log(f"{context} repeated_combine.return (device completion not yet confirmed)")
-            completed.current_stream_wait()
+            assert completed.event is None
             assert no_weights is None
             _notify["assert_bytes"](again, golden, f"{context} repeated combine", progress=log)
             if weights is not None:
                 changed = weight_payload(weight_ids, generation + 1).npu()
                 again, changed_out, completed = buffer.combine(expert, handle, topk_weights=changed)
-                completed.current_stream_wait()
+                assert completed.event is None
                 _notify["assert_bytes"](again, golden, f"{context} changed weights hidden")
                 _notify["assert_bytes"](
                     changed_out,

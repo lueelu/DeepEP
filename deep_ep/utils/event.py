@@ -2,7 +2,7 @@
 # Modified by nino888 2026
 
 # API signatures adapted from DeepSeek DeepEP; see third-party/deepseek-deepep.LICENSE.
-"""Real framework events; empty or fabricated handles never report completion."""
+"""NPU events and upstream-compatible overlap wrappers for both backends."""
 
 from __future__ import annotations
 
@@ -39,113 +39,84 @@ class EventHandle:
 
 
 class EventOverlap:
+    """Upstream-compatible event wrapper shared by POD and CLOS.
+
+    An empty wrapper is valid, but has no event to explicitly wait for.
+    NPU tensor stream tracking is internal and does not narrow the public
+    constructor's duck-typed event and extra_tensors arguments.
+    """
+
     def __init__(
         self,
         event: Optional[EventHandle] = None,
         extra_tensors: Optional[Tuple[torch.Tensor]] = None,
     ) -> None:
-        if not isinstance(event, EventHandle) or not hasattr(event, "_event"):
-            raise ValueError("EventOverlap requires a recorded EventHandle")
-        if extra_tensors is not None and not isinstance(extra_tensors, tuple):
-            raise TypeError("extra_tensors must be a tuple or None")
-        if extra_tensors:
-            import torch
-
-            if any(
-                not isinstance(t, torch.Tensor) or t.device.type != "npu" or t.device.index != event._device
-                for t in extra_tensors
-            ):
-                raise ValueError("extra_tensors must be NPU tensors on the event device")
-            # The wrapper may be abandoned without a wait. Protect producer
-            # stream use as well as the eventual consumer stream use.
-            for tensor in extra_tensors:
-                tensor.record_stream(event._stream)
         self.event = event
         self.extra_tensors = extra_tensors
-        self._hook = None
-        self._release = False
+        self._release_handle_by_call = False
+        self.hook_after_wait: Optional[Callable] = None
         self._retained_objects = None
-        self._empty_result = False
+        self._stream_tensors = ()
+        if isinstance(event, EventHandle) and extra_tensors is not None:
+            self._track_tensors(extra_tensors)
+
+    def _track_tensors(self, resources) -> None:
+        import torch
+
+        values = resources if isinstance(resources, (tuple, list)) else (resources,)
+        self._stream_tensors = tuple(
+            t
+            for t in values
+            if isinstance(t, torch.Tensor) and t.device.type == "npu" and t.device.index == self.event._device
+        )
+        # Protect producer-stream use even if the wrapper is abandoned.
+        for tensor in self._stream_tensors:
+            tensor.record_stream(self.event._stream)
 
     @classmethod
     def _from_resources(cls, event: EventHandle, resources: Tuple[Any, ...]) -> "EventOverlap":
-        """Retain backend objects separately from stream-tracked NPU tensors."""
-        import torch
-
-        tensors = tuple(t for t in resources if isinstance(t, torch.Tensor) and t.device.type == "npu")
-        overlap = cls(event, tensors)
+        """Own backend resources without changing public extra_tensors semantics."""
+        overlap = cls(event)
         overlap._retained_objects = resources
+        overlap._track_tensors(resources)
         return overlap
 
-    @classmethod
-    def _empty(cls) -> "EventOverlap":
-        """Synchronous API result after its compute-stream dependency is queued.
-
-        This is not a completion event and cannot be explicitly waited on.
-        The public constructor still requires a recorded EventHandle.
-        """
-        overlap = cls.__new__(cls)
-        overlap.event = None
-        overlap.extra_tensors = None
-        overlap._hook = None
-        overlap._release = False
-        overlap._retained_objects = None
-        overlap._empty_result = True
-        return overlap
-
-    @property
-    def hook_after_wait(self) -> Optional[Callable]:
-        return self._hook
-
-    @hook_after_wait.setter
-    def hook_after_wait(self, hook: Optional[Callable]) -> None:
-        if hook is not None and not callable(hook):
-            raise TypeError("hook_after_wait must be callable or None")
-        self._hook = hook
-
-    def current_stream_wait(self, release_handle: bool = False) -> None:
-        if type(release_handle) is not bool:
-            raise TypeError("release_handle must be bool")
-        if getattr(self, "event", None) is None:
-            raise RuntimeError("EventOverlap has no event or was released")
+    def current_stream_wait(self, release_handle: bool = False) -> Any:
+        assert self.event is not None
         self.event.current_stream_wait()
-        # A stream wait is not host completion. Register consumer-stream use
-        # with the allocator before dropping retained tensor references.
-        if self.extra_tensors:
+        # Enqueuing a wait is not host completion. Register consumer use before
+        # dropping the internal owners, including CLOS handles and epilogues.
+        if self._stream_tensors:
             stream = npu_api().current_stream(self.event._device)
-            for tensor in self.extra_tensors:
+            for tensor in self._stream_tensors:
                 tensor.record_stream(stream)
-        hook, self._hook = self._hook, None
-        if hook is not None:
-            hook()
+        result = None
+        if self.hook_after_wait is not None:
+            result = self.hook_after_wait()
+            self.hook_after_wait = None
         if release_handle:
             self.event = None
-            self.extra_tensors = None
             self._retained_objects = None
+            self._stream_tensors = ()
+        # Upstream keeps extra_tensors until the wrapper itself is released.
+        return result
+
+    def wait(self) -> Any:
+        """Wait on the current stream and return the registered epilogue result."""
+        return self.current_stream_wait()
 
     def register_hook_after_wait(self, hook_after_wait: Callable) -> None:
-        if getattr(self, "event", None) is None:
-            raise RuntimeError("EventOverlap has no event or was released")
-        if not callable(hook_after_wait):
-            raise TypeError("hook_after_wait must be callable")
-        if self._hook is not None:
-            raise RuntimeError("A hook is already registered")
-        self._hook = hook_after_wait
+        assert self.hook_after_wait is None, "A hook is already registered on this `EventOverlap`"
+        self.hook_after_wait = hook_after_wait
 
     def __call__(self, release_handle: bool = False) -> "EventOverlap":
-        if type(release_handle) is not bool:
-            raise TypeError("release_handle must be bool")
-        self._release = release_handle
+        self._release_handle_by_call = release_handle
         return self
 
     def __enter__(self) -> Any:
-        if getattr(self, "event", None) is None and not getattr(self, "_empty_result", False):
-            raise RuntimeError("EventOverlap has no event or was released")
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        try:
-            if not self._empty_result:
-                self.current_stream_wait(release_handle=self._release)
-        finally:
-            self._release = False
+        if self.event is not None:
+            self.current_stream_wait(release_handle=self._release_handle_by_call)
+        self._release_handle_by_call = False

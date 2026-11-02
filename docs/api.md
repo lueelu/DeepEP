@@ -29,10 +29,14 @@ POD 和 CLOS 共用 `deep_ep.EventHandle`、`deep_ep.EventOverlap`。旧的
 事件操作只加载 Torch/torch_npu，不要求加载某个通信后端的原生扩展。
 
 V1 的 `previous_event` 使用 `EventOverlap`，V2 使用 `EventHandle`；统一类型不改变两者的
-参数约定。`EventOverlap(event, extra_tensors)` 仍要求真实事件及同设备的 NPU Tensor，
-并在生产流和等待它的消费流上登记 Tensor 使用。CLOS 的 handle 等内部对象单独保活。
-CLOS 同步调用仍返回 `event=None` 的包装，它不能显式等待；公共 `EventOverlap()`
-不会创建这种内部返回值，而是报错。旧 CLOS 包装对任意对象/伪造事件的宽松构造不再支持。
+参数约定。`EventOverlap()` / `EventOverlap(None)` 与官方一样允许构造，空包装退出
+`with` 时不等待，显式 `current_stream_wait()` / `wait()` 则触发断言。构造器不对非空
+事件做额外类型限制，等待时调用其 `current_stream_wait()` 方法。
+
+POD 与 CLOS 的同步调用均先建立计算流依赖，再返回 `event=None` 的包装；异步调用返回
+有效事件。hook 成功执行一次后清除，等待返回 hook 的结果。`release_handle=True`
+清除事件与内部资源，但保留用户传入的 `extra_tensors`，与官方保持一致。NPU Tensor
+的生产/消费流登记和后端资源保活作为内部适配保留，不改变这些公共语义。
 
 ## 初始化与资源
 
@@ -85,7 +89,7 @@ CLOS 同步调用仍返回 `event=None` 的包装，它不能显式等待；公�
 
 `event.current_stream_wait()` 向当前流添加依赖，不等同于 CPU 等待设备完成。读取输出、复用输入或交给另一条流之前，调用方须建立对应依赖。输入的 dtype/contiguous 转换应在 capture 之前完成。
 
-`EventOverlap` 保留事件及相关 Tensor；不能用 `EventOverlap(None)` 表示已经完成。`register_hook_after_wait()` 注册的 hook 在添加等待后执行一次，不是设备执行完成回调。上下文管理器退出也会添加等待。指定 `release_handle=True` 后释放包装所持引用，该包装不能再次等待。
+`EventOverlap` 保留事件及相关 Tensor；空包装只表示没有可等待的事件，不代表设备已完成执行。`register_hook_after_wait()` 注册的 hook 在添加等待后执行一次，不是设备执行完成回调。上下文管理器退出时仅对非空事件添加等待。指定 `release_handle=True` 后清除事件及内部资源，保留 `extra_tensors`；该空包装不能再次显式等待。
 
 HT 的 `async_with_compute_stream=True` 不在返回前为计算流添加输出依赖，调用方通过返回事件连接后续计算。fresh Notify 仍回读计数；cached Dispatch 支持 `do_cpu_sync=False`，复用 handle 的计数。Dispatch 控制区首次使用或布局变化时仍有原生 Host 同步，开启 `debug_collectives` 也会增加 Host 等待。cached Combine 复用 handle 的计数和布局，通过通信流上的 barrier 保护工作区，不保证所有调用均无 Host 阻塞。LL 只接受默认流选项。`ElasticBuffer.barrier()` 只支持显式 `with_cpu_sync=True, sequential=True` 的同步用法。
 

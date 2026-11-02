@@ -900,7 +900,7 @@ class EventTest(unittest.TestCase):
         self.assertIsNone(overlap.event)
         self.assertIsNone(overlap.extra_tensors)
         self.assertIsNone(overlap.hook_after_wait)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(AssertionError):
             overlap.current_stream_wait()
 
     def test_event_overlap_context_manager_waits(self):
@@ -914,16 +914,14 @@ class EventTest(unittest.TestCase):
 
     def test_event_overlap_validates_event_hook_and_flags(self):
         raw_event = object()
-        with self.assertRaises(ValueError):
-            EventOverlap(raw_event)
+        self.assertIs(EventOverlap(raw_event).event, raw_event)
         overlap = EventOverlap(EventHandle())
-        with self.assertRaises(TypeError):
-            overlap.register_hook_after_wait(None)
+        overlap.register_hook_after_wait(None)
         overlap.register_hook_after_wait(lambda: None)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(AssertionError):
             overlap.register_hook_after_wait(lambda: None)
-        with self.assertRaises(TypeError):
-            overlap.current_stream_wait(release_handle=1)
+        overlap.current_stream_wait(release_handle=1)
+        self.assertIsNone(overlap.event)
 
     def test_buffer_capture_returns_event_overlap(self):
         overlap = Buffer.capture()

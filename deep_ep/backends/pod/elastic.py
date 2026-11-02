@@ -555,11 +555,11 @@ class ElasticBuffer:
                         out = out.narrow(0, 0, rows)
                         if out_scales is not None:
                             out_scales = out_scales.narrow(0, 0, rows)
-                    event = EventOverlap(EventHandle(), retained)
+                    event = EventOverlap._from_resources(EventHandle(), retained)
                 except Exception:
                     runtime.notify_failed = True
                     raise
-            event.current_stream_wait()
+            event.current_stream_wait(release_handle=True)
             runtime.notify_inflight = None
             return (out, out_scales) if scales is not None else out, None, None, result, event
 
@@ -637,11 +637,11 @@ class ElasticBuffer:
                 runtime.notify_inflight = retained
                 try:
                     native.combine_low_latency(runtime.native, tensors, b, h, k, e, dtype, runtime.stream.npu_stream)
-                    event = EventOverlap(EventHandle(), retained)
+                    event = EventOverlap._from_resources(EventHandle(), retained)
                 except Exception:
                     runtime.notify_failed = True
                     raise
-            event.current_stream_wait()
+            event.current_stream_wait(release_handle=True)
             runtime.notify_inflight = None
             return tensors["output"], None, event
 
@@ -998,9 +998,9 @@ class ElasticBuffer:
                     handle.metadata_only = False
                     handle.num_compute_units = 64 if fp8 else 32
                     handle._routing_versions = routing_versions
-                    event = EventOverlap(EventHandle(), retained)
+                    event = EventOverlap._from_resources(EventHandle(), retained)
                 if not async_with_compute_stream:
-                    event.current_stream_wait()
+                    event.current_stream_wait(release_handle=True)
                 runtime.notify_inflight = None
                 return (out, out_scales) if fp8 else out, None, out_weights, handle, event
             except Exception:
@@ -1273,9 +1273,9 @@ class ElasticBuffer:
                         chunk,
                         runtime.stream.npu_stream,
                     )
-                    event = EventOverlap(EventHandle(), retained)
+                    event = EventOverlap._from_resources(EventHandle(), retained)
                 if not async_with_compute_stream:
-                    event.current_stream_wait()
+                    event.current_stream_wait(release_handle=True)
                 runtime.notify_inflight = None
                 return output, output_weights, event
             except Exception:
@@ -1520,9 +1520,9 @@ class ElasticBuffer:
                         *(tensors[name] for name in _PERSISTENT),
                         *((tensors["_peer_plan"],) if "_peer_plan" in tensors else ()),
                     )
-                    event = EventOverlap(EventHandle(), retained)
+                    event = EventOverlap._from_resources(EventHandle(), retained)
                 if not async_with_compute:
-                    event.current_stream_wait()
+                    event.current_stream_wait(release_handle=True)
                 runtime.notify_inflight = None
                 return None, None, None, result, event
             except Exception:

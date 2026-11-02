@@ -407,7 +407,7 @@ class Buffer:
             # including when event recording fails during graph capture.
             self._failed_event_tensors = _compact_extra_tensors(extra_tensors)
             raise
-        return EventOverlap._empty()
+        return EventOverlap()
 
     def get_dispatch_layout(
         self,

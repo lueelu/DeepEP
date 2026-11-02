@@ -1118,7 +1118,7 @@ class ElasticBuffer:
         if async_with_compute_stream:
             return EventOverlap._from_resources(event, _compact_extra_tensors(extra_tensors))
         event.current_stream_wait()
-        return EventOverlap._empty()
+        return EventOverlap()
 
     def _validate_handle(self, handle: EPHandle) -> None:
         if not isinstance(handle, EPHandle):
