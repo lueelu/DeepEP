@@ -3,8 +3,9 @@
 
 """DeepEP resource/event interfaces; imports do not require Torch or an NPU SDK.
 
-Installed native wheels provide resources, events, and ElasticBuffer EP operations.
-Without the extension, runtime calls fail explicitly. See docs/api.md.
+Installed native wheels provide communication resources and EP operations.
+Framework events require Torch/torch_npu only. Communication runtime calls without
+the extension fail explicitly. See docs/api.md.
 """
 
 from ._config import Config

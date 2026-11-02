@@ -150,7 +150,7 @@ def test_manual_relevant_fields_only():
 def test_v1_original_core_api_and_cached_policy(monkeypatch):
     from deep_ep.backends.clos import Buffer
 
-    monkeypatch.setattr("deep_ep.backends.clos.event._get_npu_api", lambda: _FakeNpu())
+    monkeypatch.setattr("deep_ep.utils.event.npu_api", lambda: _FakeNpu())
     monkeypatch.setattr("deep_ep.backends.clos.buffer._use_comm_stream", lambda _: nullcontext())
     monkeypatch.setattr(Buffer, "num_sms", 20)
     b = _make_buffer(group=_Group(size=8), transport="udma")
@@ -231,7 +231,7 @@ def test_v2_default_ignores_overrides_and_manual_parameters(elastic_api):
 def test_v1_manual_config_required_and_auto_conflicts(monkeypatch):
     from test_public_api import _make_manual_buffer
 
-    monkeypatch.setattr("deep_ep.backends.clos.event._get_npu_api", lambda: _FakeNpu())
+    monkeypatch.setattr("deep_ep.utils.event.npu_api", lambda: _FakeNpu())
     monkeypatch.setattr("deep_ep.backends.clos.buffer._use_comm_stream", lambda _: nullcontext())
     x = torch.ones((4, 8), dtype=torch.bfloat16)
     b = _make_manual_buffer(transport="udma")

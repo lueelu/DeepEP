@@ -48,7 +48,6 @@ def event_backend(monkeypatch):
         current_stream=lambda device: "consumer",
         Event=lambda: FakeEvent(log),
     )
-    monkeypatch.setattr(events, "require_native", lambda operation: None)
     monkeypatch.setattr(events, "npu_api", lambda: npu)
     return log, npu
 
@@ -106,6 +105,86 @@ def test_empty_event_wrong_device_and_hooks(event_backend):
     wrapper.register_hook_after_wait(lambda: None)
     with pytest.raises(RuntimeError, match="already"):
         wrapper.register_hook_after_wait(lambda: None)
+
+
+def test_explicit_stream_is_recorded_and_cross_device_is_rejected(event_backend):
+    log, npu = event_backend
+    stream = SimpleNamespace(device=SimpleNamespace(index=0))
+    event = events.EventHandle(stream)
+    assert event._stream is stream and event.event is event._event
+    npu.current_stream = lambda device: "next-consumer"
+    event.current_stream_wait()
+    assert log == [("record", stream), ("wait", "next-consumer")]
+    with pytest.raises(RuntimeError, match="another NPU device"):
+        events.EventHandle(SimpleNamespace(device=SimpleNamespace(index=1)))
+    assert len(log) == 2
+
+
+def test_internal_sync_result_is_not_a_waitable_event():
+    with pytest.raises(ValueError, match="recorded"):
+        events.EventOverlap()
+    result = events.EventOverlap._empty()
+    with result(True):
+        assert result.event is None
+    with pytest.raises(RuntimeError, match="no event"):
+        result.current_stream_wait()
+    with pytest.raises(RuntimeError):
+        result.register_hook_after_wait(lambda: None)
+
+
+def test_resources_track_both_streams_before_release(event_backend, monkeypatch):
+    import gc
+    import weakref
+
+    log, npu = event_backend
+
+    class Tensor:
+        device = SimpleNamespace(type="npu", index=0)
+
+        def record_stream(self, stream):
+            log.append(("tensor", stream))
+
+    class Owner:
+        pass
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(Tensor=Tensor))
+    tensor, owner = Tensor(), Owner()
+    owner_ref, tensor_ref = weakref.ref(owner), weakref.ref(tensor)
+    event = events.EventHandle()
+    with pytest.raises(ValueError, match="NPU tensors"):
+        events.EventOverlap(event, (owner,))
+    overlap = events.EventOverlap._from_resources(event, (tensor, owner))
+    del tensor, owner
+    gc.collect()
+    assert owner_ref() is not None and tensor_ref() is not None
+    npu.current_stream = lambda device: "next-consumer"
+    original_wait = event._event.wait
+
+    def fail(stream):
+        raise RuntimeError("wait failed")
+
+    event._event.wait = fail
+    with pytest.raises(RuntimeError, match="wait failed"):
+        overlap.current_stream_wait(True)
+    assert owner_ref() is not None and tensor_ref() is not None
+    event._event.wait = original_wait
+    overlap.current_stream_wait(True)
+    gc.collect()
+    assert log == [
+        ("record", "consumer"),
+        ("tensor", "consumer"),
+        ("wait", "next-consumer"),
+        ("tensor", "next-consumer"),
+    ]
+    assert owner_ref() is None and tensor_ref() is None
+    assert overlap._retained_objects is None
+
+
+def test_events_do_not_load_native_extension(event_backend, monkeypatch):
+    from deep_ep import _native
+
+    monkeypatch.setattr(_native, "require_native", lambda _: pytest.fail("event loaded a backend extension"))
+    events.EventOverlap(events.EventHandle()).current_stream_wait()
 
 
 @pytest.mark.parametrize("value", [None, -1, 0, True, 1.5, 2**63])

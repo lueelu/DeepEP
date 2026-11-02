@@ -6,7 +6,6 @@ import math
 import os
 from contextlib import contextmanager, nullcontext
 from typing import Any, List, Optional, Tuple, Union
-from deep_ep.utils.event import EventHandle as PublicEventHandle
 
 from ._native import get_native_class
 from .buffer import (
@@ -1116,12 +1115,10 @@ class ElasticBuffer:
 
     def _finish_comm_event(self, async_with_compute_stream: bool, extra_tensors: Tuple[Any, ...]) -> EventOverlap:
         event = _try_record_event(self._communication_stream)
-        if event is None:
-            return EventOverlap()
         if async_with_compute_stream:
-            return EventOverlap(event, _compact_extra_tensors(extra_tensors))
+            return EventOverlap._from_resources(event, _compact_extra_tensors(extra_tensors))
         event.current_stream_wait()
-        return EventOverlap()
+        return EventOverlap._empty()
 
     def _validate_handle(self, handle: EPHandle) -> None:
         if not isinstance(handle, EPHandle):
@@ -1267,12 +1264,12 @@ def _validate_dispatch_scope(
 
 
 def _validate_epilogue_event(event: Optional[EventHandle]) -> None:
-    if event is not None and not isinstance(event, (EventHandle, PublicEventHandle)):
+    if event is not None and not isinstance(event, EventHandle):
         raise TypeError("previous_event_before_epilogue must be an EventHandle or None")
 
 
 def _validate_event_dependency(event: Optional[EventHandle], allocate_on_comm_stream: bool) -> None:
-    if event is not None and not isinstance(event, (EventHandle, PublicEventHandle)):
+    if event is not None and not isinstance(event, EventHandle):
         raise TypeError("previous_event must be an EventHandle or None")
     if event is not None and not allocate_on_comm_stream:
         raise ValueError("allocate_on_comm_stream must be True when a previous event is provided")

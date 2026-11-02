@@ -53,3 +53,11 @@ def test_clos_accepts_public_event_dependencies_without_recording_or_waiting():
         _validate_event_dependency(event, False)
     with pytest.raises(TypeError):
         _validate_epilogue_event(object())
+
+
+def test_clos_event_imports_are_the_public_classes():
+    from deep_ep.backends import clos
+    from deep_ep.backends.clos import event
+
+    assert clos.EventHandle is event.EventHandle is deep_ep.EventHandle
+    assert clos.EventOverlap is event.EventOverlap is deep_ep.EventOverlap

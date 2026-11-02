@@ -18,9 +18,12 @@ class _Stream:
         pass
 
 
-class _Event:
+class _Event(deep_ep.EventHandle):
     def __init__(self, stream=None):
         self.stream = stream
+        self._event = object()
+        self._device = 0
+        self._stream = stream
         self.wait_count = 0
 
     def current_stream_wait(self):
@@ -126,7 +129,7 @@ class ElasticApiTest(unittest.TestCase):
             ),
             patch(
                 "deep_ep.backends.clos.elastic._try_record_event",
-                return_value=None,
+                side_effect=lambda stream: _Event(stream),
             ),
             patch(
                 "deep_ep.backends.clos.elastic._current_npu_stream",
@@ -384,7 +387,7 @@ class ElasticApiTest(unittest.TestCase):
                         self.assertEqual(rec.call_count, 2)
                         if asynchronous:
                             self.assertIs(result[-1].event, completion)
-                            self.assertTrue(any(v is b.runtime.last_epilogue for v in result[-1].extra_tensors))
+                            self.assertTrue(any(v is b.runtime.last_epilogue for v in result[-1]._retained_objects))
                             result[-1].current_stream_wait(release_handle=True)
                             self.assertEqual(log[-1], "caller_wait")
                         with self.assertRaises(RuntimeError):
@@ -438,7 +441,7 @@ class ElasticApiTest(unittest.TestCase):
         )
         self.assertIs(b.runtime.single_combine_args[2], h._expand_layout[2])
         self.assertIs(result[-1].event, completion)
-        self.assertTrue(any(v is b.runtime.last_epilogue for v in result[-1].extra_tensors))
+        self.assertTrue(any(v is b.runtime.last_epilogue for v in result[-1]._retained_objects))
         result[-1].current_stream_wait(release_handle=True)
         self.assertEqual(log[-1], "caller_wait")
         b.destroy()
@@ -534,7 +537,7 @@ class ElasticApiTest(unittest.TestCase):
         x, _, w, h, _ = self.fresh(b)
         with patch("deep_ep.backends.clos.elastic._try_record_event", side_effect=lambda _: _Event()):
             _, _, _, _, event = b.dispatch(x, handle=h, topk_weights=w, async_with_compute_stream=True)
-        self.assertTrue(any(t is b.runtime.returned_plan for t in event.extra_tensors))
+        self.assertTrue(any(t is b.runtime.returned_plan for t in event._retained_objects))
         self.assertIsNot(b.runtime.returned_plan, h._dispatch_plan)
         b.destroy()
 

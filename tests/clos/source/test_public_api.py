@@ -660,7 +660,10 @@ class _FakeNpu:
     def __init__(self):
         self.stream = object()
 
-    def current_stream(self):
+    def current_device(self):
+        return 0
+
+    def current_stream(self, device=None):
         return self.stream
 
 
@@ -670,7 +673,7 @@ class EventTest(unittest.TestCase):
         cpu_npu.start()
         self.addCleanup(cpu_npu.stop)
         self.npu = _FakeNpu()
-        self.npu_patch = patch("deep_ep.backends.clos.event._get_npu_api", return_value=self.npu)
+        self.npu_patch = patch("deep_ep.utils.event.npu_api", return_value=self.npu)
         self.npu_patch.start()
 
     def tearDown(self):
@@ -809,7 +812,7 @@ class EventTest(unittest.TestCase):
                     self.assertEqual(wait.call_count, int(not async_finish))
                     if async_finish:
                         self.assertIsInstance(overlap.event, EventHandle)
-                        self.assertIs(overlap.extra_tensors[0], payload)
+                        self.assertIs(overlap._retained_objects[0], payload)
                         self.assertIs(
                             overlap.event.event.recorded_stream,
                             buffer._communication_stream,
@@ -889,7 +892,7 @@ class EventTest(unittest.TestCase):
                     raise TypeError("operation failed")
 
     def test_event_overlap_wait_hook_and_release(self):
-        overlap = EventOverlap(EventHandle(), extra_tensors=(object(),))
+        overlap = EventOverlap._from_resources(EventHandle(), (object(),))
         calls = []
         overlap.register_hook_after_wait(hook_after_wait=lambda: calls.append("waited"))
         overlap.current_stream_wait(release_handle=True)
@@ -911,7 +914,8 @@ class EventTest(unittest.TestCase):
 
     def test_event_overlap_validates_event_hook_and_flags(self):
         raw_event = object()
-        self.assertIs(EventOverlap(raw_event).event, raw_event)
+        with self.assertRaises(ValueError):
+            EventOverlap(raw_event)
         overlap = EventOverlap(EventHandle())
         with self.assertRaises(TypeError):
             overlap.register_hook_after_wait(None)
@@ -1603,11 +1607,7 @@ class SlotAndHandleTest(unittest.TestCase):
         cpu_npu = patch.object(torch, "npu", SimpleNamespace(), create=True)
         cpu_npu.start()
         self.addCleanup(cpu_npu.stop)
-        self.event_patch = patch.object(
-            buffer_module,
-            "_try_record_event",
-            side_effect=lambda stream: SimpleNamespace(current_stream_wait=lambda: None),
-        )
+        self.event_patch = patch("deep_ep.utils.event.npu_api", return_value=_FakeNpu())
         self.event_patch.start()
         self.addCleanup(self.event_patch.stop)
         self.buffer = _make_buffer()

@@ -397,7 +397,7 @@ class Buffer:
         try:
             event = _try_record_event(self._communication_stream)
             if async_finish:
-                return EventOverlap(event, _compact_extra_tensors(extra_tensors))
+                return EventOverlap._from_resources(event, _compact_extra_tensors(extra_tensors))
             event.current_stream_wait()
         except Exception:
             # Native work has already been submitted. Do not reuse this Buffer
@@ -407,7 +407,7 @@ class Buffer:
             # including when event recording fails during graph capture.
             self._failed_event_tensors = _compact_extra_tensors(extra_tensors)
             raise
-        return EventOverlap()
+        return EventOverlap._empty()
 
     def get_dispatch_layout(
         self,

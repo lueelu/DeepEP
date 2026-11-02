@@ -19,7 +19,20 @@ Modified by Joyce_An 2026
 | `Config` | `deep_ep` | 保留配置签名；构造和容量查询报 `NotImplementedError` |
 | `EventHandle`、`EventOverlap` | `deep_ep`、`deep_ep.utils`、`deep_ep.utils.event` | 记录 NPU 事件、建立流依赖和保留相关 Tensor |
 
-同一对象的不同导入路径指向同一个类。普通 `import deep_ep` 不加载 Torch、torch_npu 或原生扩展；运行时调用按需加载当前安装目录的扩展并校验 SHMEM 库身份。普通导入成功不表示运行环境、算法或设备验证通过。
+同一对象的不同导入路径指向同一个类。普通 `import deep_ep` 不加载 Torch、torch_npu 或原生扩展；通信运行时调用按需加载当前安装目录的扩展并校验 SHMEM 库身份。普通导入成功不表示运行环境、算法或设备验证通过。
+
+### 公共事件与后端兼容
+
+POD 和 CLOS 共用 `deep_ep.EventHandle`、`deep_ep.EventOverlap`。旧的
+`deep_ep.backends.clos.event` 路径仅转发相同的类，返回事件也可使用公共类型进行检查。
+`EventHandle()` 记录当前流；`EventHandle(stream)` 记录指定的同设备 NPU 流。
+事件操作只加载 Torch/torch_npu，不要求加载某个通信后端的原生扩展。
+
+V1 的 `previous_event` 使用 `EventOverlap`，V2 使用 `EventHandle`；统一类型不改变两者的
+参数约定。`EventOverlap(event, extra_tensors)` 仍要求真实事件及同设备的 NPU Tensor，
+并在生产流和等待它的消费流上登记 Tensor 使用。CLOS 的 handle 等内部对象单独保活。
+CLOS 同步调用仍返回 `event=None` 的包装，它不能显式等待；公共 `EventOverlap()`
+不会创建这种内部返回值，而是报错。旧 CLOS 包装对任意对象/伪造事件的宽松构造不再支持。
 
 ## 初始化与资源
 
