@@ -101,8 +101,8 @@ class EPHandle:
 class ElasticBuffer:
     """DeepEP V2 intranode buffer with an API independent from V1 ``Buffer``.
 
-    UDMA defaults to automatic peer/rank host tuning without
-    changing num_sms selection or the existing EPHandle core-count contract.
+    Fresh dispatch defaults to 32 AIVs. Cached dispatch and combine inherit
+    the EPHandle core count. UDMA automatically tunes peer/rank scheduling.
 
     Dispatch and combine share the optimized V1 backend. V2 keeps EPHandle,
     optional expert expansion and independently allocated GM outputs. UDMA
@@ -730,8 +730,7 @@ class ElasticBuffer:
                 _validate_positive_int("num_max_tokens_per_rank", resolved_capacity)
             resolved_alignment = _value_or(expert_alignment, 1)
             resolved_do_cpu_sync = _value_or(do_cpu_sync, True)
-            num_topk = int(resolved_topk_idx.size(1))
-            resolved_num_sms = self.get_theoretical_num_sms(resolved_num_experts, num_topk) if num_sms == 0 else num_sms
+            resolved_num_sms = 32 if num_sms == 0 else num_sms
 
         _validate_dispatch_tensors(
             x_tensor,

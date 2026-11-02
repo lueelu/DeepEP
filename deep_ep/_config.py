@@ -13,14 +13,14 @@ class Config:
 
     def __init__(
         self,
-        num_compute_units: int = 20,
+        num_compute_units: int = 32,
         num_max_scaleup_chunked_send_tokens: int = 6,
         num_max_scaleup_chunked_recv_tokens: int = 256,
         num_max_scaleout_chunked_send_tokens: int = 6,
         num_max_scaleout_chunked_recv_tokens: int = 256,
         *,
-        udma_peers_per_worker: int = 4,
-        udma_wqes_per_visit: int = 8,
+        udma_peers_per_worker: int | None = None,
+        udma_wqes_per_visit: int | None = None,
     ) -> None:
         from .backends.clos.config import Config as ClosConfig
 

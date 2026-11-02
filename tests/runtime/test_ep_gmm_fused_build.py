@@ -221,7 +221,7 @@ def test_build_directories_preserve_core_defaults_and_explicit_paths(build, monk
 def packaging_source(tmp_path):
     for name in ("setup.py", "build_support.py", "VERSION", "pyproject.toml"):
         shutil.copy2(ROOT / name, tmp_path / name)
-    for directory in ("deep_ep", "experiments/ep_gmm_fused/python"):
+    for directory in ("deep_ep", "ascend_deepep", "experiments/ep_gmm_fused/python"):
         shutil.copytree(ROOT / directory, tmp_path / directory, ignore=shutil.ignore_patterns("__pycache__"))
     return tmp_path
 
@@ -246,6 +246,10 @@ def test_switching_component_and_lineinfo_produces_clean_wheels(packaging_source
         assert any(n.startswith(component) for n in names) is (enabled == "ON")
         assert not any(component in n and not n.startswith(component) for n in names)
         assert not any("ep-gmm-fused-shared" in n for n in names)
+        assert "ascend_deepep/__init__.py" in names
+        assert "ascend_deepep/elastic.py" in names
+        assert "ascend_deepep/utils/__init__.py" in names
+        assert not any(n.startswith("ascend_deepep/") and n.endswith(".so") for n in names)
 
 
 @pytest.mark.parametrize("prefix", ["ep-gmm-fused-shared", "ep-gmm-fused-shared-lineinfo", ""])
@@ -263,18 +267,51 @@ def test_old_or_explicitly_reused_staging_cannot_leak_into_core_wheel(packaging_
     assert not list((packaging_source / "dist").glob("*.whl"))
 
 
-def test_removed_python_package_cannot_leak_from_reused_build_staging(packaging_source):
+@pytest.mark.parametrize("filename", ["__init__.py", "buffer.py", "lib/libascend_deepep_kernels.so"])
+def test_old_implementation_cannot_leak_from_reused_build_staging(packaging_source, filename):
     result = run_packaging(packaging_source, "OFF", "OFF", "build_py")
     assert result.returncode == 0, result.stderr
     staging = next((packaging_source / "build").glob("lib*"))
-    stale = staging / "ascend_deepep/__init__.py"
-    stale.parent.mkdir()
+    stale = staging / "ascend_deepep" / filename
+    stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text("# Obsolete compatibility package from a previous build.\n")
     result = run_packaging(packaging_source, "OFF", "OFF", "bdist_wheel", "--skip-build")
     assert result.returncode != 0
     assert "Obsolete ascend_deepep package" in result.stderr
     assert stale.is_file()
     assert not list((packaging_source / "dist").glob("*.whl"))
+
+
+def test_compatibility_imports_from_packaged_files_outside_checkout(packaging_source):
+    result = run_packaging(packaging_source, "OFF", "OFF", "build_py")
+    assert result.returncode == 0, result.stderr
+    result = run_packaging(packaging_source, "OFF", "OFF", "bdist_wheel", "--skip-build")
+    assert result.returncode == 0, result.stderr
+    installed = packaging_source / "isolated-package"
+    with zipfile.ZipFile(next((packaging_source / "dist").glob("*.whl"))) as archive:
+        archive.extractall(installed)
+    code = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import ascend_deepep, deep_ep
+from ascend_deepep.buffer import Buffer
+from ascend_deepep.elastic import ElasticBuffer
+from ascend_deepep.config import Config
+assert Buffer is ascend_deepep.Buffer is deep_ep.Buffer
+assert ElasticBuffer is ascend_deepep.ElasticBuffer is deep_ep.ElasticBuffer
+assert Config is ascend_deepep.Config is deep_ep.Config
+assert 'torch' not in sys.modules and 'deep_ep._C' not in sys.modules
+assert ascend_deepep.__file__.startswith(sys.argv[1])
+assert deep_ep.__file__.startswith(sys.argv[1])
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code, str(installed)],
+        cwd=packaging_source,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture

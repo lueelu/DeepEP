@@ -111,8 +111,12 @@ class UdmaPolicy:
         return Config(num_aiv, udma_peers_per_worker=self.peers_per_worker, udma_wqes_per_visit=self.wqes_per_visit)
 
     def resolve_config(self, config, default_num_aiv, *, rank=0):
+        from ..._config import Config as PublicConfig
+
         if config is None:
             return self.config(default_num_aiv)
+        if isinstance(config, PublicConfig):
+            config = config._impl
         if not isinstance(config, Config):
             raise TypeError("config must be a Config")
         for name, flag, effective in (

@@ -33,6 +33,13 @@
   ],
   "deviations": [
     {
+      "symbol": "Config.__init__",
+      "parameter": "num_sms",
+      "upstream_default": 20,
+      "project_default": 32,
+      "reason": "The default AIV budget must accommodate the automatic Clos scheduling policy."
+    },
+    {
       "symbol": "ElasticBuffer.dispatch",
       "parameter": "do_expand",
       "upstream_default": false,
@@ -1371,12 +1378,12 @@
             {
               "name": "udma_peers_per_worker",
               "kind": "KEYWORD_ONLY",
-              "default": 4
+              "default": null
             },
             {
               "name": "udma_wqes_per_visit",
               "kind": "KEYWORD_ONLY",
-              "default": 8
+              "default": null
             }
           ]
         },

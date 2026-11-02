@@ -68,13 +68,18 @@ class CheckedInstallLib(install_lib):
         component_enabled = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
         for directory in (self.build_dir, self.install_dir):
             root = Path(directory)
-            obsolete_package = root / "ascend_deepep"
-            if obsolete_package.exists():
-                raise RuntimeError(
-                    f"Obsolete ascend_deepep package at {obsolete_package}. "
-                    "Remove this old package or use a clean build/install directory; "
-                    "the Python interfaces now live under deep_ep."
-                )
+            compatibility = root / "ascend_deepep"
+            # Only ship the forwarding files from this source tree, never an
+            # old implementation or its native libraries left in build staging.
+            for path in compatibility.rglob("*"):
+                if not path.is_file() or "__pycache__" in path.parts:
+                    continue
+                source = ROOT / "ascend_deepep" / path.relative_to(compatibility)
+                if not source.is_file() or path.read_bytes() != source.read_bytes():
+                    raise RuntimeError(
+                        f"Obsolete ascend_deepep package file at {path}. "
+                        "Use a clean build/install directory; only the current compatibility aliases are supported."
+                    )
             for component in root.glob("**/deep_ep_experimental/ep_gmm_fused"):
                 relative = component.relative_to(root).as_posix()
                 if not component_enabled or relative != "deep_ep_experimental/ep_gmm_fused":

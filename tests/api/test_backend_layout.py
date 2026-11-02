@@ -38,8 +38,8 @@ def test_all_backend_packages_are_in_distribution():
     root = Path(__file__).resolve().parents[2]
     packages = set(find_packages(where=root))
     assert {"deep_ep.backends", "deep_ep.backends.pod", "deep_ep.backends.clos"} <= packages
-    assert not any(name == "ascend_deepep" or name.startswith("ascend_deepep.") for name in packages)
-    assert not (root / "ascend_deepep").exists()
+    assert {"ascend_deepep", "ascend_deepep.utils"} <= packages
+    assert not (root / "ascend_deepep/lib").exists()
 
 
 @pytest.mark.parametrize("first", ["deep_ep", "deep_ep.backends.clos"])

@@ -33,7 +33,7 @@ for construct in (lambda: deep_ep.Buffer.dispatch(None, None),
     except NotImplementedError:
         continue
     raise AssertionError('Unimplemented communication/configuration unexpectedly succeeded')
-assert deep_ep.Config().num_compute_units == 20
+assert deep_ep.Config().num_compute_units == 32
 assert not torch.npu.is_initialized(), 'DeepEP declarations initialized an NPU'
 print(json.dumps({'torch': torch.__version__, 'torch_npu': torch_npu.__version__,
                   'npu_initialized': torch.npu.is_initialized(), 'deep_ep': deep_ep.__file__}))

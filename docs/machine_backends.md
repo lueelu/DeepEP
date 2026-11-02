@@ -13,6 +13,15 @@ V1 的统一入口为 `deep_ep/buffer.py`，V2 的统一入口为
 后续 dispatch/combine 直接调用对应实现。Python 公开入口统一为 `deep_ep`；
 V1 的 `deep_ep.buffers.legacy` 仅保留兼容导入，不存放另一份算子实现。
 
+旧的 `ascend_deepep` 及其 `buffer`、`elastic`、`config`、`event` 等公开子模块
+作为兼容入口转发到同一套实现，构造 Buffer 时仍自动选择机型。兼容入口不包含
+另一份原生库，也不恢复已移除的参数。安装时同一 Python 环境只保留一种 DeepEP
+发行包；官方 DeepEP 与本仓共享 `deep_ep` 导入名，应使用独立环境。
+
+Clos 的公开 Config 和 fresh dispatch 默认使用 32 AIV；显式核数继续校验。
+cached dispatch 和 combine 未指定核数时沿用 handle 中的核数，包括显式 64 核的
+handle。POD 的调度不受这一默认值调整影响。
+
 ## 构建
 
 继续使用本仓的[编译安装流程](build.md)，同一 Python 环境需有匹配的 Torch/torch_npu。
