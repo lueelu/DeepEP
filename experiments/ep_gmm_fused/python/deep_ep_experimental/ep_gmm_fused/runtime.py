@@ -1,4 +1,3 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Modified by zhu-mingzhe71 2026
 """EP_GMM_FUSED adapter for the public Session's UDMA communication domain."""
 

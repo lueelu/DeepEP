@@ -1,4 +1,3 @@
-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # Modified by zhu-mingzhe71 2026
 
 # find ascend toolkit

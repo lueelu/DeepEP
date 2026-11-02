@@ -6,12 +6,12 @@ updates now track branch `v1-shared-jetty-scheduler`, commit
 `6f9d8c9ef9403a302724ce42cf55810843ffebc3`.
 The imported implementation is licensed under CANN Open Software License
 Agreement Version 2.0; see `third-party/ascend-deepep.LICENSE` at repository root.
-Retained copyright notices apply to their respective files.
 
 `upstream.json` records the original kernel/include hashes and the minimal
 CATLASS/TLA resource-header dependency closure. The latter is pinned to
 `48f7461afcff7c9282c6372c19d8768d9c6e0d9d` and retains its CANN license notices.
 It does not replace the existing MegaMoE CATLASS submodule.
+Local header comments differ; the recorded hashes describe upstream originals.
 
 Device sources and layouts match that updated source revision. Both backends
 use the target repository's SHMEM `836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7`,

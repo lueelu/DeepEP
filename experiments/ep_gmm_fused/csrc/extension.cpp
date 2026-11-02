@@ -1,4 +1,3 @@
-// Copyright (c) 2026 Huawei Technologies Co., Ltd.
 // Modified by zhu-mingzhe71 2026
 
 #define Py_LIMITED_API_VERSION 0x03080000

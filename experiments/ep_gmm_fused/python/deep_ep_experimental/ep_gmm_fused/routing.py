@@ -1,4 +1,3 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Modified by zhu-mingzhe71 2026
 """Route-table helpers matching CatCCOS ``moe_route_table.h`` exactly."""
 

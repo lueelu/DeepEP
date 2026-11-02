@@ -1,4 +1,3 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Modified by zhu-mingzhe71 2026
 
 set(ALL_TO_ALLV_GROUPED_MAT_MUL_UDMA_ASC_FLAGS
