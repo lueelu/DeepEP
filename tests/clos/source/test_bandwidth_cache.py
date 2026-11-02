@@ -20,8 +20,6 @@ from bandwidth_cache import (
 )
 import bench_v1_bandwidth as v1
 import bench_v2_bandwidth as v2
-import bench_v2_auto_bandwidth as auto
-import bench_udma_sweep as sweep
 
 
 class BandwidthCacheTest(unittest.TestCase):
@@ -162,7 +160,7 @@ class BandwidthCacheTest(unittest.TestCase):
 
     def test_all_entrypoints_and_worker_replay(self):
         case = dict(name="bf16_expand0_aiv32", dtype="bf16", expand=0, aiv=32)
-        for entry in (v1, v2, auto):
+        for entry in (v1, v2):
             for enabled in (False, True):
                 with self.subTest(entry=entry.__name__, enabled=enabled):
                     flags = [] if enabled else ["--no-flush-l2-cache", "--combine-bias", "two"]
@@ -173,13 +171,6 @@ class BandwidthCacheTest(unittest.TestCase):
                     replay = entry.arguments(command[command.index("--worker") :])
                     self.assertEqual(replay.flush_l2_cache, enabled)
                     self.assertEqual(replay.combine_bias, args.combine_bias)
-        options, base = sweep.arguments(["--no-flush-l2-cache"])
-        plan = sweep.make_plan(options, base)
-        child = sweep.job_arguments(base, plan["jobs"][0], Path("out"), plan["sha256"])
-        self.assertFalse(plan["contract"]["flush_l2_cache"])
-        self.assertFalse(child.flush_l2_cache)
-        self.assertEqual(child.combine_bias, "none")
-        self.assertEqual(plan["contract"]["combine_bias"], "none")
 
 
 if __name__ == "__main__":

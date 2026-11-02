@@ -152,9 +152,31 @@ dispatch/combine 数据区与容量计算同步后移。普通 combine 省去前
 cached dispatch、MTE 和需要独立初始化的实验路径保留对应 notify。
 这些改动需要整体重编 Python/native/device 库，不能只替换 Python 文件。
 
-带宽入口位于 `benchmarks/clos/bench_v2_auto_bandwidth.py`；支持可选 L2 清理和
-`--combine-bias none`，逐项打印通信带宽及独立的 notify/reduce 耗时。
-通信带宽分母仅为通信 kernel 耗时，不能直接当作完整 API 吞吐。
+Clos 仅保留两个精度与带宽入口，均使用库的默认自动调度策略，不提供手动调度或参数扫描：
+
+```bash
+python benchmarks/clos/bench_v1_bandwidth.py --ep-size 8 --output clos_v1_ep8
+python benchmarks/clos/bench_v2_bandwidth.py --ep-size 8 --output clos_v2_ep8
+```
+
+每个入口默认使用 32 AIV，覆盖 BF16/FP8 × 展开/不展开共 4 组配置，每组先做精度
+检查，再测 fresh dispatch、cached dispatch、无 weight combine 和带 weight combine。
+可通过 `--aiv 20` 指定核数；`--dtypes bf16 --expand 0` 可缩小功能组合。
+保留 token/hidden/top-k、路由分布、bias、多机和报告重算选项。
+V2 通信带宽分母仅为通信 kernel 耗时，notify/reduce 单列；V1 的 fused combine
+保留融合耗时，不能将其当作独立通信耗时。
+
+EP32 默认两机、每机 16 rank；每机只有 8 卡时显式设置 `--nnodes 4`。所有节点
+使用相同的 `--ep-size`、`--nnodes`、`--master-addr` 和 `--run-id`，分别设置
+`--node-rank`。例如两机时在 node0/node1 分别执行以下命令并替换 node-rank：
+
+```bash
+python benchmarks/clos/bench_v2_bandwidth.py --ep-size 32 --nnodes 2 --node-rank 0 \
+    --master-addr <NODE0_IP> --run-id clos_v2_ep32 --output clos_v2_ep32_node0
+```
+
+两个入口共用 `bandwidth_multinode.py`、`route_workloads.py`、`bandwidth_cache.py`
+和 `stage_metrics.py`，分别负责启动与结果收集、路由生成、采样和阶段计时。
 
 ## PR：四卡 Mesh 与跨域 PCIe
 

@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "benchmarks/clos"))
 import route_workloads as routing
 import bench_v1_bandwidth as v1
 import bench_v2_bandwidth as v2
-import bench_udma_sweep as sweep
 
 
 class RouteWorkloadsTest(unittest.TestCase):
@@ -152,50 +151,6 @@ class RouteWorkloadsTest(unittest.TestCase):
             ):
                 with self.assertRaises(SystemExit):
                     module.arguments(flags)
-
-    def test_sweep_four_loads_fixed_group_and_separate_rankings(self):
-        grid, base = sweep.arguments(
-            [
-                "--apis",
-                "v2",
-                "--schedules",
-                "peer",
-                "--aiv",
-                "64",
-                "--dtypes",
-                "bf16",
-                "--expand",
-                "0",
-                "--peers-per-worker",
-                "4",
-                "--wqes-per-visit",
-                "8",
-                "--dispatch-peer-orders",
-                "rank",
-                "--combine-peer-orders",
-                "rank",
-                "--route-modes",
-                "uniform",
-                "rank_hotspot",
-                "local_group",
-                "--route-group-size",
-                "4",
-                "--route-skews",
-                "2",
-                "4",
-            ]
-        )
-        plan = sweep.make_plan(grid, base)
-        self.assertEqual(plan["candidates"], 4)
-        rows = []
-        for i, job in enumerate(plan["jobs"]):
-            args = sweep.job_arguments(base, job, Path("out"), plan["sha256"])
-            self.assertEqual(args.route_group_size, 4)
-            self.assertIsNone(args.ranks_per_group)
-            rows.append(dict(job["config"], candidate=i, repeat=1, rank="all", op="dispatch", caller_us=i + 1))
-        ranking = sweep.rankings(rows, 1)
-        self.assertEqual(len(ranking), 4)
-        self.assertTrue(all(row["position"] == 1 for row in ranking))
 
 
 if __name__ == "__main__":

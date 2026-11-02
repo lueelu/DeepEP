@@ -2,7 +2,8 @@
 
 python benchmarks/clos/bench_v1_bandwidth.py --output ./bandwidth_v1_results
 
-Shares EP8/EP16 orchestration, input routing and byte accounting with V2.
+Uses the default library scheduling policy and shares multi-node orchestration,
+input routing and byte accounting with V2.
 Uses only public V1 Buffer operations. Fused combine transfer/reduce times are
 not separable: report fused_combine_us, never fabricate a communication timer.
 """
@@ -10,6 +11,7 @@ not separable: report fused_combine_us, never fabricate a communication timer.
 from __future__ import annotations
 
 import datetime
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -98,7 +100,8 @@ def worker(args):
     import torch.distributed as dist
     import torch_npu  # noqa: F401
     from deep_ep._clos_adapter import Buffer
-    from deep_ep import Config, topk_idx_t
+    from deep_ep import topk_idx_t
+    from deep_ep.backends.clos import Config
     import test_v1_intranode as golden
 
     rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
@@ -131,9 +134,7 @@ def worker(args):
         write_json(destination / "input_routes.json", routes[rank].tolist())
         torch.npu.set_device(device)
         dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=args.rendezvous_timeout))
-        config = Config(
-            args.num_aiv, udma_peers_per_worker=args.peers_per_worker, udma_wqes_per_visit=args.wqes_per_visit
-        )
+        config = Config(args.num_aiv)
         # Dispatch FP8 is smaller than the BF16 combine workspace; reserve for both.
         args.num_bytes = config.get_nvl_buffer_size_hint(args.hidden * 2, args.ep_size, num_tokens=args.num_tokens)
         buffer = Buffer(
@@ -141,16 +142,9 @@ def worker(args):
             num_nvl_bytes=args.num_bytes,
             explicitly_destroy=True,
             transport="udma",
-            udma_auto_policy=False,
-            udma_schedule=args.udma_schedule,
             use_1g_huge_pages=args.huge_pages,
-            udma_dispatch_peer_order=args.dispatch_peer_order,
-            udma_combine_peer_order=args.combine_peer_order,
-            udma_ranks_per_group=args.ranks_per_group,
-            udma_peers_per_group_per_worker=args.peers_per_group_per_worker,
-            udma_workers_per_peer=args.workers_per_peer,
-            udma_qps_per_worker=args.qps_per_worker,
         )
+        args.resolved_udma_policy = asdict(buffer.udma_auto_policy)
         args.effective_udma_config = shared.effective_udma_config(buffer, config)
         if rank == 0:
             print("EFFECTIVE_UDMA_CONFIG", json.dumps(args.effective_udma_config, sort_keys=True), flush=True)

@@ -4,6 +4,9 @@ python benchmarks/clos/bench_v2_bandwidth.py --output ./bandwidth_results
 
 Each dtype/expand/AIV configuration gets a fresh torchrun group. No kernel or
 public API instrumentation is installed. Precision is checked before profiling.
+Both APIs use the default library scheduling policy; this entrypoint exposes
+workload options, not manual scheduling knobs.
+Defaults cover BF16/FP8 and expanded/non-expanded operations at 32 AIVs.
 """
 
 from __future__ import annotations
@@ -47,11 +50,11 @@ from bandwidth_multinode import PeerGroup, collection_manifest, content_identity
 REPO = Path(__file__).resolve().parents[2]
 
 
-def arguments(argv=None, *, description=None, auto_policy=False):
+def arguments(argv=None, *, description=None):
     p = argparse.ArgumentParser(
         description=description or __doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.set_defaults(udma_auto_policy=auto_policy)
+    p.set_defaults(udma_auto_policy=True)
     p.add_argument(
         "--flush-l2-cache",
         action=argparse.BooleanOptionalAction,
@@ -64,12 +67,12 @@ def arguments(argv=None, *, description=None, auto_policy=False):
         default="none",
         help="bias inputs for weighted combine only (default: none; two reproduces older benchmarks)",
     )
-    p.add_argument("--ep-size", type=int, choices=(4, 8, 16, 32) if auto_policy else (2, 4, 8, 16, 32, 64), default=8)
+    p.add_argument("--ep-size", type=int, choices=(2, 4, 8, 16, 32, 64), default=8)
     p.add_argument(
         "--nnodes",
         type=int,
         choices=(1, 2, 4, 8),
-        default=None if auto_policy else 1,
+        default=None,
         help="equal local rank count on each node; at most 16 devices per node",
     )
     p.add_argument("--node-rank", type=int, choices=range(8), default=0)
@@ -82,12 +85,12 @@ def arguments(argv=None, *, description=None, auto_policy=False):
     p.add_argument(
         "--aiv",
         type=int,
-        choices=range(2, 65, 2) if auto_policy else (32, 64),
+        choices=range(2, 65, 2),
         nargs="+",
-        default=[32] if auto_policy else [32, 64],
+        default=[32],
     )
-    p.add_argument("--dtypes", choices=("bf16", "fp8"), nargs="+", default=["bf16"] if auto_policy else ["bf16", "fp8"])
-    p.add_argument("--expand", type=int, choices=(0, 1), nargs="+", default=[0] if auto_policy else [0, 1])
+    p.add_argument("--dtypes", choices=("bf16", "fp8"), nargs="+", default=["bf16", "fp8"])
+    p.add_argument("--expand", type=int, choices=(0, 1), nargs="+", default=[0, 1])
     for name, default in [
         ("num-tokens", 8192),
         ("hidden", 6144),
@@ -99,22 +102,6 @@ def arguments(argv=None, *, description=None, auto_policy=False):
         ("case-timeout", 1800),
     ]:
         p.add_argument("--" + name, type=int, default=default)
-    p.add_argument("--peers-per-worker", type=int, choices=(1, 2, 4, 8), default=None if auto_policy else 1)
-    p.add_argument("--wqes-per-visit", type=int, choices=(4, 8, 16, 32), default=None if auto_policy else 8)
-    p.add_argument("--udma-schedule", choices=("peer", "token"), default="peer")
-    p.add_argument("--sweep-plan-sha256", help=argparse.SUPPRESS)
-    p.add_argument(
-        "--dispatch-peer-order", choices=("rank", "group", "group_staggered", "group_round_robin"), default="rank"
-    )
-    p.add_argument(
-        "--combine-peer-order", choices=("rank", "group", "group_staggered", "group_round_robin"), default="rank"
-    )
-    p.add_argument("--workers-per-peer", type=int, choices=(1, 2), default=None if auto_policy else 1)
-    p.add_argument("--qps-per-worker", type=int, choices=(1, 2), default=None if auto_policy else 1)
-    p.add_argument("--peers-per-group-per-worker", type=int, choices=(1, 2, 4))
-    p.add_argument(
-        "--ranks-per-group", type=int, help="contiguous EP-local ranks per topology group; required for group orders"
-    )
     p.add_argument("--huge-pages", action="store_true", help="explicitly request 1 GiB SHMEM pages")
     p.add_argument(
         "--output", type=Path, default=Path("bandwidth_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -124,22 +111,7 @@ def arguments(argv=None, *, description=None, auto_policy=False):
     add_route_arguments(p)
     args = p.parse_args(argv)
     if args.nnodes is None:
-        args.nnodes = 2 if args.ep_size == 32 else 1
-    if auto_policy:
-        if any(
-            getattr(args, key) is not None
-            for key in (
-                "peers_per_worker",
-                "workers_per_peer",
-                "qps_per_worker",
-                "wqes_per_visit",
-                "ranks_per_group",
-                "peers_per_group_per_worker",
-            )
-        ) or (args.udma_schedule != "peer" or args.dispatch_peer_order != "rank" or args.combine_peer_order != "rank"):
-            p.error(
-                "automatic benchmark selects scheduling in ElasticBuffer; use bench_v2_bandwidth.py for manual tuning"
-            )
+        args.nnodes = max(1, args.ep_size // 16)
     try:
         validate_routes(args)
     except ValueError as exc:
@@ -158,40 +130,6 @@ def arguments(argv=None, *, description=None, auto_policy=False):
         )
     ):
         p.error("shape, iterations and timeout must be positive")
-    if args.ranks_per_group is not None and (
-        args.ranks_per_group <= 0 or args.ranks_per_group > args.ep_size or args.ep_size % args.ranks_per_group
-    ):
-        p.error("ranks-per-group must be a positive divisor of ep-size")
-    if (args.dispatch_peer_order != "rank" or args.combine_peer_order != "rank") and args.ranks_per_group is None:
-        p.error("group peer orders require ranks-per-group")
-    if args.udma_schedule == "token" and (
-        args.dispatch_peer_order != "rank" or args.combine_peer_order != "rank" or args.ranks_per_group is not None
-    ):
-        p.error("token schedule requires rank orders and no ranks-per-group")
-    if not auto_policy and args.qps_per_worker != 1 and (args.workers_per_peer != 1 or args.udma_schedule != "peer"):
-        p.error("two QPs per worker require peer schedule and workers-per-peer=1")
-    if args.udma_schedule == "token" and args.workers_per_peer != 1:
-        p.error("workers-per-peer applies only to peer schedule")
-    rr = "group_round_robin" in (args.dispatch_peer_order, args.combine_peer_order)
-    if args.peers_per_group_per_worker is not None and not rr:
-        p.error("peers-per-group-per-worker requires group_round_robin")
-    workers = []
-    for order in () if auto_policy else (args.dispatch_peer_order, args.combine_peer_order):
-        if order == "group_round_robin":
-            lanes = (args.ranks_per_group + (args.peers_per_group_per_worker or 1) - 1) // (
-                args.peers_per_group_per_worker or 1
-            )
-            if ((args.ranks_per_group + lanes - 1) // lanes) * (args.ep_size // args.ranks_per_group) > 64:
-                p.error("group_round_robin exceeds 64 peers per worker")
-            workers.append(lanes)
-        else:
-            workers.append((args.ep_size - 1 + args.peers_per_worker - 1) // args.peers_per_worker)
-    if args.udma_schedule == "peer" and any(
-        (w * args.workers_per_peer > aiv or w * args.workers_per_peer * args.qps_per_worker > 32)
-        for aiv in args.aiv
-        for w in workers
-    ):
-        p.error("peers-per-worker requires more sending workers than available AIV/QPs")
     if args.warmup < 0 or args.first_device < 0 or args.hidden % 128:
         p.error("warmup/first-device must be nonnegative; hidden must be a multiple of 128")
     if args.num_topk > min(128, args.ep_size * args.experts_per_rank):
@@ -265,14 +203,9 @@ def worker_command(args, case, path, *, entrypoint=None):
         "iterations",
         "seed",
         "case_timeout",
-        "peers_per_worker",
-        "wqes_per_visit",
         "rendezvous_timeout",
         "collection_timeout",
         "master_port",
-        "dispatch_peer_order",
-        "combine_peer_order",
-        "udma_schedule",
     ):
         value = getattr(args, key)
         if value is not None:
@@ -283,17 +216,8 @@ def worker_command(args, case, path, *, entrypoint=None):
             command += ["--" + key.replace("_", "-"), str(value)]
     if args.nnodes > 1:
         command += ["--master-addr", args.master_addr, "--run-id", args.run_id]
-    for key in ("workers_per_peer", "qps_per_worker"):
-        if getattr(args, key) is not None:
-            command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
-    if args.peers_per_group_per_worker is not None:
-        command += ["--peers-per-group-per-worker", str(args.peers_per_group_per_worker)]
-    if args.ranks_per_group is not None:
-        command += ["--ranks-per-group", str(args.ranks_per_group)]
     if args.huge_pages:
         command.append("--huge-pages")
-    if args.sweep_plan_sha256:
-        command += ["--sweep-plan-sha256", args.sweep_plan_sha256]
     command.append("--flush-l2-cache" if args.flush_l2_cache else "--no-flush-l2-cache")
     command += ["--combine-bias", args.combine_bias]
     return command
@@ -360,19 +284,6 @@ def check_idle(text, first_device, ep_size):
             raise RuntimeError(f"NPU {device} is busy, unhealthy or cannot be verified; no job started")
 
 
-def v2_tuning_options(args):
-    # Omit manual defaults entirely so the library's auto policy is exercised.
-    if getattr(args, "udma_auto_policy", False):
-        return dict(udma_auto_policy=True)
-    return dict(
-        udma_auto_policy=False,
-        udma_peers_per_worker=args.peers_per_worker,
-        udma_wqes_per_visit=args.wqes_per_visit,
-        udma_workers_per_peer=args.workers_per_peer,
-        udma_qps_per_worker=args.qps_per_worker,
-    )
-
-
 def effective_udma_config(buffer, config=None):
     """Report resolved runtime values rather than caller defaults (V1 uses Config)."""
     result = {
@@ -388,7 +299,11 @@ def effective_udma_config(buffer, config=None):
         )
     }
     for name in ("udma_peers_per_worker", "udma_wqes_per_visit"):
-        result[name] = getattr(buffer if config is None else config, name)
+        result[name] = (
+            getattr(buffer.udma_auto_policy, name.removeprefix("udma_"))
+            if buffer.udma_auto_policy is not None
+            else getattr(buffer if config is None else config, name)
+        )
     result["udma_auto_policy"] = buffer.udma_auto_policy is not None
     return result
 
@@ -470,13 +385,7 @@ def worker(args):
             use_fp8_dispatch=args.dtype == "fp8",
             explicitly_destroy=True,
             transport="udma",
-            udma_schedule=args.udma_schedule,
             use_1g_huge_pages=args.huge_pages,
-            udma_dispatch_peer_order=args.dispatch_peer_order,
-            udma_combine_peer_order=args.combine_peer_order,
-            udma_ranks_per_group=args.ranks_per_group,
-            udma_peers_per_group_per_worker=args.peers_per_group_per_worker,
-            **v2_tuning_options(args),
         )
         args.effective_udma_config = effective_udma_config(buffer)
         if rank == 0:
@@ -823,6 +732,8 @@ def report(root):
             ):
                 raise ValueError("case configuration mismatch")
             for key, default in (
+                ("peers_per_worker", None),
+                ("wqes_per_visit", None),
                 ("dispatch_peer_order", "rank"),
                 ("combine_peer_order", "rank"),
                 ("ranks_per_group", None),
@@ -854,8 +765,6 @@ def report(root):
                 "iterations",
                 "warmup",
                 "seed",
-                "peers_per_worker",
-                "wqes_per_visit",
                 "huge_pages",
             ):
                 if config[key] != plan["arguments"][key]:

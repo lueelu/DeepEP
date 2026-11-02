@@ -15,9 +15,9 @@ python -m pytest tests/clos/source/test_public_api.py \
     tests/clos/source/test_stage_metrics.py
 ```
 
-Automatic-policy validation and profiler/sweep contracts are also covered by
-`test_udma_auto_policy.py`, `test_bandwidth_cache.py`, `test_udma_sweep.py`,
-`test_v1_bandwidth.py`, `test_v2_auto_bandwidth.py`, and `test_route_workloads.py`.
+Automatic-policy validation and profiler contracts are also covered by
+`test_udma_auto_policy.py`, `test_bandwidth_cache.py`,
+`test_v1_bandwidth.py`, `test_v2_bandwidth.py`, and `test_route_workloads.py`.
 Run with `PYTHONPATH=tests/clos/source` when invoking these files separately.
 
 The old source repository's build-identity test is superseded by
@@ -64,8 +64,13 @@ development node, use `--public-clos` instead of `--public-auto`; this selects
 `machine_type="clos_only"` and is not evidence that topology auto-detection or
 a different physical topology has been qualified.
 
-`benchmarks/clos/bench_v2_bandwidth.py` preserves the migrated one-command EP8/EP16
-benchmark and stage accounting. The original POD benchmarks stay in their
+`benchmarks/clos/bench_v1_bandwidth.py` and `bench_v2_bandwidth.py` are the two
+Clos precision/profiling entrypoints. Both use the default library policy;
+manual scheduling and sweep entrypoints are not included. Each defaults to
+32 AIVs and BF16/FP8 × expanded/non-expanded coverage, checking fresh/cached
+dispatch and weighted/unweighted combine before measuring them. Workload shape,
+routing, core count, and multi-node options remain configurable.
+The original POD benchmarks stay in their
 original paths. Separate runs are needed to qualify each backend and topology;
 compilation or CPU tests alone do not establish NPU correctness/performance.
 Install the wheel built from this revision first. Benchmarks load that installed

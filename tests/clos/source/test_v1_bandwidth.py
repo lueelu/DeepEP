@@ -28,8 +28,7 @@ class V1BandwidthTest(unittest.TestCase):
             "experts_per_rank",
             "iterations",
             "warmup",
-            "peers_per_worker",
-            "wqes_per_visit",
+            "udma_auto_policy",
         ):
             self.assertEqual(getattr(first, key), getattr(second, key))
         case = dict(name="bf16_expand0_aiv32", dtype="bf16", expand=0, aiv=32)
@@ -56,43 +55,6 @@ class V1BandwidthTest(unittest.TestCase):
             replay = v1.arguments(command[command.index("--worker") :])
             self.assertEqual(replay.api, "v1")
             self.assertEqual(replay.node_rank, node)
-
-    def test_peer_order_cli_forwarding_and_contract(self):
-        case = dict(name="bf16_expand0_aiv32", dtype="bf16", expand=0, aiv=32)
-        for module in (v1, v2):
-            flags = [
-                "--ep-size",
-                "16",
-                "--dispatch-peer-order",
-                "group",
-                "--combine-peer-order",
-                "group_staggered",
-                "--ranks-per-group",
-                "8",
-            ]
-            args = module.arguments(flags)
-            command = v2.worker_command(args, case, Path("out"), entrypoint=module.__file__)
-            replay = module.arguments(command[command.index("--worker") :])
-            self.assertEqual(
-                (replay.dispatch_peer_order, replay.combine_peer_order, replay.ranks_per_group),
-                ("group", "group_staggered", 8),
-            )
-            contract = v2.suite_contract(replay)
-            self.assertEqual(contract["dispatch_peer_order"], "group")
-            self.assertEqual(contract["ranks_per_group"], 8)
-            default = module.arguments([])
-            self.assertEqual(
-                (default.dispatch_peer_order, default.combine_peer_order, default.ranks_per_group),
-                ("rank", "rank", None),
-            )
-            for invalid in (
-                ["--dispatch-peer-order", "group"],
-                ["--ranks-per-group", "3"],
-                ["--ranks-per-group", "0"],
-                ["--combine-peer-order", "bad"],
-            ):
-                with self.assertRaises(SystemExit):
-                    module.arguments(invalid)
 
     def test_single_node_ep16_launch_and_idle_gate(self):
         case = dict(name="bf16_expand0_aiv32", dtype="bf16", expand=0, aiv=32)
