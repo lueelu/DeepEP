@@ -14,7 +14,9 @@ V1 的统一入口为 `deep_ep/buffer.py`，V2 的统一入口为
 V1 的 `deep_ep.buffers.legacy` 仅保留兼容导入，不存放另一份算子实现。
 
 旧的 `ascend_deepep` 及其 `buffer`、`elastic`、`config`、`event` 等公开子模块
-作为兼容入口转发到同一套实现，构造 Buffer 时仍自动选择机型。兼容入口不包含
+作为兼容入口转发到同一套实现，构造 Buffer 时仍自动选择机型。兼容映射集中在
+`ascend_deepep/__init__.py`，旧子模块动态注册，访问导出对象时才加载对应实现，
+不再为每个旧路径保留单独的转发文件。兼容入口不包含
 另一份原生库，也不恢复已移除的参数。安装时同一 Python 环境只保留一种 DeepEP
 发行包；官方 DeepEP 与本仓共享 `deep_ep` 导入名，应使用独立环境。
 

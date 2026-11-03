@@ -28,7 +28,14 @@ def run_host(code, *, dtypes=True):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("first", ["ascend_deepep", "ascend_deepep.elastic", "deep_ep"])
+@pytest.mark.parametrize(
+    "first",
+    ["deep_ep", "ascend_deepep"]
+    + [
+        f"ascend_deepep.{name}"
+        for name in ("buffer", "elastic", "config", "event", "expand", "resources", "dtypes", "utils")
+    ],
+)
 def test_legacy_first_import_is_lazy_and_uses_public_entries(first):
     run_host(
         f"""
@@ -65,6 +72,48 @@ def test_legacy_extra_exports_reuse_backend_objects():
         assert align_up is clos.utils.align_up
         assert align_up(33, 32) == 64
         assert isinstance(object.__new__(clos.EPHandle), old.EPHandle)
+    """)
+
+
+def test_consolidated_submodules_preserve_imports_and_exports():
+    run_host("""
+        import importlib, importlib.util, sys
+        import ascend_deepep as old
+        aliases = {
+            'buffer': ('deep_ep.buffer', ('Buffer',)),
+            'elastic': ('deep_ep.buffers.elastic', ('ElasticBuffer', 'EPHandle')),
+            'config': ('deep_ep', ('Config',)),
+            'event': ('deep_ep.utils.event', ('EventHandle', 'EventOverlap')),
+            'expand': ('deep_ep.backends.clos.expand', ('ExpandHandle',)),
+            'resources': ('deep_ep.backends.clos.resources', ('Handle', 'Slot', 'SlotState')),
+            'dtypes': ('deep_ep.backends.clos.dtypes', ('topk_idx_t',)),
+            'utils': ('deep_ep.backends.clos.utils', ('align_up',)),
+        }
+        for name, (target, exports) in aliases.items():
+            fullname = 'ascend_deepep.' + name
+            module = importlib.import_module(fullname)
+            assert getattr(old, name) is module is sys.modules[fullname]
+            assert module.__name__ == fullname
+            assert importlib.util.find_spec(fullname).name == fullname
+            assert module.__all__ == list(exports)
+            assert set(exports) <= set(dir(module))
+            scope = {}
+            exec('from ' + fullname + ' import *', scope)
+            for symbol in exports:
+                assert scope[symbol] is getattr(importlib.import_module(target), symbol)
+            try:
+                module.not_a_legacy_export
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError('unknown compatibility export accepted')
+        saved = old.buffer
+        importlib.reload(old)
+        assert old.buffer is saved
+        scope = {'__package__': 'ascend_deepep'}
+        exec('from .buffer import Buffer', scope)
+        assert scope['Buffer'] is old.Buffer
+        assert 'deep_ep._C' not in sys.modules and 'deep_ep._clos_C' not in sys.modules
     """)
 
 

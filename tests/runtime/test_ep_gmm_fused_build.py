@@ -246,10 +246,7 @@ def test_switching_component_and_lineinfo_produces_clean_wheels(packaging_source
         assert any(n.startswith(component) for n in names) is (enabled == "ON")
         assert not any(component in n and not n.startswith(component) for n in names)
         assert not any("ep-gmm-fused-shared" in n for n in names)
-        assert "ascend_deepep/__init__.py" in names
-        assert "ascend_deepep/elastic.py" in names
-        assert "ascend_deepep/utils/__init__.py" in names
-        assert not any(n.startswith("ascend_deepep/") and n.endswith(".so") for n in names)
+        assert [n for n in names if n.startswith("ascend_deepep/")] == ["ascend_deepep/__init__.py"]
 
 
 @pytest.mark.parametrize("prefix", ["ep-gmm-fused-shared", "ep-gmm-fused-shared-lineinfo", ""])
@@ -267,7 +264,9 @@ def test_old_or_explicitly_reused_staging_cannot_leak_into_core_wheel(packaging_
     assert not list((packaging_source / "dist").glob("*.whl"))
 
 
-@pytest.mark.parametrize("filename", ["__init__.py", "buffer.py", "lib/libascend_deepep_kernels.so"])
+@pytest.mark.parametrize(
+    "filename", ["__init__.py", "buffer.py", "utils/__init__.py", "lib/libascend_deepep_kernels.so"]
+)
 def test_old_implementation_cannot_leak_from_reused_build_staging(packaging_source, filename):
     result = run_packaging(packaging_source, "OFF", "OFF", "build_py")
     assert result.returncode == 0, result.stderr
@@ -291,18 +290,35 @@ def test_compatibility_imports_from_packaged_files_outside_checkout(packaging_so
     with zipfile.ZipFile(next((packaging_source / "dist").glob("*.whl"))) as archive:
         archive.extractall(installed)
     code = """
+import importlib
 import sys
 sys.path.insert(0, sys.argv[1])
 import ascend_deepep, deep_ep
 from ascend_deepep.buffer import Buffer
 from ascend_deepep.elastic import ElasticBuffer
 from ascend_deepep.config import Config
+from ascend_deepep.event import EventHandle
 assert Buffer is ascend_deepep.Buffer is deep_ep.Buffer
 assert ElasticBuffer is ascend_deepep.ElasticBuffer is deep_ep.ElasticBuffer
 assert Config is ascend_deepep.Config is deep_ep.Config
+assert EventHandle is deep_ep.EventHandle
+for name in ('expand', 'resources', 'dtypes', 'utils'):
+    module = importlib.import_module('ascend_deepep.' + name)
+    assert module is getattr(ascend_deepep, name)
 assert 'torch' not in sys.modules and 'deep_ep._C' not in sys.modules
 assert ascend_deepep.__file__.startswith(sys.argv[1])
 assert deep_ep.__file__.startswith(sys.argv[1])
+from types import ModuleType
+torch = ModuleType('torch')
+torch.int32, torch.int64 = 'int32', 'int64'
+sys.modules['torch'] = torch
+from ascend_deepep.utils import align_up
+from ascend_deepep.dtypes import topk_idx_t
+from ascend_deepep.expand import ExpandHandle
+from ascend_deepep.resources import Handle, Slot, SlotState
+assert align_up(33, 32) == 64
+for name in ('topk_idx_t', 'ExpandHandle', 'Handle', 'Slot', 'SlotState'):
+    assert globals()[name] is getattr(deep_ep, name)
 """
     result = subprocess.run(
         [sys.executable, "-I", "-c", code, str(installed)],
