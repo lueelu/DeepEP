@@ -312,10 +312,9 @@ void bind_low_latency(py::module_& module)
         const bool fp8 = dtype == "float8_e4m3fn";
         const auto plan = layout(session.world(), b, h, k, e, fp8);
         const auto format = dispatch_format_tiling(session.world(), dtype);
-        const uint32_t variant = DispatchDedup::LlDispatchVariantForTiling(
-            format.dtype, format.quantMode, format.expandXOutDtype, format.inputMode, format.tilingKey);
-        if (variant == DispatchDedup::kLlDispatchInvalidVariant)
-            throw std::invalid_argument("Unsupported LL dispatch specialization");
+        if (DispatchDedup::LlDispatchInputClass(format.dtype, format.quantMode, format.expandXOutDtype,
+                                                format.inputMode) == DispatchDedup::kLlDispatchInvalidVariant)
+            throw std::invalid_argument("Unsupported LL dispatch format");
         const int64_t c = plan.capacityRows;
         if (!stream_address || rows < c || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes) {
             throw std::invalid_argument("Invalid LL output capacity, workspace or stream");
@@ -352,7 +351,7 @@ void bind_low_latency(py::module_& module)
         session.workspace();  // Validate the owning context before launch.
         py::gil_scoped_release release;
         session.invalidate_dispatch_controls();
-        dispatch_server_dedup_kernel_do_v2(reinterpret_cast<void*>(stream_address), &args, variant);
+        dispatch_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
     });
     module.def("clear_low_latency_combine_windows", [](Session& session, int b, int h, int k, int e,
                                                        uintptr_t stream_address) {

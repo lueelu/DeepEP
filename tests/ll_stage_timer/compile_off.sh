@@ -9,11 +9,6 @@ SDK="$LL_TIMER_ROOT/third-party/shmem/install/shmem"
 test -f "$SDK/lib/libshmem.so"
 HNS_PI_ON_CHIP=$(python3 "$LL_TIMER_ROOT/scripts/shmem_sdk_identity.py" "$SDK")
 SOURCES=(dispatch/low_latency.cpp combine/low_latency.cpp)
-for mode in prequant_e4m3 fp16 fp16_e4m3 fp16_e5m2 bf16 bf16_e4m3 bf16_e5m2; do
-  for group in 4 16; do
-    SOURCES+=("dispatch/low_latency/variants/${mode}_g${group}.cpp")
-  done
-done
 # NDR has one compiled transport capability. Runtime MTE is selected at runtime,
 # so compiling with RDMA absent would not test the production configuration.
 for src in "${SOURCES[@]}"; do

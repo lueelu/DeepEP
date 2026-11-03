@@ -11,14 +11,17 @@
 #include "device/dispatch_server_dedup_recv.h"
 
 namespace DispatchDedup {
-template <class XType, bool WireFp8, bool E4M3, bool Prequantized = false, uint32_t Group = 16U>
+// The input element class and the group size are the only compile-time axes;
+// plain/quantized/prequantized wire formats come from the runtime tiling.
+template <class XType, uint32_t Group = 16U>
 class DispatchMemoryServerDedupKernel {
 public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR x, GM_ADDR expertIds, GM_ADDR expertScales,
                                 GM_ADDR expandXOut, GM_ADDR dynamicScalesOut, GM_ADDR expertTokenNumsOut,
                                 GM_ADDR sendCountsOut, GM_ADDR tokenTypeOut, GM_ADDR destinationIndexOut,
                                 GM_ADDR relayReadIndexOut, GM_ADDR sourceMaskOut, GM_ADDR expertScalesOut, uint32_t bs,
-                                uint32_t h, uint32_t topK, uint32_t experts, uint32_t expertTokenNumsType, TPipe* pipe,
+                                uint32_t h, uint32_t topK, uint32_t experts, uint32_t expertTokenNumsType,
+                                EpServerDedupInputMode inputMode, bool e4m3, TPipe* pipe,
                                 GM_ADDR inputScales = nullptr, bool enableDedup = true,
                                 LlReferenceProfile::DeviceProfile* profile = nullptr)
     {
@@ -38,11 +41,11 @@ public:
         if (profile_) profile_->Mark<4>();  // w4: counts_init_end
 
         if (core_ < sendCores_)
-            sender_.Init(args_, x, expertIds, expertScales, sourceMaskOut, expertScalesOut, bs, h, topK, experts, pipe,
-                         magic, inputScales, enableDedup);
+            sender_.Init(args_, x, expertIds, expertScales, sourceMaskOut, expertScalesOut, bs, h, topK, experts,
+                         inputMode, e4m3, pipe, magic, inputScales, enableDedup);
         else
             receiver_.Init(args_, expandXOut, dynamicScalesOut, tokenTypeOut, destinationIndexOut, relayReadIndexOut,
-                           bs, h, topK, experts, pipe, magic, enableDedup);
+                           bs, h, topK, experts, inputMode, pipe, magic, enableDedup);
         if (profile_) profile_->Mark<5>();  // w5: role_init_end
     }
 
@@ -109,8 +112,8 @@ public:
 private:
     LlReferenceProfile::DeviceProfile* profile_ = nullptr;
     ServerDedupCounts counts_;
-    ServerDedupSender<XType, WireFp8, E4M3, Prequantized, Group> sender_;
-    ServerDedupReceiver<XType, WireFp8, E4M3, Prequantized> receiver_;
+    ServerDedupSender<XType, Group> sender_;
+    ServerDedupReceiver receiver_;
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
     TPipe* pipe_ = nullptr;
     uint32_t core_ = 0, sendCores_ = 0;

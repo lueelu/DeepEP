@@ -18,21 +18,17 @@ using namespace AscendC;
 
 // 中文审计：完整dispatch的接收、包消费和输出元数据路径；第2层提取核不调用本类。
 // 审计接收任务/包格式时继续查看dispatch_server_dedup_receive_tasks.h和receive_packet.h。
-template <class XType, bool WireFp8, bool E4M3, bool Prequantized = false>
+// 接收侧只处理字节，不读取输入元素类型；wire格式是运行时tiling字段。
 class ServerDedupReceiver {
-    static_assert(!Prequantized || WireFp8, "prequantized input requires FP8 wire");
-    static constexpr EpServerDedupInputMode InputMode =
-        Prequantized ? EpServerDedupInputMode::PrequantizedFp8Packs
-                     : (WireFp8 ? EpServerDedupInputMode::Quantize16 : EpServerDedupInputMode::Plain16);
-
 public:
     // 摘要：绑定本 rank 接收输出，确定接收核编号和本轮双窗口偏移。
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, GM_ADDR expandX, GM_ADDR dynamicScales,
                                 GM_ADDR tokenType, GM_ADDR destinationIndex, GM_ADDR relayReadIndex, uint32_t bs,
-                                uint32_t h, uint32_t k, uint32_t experts, TPipe* pipe, int64_t magic = 0,
-                                bool enableDedup = true)
+                                uint32_t h, uint32_t k, uint32_t experts, EpServerDedupInputMode inputMode,
+                                TPipe* pipe, int64_t magic = 0, bool enableDedup = true)
     {
         args_ = args;
+        wireFp8_ = inputMode != EpServerDedupInputMode::Plain16;
 
         coreNum_ = GetBlockNum();
         recvCoreNum_ = coreNum_ / 2U;
@@ -43,8 +39,9 @@ public:
         experts_ = experts;
         localExperts_ = experts / uint32_t(args_->rankSize);
         receiver_ = GetBlockIdx() - recvCoreNum_;
-        hiddenBytes_ = WireFp8 ? h : h * uint32_t(sizeof(XType));
-        data_ = DispatchServerDedupDataLayout(bs, h, k, experts, InputMode);
+        // Both admitted 16-bit input families occupy two bytes per element.
+        hiddenBytes_ = wireFp8_ ? h : h * 2U;
+        data_ = DispatchServerDedupDataLayout(bs, h, k, experts, inputMode);
         windowOffset_ = DispatchServerDedupWindowOffset(magic);
         data_.dispatchOffset += windowOffset_;
         expandX_.SetGlobalBuffer(expandX);
@@ -369,7 +366,7 @@ private:
             WaitFlag<HardEvent::MTE2_MTE3>(lane);
 
             DataCopyPad(expandX_[uint64_t(row) * hiddenBytes_], wire, {1U, hiddenBytes_, 0U, 0U, 0U});
-            if constexpr (WireFp8)
+            if (wireFp8_)
                 DataCopyPad(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire[uint32_t(data_.quantCount)],
                             {1U, uint32_t(data_.scaleBytes), 0U, 0U, 0U});
 
@@ -405,12 +402,12 @@ private:
 
         if (keepFlags) {
             WriteServerDedupPayloadRange(expandX_[uint64_t(row) * hiddenBytes_], wire, 0U, hiddenBytes_);
-            if constexpr (WireFp8)
+            if (wireFp8_)
                 WriteServerDedupPayloadRange(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire,
                                              uint32_t(data_.quantCount), uint32_t(data_.scaleBytes));
         } else {
             DataCopyPad(expandX_[uint64_t(row) * hiddenBytes_], wire, {1U, hiddenBytes_, 0U, 0U, 0U});
-            if constexpr (WireFp8)
+            if (wireFp8_)
                 DataCopyPad(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire[uint32_t(data_.quantCount)],
                             {1U, uint32_t(data_.scaleBytes), 0U, 0U, 0U});
         }
@@ -462,7 +459,7 @@ public:
 private:
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
     TPipe* pipe_ = nullptr;
-    bool enableDedup_ = false;
+    bool enableDedup_ = false, wireFp8_ = false;
     uint64_t windowOffset_ = 0;
     uint32_t recvCoreNum_ = 0, coreNum_ = 0;
     uint32_t bs_ = 0U, k_ = 0U, experts_ = 0U, localExperts_ = 0U, receiver_ = 0U;

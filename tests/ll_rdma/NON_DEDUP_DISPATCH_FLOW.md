@@ -44,7 +44,7 @@ non_dedup = not enable_dedup
 逻辑G在P=16时为4，P>16时为16；物理机界固定为每16个连续rank，不能把G与物理机界混用。
 
 源码：[模式条件](../../csrc/kernels/dispatch/low_latency/common/ep_memory_server_dedup_mode.h#L18)、
-[设备入口](../../csrc/kernels/dispatch/low_latency/dispatch_variant_kernel.h#L61)、
+[设备入口](../../csrc/kernels/dispatch/low_latency.cpp)、
 [分组规则](../../csrc/kernels/dispatch/low_latency/common/ll_group_policy.h)。
 
 ## 2 变量与三个不同的索引
@@ -73,8 +73,8 @@ ElasticBuffer.dispatch
   → _low_latency_plan
   → _dispatch_low_latency
   → native.dispatch_low_latency
-  → dispatch_server_dedup_kernel_do_v2
-  → 选中的dispatch_server_dedup_kernel_<mode>_g4或g16
+  → dispatch_server_dedup_kernel_do
+  → 单一dispatch_server_dedup_kernel按输入元素类与g4/g16选择实例
   → DispatchMemoryServerDedupKernel.Init / Process
 ```
 

@@ -11,7 +11,8 @@ A3实测时其余6个设备单元约40秒完成，dispatch的单个Bisheng进程
 - variants/的14个入口共用dispatch_variant_kernel.h，保持Init/Process、计时、专家统计及对象析构顺序。
 - Host从已有world/dtype字段选择一个入口，tiling生成与选择共用字段构造，不增加设备读回或同步。
 - 设备入口再次校验上传的tiling与特化一致；不支持的组合明确拒绝。
-- 152字节EpServerDedupKernelArgs与核心通信ABI5保持；内部启动符号改为dispatch_server_dedup_kernel_do_v2。Host与设备库必须整套更新，混装旧库会缺失符号而失败。
+- 152字节EpServerDedupKernelArgs与核心通信ABI5保持；内部启动符号为dispatch_server_dedup_kernel_do。Host与设备库必须整套更新，混装旧库会缺失符号而失败。
+- 后续已回退为main的单入口单TU结构（一个global入口内按tiling选择输入元素类与G，不再有variants/与dispatch_variant_kernel.h）；本文记录的是拆分实验。当前结构以csrc/kernels/dispatch/low_latency.cpp为准。
 - 当前NDR阶段schema3和EP16数据计数保留；泛化分支未做此次拆分。
 
 ## 同基线冷构建结果

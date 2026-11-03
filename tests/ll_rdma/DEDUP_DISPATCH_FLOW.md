@@ -103,8 +103,8 @@ relay包数 = sum(max(m_g-1,0))
 ElasticBuffer.dispatch
   → _low_latency_plan / _dispatch_low_latency
   → native.dispatch_low_latency
-  → dispatch_server_dedup_kernel_do_v2
-  → 单个格式与G对应的kernel
+  → dispatch_server_dedup_kernel_do
+  → 单一kernel内按输入元素类与G选择实例
   → DispatchMemoryServerDedupKernel.Init / Process
 ```
 

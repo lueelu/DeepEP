@@ -25,22 +25,23 @@ using namespace AscendC;
 
 // R02-01/R05-04 source path: first hops precede the cached DIRECT tasks on
 // each core, sharing one packet sequence and ring of in-flight send buffers.
-template <class XType, bool WireFp8, bool E4M3, bool Prequantized = false, uint32_t Group = 16U>
+// Only the input element class and the group size stay compile-time; the wire
+// format and prequantization are runtime tiling fields.
+template <class XType, uint32_t Group = 16U>
 class ServerDedupSender {
-    static_assert(!Prequantized || WireFp8, "prequantized input requires FP8 wire");
-    static constexpr bool NeedQuantize = WireFp8 && !Prequantized;
-    static constexpr EpServerDedupInputMode InputMode =
-        Prequantized ? EpServerDedupInputMode::PrequantizedFp8Packs
-                     : (NeedQuantize ? EpServerDedupInputMode::Quantize16 : EpServerDedupInputMode::Plain16);
-
 public:
     // 摘要：绑定输入输出和本核 token 分片，并按 magic 奇偶选择本轮通信窗口。
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, GM_ADDR x, GM_ADDR ids, GM_ADDR weights,
                                 GM_ADDR sourceMask, GM_ADDR sourceWeights, uint32_t bs, uint32_t h, uint32_t k,
-                                uint32_t experts, TPipe* pipe, int64_t magic = 0, GM_ADDR inputScales = nullptr,
+                                uint32_t experts, EpServerDedupInputMode inputMode, bool e4m3, TPipe* pipe,
+                                int64_t magic = 0, GM_ADDR inputScales = nullptr,
                                 bool enableDedup = true, uint32_t coreNum = 0U)
     {
         args_ = args;
+        prequantized_ = inputMode == EpServerDedupInputMode::PrequantizedFp8Packs;
+        needQuantize_ = inputMode == EpServerDedupInputMode::Quantize16;
+        e4m3_ = e4m3;
+        inputRowBytes_ = uint32_t(prequantized_ ? h : h * sizeof(XType));
         sendCores_ = (coreNum == 0U ? GetBlockNum() : coreNum) / 2U;
         pipe_ = pipe;
         enableDedup_ = enableDedup;
@@ -54,10 +55,10 @@ public:
         const uint32_t base = bs / sendCores_, remainder = bs % sendCores_;
         count_ = base + (core < remainder ? 1U : 0U);
         start_ = core * base + (core < remainder ? core : remainder);
-        data_ = DispatchServerDedupDataLayout(bs, h, k, experts, InputMode);
+        data_ = DispatchServerDedupDataLayout(bs, h, k, experts, inputMode);
         data_.dispatchOffset += DispatchServerDedupWindowOffset(magic);
         inputScales_.SetGlobalBuffer(inputScales);
-        x_.SetGlobalBuffer(reinterpret_cast<__gm__ XType*>(x));
+        x_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(x));
         ids_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(ids));
         weights_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(weights));
         maskOut_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(sourceMask));
@@ -97,10 +98,10 @@ public:
         // 输入队列使用两份缓冲：MTE2 搬入 token 后交给量化/打包阶段。
         // 量化会读取对齐到 256 元素的尾部，所以需先把两份输入缓冲的 padding 清零。
         const uint32_t inputBytes =
-            NeedQuantize ? uint32_t(data_.quantCount * sizeof(XType)) : uint32_t(data_.packedPayloadBytes);
+            needQuantize_ ? uint32_t(data_.quantCount * sizeof(XType)) : uint32_t(data_.packedPayloadBytes);
         scratch_->InitBuffer(input, 2U, inputBytes);
         usedBytes_ = reservedBytes + 2U * inputBytes;
-        if constexpr (NeedQuantize) {
+        if (needQuantize_) {
             // Alias the two input buffers exactly as Memory does. Quantization
             // reads the compute padding, so initialize it once before copying input.
             pipe_->InitBufPool(cleanPool, 2U * inputBytes, scratch);
@@ -117,12 +118,12 @@ public:
         const uint32_t scaleCount = uint32_t(data_.quantCount / 32U);
         const uint32_t quantWorkBytes =
             uint32_t(DispatchDedupAlign(DispatchDedupAlign(scaleCount, 32U) * 4U + uint64_t(scaleCount) * 2U, 32U));
-        const uint32_t scratchBytes = NeedQuantize && quantWorkBytes > qBytes ? quantWorkBytes : qBytes;
+        const uint32_t scratchBytes = needQuantize_ && quantWorkBytes > qBytes ? quantWorkBytes : qBytes;
         Allocate(idsBuf_, routeBytes);
         Allocate(qDstBuf_, scratchBytes);
         Allocate(qSubBuf_, scratchBytes);
         Allocate(qWorkBuf_, qBytes);
-        if constexpr (NeedQuantize) Allocate(quantBuf_, uint32_t(data_.packedPayloadBytes));
+        if (needQuantize_) Allocate(quantBuf_, uint32_t(data_.packedPayloadBytes));
         Allocate(weightInBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 4U, 32U)));
         Allocate(weightOutBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 4U, 32U)));
         Allocate(maskBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * 4U, 32U)));
@@ -423,7 +424,7 @@ private:
                 index.SetValue(entries * 2U, expert | (q << 16U));
                 weights.SetValue(entries * 2U + 1U, routeWeights_.GetValue(token * k_ + k));
             }
-        if constexpr (Prequantized) {
+        if (prequantized_) {
             LlClearStalePrequantTail(index, cachedTailEntries_, entries);
             cachedTailEntries_ = entries;
         }
@@ -434,7 +435,7 @@ private:
         TQue<QuePosition::VECIN, 1>& input;
         __aicore__ inline void LoadInput(uint32_t token) { sender.LoadTokenInput(input, token); }
         __aicore__ inline void ReleaseInput() {
-            if constexpr (!NeedQuantize) input.template FreeTensor<XType>(sender.cachedInput_);
+            if (!sender.needQuantize_) input.template FreeTensor<uint8_t>(sender.cachedInput_);
         }
         __aicore__ inline void WaitPackedRead() {
 
@@ -451,50 +452,51 @@ private:
     __aicore__ inline void LoadTokenInput(TQue<QuePosition::VECIN, 1>& input, uint32_t token)
     {
 
-        auto x = input.template AllocTensor<XType>();
-        if constexpr (Prequantized) {
+        auto x = input.template AllocTensor<uint8_t>();
+        if (prequantized_) {
             // The full payload queue slot stages H bytes and 4P scale bytes.
             // Clear padding instead of the whole payload. For nonaligned H,
             // only the last <=31 input bytes share its aligned padding clear;
             // the following load overwrites them. Scales remain untouched.
             const auto padding = LlPlanPrequantPadding(h_, uint32_t(data_.quantCount),
                 uint32_t(data_.scaleBytes), uint32_t(data_.packedPayloadBytes));
-            auto bytes = x.template ReinterpretCast<uint8_t>();
-            if (padding.inputBytes) Duplicate<uint8_t>(bytes[padding.inputOffset], 0U, padding.inputBytes);
+            if (padding.inputBytes) Duplicate<uint8_t>(x[padding.inputOffset], 0U, padding.inputBytes);
             if (padding.tailBlockMask) {
                 uint64_t mask[2] = {padding.tailBlockMask, 0U};
-                Duplicate<uint32_t>(bytes[padding.tailBlockOffset].template ReinterpretCast<uint32_t>(),
+                Duplicate<uint32_t>(x[padding.tailBlockOffset].template ReinterpretCast<uint32_t>(),
                                     0U, mask, 1U, 1U, 8U);
             }
-            if (padding.tailBytes) Duplicate<uint8_t>(bytes[padding.tailOffset], 0U, padding.tailBytes);
+            if (padding.tailBytes) Duplicate<uint8_t>(x[padding.tailOffset], 0U, padding.tailBytes);
             Sync<HardEvent::V_MTE2>();
             cachedTailEntries_ = 0U;
         }
-        DataCopyPad(x, x_[uint64_t(token) * h_], {1U, h_ * uint32_t(sizeof(XType)), 0U, 0U, 0U},
-                    {NeedQuantize, 0U, 0U, XType(0)});
-        if constexpr (Prequantized) {
-            auto scale = x.template ReinterpretCast<uint8_t>()[uint32_t(data_.quantCount)];
+        // Input rows are addressed and copied in bytes: prequantized rows carry
+        // H FP8 bytes, 16-bit rows carry H elements.
+        DataCopyPad(x, x_[uint64_t(token) * inputRowBytes_], {1U, inputRowBytes_, 0U, 0U, 0U},
+                    {needQuantize_, 0U, 0U, uint8_t(0)});
+        if (prequantized_) {
+            auto scale = x[uint32_t(data_.quantCount)];
             DataCopyPad(scale, inputScales_[uint64_t(token) * data_.scaleBytes],
                         {1U, uint32_t(data_.scaleBytes), 0U, 0U, 0U}, {false, 0U, 0U, uint8_t(0)});
         }
         input.EnQue(x);
 
-        x = input.template DeQue<XType>();
+        x = input.template DeQue<uint8_t>();
 
-        if constexpr (NeedQuantize) {
+        if (needQuantize_) {
             cachedPayload_ = quantBuf_.Get<uint8_t>();
-            if constexpr (E4M3)
-                QuantMxfp8<fp8_e4m3fn_t>(cachedPayload_, x);
+            if (e4m3_)
+                QuantMxfp8<fp8_e4m3fn_t>(cachedPayload_, x.template ReinterpretCast<XType>());
             else
-                QuantMxfp8<fp8_e5m2_t>(cachedPayload_, x);
-            input.template FreeTensor<XType>(x);
+                QuantMxfp8<fp8_e5m2_t>(cachedPayload_, x.template ReinterpretCast<XType>());
+            input.template FreeTensor<uint8_t>(x);
             Sync<HardEvent::V_S>();
         } else {
 
             Sync<HardEvent::MTE2_S>();
 
             cachedInput_ = x;
-            cachedPayload_ = x.template ReinterpretCast<uint8_t>();
+            cachedPayload_ = x;
         }
     }
 
@@ -571,16 +573,18 @@ private:
     LlReferenceProfile::DeviceProfile* packetProfile_ = nullptr;
 #endif
     LlSenderInputReuse inputReuse_;
-    LocalTensor<XType> cachedInput_;
+    LocalTensor<uint8_t> cachedInput_;
     LocalTensor<uint8_t> cachedPayload_;
     uint32_t cachedTailEntries_ = 0U;
     bool enableDedup_ = false, fullMeshFirstHop_ = false;
+    bool prequantized_ = false, needQuantize_ = false, e4m3_ = true;
     TBufPool<TPosition::VECCALC, 16>* scratch_ = nullptr;
     uint32_t sendCores_ = 0;
     uint32_t bs_ = 0, h_ = 0, k_ = 0, experts_ = 0, localExperts_ = 0, start_ = 0, count_ = 0;
+    uint32_t inputRowBytes_ = 0;
     uint32_t usedBytes_ = 0, lanes_ = 0, packets_ = 0, directCount_ = 0;
     EpServerDedupDataLayout data_{};
-    GlobalTensor<XType> x_;
+    GlobalTensor<uint8_t> x_;
     GlobalTensor<uint8_t> inputScales_;
     GlobalTensor<int32_t> ids_;
     GlobalTensor<float> weights_, weightOut_;

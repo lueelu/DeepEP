@@ -10,9 +10,6 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DISPATCH_MODES = ("prequant_e4m3", "fp16", "fp16_e4m3", "fp16_e5m2", "bf16", "bf16_e4m3", "bf16_e5m2")
-DISPATCH_VARIANTS = [f"dispatch/low_latency/variants/{mode}_g{group}.cpp"
-                     for mode in DISPATCH_MODES for group in (4, 16)]
 
 
 def tool(name):
@@ -161,13 +158,11 @@ def test_real_device_rules_recompile_only_ll_when_timer_changes(tmp_path):
     child.mkdir(parents=True)
     shutil.copyfile(ROOT / "cmake/device/CMakeLists.txt", child / "CMakeLists.txt")
     shutil.copyfile(ROOT / "cmake/Dependencies.cmake", source / "cmake/Dependencies.cmake")
-    units = ["dispatch/low_latency.cpp", "combine/low_latency.cpp", *DISPATCH_VARIANTS]
+    units = ["dispatch/low_latency.cpp", "combine/low_latency.cpp"]
     for unit in units:
         path = source / "csrc/kernels" / unit
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("// fake translation unit\n")
-    variant_header = source / "csrc/kernels/dispatch/low_latency/dispatch_variant_kernel.h"
-    variant_header.write_text("// shared dispatch variant dependency\n")
     sdk = source / "sdk"
     for path in [sdk / "lib64/libascendcl.so", sdk / "lib64/libruntime.so", sdk / "lib/libshmem.so"]:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,10 +192,8 @@ if "-o" in args:
         def escape(value):
             return str(value).replace("\\\\", "/").replace(" ", "\\\\ ").replace(":", "\\\\:")
         dependencies = [unit]
-        if unit.replace("\\\\", "/").endswith("/variants/bf16_g4.cpp"):
+        if unit.replace("\\\\", "/").endswith("/dispatch/low_latency.cpp"):
             dependencies.append(Path(__file__).parent / "checkout with spaces/sdk/shared.h")
-        if "/variants/" in unit.replace("\\\\", "/"):
-            dependencies.append(Path(__file__).parent / "checkout with spaces/csrc/kernels/dispatch/low_latency/dispatch_variant_kernel.h")
         Path(args[args.index("-MF") + 1]).write_text(
             escape(output) + ": " + " ".join(escape(item) for item in dependencies) + "\\n")
 ''')
@@ -225,10 +218,10 @@ if "-o" in args:
         return [json.loads(line) for line in commands.read_text().splitlines()[len(before):]]
 
     initial = run("OFF")
-    assert len(initial) == 17  # Sixteen LL objects plus the shared library; no HT sources.
+    assert len(initial) == 3  # Two LL objects plus the shared library; no HT sources.
     changed = run("ON")
-    assert len(changed) == 17
-    expected_ll = {"dispatch/low_latency.cpp", "combine/low_latency.cpp", *DISPATCH_VARIANTS}
+    assert len(changed) == 3
+    expected_ll = {"dispatch/low_latency.cpp", "combine/low_latency.cpp"}
     assert {Path(unit).relative_to(source / "csrc/kernels").as_posix()
             for unit in changed if unit != "link"} == expected_ll
     for timer in ["OFF", "ON", "OFF"]:
@@ -246,7 +239,7 @@ if "-o" in args:
     shared_header.write_text("// changed SDK dependency\n")
     changed = run("OFF")
     assert len(changed) == 2
-    assert any(unit.endswith("/variants/bf16_g4.cpp") for unit in changed)
+    assert any(unit.endswith("/dispatch/low_latency.cpp") for unit in changed)
     assert "link" in changed
     (source / "csrc/kernels/combine/low_latency.cpp").write_text("// changed LL source\n")
     changed = run("OFF")
@@ -256,16 +249,9 @@ if "-o" in args:
     # The inactive timer variant must catch both edits when selected again.
     changed = run("ON")
     assert len(changed) == 3
-    assert sorted(Path(unit).parent.name for unit in changed if unit != "link") == ["combine", "variants"]
+    assert sorted(Path(unit).parent.name for unit in changed if unit != "link") == ["combine", "dispatch"]
     assert run("OFF") == ["link"]
     assert run("OFF") == []
-    variant_header.write_text("// changed shared dispatch variant dependency\n")
-    for timer in ("OFF", "ON"):
-        changed = run(timer)
-        assert len(changed) == 15
-        assert {Path(unit).relative_to(source / "csrc/kernels").as_posix()
-                for unit in changed if unit != "link"} == set(DISPATCH_VARIANTS)
-    assert run("ON") == []
     # SDK and inline LL headers must select the same doorbell mode. Changing
     # that recorded mode changes real compiler commands for every device unit.
     identity_path = sdk / "deepep-sdk.json"
@@ -273,7 +259,7 @@ if "-o" in args:
     identity["build"]["hns_1825_pi_on_chip"] = 1
     identity_path.write_text(json.dumps(identity))
     previous_commands = len((tmp_path / "command_args.jsonl").read_text().splitlines())
-    assert len(run("ON")) == 17
+    assert len(run("ON")) == 3
     for line in (tmp_path / "command_args.jsonl").read_text().splitlines()[previous_commands:]:
         args = json.loads(line)
         if "-c" in args:

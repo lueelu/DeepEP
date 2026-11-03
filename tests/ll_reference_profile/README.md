@@ -111,7 +111,7 @@ Excel/原始样本可能超过回传上限，留在目标机查看；只回传�
 - 未执行阶段留空，已执行但耗时为0保留0。父子和并行阶段不能相加，
   也不能把不同核各阶段的最大值相加当作kernel时延。
 
-源码入口为 `dispatch_variant_kernel.h`、`dispatch_server_dedup_kernel.h` 和
+源码入口为 `csrc/kernels/dispatch/low_latency.cpp`、`dispatch_server_dedup_kernel.h` 和
 `device/dispatch_server_dedup_{counts,send,recv}.h`；记录契约在
 `common/ll_reference_profile_layout.h`，纯CPU解析在 `deep_ep/utils/ll_reference_profile_parse.py`。
 

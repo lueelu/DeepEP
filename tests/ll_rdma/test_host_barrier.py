@@ -26,7 +26,7 @@ def test_project_build_owns_barrier():
     ll_sources = cmake.split("set(_ll_sources", 1)[1].split("add_library(deepep_kernel_ll_plain", 1)[0]
     assert "csrc/kernels/dispatch/low_latency.cpp" in ll_sources
     assert "csrc/kernels/combine/low_latency.cpp" in ll_sources
-    assert "low_latency/variants/${_mode}_g${_group}.cpp" in ll_sources
+    assert "variants" not in ll_sources
     for variant in ("plain", "reference"):
         assert f"add_library(deepep_kernel_ll_{variant} OBJECT ${{_ll_sources}})" in cmake
     assert "add_library(deepep_kernels SHARED $<TARGET_OBJECTS:${_ll_variant}>)" in cmake

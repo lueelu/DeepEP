@@ -236,13 +236,7 @@ def make_parser():
     return parser
 
 
-DISPATCH_PROFILER_ENTRIES = (
-    "dispatch_server_dedup_kernel",
-    *(f"dispatch_server_dedup_kernel_{mode}_g{group}"
-      for mode in ("prequant_e4m3", "fp16", "fp16_e4m3", "fp16_e5m2",
-                   "bf16", "bf16_e4m3", "bf16_e5m2")
-      for group in (4, 16)),
-)
+DISPATCH_PROFILER_ENTRIES = ("dispatch_server_dedup_kernel",)
 
 
 def kernel_durations(root, kernel, expected):

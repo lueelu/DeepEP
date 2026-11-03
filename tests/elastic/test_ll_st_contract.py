@@ -68,12 +68,7 @@ def test_kernel_csv_contract(tmp_path):
         st.kernel_durations(tmp_path, "combine_server_dedup_kernel", 1)
 
 
-@pytest.mark.parametrize("entry", ["dispatch_server_dedup_kernel"] + [
-    f"dispatch_server_dedup_kernel_{mode}_g{group}"
-    for mode in ("prequant_e4m3", "fp16", "fp16_e4m3", "fp16_e5m2",
-                 "bf16", "bf16_e4m3", "bf16_e5m2")
-    for group in (4, 16)
-])
+@pytest.mark.parametrize("entry", ["dispatch_server_dedup_kernel"])
 def test_dispatch_profiler_entries_and_stable_tail(tmp_path, entry):
     # Reverse CSV order to check timestamp ordering before last-50 selection.
     rows = [f"void {entry}(),{i},{i}" for i in range(100, 0, -1)]
@@ -98,26 +93,12 @@ def test_dispatch_profiler_entries_and_stable_tail(tmp_path, entry):
 
 
 @pytest.mark.parametrize("second", [
-    "dispatch_server_dedup_kernel",  # Old and new wheel traces cannot mix.
-    "dispatch_server_dedup_kernel_bf16_g16",
-    "dispatch_server_dedup_kernel_fp16_g4",
-])
-def test_dispatch_profiler_rejects_mixed_entries_across_exports(tmp_path, second):
-    for directory, name in (("a", "dispatch_server_dedup_kernel_bf16_g4"), ("b", second)):
-        export = tmp_path / directory
-        export.mkdir()
-        (export / "kernel_details.csv").write_text(f"Name,Duration(us)\n{name},2\n")
-    with pytest.raises(ValueError, match="Mixed dispatch profiler entries"):
-        st.kernel_durations(tmp_path, "dispatch_server_dedup_kernel", 2)
-
-
-@pytest.mark.parametrize("second", [
-    "dispatch_server_dedup_kernel_bf16_g4 [task=2]",
-    "void dispatch_server_dedup_kernel_bf16_g4()",
+    "dispatch_server_dedup_kernel [task=2]",
+    "void dispatch_server_dedup_kernel()",
 ])
 def test_dispatch_profiler_rejects_different_task_names(tmp_path, second):
     (tmp_path / "kernel_details.csv").write_text(
-        "Name,Duration(us)\ndispatch_server_dedup_kernel_bf16_g4,2\n"
+        "Name,Duration(us)\ndispatch_server_dedup_kernel,2\n"
         f"{second},3\n")
     with pytest.raises(ValueError, match="Mixed dispatch profiler task names"):
         st.kernel_durations(tmp_path, "dispatch_server_dedup_kernel", 2)

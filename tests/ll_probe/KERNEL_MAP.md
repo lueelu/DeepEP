@@ -7,7 +7,7 @@
 | Host API、参数上传、版本互检 | `deep_ep/buffers/elastic.py` → `csrc/ops/low_latency.cpp` |
 | Session、对称内存和 transport 建域 | `csrc/runtime/session.cpp` |
 | AIV 核数与逻辑组 | `csrc/runtime/ll_core_config.hpp`、`csrc/kernels/dispatch/low_latency/common/ll_core_config.h`、`ep_memory_server_dedup_layout.h`、`common/ll_group_policy.h`（tiling key4/16与物理机界） |
-| dispatch 总入口 | `csrc/kernels/dispatch/low_latency.cpp`（Host分发）→ `low_latency/variants/*.cpp` → `dispatch_variant_kernel.h` → `dispatch_server_dedup_kernel.h` |
+| dispatch 总入口 | `csrc/kernels/dispatch/low_latency.cpp`（单一 kernel，按 tiling 选择输入元素类与 group）→ `dispatch_server_dedup_kernel.h` |
 | dispatch 计数、发送、转发、接收 | `csrc/kernels/dispatch/low_latency/device/dispatch_server_dedup_{counts,send,recv}.h` |
 | combine 总入口/准备/通知/直接回传 | `csrc/kernels/combine/low_latency.cpp`、`low_latency/combine_server_dedup_kernel.h` |
 | partial get/归约/回传、最终聚合 | `csrc/kernels/combine/low_latency/combine_server_dedup_{partial,source_aggregate}.h` |

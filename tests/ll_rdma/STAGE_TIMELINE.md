@@ -120,7 +120,7 @@ flowchart TD
 
 源码位置（每个点均有同名注释）：
 
-- [dispatch_variant_kernel.h](../../csrc/kernels/dispatch/low_latency/dispatch_variant_kernel.h)：入口 w0/w1。
+- [dispatch/low_latency.cpp](../../csrc/kernels/dispatch/low_latency.cpp)：入口 w0/w1。
 - [dispatch_server_dedup_kernel.h](../../csrc/kernels/dispatch/low_latency/dispatch_server_dedup_kernel.h)：主流程 w2..w21。
 - [dispatch_server_dedup_counts.h](../../csrc/kernels/dispatch/low_latency/device/dispatch_server_dedup_counts.h)：w24..w29。
 - [dispatch_server_dedup_send.h](../../csrc/kernels/dispatch/low_latency/device/dispatch_server_dedup_send.h)：w38..w40、w43。

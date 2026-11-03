@@ -49,10 +49,9 @@ static_assert(offsetof(EpServerDedupKernelArgs, coreNum) == 140, "active cores")
 static_assert(offsetof(EpServerDedupKernelArgs, expertTimer) == 144, "expert timer address");
 }  // namespace deepep
 
-// Versioned internal symbol: mixed old/new Host and device libraries fail to link/load.
-// The 152-byte argument structure and communication protocol are unchanged.
-extern "C" void dispatch_server_dedup_kernel_do_v2(void* stream, const deepep::EpServerDedupKernelArgs* args,
-                                                   uint32_t variant);
+// Single internal launch entry. The 152-byte argument structure and the
+// communication protocol are unchanged.
+extern "C" void dispatch_server_dedup_kernel_do(void* stream, const deepep::EpServerDedupKernelArgs* args);
 
 extern "C" uint32_t deepep_ll_core_protocol_version();
 extern "C" uint32_t deepep_ll_rdma_enabled();
