@@ -140,6 +140,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
                 component.mkdir(parents=True)
 
     monkeypatch.setattr(build, "checked_run", run)
+    monkeypatch.setattr(build, "bundle_shmem_runtime", lambda sdk, target: {"test": "hash"})
     published = []
     monkeypatch.setattr(build, "publish_source_native", published.append)
     if expected_jobs is None:
@@ -417,13 +418,16 @@ def test_lineinfo_only_affects_component_builds(build, sdk_environment, ep_gmm_f
 
 
 @pytest.mark.parametrize("component", ["ep_gmm_fused", "other", "nested"])
-def test_disabled_component_check_leaves_other_experiments_alone(tmp_path, component):
+def test_disabled_component_check_leaves_other_experiments_alone(tmp_path, component, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
     wheel = tmp_path / "test.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("deep_ep/_C.fake.so", b"test")
         archive.writestr("deep_ep/deepseek-deepep.LICENSE", b"test")
-        archive.writestr("deep_ep/_build_info.json", json.dumps({"communication_operations": []}))
+        archive.writestr(
+            "deep_ep/_build_info.json",
+            json.dumps({"communication_operations": [], "shmem_runtime": shmem_wheel_payload(archive)}),
+        )
         archive.writestr("deep_ep_experimental/__init__.py", "")
         name = (
             "ep-gmm-fused-shared/deep_ep_experimental/ep_gmm_fused/__init__.py"

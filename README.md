@@ -81,14 +81,15 @@ DeepEP/
 
 ### 安装 SHMEM 依赖
 
-按照[构建指南](docs/build.md)准备 SHMEM SDK，加载 CANN 与 SHMEM 环境：
+源码构建时按照[构建指南](docs/build.md)准备 SHMEM SDK，并加载 CANN 环境：
 
 ```bash
 source /path/to/ascend-toolkit/set_env.sh
 export SHMEM_ROOT=/path/to/shmem-sdk
-source "$SHMEM_ROOT/set_env.sh"
-export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 ```
+
+wheel 包含构建所用的 SHMEM 运行库。安装后只需加载匹配的 CANN 环境，
+无需设置 `SHMEM_ROOT` 或手动添加 SHMEM 的 `LD_LIBRARY_PATH`；`SHMEM_ROOT` 仅用于选择构建 SDK。
 
 ### 开发
 

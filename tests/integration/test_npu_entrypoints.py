@@ -201,7 +201,10 @@ def test_installed_native_preflight(monkeypatch, tmp_path, installed, operations
     site = tmp_path / "site"
     package = (site if installed else tmp_path / "checkout") / "deep_ep"
     package.mkdir(parents=True)
-    (package / "_build_info.json").write_text(json.dumps({"communication_operations": operations}), encoding="utf-8")
+    (package / "_build_info.json").write_text(
+        json.dumps({"communication_operations": operations}),
+        encoding="utf-8",
+    )
     module = SimpleNamespace(__file__=str(package / "__init__.py"))
     monkeypatch.setitem(sys.modules, "deep_ep", module)
     monkeypatch.setitem(
@@ -269,12 +272,15 @@ def test_outer_launcher_runs_every_case_once_without_install(monkeypatch, launch
         (None, False),
     ),
 )
-def test_wheel_capability_schema(tmp_path, operations, accepted):
+def test_wheel_capability_schema(tmp_path, operations, accepted, shmem_wheel_payload):
     validator = load_script("validate_package")
     path = tmp_path / "test.whl"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("deep_ep/_C.fake.so", b"fixture")
-        archive.writestr("deep_ep/_build_info.json", json.dumps({"communication_operations": operations}))
+        archive.writestr(
+            "deep_ep/_build_info.json",
+            json.dumps({"communication_operations": operations, "shmem_runtime": shmem_wheel_payload(archive)}),
+        )
         archive.writestr("licenses/deepseek-deepep.LICENSE", "fixture")
     if accepted:
         assert validator.inspect_wheel(path)["communication_operations"] == operations

@@ -23,6 +23,35 @@ from setuptools.command.install_lib import install_lib
 
 ROOT = Path(__file__).resolve().parent
 
+# Runtime closure of the pinned SDK; CANN and driver libraries remain external.
+SHMEM_RUNTIME_LIBRARIES = (
+    "libshmem_utils.so",
+    "aclshmem_bootstrap_config_store.so",
+    "aclshmem_bootstrap_uid.so",
+    "libshmem.so",
+)
+
+
+def bundle_shmem_runtime(sdk, destination):
+    """Copy SDK runtime files, following SDK links into a self-contained wheel."""
+    sources = [Path(sdk) / "lib" / name for name in SHMEM_RUNTIME_LIBRARIES]
+    for path in sources:
+        if not path.is_file():
+            raise RuntimeError(f"Incomplete SHMEM runtime: missing {path}")
+    directory = destination / ".libs"
+    if directory.is_symlink():
+        raise RuntimeError(f"Refusing to replace linked SHMEM staging: {directory}")
+    # This directory belongs to build staging; discard stale SDK payloads.
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir()
+    hashes = {}
+    for source in sources:
+        target = directory / source.name
+        shutil.copy2(source, target)
+        hashes[source.name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    return hashes
+
 
 class BuildEggInfo(egg_info):
     def finalize_options(self):
@@ -408,6 +437,10 @@ def publish_source_native(destination):
     for name in names:
         if not (destination / name).is_file():
             raise RuntimeError(f"Incomplete native build: {destination / name}")
+    for name in SHMEM_RUNTIME_LIBRARIES:
+        if not (destination / ".libs" / name).is_file():
+            raise RuntimeError(f"Incomplete native build: {destination / '.libs' / name}")
+    names.append(".libs")
     anchor = package / ".native-build"
     storage = ROOT / "build" / "source-native"
     if anchor.exists() and not anchor.is_symlink():
@@ -425,12 +458,15 @@ def publish_source_native(destination):
     storage.mkdir(parents=True, exist_ok=True)
     snapshot = Path(tempfile.mkdtemp(prefix="build-", dir=storage)).resolve()
     for name in names:
-        shutil.copy2(destination / name, snapshot / name)
+        if name == ".libs":
+            shutil.copytree(destination / name, snapshot / name)
+        else:
+            shutil.copy2(destination / name, snapshot / name)
     # Install new names before publishing the completed snapshot. Old names use
     # the previous snapshot until the anchor is atomically replaced.
     for name in names:
         if name not in managed:
-            (package / name).symlink_to(Path(".native-build") / name)
+            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name == ".libs")
     pending = snapshot / "anchor"
     pending.symlink_to(os.path.relpath(snapshot, package), target_is_directory=True)
     os.replace(pending, anchor)
@@ -517,6 +553,7 @@ class CMakeBuild(build_ext):
         }
         info["compiler"] = json.loads((directory / "compiler-info.json").read_text())
         info.update(json.loads((directory / "capabilities.json").read_text(encoding="utf-8")))
+        info["shmem_runtime"] = bundle_shmem_runtime(configuration["SHMEM_ROOT"], destination)
         (destination / "_build_info.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

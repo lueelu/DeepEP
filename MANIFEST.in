@@ -16,6 +16,7 @@ include third-party/*.md third-party/*.LICENSE
 prune third-party/shmem
 prune third-party/catlass
 prune deep_ep/.native-build
+prune deep_ep/.libs
 recursive-exclude deep_ep *.so *.so.*
 exclude deep_ep/_build_info.json
 recursive-include experiments/megamoe *.sh *.py *.cpp *.hpp *.cmake CMakeLists.txt *.json *.md *.txt *.LICENSE

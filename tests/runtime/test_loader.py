@@ -30,17 +30,15 @@ def test_require_native_reuses_success_across_operations(monkeypatch):
         _native._require_native_cached.cache_clear()
 
 
-@pytest.mark.parametrize("fault", [None, "origin", "protocol", "checksum", "missing", "source_link"])
+@pytest.mark.parametrize("fault", [None, "origin", "protocol", "external", "missing", "source_link"])
 def test_native_loader_identity(monkeypatch, tmp_path, fault):
     library = tmp_path / "libshmem.so"
     library.write_bytes(b"test SDK identity")
     expected = hashlib.sha256(library.read_bytes()).hexdigest()
-    (tmp_path / "_build_info.json").write_text(
-        json.dumps({"shmem": {"sha256": {"lib/libshmem.so": expected if fault != "checksum" else "0" * 64}}})
-    )
+    (tmp_path / "_build_info.json").write_text(json.dumps({"shmem": {"sha256": {"lib/libshmem.so": expected}}}))
     module = SimpleNamespace(
         runtime_protocol=2 if fault == "protocol" else 1,
-        shmem_library_path=lambda: str(library),
+        shmem_library_path=lambda: str(library if fault != "external" else tmp_path.parent / "libshmem.so"),
     )
     spec = SimpleNamespace(origin=str((tmp_path.parent if fault == "origin" else tmp_path) / "_C.so"))
     if fault == "source_link":
@@ -60,15 +58,62 @@ def test_native_loader_identity(monkeypatch, tmp_path, fault):
         lambda name: None if fault == "missing" else spec,
     )
     monkeypatch.setattr(_native.importlib, "import_module", lambda name: module)
+    monkeypatch.setattr(_native, "_load_bundled_shmem", lambda directory, info: tmp_path)
     _native._load_native.cache_clear()
     try:
-        if fault == "checksum":
-            with pytest.warns(RuntimeWarning, match="Loaded SHMEM library differs"):
-                assert _native._load_native() is module
-        elif fault and fault != "source_link":
+        if fault and fault != "source_link":
             with pytest.raises(ImportError):
                 _native._load_native()
         else:
             assert _native._load_native() is module
     finally:
         _native._load_native.cache_clear()
+
+
+@pytest.mark.parametrize("fault", [None, "manifest", "missing", "checksum", "external", "dependency"])
+def test_bundled_shmem_is_complete_and_never_falls_back(monkeypatch, tmp_path, fault):
+    import ctypes
+
+    bundle = tmp_path / ".libs"
+    bundle.mkdir()
+    hashes = {}
+    for name in _native._SHMEM_LIBRARIES:
+        path = bundle / name
+        path.write_bytes(name.encode())
+        hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    target = bundle / "aclshmem_bootstrap_uid.so"
+    if fault == "manifest":
+        hashes.pop(target.name)
+    elif fault == "missing":
+        target.unlink()
+    elif fault == "checksum":
+        target.write_bytes(b"replaced library")
+    external = tmp_path / "external" / "libshmem.so"
+    monkeypatch.setattr(_native, "_loaded_shmem_paths", lambda: {external} if fault == "external" else set())
+    monkeypatch.setattr(_native, "_shmem_handles", {})
+    calls = []
+
+    def load(path, mode):
+        calls.append(path)
+        if fault == "dependency":
+            raise OSError("libruntime.so: not found")
+        return object()
+
+    monkeypatch.setattr(ctypes, "CDLL", load)
+    if fault:
+        with pytest.raises(
+            ImportError,
+            match={
+                "manifest": "Incomplete bundled",
+                "missing": "Missing bundled",
+                "checksum": "checksum mismatch",
+                "external": "Conflicting SHMEM",
+                "dependency": "libruntime.so: not found",
+            }[fault],
+        ):
+            _native._load_bundled_shmem(tmp_path, {"shmem_runtime": hashes})
+        assert len(calls) == (1 if fault == "dependency" else 0)
+    else:
+        for _ in range(2):
+            assert _native._load_bundled_shmem(tmp_path, {"shmem_runtime": hashes}) == bundle
+        assert calls == [str(bundle / name) for name in _native._SHMEM_LIBRARIES]

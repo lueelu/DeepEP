@@ -298,7 +298,7 @@ def test_lock_declares_operators_without_claiming_device_qualification():
         "elastic-combine-expanded-v3",
     ],
 )
-def test_elastic_wheel_requires_device_library(tmp_path, capability):
+def test_elastic_wheel_requires_device_library(tmp_path, capability, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
     operations = ["ElasticBuffer.dispatch", "ElasticBuffer.combine"]
     for device_library in (False, True):
@@ -312,6 +312,7 @@ def test_elastic_wheel_requires_device_library(tmp_path, capability):
                     {
                         "communication_operations": operations,
                         "capabilities": [capability],
+                        "shmem_runtime": shmem_wheel_payload(archive),
                     }
                 ),
             )
@@ -327,7 +328,7 @@ def test_elastic_wheel_requires_device_library(tmp_path, capability):
 @pytest.mark.parametrize(
     "missing", [None, "deep_ep/libdeepep_kernels.so", "deep_ep_experimental/megamoe/libmegamoe_kernel.so"]
 )
-def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing):
+def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
     info = {
         "megamoe": {"enabled": True, "timer": True},
@@ -347,6 +348,7 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
     }
     wheel = tmp_path / "combined.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
+        info["shmem_runtime"] = shmem_wheel_payload(archive)
         archive.writestr("deep_ep/_build_info.json", json.dumps(info))
         for name in sorted(members - {missing}):
             archive.writestr(name, b"fixture")
@@ -404,6 +406,9 @@ def source_native(build, monkeypatch, tmp_path):
     names = ["_C.test.so", "_clos_C.test.so", "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
     for name in names:
         (destination / name).write_bytes(("first:" + name).encode())
+    (destination / ".libs").mkdir()
+    for name in build.SHMEM_RUNTIME_LIBRARIES:
+        (destination / ".libs" / name).write_bytes(b"SDK")
     return package, destination, names
 
 
@@ -421,6 +426,65 @@ def test_source_native_snapshot_survives_staging_removal_and_refresh(build, sour
     assert (package / ".native-build").resolve() != first
     build.shutil.rmtree(destination)
     assert all((package / name).read_bytes() == b"second" for name in names)
+    assert (package / ".libs").is_symlink()
+    assert all((package / ".libs" / name).read_bytes() == b"SDK" for name in build.SHMEM_RUNTIME_LIBRARIES)
+
+
+@pytest.mark.parametrize("missing", [None, "libshmem_utils.so", "aclshmem_bootstrap_uid.so"])
+def test_bundle_shmem_runtime(build, tmp_path, missing):
+    sdk = tmp_path / "sdk"
+    (sdk / "lib").mkdir(parents=True)
+    destination = tmp_path / "package"
+    destination.mkdir()
+    for name in build.SHMEM_RUNTIME_LIBRARIES:
+        if name != missing:
+            (sdk / "lib" / name).write_bytes(name.encode())
+    if missing:
+        with pytest.raises(RuntimeError, match="Incomplete SHMEM runtime"):
+            build.bundle_shmem_runtime(sdk, destination)
+        assert not (destination / ".libs").exists()
+    else:
+        hashes = build.bundle_shmem_runtime(sdk, destination)
+        build.shutil.rmtree(sdk)
+        assert set(hashes) == set(build.SHMEM_RUNTIME_LIBRARIES)
+        for name, digest in hashes.items():
+            path = destination / ".libs" / name
+            assert not path.is_symlink()
+            assert build.hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "checksum", "manifest", "license", "extra"])
+def test_wheel_shmem_runtime_integrity(tmp_path, shmem_wheel_payload, fault):
+    validator = load(ROOT / "scripts/validate_package.py")
+    wheel = tmp_path / "bundle.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        hashes = shmem_wheel_payload(archive)
+        archive.writestr("deep_ep/_C.fake.so", "fixture")
+        archive.writestr("licenses/deepseek-deepep.LICENSE", "fixture")
+        if fault == "manifest":
+            hashes.pop("libshmem.so")
+        archive.writestr(
+            "deep_ep/_build_info.json", json.dumps({"communication_operations": [], "shmem_runtime": hashes})
+        )
+    with zipfile.ZipFile(wheel) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    target = "deep_ep/.libs/libshmem_utils.so"
+    if fault == "missing":
+        members.pop(target)
+    elif fault == "checksum":
+        members[target] = b"wrong SDK"
+    elif fault == "license":
+        members.pop("licenses/cann.LICENSE")
+    elif fault == "extra":
+        members["deep_ep/.libs/old.so"] = b"old SDK"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    if fault:
+        with pytest.raises(RuntimeError, match="SHMEM"):
+            validator.inspect_wheel(wheel)
+    else:
+        assert validator.inspect_wheel(wheel)["shmem_runtime"] == hashes
 
 
 def test_incomplete_source_native_build_keeps_previous_links(build, source_native):
@@ -522,6 +586,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
             (destination / "libdeepep_kernels.so").write_bytes(b"new")
 
     monkeypatch.setattr(build, "checked_run", run)
+    monkeypatch.setattr(build, "bundle_shmem_runtime", lambda sdk, target: {"test": "hash"})
     published = []
     monkeypatch.setattr(build, "publish_source_native", published.append)
     command.inplace = inplace

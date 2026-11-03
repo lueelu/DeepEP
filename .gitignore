@@ -28,6 +28,7 @@ compile_commands.json
 *.pyd
 *.whl
 /deep_ep/.native-build
+/deep_ep/.libs
 /deep_ep/_build_info.json
 
 # Machine-local configuration and reports
