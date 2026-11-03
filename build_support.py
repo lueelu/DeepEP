@@ -8,10 +8,12 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import warnings
 
 from setuptools.command.build_ext import build_ext
@@ -20,6 +22,35 @@ from setuptools.command.egg_info import egg_info
 from setuptools.command.install_lib import install_lib
 
 ROOT = Path(__file__).resolve().parent
+
+# Runtime closure of the pinned SDK; CANN and driver libraries remain external.
+SHMEM_RUNTIME_LIBRARIES = (
+    "libshmem_utils.so",
+    "aclshmem_bootstrap_config_store.so",
+    "aclshmem_bootstrap_uid.so",
+    "libshmem.so",
+)
+
+
+def bundle_shmem_runtime(sdk, destination):
+    """Copy SDK runtime files, following SDK links into a self-contained wheel."""
+    sources = [Path(sdk) / "lib" / name for name in SHMEM_RUNTIME_LIBRARIES]
+    for path in sources:
+        if not path.is_file():
+            raise RuntimeError(f"Incomplete SHMEM runtime: missing {path}")
+    directory = destination / ".libs"
+    if directory.is_symlink():
+        raise RuntimeError(f"Refusing to replace linked SHMEM staging: {directory}")
+    # This directory belongs to build staging; discard stale SDK payloads.
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir()
+    hashes = {}
+    for source in sources:
+        target = directory / source.name
+        shutil.copy2(source, target)
+        hashes[source.name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    return hashes
 
 
 class BuildEggInfo(egg_info):
@@ -68,6 +99,28 @@ class CheckedInstallLib(install_lib):
         component_enabled = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
         for directory in (self.build_dir, self.install_dir):
             root = Path(directory)
+            # Renamed internal implementations must not survive in a reused
+            # wheel staging directory alongside the canonical topology packages.
+            for old in ("backends/clos", "backends/pod", "_clos_adapter.py", "_card_adapter.py"):
+                obsolete = root / "deep_ep" / old
+                files = obsolete.rglob("*") if obsolete.is_dir() else (obsolete,)
+                if any(path.is_file() and "__pycache__" not in path.parts for path in files):
+                    raise RuntimeError(
+                        f"Obsolete backend implementation at {obsolete}. "
+                        "Use a clean build/install directory for the topology package layout."
+                    )
+            compatibility = root / "ascend_deepep"
+            # Only ship the forwarding files from this source tree, never an
+            # old implementation or its native libraries left in build staging.
+            for path in compatibility.rglob("*"):
+                if not path.is_file() or "__pycache__" in path.parts:
+                    continue
+                source = ROOT / "ascend_deepep" / path.relative_to(compatibility)
+                if not source.is_file() or path.read_bytes() != source.read_bytes():
+                    raise RuntimeError(
+                        f"Obsolete ascend_deepep package file at {path}. "
+                        "Use a clean build/install directory; only the current compatibility aliases are supported."
+                    )
             for component in root.glob("**/deep_ep_experimental/ep_gmm_fused"):
                 relative = component.relative_to(root).as_posix()
                 if not component_enabled or relative != "deep_ep_experimental/ep_gmm_fused":
@@ -261,14 +314,26 @@ def build_configuration(environment=None):
         raise RuntimeError("pybind11 version differs from dependencies.lock.json")
     version_file = Path(result["ASCEND_HOME_PATH"]) / "compiler/version.info"
     versions = dict(line.split("=", 1) for line in version_file.read_text().splitlines() if "=" in line)
-    if versions.get("Version") != lock["cann_version"]:
-        raise RuntimeError(f"This runtime build requires the CANN {lock['cann_version']} qualification baseline")
+    actual = versions.get("Version", "")
+    release = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?(?:[.+-].*)?", actual)
+    minimum = tuple(int(part) for part in lock["cann_version"].split("."))
+    if release is None or tuple(int(part or 0) for part in release.groups()) < minimum:
+        raise RuntimeError(f"This runtime build requires CANN >= {lock['cann_version']}; detected {actual!r}")
     result["cann"] = {
         "version": versions["Version"],
         "timestamp": versions.get("timestamp", "unknown"),
     }
     result["source_version"] = (ROOT / "VERSION").read_text().strip()
     result["source_sha256"] = source_fingerprint()
+    import torch
+    import torch_npu
+
+    result["direct"] = {
+        "torch": torch.__version__,
+        "torch_npu": torch_npu.__version__,
+        "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+        "topk_idx_bits": 64,
+    }
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
@@ -359,11 +424,64 @@ class VariantBuild(ConfiguredBuild):
         super().finalize_options()
 
 
+def publish_source_native(destination):
+    """Expose a complete build to imports from the checkout, without mixing wheels.
+
+    Keep a private, persistent copy: setuptools staging can be temporary or be
+    overwritten by a later build. Switch all existing links through one anchor.
+    This does not run when installing a prebuilt wheel.
+    """
+    package = ROOT / "deep_ep"
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    names = ["_C" + suffix, "_clos_C" + suffix, "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    for name in names:
+        if not (destination / name).is_file():
+            raise RuntimeError(f"Incomplete native build: {destination / name}")
+    for name in SHMEM_RUNTIME_LIBRARIES:
+        if not (destination / ".libs" / name).is_file():
+            raise RuntimeError(f"Incomplete native build: {destination / '.libs' / name}")
+    names.append(".libs")
+    anchor = package / ".native-build"
+    storage = ROOT / "build" / "source-native"
+    if anchor.exists() and not anchor.is_symlink():
+        raise RuntimeError(f"Refusing to replace non-link source artifact: {anchor}")
+    if anchor.is_symlink() and anchor.resolve().parent != storage.resolve():
+        raise RuntimeError(f"Refusing to replace unmanaged source anchor: {anchor}")
+    managed = {}
+    for path in package.iterdir():
+        if path.is_symlink() and path.readlink() == Path(".native-build") / path.name:
+            managed[path.name] = path
+    for name in names:
+        path = package / name
+        if (path.exists() or path.is_symlink()) and name not in managed:
+            raise RuntimeError(f"Refusing to replace unmanaged source artifact: {path}")
+    storage.mkdir(parents=True, exist_ok=True)
+    snapshot = Path(tempfile.mkdtemp(prefix="build-", dir=storage)).resolve()
+    for name in names:
+        if name == ".libs":
+            shutil.copytree(destination / name, snapshot / name)
+        else:
+            shutil.copy2(destination / name, snapshot / name)
+    # Install new names before publishing the completed snapshot. Old names use
+    # the previous snapshot until the anchor is atomically replaced.
+    for name in names:
+        if name not in managed:
+            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name == ".libs")
+    pending = snapshot / "anchor"
+    pending.symlink_to(os.path.relpath(snapshot, package), target_is_directory=True)
+    os.replace(pending, anchor)
+    for name, path in managed.items():
+        if name not in names:
+            path.unlink()
+    print(f"Prepared source native links in {package}")
+
+
 class CMakeBuild(build_ext):
     def run(self):
         # Check before setuptools temporarily clears inplace during run().
         if enabled("DEEPEP_BUILD_EP_GMM_FUSED") and (self.inplace or self.editable_mode):
             raise RuntimeError("EP_GMM_FUSED requires a wheel; editable/inplace builds are not supported")
+        self._publish_source_links = not (self.inplace or self.editable_mode)
         super().run()
 
     def build_extension(self, ext):
@@ -435,6 +553,7 @@ class CMakeBuild(build_ext):
         }
         info["compiler"] = json.loads((directory / "compiler-info.json").read_text())
         info.update(json.loads((directory / "capabilities.json").read_text(encoding="utf-8")))
+        info["shmem_runtime"] = bundle_shmem_runtime(configuration["SHMEM_ROOT"], destination)
         (destination / "_build_info.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -454,3 +573,6 @@ class CMakeBuild(build_ext):
             (component / "_build_info.json").write_text(
                 json.dumps(component_info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
+        # Run only after every native artifact and its build identity is ready.
+        if getattr(self, "_publish_source_links", not (self.inplace or self.editable_mode)):
+            publish_source_native(destination)

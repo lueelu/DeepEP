@@ -41,7 +41,7 @@ def test_public_exports_and_type_identity():
 def test_public_methods_have_no_undeclared_aliases(name, spec):
     public = {
         key
-        for key, value in vars(getattr(deep_ep, name)).items()
+        for key, value in inspect.getmembers(getattr(deep_ep, name))
         if not key.startswith("_") and (callable(value) or isinstance(value, staticmethod))
     }
     assert public == {key for key in spec["methods"] if not key.startswith("_")}
@@ -98,18 +98,18 @@ def test_no_variadic_escape_hatch_for_unknown_arguments():
         (deep_ep.Config, "num_max_rdma_chunked_send_tokens", "num_max_scaleout_chunked_send_tokens"),
         (deep_ep.Config, "num_max_rdma_chunked_recv_tokens", "num_max_scaleout_chunked_recv_tokens"),
         (deep_ep.Buffer, "num_rdma_bytes", "num_scaleout_bytes"),
-        (deep_ep.Buffer, "allow_scaleup_for_low_latency_mode", "allow_memory_transport_for_low_latency_mode"),
-        (deep_ep.Buffer, "allow_multinode_scaleup", "allow_multinode_memory_transport"),
+        (deep_ep.Buffer, "allow_nvlink_for_low_latency_mode", "allow_memory_transport_for_low_latency_mode"),
+        (deep_ep.Buffer, "allow_mnnvl", "allow_multinode_memory_transport"),
         (deep_ep.Buffer.dispatch, "num_tokens_per_rdma_rank", "num_tokens_per_scaleout_rank"),
         (deep_ep.ElasticBuffer.get_theoretical_num_compute_units, "rdma_gbs", "scaleout_gbs"),
     ],
 )
-def test_transport_keyword_migration_has_no_implicit_alias(operation, old, new):
+def test_signature_publishes_upstream_name_not_compatibility_alias(operation, old, new):
     signature = inspect.signature(operation)
     value = object()
-    assert signature.bind_partial(**{new: value}).arguments[new] is value
+    assert signature.bind_partial(**{old: value}).arguments[old] is value
     with pytest.raises(TypeError, match="unexpected keyword"):
-        signature.bind_partial(**{old: value})
+        signature.bind_partial(**{new: value})
 
 
 @pytest.mark.parametrize(
@@ -119,9 +119,9 @@ def test_transport_keyword_migration_has_no_implicit_alias(operation, old, new):
         (deep_ep.Buffer, "get_low_latency_rdma_size_hint", "get_low_latency_scaleout_size_hint"),
     ],
 )
-def test_transport_size_hint_migration_has_no_implicit_alias(cls, old, new):
+def test_size_hint_aliases_are_the_same_operation(cls, old, new):
     assert callable(getattr(cls, new))
-    assert not hasattr(cls, old)
+    assert getattr(cls, old) is getattr(cls, new)
 
 
 @pytest.mark.parametrize("cached", [False, True])

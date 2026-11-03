@@ -14,8 +14,9 @@ from uuid import UUID
 from ._native import npu_api, require_native
 from ._store import StoreGroup
 
+from ._backend_lock import LOCK as _LOCK
+
 _OWNER = None
-_LOCK = threading.Lock()
 
 
 def integer(name, value, minimum, maximum):

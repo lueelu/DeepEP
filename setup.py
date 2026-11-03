@@ -24,7 +24,7 @@ from build_support import (  # noqa: E402
 BETA = "experiments/megamoe/python"
 beta_enabled = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
 ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
-packages = find_packages(include=["deep_ep", "deep_ep.*"])
+packages = find_packages(include=["deep_ep", "deep_ep.*", "ascend_deepep"])
 package_dir = {}
 cmdclass = {"build_ext": CMakeBuild, "install_lib": CheckedInstallLib}
 if ep_gmm_fused:
@@ -42,8 +42,11 @@ setup(
     name="ascend-deepep",
     version=(ROOT / "VERSION").read_text(encoding="utf-8").strip(),
     description="DeepEP for Ascend: native runtime and optional communication/GMM operators",
-    license_files=["LICENSE", "third-party/deepseek-deepep.LICENSE"]
-    + (["third-party/cann.LICENSE"] if beta_enabled else []),
+    license_files=[
+        "LICENSE",
+        "third-party/deepseek-deepep.LICENSE",
+        "third-party/cann.LICENSE",
+    ],
     python_requires=">=3.11",
     packages=packages,
     package_dir=package_dir,

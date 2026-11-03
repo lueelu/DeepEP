@@ -587,7 +587,7 @@ def golden_combine_handle(buffer, args, indices, reference, routes):
     """Build a test-only Combine handle without launching Notify or Dispatch."""
     import torch
     from deep_ep._native import require_native
-    from deep_ep.buffers.elastic import EPHandle, _PERSISTENT
+    from deep_ep.backends.mesh_clos.elastic import EPHandle, _PERSISTENT
 
     rank, world = buffer._runtime.rank, buffer._runtime.world_size
     specification = require_native("Combine golden layout").notify_layout(
@@ -695,7 +695,7 @@ def prepare_routing(buffer, args, x, indices, input_weights, handle, reference=N
         chunk_tokens=getattr(args, "chunk_tokens", 256),
         rank_dedup=getattr(args, "no_server_dedup", False),
     )
-    from deep_ep.buffers.elastic import _PERSISTENT
+    from deep_ep.backends.mesh_clos.elastic import _PERSISTENT
 
     # Test-only fixture: expanded expert inputs are constructed independently below,
     # so admit this Notify handle to Combine without executing a payload dispatch.
@@ -1034,6 +1034,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                 expert, handle, topk_weights=weights, previous_event=before, async_with_compute_stream=True
             )
             log(f"{context} combine.return (async; device completion not yet confirmed)")
+            assert completed.event is not None
             completed.current_stream_wait()
             args.combine_reuse = bool(getattr(buffer, "_combine_last_reuse_tokens", 0))
             log(f"{context} combine_golden.begin (CPU)")
@@ -1047,7 +1048,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                     buffer._combine_reuse_tokens = 0
                     buffer._combine_capacity_limit = buffer._runtime.capacity // 2
                     full, full_weights, done = buffer.combine(expert, handle, topk_weights=weights)
-                    done.current_stream_wait()
+                    assert done.event is None
                     assert buffer._combine_last_reuse_tokens == 0
                     _notify["assert_bytes"](output, full.cpu(), f"{context} reuse versus full", progress=log)
                     if weights is not None:
@@ -1097,13 +1098,13 @@ def run_case(buffer, args, rank, world, info, log, references):
             log(f"{context} repeated_combine.enter")
             again, no_weights, completed = buffer.combine(expert, handle)
             log(f"{context} repeated_combine.return (device completion not yet confirmed)")
-            completed.current_stream_wait()
+            assert completed.event is None
             assert no_weights is None
             _notify["assert_bytes"](again, golden, f"{context} repeated combine", progress=log)
             if weights is not None:
                 changed = weight_payload(weight_ids, generation + 1).npu()
                 again, changed_out, completed = buffer.combine(expert, handle, topk_weights=changed)
-                completed.current_stream_wait()
+                assert completed.event is None
                 _notify["assert_bytes"](again, golden, f"{context} changed weights hidden")
                 _notify["assert_bytes"](
                     changed_out,
@@ -1331,7 +1332,7 @@ def test_rank_return_plan_has_unique_slots_and_complete_reduction(monkeypatch, w
 @pytest.mark.parametrize("world", [8, 16, 32, 64, 128, 256])
 @pytest.mark.parametrize("topk", [1, 6, 16])
 def test_combine_return_slots_cover_topk(world, topk):
-    combine_layout = runpy.run_path(str(Path(__file__).parents[2] / "deep_ep/buffers/_elastic_layout.py"))[
+    combine_layout = runpy.run_path(str(Path(__file__).parents[2] / "deep_ep/backends/mesh_clos/_elastic_layout.py"))[
         "combine_layout"
     ]
 
@@ -1497,7 +1498,7 @@ def test_large_shape_and_capacity_bounds(monkeypatch):
     import pytest
     from deep_ep.buffers._elastic_layout import combine_layout, dispatch_layout, elastic_size_hint
 
-    elastic = importlib.import_module("deep_ep.buffers.elastic")
+    elastic = importlib.import_module("deep_ep.backends.mesh_clos.elastic")
     monkeypatch.setattr(elastic, "require_native", lambda *_: None)
     for world in (256, 512):
         for tokens in (4608, 4609, 8192, 16383, 16384):
@@ -1654,7 +1655,7 @@ def test_dispatch_check_is_opt_in(monkeypatch, tmp_path):
 @pytest.mark.parametrize("rank_dedup", [False, True])
 def test_routing_without_dispatch_and_explicit_opt_in(notify_cores, rank_dedup):
     from types import SimpleNamespace
-    from deep_ep.buffers.elastic import _PERSISTENT
+    from deep_ep.backends.mesh_clos.elastic import _PERSISTENT
 
     tensor = SimpleNamespace(data_ptr=lambda: 123, _version=0)
     handle = SimpleNamespace(metadata_only=True, **{name: tensor for name in ("topk_idx", *_PERSISTENT, "_peer_plan")})
@@ -1709,7 +1710,7 @@ def test_routing_without_dispatch_and_explicit_opt_in(notify_cores, rank_dedup):
 def test_golden_routing_skips_device_notify(monkeypatch, world, mode):
     torch = pytest.importorskip("torch")
     import deep_ep._native as native_module
-    import deep_ep.buffers.elastic as elastic
+    import deep_ep.backends.mesh_clos.elastic as elastic
 
     args = SimpleNamespace(
         tokens=9, topk=6, experts=world * 2, chunk_tokens=256, hidden=7168, check_dispatch=False, golden_notify=True
@@ -3850,7 +3851,7 @@ def test_chunk_notify_chunk_layout_matches_host_tiling(tmp_path):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if not compiler:
         pytest.skip("Requires a host C++ compiler")
-    layout = runpy.run_path(str(_chunk_ROOT / "deep_ep/buffers/_elastic_layout.py"))
+    layout = runpy.run_path(str(_chunk_ROOT / "deep_ep/backends/mesh_clos/_elastic_layout.py"))
     source = tmp_path / "chunk_layout.cpp"
     source.write_text(
         r"""

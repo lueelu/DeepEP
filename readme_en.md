@@ -11,6 +11,20 @@ Modified by Joyce_An 2026
 
 **DeepEP on Ascend** (`Ascend/DeepEP`) is an expert-parallel (EP) communication library for mixture-of-experts (MoE) inference on Ascend NPUs. It provides high-throughput **prefill** and low-latency **decode** communication, together with experimental **MegaMoE** fused inference.
 
+## Machine-specific backends
+
+Mesh+PCIe, Mesh+Clos, and Global Clos share the same pinned CANN SHMEM
+dependency and build workflow. Buffer constructors accept `machine_type="auto"`,
+`"mesh_clos"`, `"global_clos"`, or `"mesh_pcie"`; explicit selection is available when
+reliable rootinfo is absent. The machine selects the communication engines:
+Global Clos uses UDMA for payload and MTE for metadata/local copies; Mesh+PCIe uses MTE,
+and Mesh+Clos uses its backend configuration. Legacy `transport` arguments are accepted
+but do not override topology selection. `ASCEND_DEEPEP_TRANSPORT` does not override
+this policy. The `direct` implementation is shared by Mesh+PCIe and Global Clos;
+it denotes EP-peer communication, not physical direct links or a fourth machine type.
+See [backend selection and compatibility](docs/machine_backends.md).
+The HT/LL/MegaMoE descriptions below apply to the Mesh+Clos backend.
+
 ## News
 
 ---

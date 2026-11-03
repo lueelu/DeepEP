@@ -34,7 +34,18 @@ RUNTIME_METHODS = {
     "EPHandle.__init__",
 }
 BASELINE = json.loads(Path(__file__).with_name("api_contract.json").read_text(encoding="utf-8"))
-METHODS = [(name, method) for name, spec in BASELINE["objects"].items() for method in spec["methods"]]
+HOST_METHODS = {
+    "Buffer.set_num_compute_units",
+    "Buffer.set_num_sms",
+    "Buffer.get_dispatch_config",
+    "Buffer.get_combine_config",
+}
+METHODS = [
+    (name, method)
+    for name, spec in BASELINE["objects"].items()
+    for method in spec["methods"]
+    if name != "Config" and f"{name}.{method}" not in HOST_METHODS
+]
 
 
 class Uninspectable:
@@ -59,7 +70,7 @@ def test_reserved_qp_budget_does_not_enable_an_algorithm(method, num_qps):
 
 @pytest.mark.parametrize("name,method", METHODS, ids=[f"{n}.{m}" for n, m in METHODS])
 def test_every_declared_operation_fails_before_touching_inputs(name, method):
-    if INSTALLED_NATIVE and (name.startswith("Event") or f"{name}.{method}" in RUNTIME_METHODS):
+    if name.startswith("Event") or (INSTALLED_NATIVE and f"{name}.{method}" in RUNTIME_METHODS):
         pytest.skip("Implemented runtime operation covered by runtime tests")
     operation = getattr(getattr(deep_ep, name), method)
     args = [
@@ -67,19 +78,26 @@ def test_every_declared_operation_fails_before_touching_inputs(name, method):
         for p in inspect.signature(operation).parameters.values()
         if p.default is inspect.Parameter.empty
     ]
-    with pytest.raises(NotImplementedError, match=rf"{name}\.{method} is not implemented"):
+    canonical = "get_theoretical_num_compute_units" if method == "get_theoretical_num_sms" else method
+    if method == "get_low_latency_rdma_size_hint":
+        canonical = "get_low_latency_scaleout_size_hint"
+    with pytest.raises(NotImplementedError, match=rf"{name}\.{canonical} is not implemented"):
         operation(*args)
 
 
-@pytest.mark.parametrize("name", BASELINE["exports"])
+@pytest.mark.parametrize("name", [name for name in BASELINE["exports"] if name != "Config"])
 def test_constructors_cannot_create_usable_objects(name):
-    if INSTALLED_NATIVE and name in {
-        "Buffer",
-        "ElasticBuffer",
-        "EventHandle",
-        "EventOverlap",
-        "EPHandle",
-    }:
+    if name.startswith("Event") or (
+        INSTALLED_NATIVE
+        and name
+        in {
+            "Buffer",
+            "ElasticBuffer",
+            "EventHandle",
+            "EventOverlap",
+            "EPHandle",
+        }
+    ):
         pytest.skip("Implemented runtime constructor covered by runtime tests")
     cls = getattr(deep_ep, name)
     args = [Uninspectable() for p in inspect.signature(cls).parameters.values() if p.default is inspect.Parameter.empty]
@@ -117,7 +135,7 @@ from deep_ep.buffers.elastic import ElasticBuffer, EPHandle
 from deep_ep.utils.event import EventHandle, EventOverlap
 assert all(getattr(deep_ep, name) is not None for name in deep_ep.__all__)
 for operation in (lambda: Buffer(None), lambda: ElasticBuffer(None), Buffer.capture,
-                  ElasticBuffer.capture, EventHandle, EventOverlap):
+                  ElasticBuffer.capture):
     try:
         operation()
     except NotImplementedError:
@@ -133,8 +151,8 @@ def test_fake_event_does_not_gain_completion_or_context_manager_success():
     if INSTALLED_NATIVE:
         pytest.skip("Installed events are covered by runtime tests")
     event = object.__new__(deep_ep.EventOverlap)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(AttributeError):
         event.current_stream_wait(release_handle=True)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(AttributeError):
         with event:
-            pytest.fail("Entered an unimplemented completion context")
+            pass  # Upstream checks on context exit, not entry.

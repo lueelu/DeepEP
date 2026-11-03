@@ -437,7 +437,7 @@ __aicore__ inline void DrainClosRelayAssist(DeepepSecondaryState& s, ClosRelayAs
     state.pending = 0U;
 }
 
-// EP64's single pod uses one SIMT fanout after all SO1 snapshots arrive.
+// EP64's single mesh_clos uses one SIMT fanout after all SO1 snapshots arrive.
 // Targets are mapped SHMEM readiness words or local GM mailbox ACKs, never
 // ordinary remote output addresses. ACKs may arrive first: all CQ reads are finished.
 __simt_vf__ __launch_bounds__(128) inline void PublishClosReadyVf(__ubuf__ uint64_t* targets, uint32_t count,

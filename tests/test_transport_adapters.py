@@ -67,6 +67,7 @@ def test_generalized_legacy_adapter_uses_domain_names(monkeypatch, rank):
         weights=(((1.0,),), ((1.0,),)),
     )
     torch = SimpleNamespace(bfloat16="bf16", int64="int64", float32="fp32")
+    monkeypatch.setattr(deep_ep, "topk_idx_t", torch.int64, raising=False)
     session = (torch, "group", SimpleNamespace(rank=rank, local_rank=rank))
     with device.buffer_for(session, case, "legacy") as buffer:
         received = device.launch_dispatch(session, buffer, case, "legacy", False)

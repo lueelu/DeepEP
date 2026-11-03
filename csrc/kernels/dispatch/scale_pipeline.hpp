@@ -240,7 +240,7 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
         WaitDispatchPeerEpoch(workspace, t, state[p].rank);
     }
 
-    // Tile-major: load/decode each route once for all peers, including cross-pod.
+    // Tile-major: load/decode each route once for all peers, including cross-mesh_clos.
     // Partial batches and both UB faces persist across tile boundaries.
     const uint64_t tx_start = Clock<Profile>();
     {

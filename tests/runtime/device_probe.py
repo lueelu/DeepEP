@@ -46,9 +46,11 @@ def main():
         overlap.register_hook_after_wait(lambda: calls.append("waited"))
         overlap.current_stream_wait(release_handle=True)
         assert torch.equal(value.cpu(), torch.full((65536,), 7.0))
-        assert calls == ["waited"] and overlap.extra_tensors is None
-        expect(RuntimeError, overlap.current_stream_wait)
-        expect(ValueError, lambda: EventOverlap(None))
+        assert calls == ["waited"] and overlap.extra_tensors == (value,)
+        expect(AssertionError, overlap.current_stream_wait)
+        with EventOverlap(None):
+            pass
+        expect(AssertionError, EventOverlap().current_stream_wait)
         native = require_native("device probe")
         # Both generations, repeated lifetimes, rejected concurrent ownership.
         for generation in (Buffer, ElasticBuffer, Buffer, ElasticBuffer):

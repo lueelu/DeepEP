@@ -13,6 +13,7 @@ Modified by Joyce_An 2026
 | --- | --- |
 | `api/` | 公开导出、签名、参数默认值和未支持操作的错误 |
 | `runtime/` | 构建预检、SDK/安装身份、资源和事件生命周期、故障传播 |
+| `clos/` | CLOS V1/V2 基础精度与事件验证、共享 CPU Golden；机型识别使用 `scripts/check_machine.py` |
 | `elastic/test_dispatch.py` | HT Notify 元数据、BF16/FP8 payload、权重、fresh/cached 和路由 |
 | `elastic/test_combine.py` | HT dispatch → 专家输出 → BF16 combine、独立权重回传、重复调用及输出生命周期 |
 | `elastic/test_ep_low_latency.py` | LL 返回、精度、重复 combine，以及 profiler kernel 耗时 |
@@ -22,6 +23,37 @@ Modified by Joyce_An 2026
 | `../experiments/ep_gmm_fused/tests/` | 通信计算融合算子的路由参考、精度、性能与 profiler；命令见[组件测试说明](../experiments/ep_gmm_fused/tests/README.md) |
 | `test_reference.py`、`test_precision.py`、`utils/` | 独立路由参考、Golden、dtype 模拟和精度比较器 |
 | `legacy/` 及通用 V2 设备用例 | 兼容性测试入口；其参数矩阵不等于当前 Elastic 算子支持范围 |
+
+## CLOS 基础验证
+
+机型识别只检查分类，不启动通信算子；`--expect` 不会强制选择后端：
+
+```bash
+python -I scripts/check_machine.py --physical-devices 0 1 2 3 4 5 6 7 --expect global_clos
+```
+
+Mesh+Clos 或 Mesh+PCIe 机器分别使用 `--expect mesh_clos` 或 `--expect mesh_pcie`。
+安装待验证的 wheel 并加载 CANN/SHMEM 环境后，在空闲设备上运行：
+
+```bash
+for api in v1 v2; do
+    timeout -k 30s 900s python tests/clos/source/test_v1_v2_shared_backend.py \
+        --api "$api" --public-auto --auto-policy \
+        --ep-size 8 --num-tokens 129 --hidden 6144 --num-topk 8 \
+        --experts-per-rank 32 --num-aiv 32 --check-events
+done
+```
+
+该入口对照独立 CPU Golden，检查 BF16 fresh/cached dispatch、payload 和路由权重、
+带/不带权重及 bias 的 combine、事件依赖和销毁后的输出。所有 rank 均须输出
+`PUBLIC_PRECISION_PASSED`，且启动器退出码为 0。`--auto-policy` 使用默认调度，保留指定的 AIV 数。
+在开发机器上强制验证 CLOS 可将 `--public-auto` 改为 `--public-clos`；这不验证自动机型选择。
+
+基础入口仅支持单机，`--ep-size` 是本机进程数。多机、FP8、展开布局及性能测量使用
+`benchmarks/clos/bench_v1_bandwidth.py` 和 `benchmarks/clos/bench_v2_bandwidth.py`，
+见[后端使用说明](../docs/machine_backends.md)。它们先验证精度再测量性能，
+共用 `tests/clos/common.py` 的参考计算和 `benchmarks/clos/profiling.py` 的采样逻辑。
+保留这些辅助文件，并避免通过 `PYTHONPATH` 用未构建的源码覆盖已安装 wheel。
 
 ## CPU 回归
 

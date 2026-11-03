@@ -12,13 +12,18 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
 ## 前置条件
 
 - Linux、Python ≥3.11、C++17 编译器、CMake ≥3.20，以及 Make 或 Ninja；构建工具须在 PATH 中。
-- CANN 9.2.0 与配套驱动/框架，目标 Ascend950；构建仅接受该 CANN 版本与目标架构。
+- CANN 版本须不低于 9.2.0，并配套匹配的驱动/框架，目标 Ascend950。
+  SHMEM 构建脚本和运行时构建均读取 `ASCEND_HOME_PATH/compiler/version.info` 的 `Version`，
+  按主、次、补丁版本号比较；`9.2` 按 `9.2.0` 处理，`9.2.0` 和 `9.2.1` 均通过检查。
+  允许以 `.`、`+`、`-` 开头的版本后缀，后缀不参与大小比较；完整版本和 timestamp 仍参与构建身份校验。
+  通过版本检查不等于该环境已完成编译与设备验证。
+- 同一构建 Python 环境安装匹配的 Torch/torch_npu；Clos Host 扩展需要其头文件和库，构建指纹记录框架版本及 C++ ABI。
 - 由本仓子模块构建或使用外部固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
 - 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` dev 提交，不直接跟随分支最新版本。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
 - 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
-- wheel 构建不自动下载/编译外部 SDK，不将驱动/CANN/SHMEM 打入 wheel。SDK 及其传递依赖必须由部署环境提供。
+- wheel 构建不自动下载/编译外部 SDK。构建时将所选 SHMEM SDK 的运行库打入 wheel；驱动和 CANN 仍由部署环境提供。
 
 ## 可选实验组件
 
@@ -38,7 +43,6 @@ git submodule update --init --recursive
 unset SHMEM_ROOT CATLASS_ROOT  # 使用仓内依赖；外部 SDK 用户见下文。
 python scripts/build_shmem.py
 export DEEPEP_NPU_ARCH=Ascend950
-export LD_LIBRARY_PATH="$PWD/third-party/shmem/install/shmem/lib:${LD_LIBRARY_PATH:-}"
 
 python -m pip install -r requirements-build.txt
 ```
@@ -51,8 +55,6 @@ python -m pip install -r requirements-build.txt
 
 ```bash
 export SHMEM_ROOT=/path/to/pinned/shmem-sdk
-source "$SHMEM_ROOT/set_env.sh"
-export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 # 仅未登记身份的 SDK 运行一次；不能改 manifest 来绕过源码/二进制检查。
 python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
   --revision "$(python -c 'import json; print(json.load(open("dependencies.lock.json"))["shmem"]["revision"])')"
@@ -70,7 +72,13 @@ MegaMoE 构建及仓内 SDK 复用保持严格校验，SDK 必须与锁文件匹
 不同工具链、SDK、Python 环境和构建模式使用不同指纹目录；源码哈希仅用于标识产物，
 修改 Python、测试或单个 kernel 不切换整个构建目录。`DEEPEP_BUILD_MEGAMOE` 默认 OFF；
 ON 的构建与使用方式见 [MegaMoE 文档](../experiments/megamoe/README.md)。
-安装产物没有构建机绝对 RPATH，使用部署环境的 SDK 路径；加载时核对实际 SHMEM 二进制身份。
+安装产物没有构建机绝对 RPATH。`deep_ep/.libs/` 携带 `libshmem.so`、`libshmem_utils.so`、
+`aclshmem_bootstrap_config_store.so` 和 `aclshmem_bootstrap_uid.so`，哈希记录在 `_build_info.json` 中。
+公开接口首次使用 native 时先校验这些文件，再按包内绝对路径加载；V1/V2 共用此入口。
+安装后只需加载匹配的 CANN 环境，不需要设置 `SHMEM_ROOT` 或向 `LD_LIBRARY_PATH` 添加 SHMEM 路径。
+`SHMEM_ROOT` 仅用于构建时选择 SDK，不能覆盖已安装 wheel 的运行库。
+缺库或哈希不符会要求重新安装，不回退到外部 SDK；若进程已加载另一套 SHMEM，则报冲突并要求重启干净进程。
+同一进程内其他 SHMEM 使用者也必须遵守该单一运行库约束。
 
 ## 编译与安装
 
@@ -88,6 +96,13 @@ python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
 ```
 
 这条命令会编译 Host 和 Device、生成 wheel 并安装到当前 Python 环境。
+在本地源码目录构建时，还会自动为 `deep_ep/` 准备原生扩展、设备库、SHMEM 运行库目录和构建信息的软链接，
+无需额外执行开发安装命令，也不修改 `PYTHONPATH`。从仓库根目录启动、或 `PYTHONPATH` 含仓库路径/空项时，
+源码包可以加载同一次构建的完整产物。软链接经 `.native-build` 指向 `build/source-native/` 中的独立副本，
+全部产物准备完成后切换；不会借用其他安装包的扩展，也不会覆盖手工放置的普通文件或非本流程管理的链接。
+该副本不依赖 pip 临时目录；删除 `build/` 会使源码链接失效，重新执行构建安装命令可恢复。
+wheel 中仍是独立的真实文件，安装版不依赖源码目录；仅安装已有 wheel 不会修改其他源码 checkout。
+同一个 checkout 的源码链接对应最后一次成功构建的 Python/SDK 环境，不要在运行源码作业期间重建或切换环境。
 `requirements-build.txt` 只安装构建依赖，不能替代上述命令；修改 kernel 或 Python 包代码后重新执行上述命令。
 只改 `tests/` 或文档时，更新共享源码即可，无需重新编译安装。
 

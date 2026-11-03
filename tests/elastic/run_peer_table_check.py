@@ -145,7 +145,7 @@ def worker(local_rank, args):
                 do_expand=True,
                 topk_weights=input_weights,
             )
-            event.current_stream_wait()
+            assert event.event is None
             torch.npu.synchronize()
             elapsed_ms = (time.perf_counter() - started) * 1000
             log(f"dispatch.done generation={generation} public_api_ms={elapsed_ms:.3f}")
@@ -290,7 +290,7 @@ def worker(local_rank, args):
                 output, _, weights, handle, event = buffer.dispatch(
                     x, handle=handle, do_expand=True, topk_weights=input_weights
                 )
-                event.current_stream_wait()
+                assert event.event is None
                 torch.npu.synchronize()
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 if iteration >= args.warmup:
@@ -303,7 +303,7 @@ def worker(local_rank, args):
                     output, _, weights, handle, event = buffer.dispatch(
                         x, handle=handle, do_expand=True, topk_weights=input_weights
                     )
-                    event.current_stream_wait()
+                    assert event.event is None
                     torch.npu.synchronize()
                     if iteration >= args.warmup:
                         clean_device_ms.append(buffer._dispatch_diagnostics["device_ms"])
@@ -335,7 +335,7 @@ def worker(local_rank, args):
                     output, _, weights, handle, event = buffer.dispatch(
                         x, handle=handle, do_expand=True, topk_weights=input_weights
                     )
-                    event.current_stream_wait()
+                    assert event.event is None
                     torch.npu.synchronize()
                 samples = args.profile_samples * (2 if args.submit_detail else 1)
                 for sample in range(samples):
@@ -350,7 +350,7 @@ def worker(local_rank, args):
                     output, _, weights, handle, event = buffer.dispatch(
                         x, handle=handle, do_expand=True, topk_weights=input_weights
                     )
-                    event.current_stream_wait()
+                    assert event.event is None
                     torch.npu.synchronize()
                     cores = metrics["decode_profile"](
                         profile.cpu().tolist(), rank, fp8=fp8, weights=args.weights, world=world, qp1_workers=8
@@ -390,7 +390,7 @@ def worker(local_rank, args):
                 output, _, weights, fresh_handle, event = buffer.dispatch(
                     x, topk_idx=indices, num_experts=args.experts, do_expand=True, topk_weights=input_weights
                 )
-                event.current_stream_wait()
+                assert event.event is None
                 torch.npu.synchronize()
                 if iteration >= args.warmup:
                     routing_samples.append(dict(buffer._routing_diagnostics))

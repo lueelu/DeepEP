@@ -12,7 +12,9 @@
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
 SHMEM 固定到 `cann/shmem` 的 dev 提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
 两个子仓库的许可证均为 CANN Open Software License Agreement Version 2.0，原文保留在各自的 `LICENSE` 中。
-MegaMoE 源文件中的 CANN 版权和许可声明保留，许可全文归档于 [cann.LICENSE](cann.LICENSE)，并随启用 MegaMoE 的 wheel 分发。
+全 Clos 后端导入的 Ascend DeepEP 实现采用 CANN Open Software License Agreement Version 2.0。
+该许可与 MegaMoE 使用的 CANN 许可文本相同，统一归档于 [cann.LICENSE](cann.LICENSE)，随 wheel 分发。
+MegaMoE 源文件中的 CANN 版权和许可声明保留。
 第三方许可适用于对应来源内容，不替代项目自身的发行许可；引入依赖时遵循[贡献指南](../CONTRIBUTING.md#许可证)。
 
 基础包按[构建说明](../docs/build.md)准备 SDK 并构建；MegaMoE 的便利入口见[实验使用说明](../experiments/megamoe/README.md)。
@@ -23,7 +25,6 @@ SHMEM 已有构建产物时，确认停止使用该 SDK 后可向准备脚本显
 git submodule update --init --recursive
 # 先加载 CANN 9.2.0 环境，再显式准备 SHMEM；不需要另外 clone CATLASS。
 python scripts/build_shmem.py
-export LD_LIBRARY_PATH="$PWD/third-party/shmem/install/shmem/lib:${LD_LIBRARY_PATH:-}"
 ```
 
 以上命令从主仓库根目录运行。SHMEM 准备入口检查固定提交、干净源码和 CANN 版本，调用其上游构建脚本，
@@ -38,8 +39,10 @@ export LD_LIBRARY_PATH="$PWD/third-party/shmem/install/shmem/lib:${LD_LIBRARY_PA
 已有 SDK/源码可继续用 `SHMEM_ROOT`、`CATLASS_ROOT` 显式覆盖。`pip wheel` 本身不下载、不编译外部 SDK。
 本入口按锁定版本和上游默认配置构建 SHMEM。
 
-Python sdist/wheel 不携带这两个子模块源码或 SHMEM 动态库；从 sdist 构建时需设置上述两个外部路径（基础 OFF 构建不需要 CATLASS）。
-SDK 和 CANN 由部署环境提供，完整编译命令见 [构建说明](../docs/build.md) 与 [MegaMoE README](../experiments/megamoe/README.md)。
+Python sdist/wheel 不携带这两个子模块源码；从 sdist 构建时需设置上述两个外部路径（基础 OFF 构建不需要 CATLASS）。
+wheel 携带构建所用 SDK 的四个 SHMEM 运行库，位于 `deep_ep/.libs/`，适用上述 `cann.LICENSE`；
+实际 SDK 提交及库哈希记录于 `deep_ep/_build_info.json`。CANN 和驱动由部署环境提供，安装后无需额外配置 SHMEM 路径。
+完整编译命令见 [构建说明](../docs/build.md) 与 [MegaMoE README](../experiments/megamoe/README.md)。
 
 ## EpGmmFused 依赖
 

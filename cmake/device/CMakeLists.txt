@@ -54,3 +54,29 @@ target_link_options(deepep_kernels PRIVATE --cce-fatobj-link -Wl,-z,relro,-z,now
 target_link_libraries(deepep_kernels PRIVATE ascend_runtime ascendcl shmem ${CMAKE_DL_LIBS})
 set_target_properties(deepep_kernels PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
+
+# Separate translation units and library preserve both backends' device ABI.
+set(_direct "${DEEPEP_SOURCE_DIR}/csrc/direct")
+add_library(deepep_clos_kernels SHARED
+    "${_direct}/kernels/dispatch/dispatch_layout.cpp" "${_direct}/kernels/notify/notify_dispatch.cpp"
+    "${_direct}/kernels/dispatch/dispatch.cpp" "${_direct}/kernels/dispatch/dispatch_udma.cpp"
+    "${_direct}/kernels/notify/notify_combine.cpp" "${_direct}/kernels/combine/combine.cpp"
+    "${_direct}/kernels/combine/combine_udma.cpp" "${_direct}/kernels/expand/expand.cpp"
+    "${_direct}/kernels/aggregate/aggregate.cpp")
+get_target_property(_direct_options deepep_kernels COMPILE_OPTIONS)
+get_target_property(_direct_includes deepep_kernels INCLUDE_DIRECTORIES)
+target_compile_options(deepep_clos_kernels PRIVATE ${_direct_options} -Xhost-start -ftrapv -Xhost-end)
+target_include_directories(deepep_clos_kernels PRIVATE ${_direct_includes}
+    "${_direct}")
+target_compile_definitions(deepep_clos_kernels PRIVATE ASCEND_DEEPEP_ARCH=3510 EP_NUM_TOPK_IDX_BITS=64 USE_SIMT L2_CACHE_HINT
+    ASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS=1)
+target_link_options(deepep_clos_kernels PRIVATE --cce-fatobj-link)
+target_link_libraries(deepep_clos_kernels PRIVATE ascend_runtime ascendcl shmem ${CMAKE_DL_LIBS})
+set_target_properties(deepep_clos_kernels PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 16)
+# Preserve the source build's translation-unit grouping. In particular its
+# local expand/aggregate helpers share the SHMEM/SIMT setup from notify.
+set_source_files_properties(
+    "${_direct}/kernels/dispatch/dispatch.cpp" "${_direct}/kernels/dispatch/dispatch_udma.cpp"
+    "${_direct}/kernels/combine/combine.cpp" "${_direct}/kernels/combine/combine_udma.cpp"
+    PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
