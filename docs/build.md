@@ -93,6 +93,13 @@ python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
 ```
 
 这条命令会编译 Host 和 Device、生成 wheel 并安装到当前 Python 环境。
+在本地源码目录构建时，还会自动为 `deep_ep/` 准备原生扩展、设备库和构建信息的软链接，
+无需额外执行开发安装命令，也不修改 `PYTHONPATH`。从仓库根目录启动、或 `PYTHONPATH` 含仓库路径/空项时，
+源码包可以加载同一次构建的完整产物。软链接经 `.native-build` 指向 `build/source-native/` 中的独立副本，
+全部产物准备完成后切换；不会借用其他安装包的扩展，也不会覆盖手工放置的普通文件或非本流程管理的链接。
+该副本不依赖 pip 临时目录；删除 `build/` 会使源码链接失效，重新执行构建安装命令可恢复。
+wheel 中仍是独立的真实文件，安装版不依赖源码目录；仅安装已有 wheel 不会修改其他源码 checkout。
+同一个 checkout 的源码链接对应最后一次成功构建的 Python/SDK 环境，不要在运行源码作业期间重建或切换环境。
 `requirements-build.txt` 只安装构建依赖，不能替代上述命令；修改 kernel 或 Python 包代码后重新执行上述命令。
 只改 `tests/` 或文档时，更新共享源码即可，无需重新编译安装。
 

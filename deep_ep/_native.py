@@ -48,7 +48,9 @@ def _load_native():
     spec = importlib.util.find_spec("deep_ep._C")
     if spec is None:
         raise ImportError("Native extension file exists but cannot be resolved")
-    if not spec.origin or Path(spec.origin).resolve().parent != Path(__file__).resolve().parent:
+    # A source build exposes its own native files through package-local links.
+    # Check the importing directory, not the target of the extension symlink.
+    if not spec.origin or Path(spec.origin).parent.resolve() != Path(__file__).resolve().parent:
         raise ImportError("Native extension must belong to this deep_ep installation")
     try:
         module = importlib.import_module("deep_ep._C")

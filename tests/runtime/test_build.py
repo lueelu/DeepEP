@@ -350,8 +350,93 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         assert build.build_cache_key({**configuration, name: value}) != key
 
 
-@pytest.mark.parametrize("beta,timer", [(False, False), (True, False), (True, True)])
-def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer):
+@pytest.fixture
+def source_native(build, monkeypatch, tmp_path):
+    source = tmp_path / "checkout"
+    package = source / "deep_ep"
+    package.mkdir(parents=True)
+    probe = package / "probe"
+    try:
+        probe.symlink_to("target")
+    except OSError:
+        pytest.skip("Source builds require symlink support")
+    probe.unlink()
+    monkeypatch.setattr(build, "ROOT", source)
+    monkeypatch.setattr(build.sysconfig, "get_config_var", lambda key: ".test.so")
+    destination = tmp_path / "temporary-staging"
+    destination.mkdir()
+    names = ["_C.test.so", "_clos_C.test.so", "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    for name in names:
+        (destination / name).write_bytes(("first:" + name).encode())
+    return package, destination, names
+
+
+def test_source_native_snapshot_survives_staging_removal_and_refresh(build, source_native):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    first = (package / ".native-build").resolve()
+    for name in names:
+        assert (package / name).is_symlink()
+        assert (package / name).read_bytes() == (destination / name).read_bytes()
+        (destination / name).write_bytes(b"second")
+    # The first complete build is not changed by staging a second one.
+    assert (package / names[0]).read_bytes().startswith(b"first:")
+    build.publish_source_native(destination)
+    assert (package / ".native-build").resolve() != first
+    build.shutil.rmtree(destination)
+    assert all((package / name).read_bytes() == b"second" for name in names)
+
+
+def test_incomplete_source_native_build_keeps_previous_links(build, source_native):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    first = (package / ".native-build").readlink()
+    (destination / names[0]).write_bytes(b"new")
+    (destination / names[1]).unlink()
+    with pytest.raises(RuntimeError, match="Incomplete native build"):
+        build.publish_source_native(destination)
+    assert (package / ".native-build").readlink() == first
+    assert (package / names[0]).read_bytes().startswith(b"first:")
+
+
+@pytest.mark.parametrize("foreign_link", [False, True])
+def test_source_native_never_overwrites_unmanaged_files(build, source_native, foreign_link):
+    package, destination, names = source_native
+    path = package / names[0]
+    if foreign_link:
+        path.symlink_to(destination / names[0])
+    else:
+        path.write_bytes(b"user file")
+    with pytest.raises(RuntimeError, match="unmanaged source artifact"):
+        build.publish_source_native(destination)
+    assert path.is_symlink() == foreign_link
+    assert not (package / ".native-build").exists()
+
+
+def test_source_native_removes_only_managed_old_abi_links(build, source_native, monkeypatch):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    for name in names[:2]:
+        (destination / name).rename(destination / name.replace(".test.so", ".next.so"))
+    monkeypatch.setattr(build.sysconfig, "get_config_var", lambda key: ".next.so")
+    build.publish_source_native(destination)
+    assert all(not (package / name).is_symlink() for name in names[:2])
+    assert (package / "_C.next.so").is_file()
+
+
+def test_source_native_recovers_after_build_directory_removed(build, source_native):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    build.shutil.rmtree(build.ROOT / "build")
+    assert (package / names[0]).is_symlink() and not (package / names[0]).exists()
+    build.publish_source_native(destination)
+    assert all((package / name).is_file() for name in names)
+
+
+@pytest.mark.parametrize(
+    "beta,timer,inplace", [(False, False, False), (True, False, False), (True, True, False), (False, False, True)]
+)
+def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer, inplace):
     from setuptools import Distribution, Extension
 
     # This CPU-only test mocks the build tools, including their discovery paths.
@@ -401,7 +486,18 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
             (destination / "libdeepep_kernels.so").write_bytes(b"new")
 
     monkeypatch.setattr(build, "checked_run", run)
-    command.build_extension(ext)
+    published = []
+    monkeypatch.setattr(build, "publish_source_native", published.append)
+    command.inplace = inplace
+
+    def setuptools_run(self):
+        # setuptools hides inplace while building into its staging directory.
+        self.inplace = False
+        self.build_extension(ext)
+
+    monkeypatch.setattr(build.build_ext, "run", setuptools_run)
+    command.run()
+    assert published == ([] if inplace else [destination.resolve()])
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]

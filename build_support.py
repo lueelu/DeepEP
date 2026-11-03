@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import warnings
 
 from setuptools.command.build_ext import build_ext
@@ -384,11 +385,57 @@ class VariantBuild(ConfiguredBuild):
         super().finalize_options()
 
 
+def publish_source_native(destination):
+    """Expose a complete build to imports from the checkout, without mixing wheels.
+
+    Keep a private, persistent copy: setuptools staging can be temporary or be
+    overwritten by a later build. Switch all existing links through one anchor.
+    This does not run when installing a prebuilt wheel.
+    """
+    package = ROOT / "deep_ep"
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    names = ["_C" + suffix, "_clos_C" + suffix, "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    for name in names:
+        if not (destination / name).is_file():
+            raise RuntimeError(f"Incomplete native build: {destination / name}")
+    anchor = package / ".native-build"
+    storage = ROOT / "build" / "source-native"
+    if anchor.exists() and not anchor.is_symlink():
+        raise RuntimeError(f"Refusing to replace non-link source artifact: {anchor}")
+    if anchor.is_symlink() and anchor.resolve().parent != storage.resolve():
+        raise RuntimeError(f"Refusing to replace unmanaged source anchor: {anchor}")
+    managed = {}
+    for path in package.iterdir():
+        if path.is_symlink() and path.readlink() == Path(".native-build") / path.name:
+            managed[path.name] = path
+    for name in names:
+        path = package / name
+        if (path.exists() or path.is_symlink()) and name not in managed:
+            raise RuntimeError(f"Refusing to replace unmanaged source artifact: {path}")
+    storage.mkdir(parents=True, exist_ok=True)
+    snapshot = Path(tempfile.mkdtemp(prefix="build-", dir=storage)).resolve()
+    for name in names:
+        shutil.copy2(destination / name, snapshot / name)
+    # Install new names before publishing the completed snapshot. Old names use
+    # the previous snapshot until the anchor is atomically replaced.
+    for name in names:
+        if name not in managed:
+            (package / name).symlink_to(Path(".native-build") / name)
+    pending = snapshot / "anchor"
+    pending.symlink_to(os.path.relpath(snapshot, package), target_is_directory=True)
+    os.replace(pending, anchor)
+    for name, path in managed.items():
+        if name not in names:
+            path.unlink()
+    print(f"Prepared source native links in {package}")
+
+
 class CMakeBuild(build_ext):
     def run(self):
         # Check before setuptools temporarily clears inplace during run().
         if enabled("DEEPEP_BUILD_EP_GMM_FUSED") and (self.inplace or self.editable_mode):
             raise RuntimeError("EP_GMM_FUSED requires a wheel; editable/inplace builds are not supported")
+        self._publish_source_links = not (self.inplace or self.editable_mode)
         super().run()
 
     def build_extension(self, ext):
@@ -479,3 +526,6 @@ class CMakeBuild(build_ext):
             (component / "_build_info.json").write_text(
                 json.dumps(component_info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
+        # Run only after every native artifact and its build identity is ready.
+        if getattr(self, "_publish_source_links", not (self.inplace or self.editable_mode)):
+            publish_source_native(destination)

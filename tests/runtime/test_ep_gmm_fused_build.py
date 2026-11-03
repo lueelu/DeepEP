@@ -140,12 +140,16 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
                 component.mkdir(parents=True)
 
     monkeypatch.setattr(build, "checked_run", run)
+    published = []
+    monkeypatch.setattr(build, "publish_source_native", published.append)
     if expected_jobs is None:
         with pytest.raises(RuntimeError, match="must be in"):
             command.build_extension(ext)
         assert not calls
+        assert not published
         return
     command.build_extension(ext)
+    assert published == [destination.resolve()]
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert f"-DDEEPEP_DEVICE_JOBS={expected_jobs}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]

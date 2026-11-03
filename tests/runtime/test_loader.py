@@ -30,7 +30,7 @@ def test_require_native_reuses_success_across_operations(monkeypatch):
         _native._require_native_cached.cache_clear()
 
 
-@pytest.mark.parametrize("fault", [None, "origin", "protocol", "checksum", "missing"])
+@pytest.mark.parametrize("fault", [None, "origin", "protocol", "checksum", "missing", "source_link"])
 def test_native_loader_identity(monkeypatch, tmp_path, fault):
     library = tmp_path / "libshmem.so"
     library.write_bytes(b"test SDK identity")
@@ -43,6 +43,16 @@ def test_native_loader_identity(monkeypatch, tmp_path, fault):
         shmem_library_path=lambda: str(library),
     )
     spec = SimpleNamespace(origin=str((tmp_path.parent if fault == "origin" else tmp_path) / "_C.so"))
+    if fault == "source_link":
+        target = tmp_path / "build" / "_C.so"
+        target.parent.mkdir()
+        target.write_bytes(b"native test double")
+        from pathlib import Path
+
+        try:
+            Path(spec.origin).symlink_to(target)
+        except OSError:
+            pytest.skip("Source builds require symlink support")
     monkeypatch.setattr(_native, "__file__", str(tmp_path / "_native.py"))
     monkeypatch.setattr(
         _native.importlib.util,
@@ -55,7 +65,7 @@ def test_native_loader_identity(monkeypatch, tmp_path, fault):
         if fault == "checksum":
             with pytest.warns(RuntimeWarning, match="Loaded SHMEM library differs"):
                 assert _native._load_native() is module
-        elif fault:
+        elif fault and fault != "source_link":
             with pytest.raises(ImportError):
                 _native._load_native()
         else:
