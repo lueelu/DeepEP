@@ -20,10 +20,20 @@ else:
 
     LOCK = RLock()
 
-KINDS = ("auto", "pod", "clos_only", "card_4pmesh")
-# Only the migrated implementation takes an engine argument internally. POD
+KINDS = ("auto", "mesh_clos", "global_clos", "mesh_pcie")
+# Input-only aliases preserve existing applications; results use canonical names.
+_ALIASES = {"pod": "mesh_clos", "clos_only": "global_clos", "card_4pmesh": "mesh_pcie"}
+
+
+def normalize_machine_type(value):
+    if not isinstance(value, str):
+        raise ValueError(f"machine_type must be one of {KINDS}")
+    return _ALIASES.get(value, value)
+
+
+# Only the migrated implementation takes an engine argument internally. Mesh+Clos
 # retains its own initialization contract and mixed-engine configuration.
-_TRANSPORT_BY_MACHINE = {"clos_only": "udma", "card_4pmesh": "mte"}
+_TRANSPORT_BY_MACHINE = {"global_clos": "udma", "mesh_pcie": "mte"}
 
 
 def read_json(path):
@@ -81,8 +91,8 @@ def classify_root(root, topology, physical):
     ):
         raise ValueError("rootinfo and topology disagree about current-device fabrics")
     if clos and not mesh:
-        return "clos_only"
-    # A mesh+Clos declaration alone is insufficient to identify a supported POD.
+        return "global_clos"
+    # A topology declaration alone is insufficient to identify a supported board.
     if clos and mesh:
         return "mesh_and_clos"
     if mesh:
@@ -172,12 +182,12 @@ def detect_physical(physical, rootinfo_path=None):
         kind = classify_root(root, topo, physical)
         if kind == "mesh_and_clos":
             if board_id(physical) not in (3, 7):
-                raise ValueError("mesh+Clos product is not a validated POD; specify machine_type")
-            kind = "pod"
+                raise ValueError("Mesh+Clos board is not validated; specify machine_type")
+            kind = "mesh_clos"
         elif kind == "mesh4":
             if board_id(physical) != 0x6C:
-                raise ValueError("four-card Mesh requires CARD_4PMESH board 0x6c")
-            kind = "card_4pmesh"
+                raise ValueError("four-card Mesh requires MESH_PCIE board 0x6c")
+            kind = "mesh_pcie"
         return {
             "machine_type": kind,
             "source": "rootinfo",
@@ -191,7 +201,7 @@ def detect_physical(physical, rootinfo_path=None):
     if board not in (3, 7, 0x6C):
         raise ValueError(f"no rootinfo and no validated rule for board 0x{board:02x}; specify machine_type")
     return {
-        "machine_type": "card_4pmesh" if board == 0x6C else "pod",
+        "machine_type": "mesh_pcie" if board == 0x6C else "mesh_clos",
         "source": "dcmi_board_rule",
         "physical_device": physical,
         "board": board,
@@ -215,6 +225,7 @@ def gather_records(group, record):
 def select(machine_type="auto", group=None, rootinfo_path=None):
     error, result = None, None
     try:
+        machine_type = normalize_machine_type(machine_type)
         if machine_type not in KINDS:
             raise ValueError(f"machine_type must be one of {KINDS}")
         result = (
@@ -236,7 +247,7 @@ def select(machine_type="auto", group=None, rootinfo_path=None):
 
 
 class MachineSelector(type):
-    """Keep the existing POD class and methods; select Clos before construction."""
+    """Select the topology implementation once before constructing a Buffer."""
 
     def __call__(cls, *args, **kwargs):
         sys.modules[cls.__module__].require_native(f"{cls.__name__}.__init__")
@@ -250,16 +261,16 @@ class MachineSelector(type):
         # SHMEM bootstrap remains responsible for its collective configuration.
         # Accept transport only for legacy keyword-call compatibility. Ignore
         # every value (including None and conflicting defaults); machine_type
-        # alone determines the engine. Do not forward it to the POD constructor
+        # alone determines the engine. Do not forward it to the Mesh+Clos constructor
         # or include it in rank consensus, even if only one rank supplies it.
         options.pop("transport", None)
         selection = select(machine_type, group, rootinfo)
         with LOCK:
-            if selection["machine_type"] in ("clos_only", "card_4pmesh"):
-                from ._clos_adapter import buffer_class
+            if selection["machine_type"] in ("global_clos", "mesh_pcie"):
+                from .backends.global_clos import buffer_class
 
-                if selection["machine_type"] == "card_4pmesh":
-                    from ._card_adapter import buffer_class as card_class, prepare
+                if selection["machine_type"] == "mesh_pcie":
+                    from .backends.mesh_pcie import buffer_class as card_class, prepare
 
                     prepare(group, options)
                     implementation = card_class(cls.__name__)
@@ -282,7 +293,7 @@ class MachineSelector(type):
         return signature.replace(parameters=list(signature.parameters.values())[1:])
 
     def __instancecheck__(cls, instance):
-        for name in ("deep_ep._clos_adapter", "deep_ep._card_adapter"):
+        for name in ("deep_ep.backends.direct.api", "deep_ep.backends.global_clos", "deep_ep.backends.mesh_pcie"):
             module = sys.modules.get(name)
             if module is not None and type(instance) is module.buffer_class(cls.__name__):
                 return True
@@ -291,7 +302,7 @@ class MachineSelector(type):
 
 class HandleSelector(type):
     def __instancecheck__(cls, instance):
-        module = sys.modules.get("deep_ep.backends.clos.elastic")
+        module = sys.modules.get("deep_ep.backends.direct.elastic")
         if module is not None and isinstance(instance, module.EPHandle):
             return True
         return super().__instancecheck__(instance)

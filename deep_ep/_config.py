@@ -22,7 +22,7 @@ class Config:
         udma_peers_per_worker: int | None = None,
         udma_wqes_per_visit: int | None = None,
     ) -> None:
-        from .backends.clos.config import Config as ClosConfig
+        from .backends.direct.config import Config as DirectConfig
 
         values = [
             num_compute_units,
@@ -31,7 +31,7 @@ class Config:
             num_max_scaleout_chunked_send_tokens,
             num_max_scaleout_chunked_recv_tokens,
         ]
-        self._impl = ClosConfig(
+        self._impl = DirectConfig(
             *values, udma_peers_per_worker=udma_peers_per_worker, udma_wqes_per_visit=udma_wqes_per_visit
         )
 

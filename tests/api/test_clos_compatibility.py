@@ -28,6 +28,27 @@ def run_host(code, *, dtypes=True):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_topology_entries_share_direct_implementation_without_native_loading():
+    run_host("""
+        import deep_ep
+        from deep_ep.backends.direct import api, buffer, elastic
+        assert isinstance(object.__new__(api.Buffer), deep_ep.Buffer)
+        assert isinstance(object.__new__(api.ElasticBuffer), deep_ep.ElasticBuffer)
+        from deep_ep.backends import global_clos, mesh_pcie
+        assert global_clos.Buffer is api.Buffer
+        assert global_clos.ElasticBuffer is api.ElasticBuffer
+        assert issubclass(mesh_pcie.Buffer, api.Buffer)
+        assert issubclass(mesh_pcie.ElasticBuffer, api.ElasticBuffer)
+        for entry in (global_clos, mesh_pcie):
+            assert entry.Buffer.destroy is buffer.Buffer.destroy
+            assert entry.ElasticBuffer.destroy is elastic.ElasticBuffer.destroy
+            assert isinstance(object.__new__(entry.Buffer), deep_ep.Buffer)
+            assert isinstance(object.__new__(entry.ElasticBuffer), deep_ep.ElasticBuffer)
+        assert 'deep_ep._C' not in sys.modules
+        assert 'deep_ep._clos_C' not in sys.modules
+    """)
+
+
 @pytest.mark.parametrize(
     "first",
     ["deep_ep", "ascend_deepep"]
@@ -62,7 +83,7 @@ def test_legacy_first_import_is_lazy_and_uses_public_entries(first):
 def test_legacy_extra_exports_reuse_backend_objects():
     run_host("""
         import ascend_deepep as old, deep_ep as new
-        from deep_ep.backends import clos
+        from deep_ep.backends import direct as clos
         from ascend_deepep.expand import ExpandHandle
         from ascend_deepep.resources import Handle, Slot, SlotState
         from ascend_deepep.dtypes import topk_idx_t
@@ -84,10 +105,10 @@ def test_consolidated_submodules_preserve_imports_and_exports():
             'elastic': ('deep_ep.buffers.elastic', ('ElasticBuffer', 'EPHandle')),
             'config': ('deep_ep', ('Config',)),
             'event': ('deep_ep.utils.event', ('EventHandle', 'EventOverlap')),
-            'expand': ('deep_ep.backends.clos.expand', ('ExpandHandle',)),
-            'resources': ('deep_ep.backends.clos.resources', ('Handle', 'Slot', 'SlotState')),
-            'dtypes': ('deep_ep.backends.clos.dtypes', ('topk_idx_t',)),
-            'utils': ('deep_ep.backends.clos.utils', ('align_up',)),
+            'expand': ('deep_ep.backends.direct.expand', ('ExpandHandle',)),
+            'resources': ('deep_ep.backends.direct.resources', ('Handle', 'Slot', 'SlotState')),
+            'dtypes': ('deep_ep.backends.direct.dtypes', ('topk_idx_t',)),
+            'utils': ('deep_ep.backends.direct.utils', ('align_up',)),
         }
         for name, (target, exports) in aliases.items():
             fullname = 'ascend_deepep.' + name
@@ -121,8 +142,8 @@ def test_consolidated_submodules_preserve_imports_and_exports():
 def test_public_config_and_helpers_work_with_auto_policy(ep):
     run_host(f"""
         import ascend_deepep as old, deep_ep as new
-        from deep_ep.backends.clos.config import Config as InternalConfig
-        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
+        from deep_ep.backends.direct.config import Config as InternalConfig
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
         policy = resolve_udma_policy(True, {ep}, 'udma', None, None, None, None, None)
         for config in (None, new.Config(), old.Config(), InternalConfig(),
                        new.Buffer.get_dispatch_config({ep}), new.Buffer.get_combine_config({ep})):
@@ -155,9 +176,9 @@ def test_public_config_and_helpers_work_with_auto_policy(ep):
 def test_v1_public_config_reaches_native_argument_conversion(operation):
     run_host(f"""
         import deep_ep
-        from deep_ep.backends.clos import buffer as m
-        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
-        from deep_ep._clos_adapter import Buffer
+        from deep_ep.backends.direct import buffer as m
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        from deep_ep.backends.direct.api import Buffer
         class Converted(Exception): pass
         def convert(config):
             assert config.num_aiv == 32
@@ -183,9 +204,9 @@ def test_v1_public_config_reaches_native_argument_conversion(operation):
 @pytest.mark.parametrize("requested", [None, 0, 8, 32, 64])
 def test_v2_core_defaults_and_handle_inheritance(operation, requested):
     run_host(f"""
-        from deep_ep.backends.clos import elastic as m
-        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
-        from deep_ep._clos_adapter import ElasticBuffer
+        from deep_ep.backends.direct import elastic as m
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        from deep_ep.backends.direct.api import ElasticBuffer
         from contextlib import contextmanager
         class ReadyForDevice(Exception): pass
         counts = []
@@ -253,7 +274,7 @@ def test_low_core_policy_preserves_core_count_and_runtime_qp_lanes(ep, cores, pe
     run_host(f"""
         import deep_ep
         from dataclasses import FrozenInstanceError
-        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
         base = resolve_udma_policy(True, {ep}, 'udma', None, None, None, None, None)
         before = base.signature()
         selected = base.for_num_aiv({cores})
@@ -278,7 +299,7 @@ def test_low_core_policy_preserves_core_count_and_runtime_qp_lanes(ep, cores, pe
 
 def test_auto_policy_budget_boundaries_and_manual_opt_out():
     run_host("""
-        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
         for ep in range(2, 257):
             base = resolve_udma_policy(True, ep, 'udma', None, None, None, None, None)
             for cores in range(2, 65, 2):
@@ -306,8 +327,8 @@ def test_bandwidth_reports_the_operation_policy_not_the_buffer_default():
     run_host("""
         sys.path.insert(0, 'benchmarks/clos')
         from bench_v2_bandwidth import effective_udma_config
-        from deep_ep.backends.clos.config import Config
-        from deep_ep.backends.clos.udma_policy import resolve_udma_policy
+        from deep_ep.backends.direct.config import Config
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
         base = resolve_udma_policy(True, 8, 'udma', None, None, None, None, None)
         buffer = SimpleNamespace(udma_auto_policy=base, udma_schedule='peer',
             udma_dispatch_peer_order='rank', udma_combine_peer_order='rank',

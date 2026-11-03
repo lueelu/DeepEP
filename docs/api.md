@@ -7,24 +7,24 @@ Modified by Joyce_An 2026
 
 `deep_ep.ElasticBuffer` 提供 V2 dispatch/combine。高吞吐（HT）和低时延（LL）使用相同方法，输入、权重、布局及路径选择见 [Elastic 接口](elastic.md)。本页说明核心 `deep_ep` 的公共对象、初始化、资源生命周期和兼容范围。MegaMoE 的 `SymmBuffer/StoreGroup` 和 EpGmmFused 的 UDMA 域使用独立接口，分别见 [MegaMoE](../experiments/megamoe/README.md)与 [EpGmmFused](../experiments/ep_gmm_fused/README.md)。
 
-下文初始化方式与算子参数限制描述 POD 路径；公共对象表注明后端差异。新增 Clos V1/V2、自动选择和使用方式见
-[机型后端说明](machine_backends.md)，不能把 POD 的限制套到 Clos 路径。
+下文初始化方式与算子参数限制描述 Mesh+Clos 路径；公共对象表注明后端差异。新增 Clos V1/V2、自动选择和使用方式见
+[机型后端说明](machine_backends.md)，不能把 Mesh+Clos 的限制套到 Clos 路径。
 
 ## 公共对象
 
 | 对象 | 导入路径 | 用途 |
 | --- | --- | --- |
 | `ElasticBuffer`、`EPHandle` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.elastic` | V2 通信资源、dispatch/combine 及配对路由信息 |
-| `Buffer` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.legacy` | 按机型选择 V1 后端；Clos/CARD 支持高吞吐 dispatch/combine，POD 仅支持资源构造、通信流、事件与销毁 |
-| `Config` | `deep_ep` | Clos V1 的核数、分块配置与容量查询，默认 32 AIV；不表示 POD 已支持 V1 通信 |
+| `Buffer` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.legacy` | 按机型选择 V1 后端；Clos/CARD 支持高吞吐 dispatch/combine，Mesh+Clos 仅支持资源构造、通信流、事件与销毁 |
+| `Config` | `deep_ep` | Clos V1 的核数、分块配置与容量查询，默认 32 AIV；不表示 Mesh+Clos 已支持 V1 通信 |
 | `EventHandle`、`EventOverlap` | `deep_ep`、`deep_ep.utils`、`deep_ep.utils.event` | 记录 NPU 事件、建立流依赖和保留相关 Tensor |
 
 同一对象的不同导入路径指向同一个类。普通 `import deep_ep` 不加载 Torch、torch_npu 或原生扩展；通信运行时调用按需加载当前安装目录的扩展并校验 SHMEM 库身份。普通导入成功不表示运行环境、算法或设备验证通过。
 
 ### 公共事件与后端兼容
 
-POD 和 CLOS 共用 `deep_ep.EventHandle`、`deep_ep.EventOverlap`。旧的
-`deep_ep.backends.clos.event` 路径仅转发相同的类，返回事件也可使用公共类型进行检查。
+Mesh+Clos 和 CLOS 共用 `deep_ep.EventHandle`、`deep_ep.EventOverlap`。旧的
+`deep_ep.backends.direct.event` 路径仅转发相同的类，返回事件也可使用公共类型进行检查。
 `EventHandle()` 记录当前流；`EventHandle(stream)` 记录指定的同设备 NPU 流。
 事件操作只加载 Torch/torch_npu，不要求加载某个通信后端的原生扩展。
 
@@ -33,7 +33,7 @@ V1 的 `previous_event` 使用 `EventOverlap`，V2 使用 `EventHandle`；统一
 `with` 时不等待，显式 `current_stream_wait()` / `wait()` 则触发断言。构造器不对非空
 事件做额外类型限制，等待时调用其 `current_stream_wait()` 方法。
 
-POD 与 CLOS 的同步调用均先建立计算流依赖，再返回 `event=None` 的包装；异步调用返回
+Mesh+Clos 与 Direct 的同步调用均先建立计算流依赖，再返回 `event=None` 的包装；异步调用返回
 有效事件。hook 成功执行一次后清除，等待返回 hook 的结果。`release_handle=True`
 清除事件与内部资源，但保留用户传入的 `extra_tensors`，与官方保持一致。NPU Tensor
 的生产/消费流登记和后端资源保活作为内部适配保留，不改变这些公共语义。
@@ -69,7 +69,7 @@ POD 与 CLOS 的同步调用均先建立计算流依赖，再返回 `event=None`
 
 `Buffer/ElasticBuffer` 的普通 Runtime 接受 EP2/4/8/16/32/64/128/256/512。对称工作区至少 2 MiB，按 2 MiB 对齐，字节数不能超过 int64 上限；实际分配受设备内存和 SHMEM 地址空间限制。各 rank 的容量相同。**这是资源准入范围；算子的 EP、shape 和容量限制另见 Elastic 文档。**
 
-`ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。POD 的 `Buffer` 使用 MTE 配置，要求显式进程组、`num_nvl_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_rdma_bytes`；资源构造不启用 V1 通信算法。Clos/PR 的 V1 通信能力见机型后端说明。
+`ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。Mesh+Clos 的 `Buffer` 使用 MTE 配置，要求显式进程组、`num_nvl_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_rdma_bytes`；资源构造不启用 V1 通信算法。Global Clos / Mesh+PCIe 的 V1 通信能力见机型后端说明。
 
 `ElasticBuffer(use_1g_huge_pages=True)` 默认为 SHMEM 工作区申请 1 GiB 大页；所有 rank 须使用相同设置。设置为 `False` 使用 SHMEM 常规分配。`num_bytes` 仍表示逻辑容量，实际分配包含页对齐和必要的保护区。
 

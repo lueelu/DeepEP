@@ -9,7 +9,7 @@ import sys
 import pytest
 
 import deep_ep
-from deep_ep.backends.pod import buffer as pod_v1, elastic as pod_v2
+from deep_ep.backends.mesh_clos import buffer as pod_v1, elastic as pod_v2
 
 
 def test_public_entries_and_legacy_identity():
@@ -37,12 +37,18 @@ def test_all_backend_packages_are_in_distribution():
 
     root = Path(__file__).resolve().parents[2]
     packages = set(find_packages(where=root))
-    assert {"deep_ep.backends", "deep_ep.backends.pod", "deep_ep.backends.clos"} <= packages
+    assert {
+        "deep_ep.backends",
+        "deep_ep.backends.mesh_clos",
+        "deep_ep.backends.direct",
+        "deep_ep.backends.mesh_pcie",
+        "deep_ep.backends.global_clos",
+    } <= packages
     assert {name for name in packages if name.startswith("ascend_deepep")} == {"ascend_deepep"}
     assert not (root / "ascend_deepep/lib").exists()
 
 
-@pytest.mark.parametrize("first", ["deep_ep", "deep_ep.backends.clos"])
+@pytest.mark.parametrize("first", ["deep_ep", "deep_ep.backends.direct"])
 def test_public_and_backend_imports_do_not_require_removed_package(first):
     pytest.importorskip("torch")
     code = f"""
@@ -56,10 +62,10 @@ class RejectRemovedPackage(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, RejectRemovedPackage())
 importlib.import_module({first!r})
 import deep_ep
-from deep_ep import _clos_adapter
-from deep_ep.backends import clos
+from deep_ep.backends.direct import api as _clos_adapter
+from deep_ep.backends import direct as clos
 for name in ("buffer", "elastic", "config", "_native", "event", "resources", "dtypes", "utils"):
-    importlib.import_module("deep_ep.backends.clos." + name)
+    importlib.import_module("deep_ep.backends.direct." + name)
 assert issubclass(_clos_adapter.Buffer, clos.Buffer)
 assert issubclass(_clos_adapter.ElasticBuffer, clos.ElasticBuffer)
 assert deep_ep.ExpandHandle is clos.ExpandHandle
@@ -73,8 +79,8 @@ assert not any(n == "ascend_deepep" or n.startswith("ascend_deepep.") for n in s
 
 def test_clos_adapter_operations_still_use_migrated_functions():
     pytest.importorskip("torch")
-    from deep_ep import _clos_adapter
-    from deep_ep.backends.clos import buffer, elastic
+    from deep_ep.backends.direct import api as _clos_adapter
+    from deep_ep.backends.direct import buffer, elastic
 
     for adapter, implementation in (
         (_clos_adapter.Buffer, buffer.Buffer),
@@ -87,5 +93,5 @@ def test_clos_adapter_operations_still_use_migrated_functions():
 
 def test_old_pod_layout_import_is_same_module():
     old = importlib.import_module("deep_ep.buffers._elastic_layout")
-    new = importlib.import_module("deep_ep.backends.pod._elastic_layout")
+    new = importlib.import_module("deep_ep.backends.mesh_clos._elastic_layout")
     assert old is new

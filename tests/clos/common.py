@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Tuple, Union
 
 import torch
-from deep_ep.backends.clos import Buffer, topk_idx_t
+from deep_ep.backends.direct import Buffer, topk_idx_t
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks/clos"))
 from route_workloads import options as route_options, generate as generate_routes

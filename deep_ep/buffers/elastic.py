@@ -6,15 +6,15 @@ from typing import TYPE_CHECKING, Optional
 
 from .._machine import MachineSelector
 from .._native import require_native
-from ..backends.pod import elastic as _pod
-from ..backends.pod.elastic import EPHandle
+from ..backends.mesh_clos import elastic as _mesh_clos
+from ..backends.mesh_clos.elastic import EPHandle
 
 if TYPE_CHECKING:
     import torch.distributed as dist
 
 
-class ElasticBuffer(_pod.ElasticBuffer, metaclass=MachineSelector):
-    """Select POD, Clos or CARD_4PMESH while preserving the V2 interface."""
+class ElasticBuffer(_mesh_clos.ElasticBuffer, metaclass=MachineSelector):
+    """Select Mesh+Clos, Global Clos or Mesh+PCIe while preserving the V2 interface."""
 
     @staticmethod
     def get_buffer_size_hint(
@@ -34,12 +34,12 @@ class ElasticBuffer(_pod.ElasticBuffer, metaclass=MachineSelector):
         require_native("ElasticBuffer.get_buffer_size_hint")
         from .._machine import select
 
-        if select(machine_type, rootinfo_path=rootinfo_path)["machine_type"] in ("clos_only", "card_4pmesh"):
-            from .._clos_adapter import ElasticBuffer as ClosElasticBuffer
+        if select(machine_type, rootinfo_path=rootinfo_path)["machine_type"] in ("global_clos", "mesh_pcie"):
+            from ..backends.direct.api import ElasticBuffer as DirectElasticBuffer
 
             if world_size is not None:
-                raise ValueError("Clos size hint requires its EP group, not an explicit world_size")
-            return ClosElasticBuffer.get_buffer_size_hint(
+                raise ValueError("Direct size hint requires its EP group, not an explicit world_size")
+            return DirectElasticBuffer.get_buffer_size_hint(
                 group,
                 num_max_tokens_per_rank,
                 hidden,
@@ -48,7 +48,7 @@ class ElasticBuffer(_pod.ElasticBuffer, metaclass=MachineSelector):
                 allow_hybrid_mode,
                 allow_multiple_reduction,
             )
-        return _pod.ElasticBuffer.get_buffer_size_hint(
+        return _mesh_clos.ElasticBuffer.get_buffer_size_hint(
             group,
             num_max_tokens_per_rank,
             hidden,
@@ -61,8 +61,8 @@ class ElasticBuffer(_pod.ElasticBuffer, metaclass=MachineSelector):
 
 
 def __getattr__(name):
-    # Preserve old imports of POD helpers used by the existing test scripts.
-    return getattr(_pod, name)
+    # Preserve old imports of Mesh+Clos helpers used by the existing test scripts.
+    return getattr(_mesh_clos, name)
 
 
 __all__ = ["ElasticBuffer", "EPHandle"]

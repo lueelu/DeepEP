@@ -7,7 +7,7 @@ import pytest
 
 import deep_ep
 from deep_ep import _compat, _machine
-from deep_ep.backends.pod import elastic, buffer as legacy
+from deep_ep.backends.mesh_clos import elastic, buffer as legacy
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +53,7 @@ def test_invalid_alias_target_is_rejected_at_definition():
 @pytest.mark.parametrize("style", ["upstream", "platform", "both", "positional"])
 def test_pod_constructors_forward_identical_values(monkeypatch, api, style):
     calls = []
-    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "pod"})
+    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "mesh_clos"})
     module = legacy if api == "Buffer" else elastic
     monkeypatch.setattr(module, "require_native", lambda _: None)
     monkeypatch.setattr(module, "warn_unclosed", lambda _: None)
@@ -64,7 +64,7 @@ def test_pod_constructors_forward_identical_values(monkeypatch, api, style):
 
     monkeypatch.setattr(module, "Runtime", runtime)
     group, capacity = object(), 128 << 20
-    args, options = [group], {"machine_type": "pod", "explicitly_destroy": True}
+    args, options = [group], {"machine_type": "mesh_clos", "explicitly_destroy": True}
     if api == "Buffer":
         if style in ("upstream", "both"):
             options["num_nvl_bytes"] = capacity
@@ -82,7 +82,7 @@ def test_pod_constructors_forward_identical_values(monkeypatch, api, style):
             args.extend([capacity, 0, 0, 0, 0, False, False, True, True, True, 3, 0, 300, 100])
             options.pop("num_bytes")
     instance = getattr(deep_ep, api)(*args, **options)
-    assert instance.machine_type == "pod" and len(calls) == 1
+    assert instance.machine_type == "mesh_clos" and len(calls) == 1
     assert calls[0][0][:2] == (group, capacity)
     if api == "ElasticBuffer":
         assert calls[0][0][2] == 300
@@ -98,13 +98,13 @@ def test_pod_constructors_forward_identical_values(monkeypatch, api, style):
     ],
 )
 def test_constructor_conflicts_fail_before_native_initialization(monkeypatch, api, kwargs):
-    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "pod"})
+    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "mesh_clos"})
     module = legacy if api == "Buffer" else elastic
     monkeypatch.setattr(module, "require_native", lambda _: None)
     monkeypatch.setattr(module, "warn_unclosed", lambda _: None)
     monkeypatch.setattr(module, "Runtime", lambda *a, **kw: pytest.fail("conflict reached native runtime"))
     with pytest.raises(TypeError, match="conflicting"):
-        getattr(deep_ep, api)(None, machine_type="pod", **kwargs)
+        getattr(deep_ep, api)(None, machine_type="mesh_clos", **kwargs)
 
 
 @pytest.mark.parametrize("method", ["get_theoretical_num_sms", "get_theoretical_num_compute_units"])

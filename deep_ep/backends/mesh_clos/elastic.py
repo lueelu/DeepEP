@@ -249,7 +249,7 @@ class ElasticBuffer:
                 num_topk,
                 use_fp8_dispatch,
                 world_size=world_size,
-                machine_type="pod",
+                machine_type="mesh_clos",
             )
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.hidden = hidden
@@ -1531,7 +1531,7 @@ class ElasticBuffer:
                 raise
 
 
-# Compatibility keywords translate to the original POD method without changing
+# Compatibility keywords translate to the original Mesh+Clos method without changing
 # its validation, scheduling, workspace, or completion behavior.
 ElasticBuffer.__init__ = public_keywords(ElasticBuffer.__init__, {"num_gpu_timeout_secs": "num_device_timeout_secs"})
 EPHandle.__init__ = public_keywords(EPHandle.__init__, {"num_sms": "num_compute_units"})

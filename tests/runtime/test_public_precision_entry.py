@@ -25,7 +25,7 @@ def entry(monkeypatch):
         calls.append((args, kwargs))
         return {"machine_type": selector.kind, "source": "rootinfo"}
 
-    selector.kind, selector.select = "clos_only", select
+    selector.kind, selector.select = "global_clos", select
     monkeypatch.setitem(sys.modules, "deep_ep", package)
     monkeypatch.setitem(sys.modules, "deep_ep._machine", selector)
     return namespace, package, selector, calls
@@ -41,11 +41,11 @@ def test_public_entry_uses_auto_and_passes_no_engine_override(entry):
     assert calls == [((), {"group": group})]
 
 
-@pytest.mark.parametrize("kind", ["pod", "card_4pmesh"])
+@pytest.mark.parametrize("kind", ["mesh_clos", "mesh_pcie"])
 def test_public_entry_rejects_other_topologies_without_forcing_clos(entry, kind):
     namespace, _, selector, _ = entry
     selector.kind = kind
-    with pytest.raises(RuntimeError, match="requires auto-detected clos_only"):
+    with pytest.raises(RuntimeError, match="requires auto-detected global_clos"):
         namespace["buffer_entrypoints"](SimpleNamespace(public_auto=True, public_clos=False, transport=None), object())
 
 
@@ -74,5 +74,5 @@ def test_explicit_public_clos_is_separate_from_detection(entry):
     result = namespace["buffer_entrypoints"](
         SimpleNamespace(public_auto=False, public_clos=True, transport=None), object()
     )
-    assert result == (public.Buffer, public.ElasticBuffer, {"machine_type": "clos_only"})
+    assert result == (public.Buffer, public.ElasticBuffer, {"machine_type": "global_clos"})
     assert calls == []

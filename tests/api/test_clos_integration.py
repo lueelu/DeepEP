@@ -5,9 +5,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 import deep_ep  # noqa: E402
-from deep_ep.backends.clos import Config as OriginalConfig  # noqa: E402
-from deep_ep.backends.clos.elastic import EPHandle as ClosHandle  # noqa: E402
-from deep_ep._clos_adapter import Buffer, ElasticBuffer  # noqa: E402
+from deep_ep.backends.direct import Config as OriginalConfig  # noqa: E402
+from deep_ep.backends.direct.elastic import EPHandle as ClosHandle  # noqa: E402
+from deep_ep.backends.direct.api import Buffer, ElasticBuffer  # noqa: E402
 
 
 def test_platform_aliases_preserve_source_size_hints_including_sixteen_ranks():
@@ -44,7 +44,7 @@ def test_cpu_helpers_do_not_initialize_npu():
 
 
 def test_clos_accepts_public_event_dependencies_without_recording_or_waiting():
-    from deep_ep.backends.clos.elastic import _validate_event_dependency, _validate_epilogue_event
+    from deep_ep.backends.direct.elastic import _validate_event_dependency, _validate_epilogue_event
 
     event = object.__new__(deep_ep.EventHandle)
     _validate_event_dependency(event, True)
@@ -56,8 +56,8 @@ def test_clos_accepts_public_event_dependencies_without_recording_or_waiting():
 
 
 def test_clos_event_imports_are_the_public_classes():
-    from deep_ep.backends import clos
-    from deep_ep.backends.clos import event
+    from deep_ep.backends import direct as clos
+    from deep_ep.backends.direct import event
 
     assert clos.EventHandle is event.EventHandle is deep_ep.EventHandle
     assert clos.EventOverlap is event.EventOverlap is deep_ep.EventOverlap

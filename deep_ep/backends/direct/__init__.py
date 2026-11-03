@@ -1,4 +1,4 @@
-"""Internal Clos backend for the public deep_ep interfaces."""
+"""Direct EP-peer implementation shared by Mesh+PCIe (MTE) and Global Clos (UDMA)."""
 
 from __future__ import annotations
 

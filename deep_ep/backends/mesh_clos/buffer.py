@@ -72,7 +72,7 @@ class Buffer:
     @staticmethod
     def set_num_compute_units(new_num_compute_units: int) -> None:
         """Set the default AIV count for the Clos V1 implementation."""
-        from ..clos.buffer import Buffer as ClosBuffer
+        from ..direct.buffer import Buffer as ClosBuffer
 
         ClosBuffer.set_num_sms(new_num_compute_units)
 
@@ -106,7 +106,7 @@ class Buffer:
     @staticmethod
     def get_dispatch_config(num_ranks: int) -> Config:
         """Return the Clos V1 dispatch configuration."""
-        from ..clos.buffer import Buffer as ClosBuffer
+        from ..direct.buffer import Buffer as ClosBuffer
         from ..._config import Config
 
         value = ClosBuffer.get_dispatch_config(num_ranks)
@@ -211,7 +211,7 @@ class Buffer:
         _unavailable("Buffer.get_next_low_latency_combine_buffer")
 
 
-# Preserve the POD implementation and defaults; only publish upstream names.
+# Preserve the Mesh+Clos implementation and defaults; only publish upstream names.
 Buffer.__init__ = public_keywords(
     Buffer.__init__,
     {

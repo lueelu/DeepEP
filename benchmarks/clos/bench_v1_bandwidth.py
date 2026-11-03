@@ -99,9 +99,9 @@ def worker(args):
     import torch
     import torch.distributed as dist
     import torch_npu  # noqa: F401
-    from deep_ep._clos_adapter import Buffer
+    from deep_ep.backends.global_clos import Buffer
     from deep_ep import topk_idx_t
-    from deep_ep.backends.clos import Config
+    from deep_ep.backends.direct import Config
     import common as golden
     import profiling
 

@@ -1,10 +1,10 @@
-"""Single-host CARD_4PMESH policy over the existing MTE V1/V2 kernels."""
+"""Single-host MESH_PCIE policy over the existing MTE V1/V2 kernels."""
 
 from pathlib import Path
 import uuid
 
-from . import _clos_adapter
-from ._machine import gather_records
+from ..direct import api
+from ..._machine import gather_records
 
 
 def host_identity():
@@ -18,20 +18,20 @@ def host_identity():
 
 def prepare(group, options):
     if group is None:
-        raise ValueError("card_4pmesh requires an EP ProcessGroup or MPI communicator")
+        raise ValueError("mesh_pcie requires an EP ProcessGroup or MPI communicator")
     error, host = None, None
     try:
         if options.get("udma_schedule", "peer") != "peer":
-            raise ValueError("card_4pmesh does not support the UDMA token schedule")
+            raise ValueError("mesh_pcie does not support the UDMA token schedule")
         host = host_identity()
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     records = gather_records(group, {"host": host, "error": error})
     errors = [(rank, record["error"]) for rank, record in enumerate(records) if record["error"]]
     if errors:
-        raise RuntimeError(f"card_4pmesh preflight failed collectively: {errors}")
+        raise RuntimeError(f"mesh_pcie preflight failed collectively: {errors}")
     if len({record["host"] for record in records}) != 1:
-        raise ValueError("card_4pmesh MTE requires all EP ranks on the same host")
+        raise ValueError("mesh_pcie MTE requires all EP ranks on the same host")
 
 
 class _MappedMte:
@@ -45,7 +45,7 @@ class _MappedMte:
             records = gather_records(group, errors)
             failures = [(rank, errors) for rank, errors in enumerate(records) if errors]
             if failures:
-                raise RuntimeError(f"card_4pmesh MTE mapping check failed collectively: {failures}")
+                raise RuntimeError(f"mesh_pcie MTE mapping check failed collectively: {failures}")
         except Exception as error:
             # No DeepEP operation has launched. Avoid a device/SHMEM barrier on
             # precisely the peer mappings which were rejected or are unknown.
@@ -59,11 +59,11 @@ class _MappedMte:
             raise
 
 
-class Buffer(_MappedMte, _clos_adapter.Buffer):
+class Buffer(_MappedMte, api.Buffer):
     pass
 
 
-class ElasticBuffer(_MappedMte, _clos_adapter.ElasticBuffer):
+class ElasticBuffer(_MappedMte, api.ElasticBuffer):
     pass
 
 

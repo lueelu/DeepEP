@@ -13,10 +13,10 @@ _SUBMODULES = {
     "elastic": ("deep_ep.buffers.elastic", ("ElasticBuffer", "EPHandle")),
     "config": ("deep_ep", ("Config",)),
     "event": ("deep_ep.utils.event", ("EventHandle", "EventOverlap")),
-    "expand": ("deep_ep.backends.clos.expand", ("ExpandHandle",)),
-    "resources": ("deep_ep.backends.clos.resources", ("Handle", "Slot", "SlotState")),
-    "dtypes": ("deep_ep.backends.clos.dtypes", ("topk_idx_t",)),
-    "utils": ("deep_ep.backends.clos.utils", ("align_up",)),
+    "expand": ("deep_ep.backends.direct.expand", ("ExpandHandle",)),
+    "resources": ("deep_ep.backends.direct.resources", ("Handle", "Slot", "SlotState")),
+    "dtypes": ("deep_ep.backends.direct.dtypes", ("topk_idx_t",)),
+    "utils": ("deep_ep.backends.direct.utils", ("align_up",)),
 }
 
 
@@ -64,7 +64,7 @@ __all__ = [
 
 def __getattr__(name):
     if name in {"BufferRuntime", "ShmemInstance"}:
-        from deep_ep.backends.clos._native import get_native_class
+        from deep_ep.backends.direct._native import get_native_class
 
         return get_native_class(name)
     if name in __all__:

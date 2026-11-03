@@ -1,4 +1,4 @@
-"""CARD_4PMESH classification and public V1/V2 constructor policy (CPU only)."""
+"""MESH_PCIE classification and public V1/V2 constructor policy (CPU only)."""
 
 import copy
 import json
@@ -50,10 +50,10 @@ def test_card_rootinfo_and_board_detection(monkeypatch, tmp_path):
     monkeypatch.setattr(_machine, "physical_device", lambda: 3)
     monkeypatch.setattr(_machine, "board_id", lambda _: 0x6C)
     result = _machine.detect(root_path)
-    assert result["machine_type"] == "card_4pmesh"
+    assert result["machine_type"] == "mesh_pcie"
     assert result["source"] == "rootinfo" and result["physical_device"] == 3
     monkeypatch.setattr(_machine, "board_id", lambda _: 3)
-    with pytest.raises(ValueError, match="requires CARD_4PMESH"):
+    with pytest.raises(ValueError, match="requires MESH_PCIE"):
         _machine.detect(root_path)
 
 
@@ -79,7 +79,7 @@ def test_card_without_rootinfo_uses_board_rule(monkeypatch):
     monkeypatch.setattr(_machine, "physical_device", lambda: 3)
     monkeypatch.setattr(_machine, "board_id", lambda _: 0x6C)
     result = _machine.select()
-    assert result["machine_type"] == "card_4pmesh" and result["board"] == 0x6C
+    assert result["machine_type"] == "mesh_pcie" and result["board"] == 0x6C
     with pytest.raises(RuntimeError, match="explicit rootinfo is missing"):
         _machine.select(rootinfo_path="missing.json")
 
@@ -87,7 +87,7 @@ def test_card_without_rootinfo_uses_board_rule(monkeypatch):
 @pytest.fixture
 def card(monkeypatch):
     pytest.importorskip("torch")
-    from deep_ep import _card_adapter
+    from deep_ep.backends import mesh_pcie as _card_adapter
 
     monkeypatch.setattr(_card_adapter, "host_identity", lambda: "one-host")
     monkeypatch.setattr(_card_adapter, "gather_records", lambda _, record: [record, copy.deepcopy(record)])
@@ -99,7 +99,7 @@ def card(monkeypatch):
 )
 def test_host_identity_requires_valid_boot_id(monkeypatch, value):
     pytest.importorskip("torch")
-    from deep_ep import _card_adapter
+    from deep_ep.backends import mesh_pcie as _card_adapter
 
     monkeypatch.setattr(Path, "read_text", lambda _: value)
     if value.startswith("9bb6"):
@@ -138,7 +138,7 @@ def test_public_card_construction_checks_before_device_barrier(kind, fault, card
     import deep_ep
     from deep_ep import buffer as legacy
     from deep_ep.buffers import elastic as public_elastic
-    from deep_ep.backends.clos import buffer as source_v1, elastic as source_v2
+    from deep_ep.backends.direct import buffer as source_v1, elastic as source_v2
 
     calls = []
     group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
@@ -164,7 +164,7 @@ def test_public_card_construction_checks_before_device_barrier(kind, fault, card
         def num_device_aiv(self):
             return 64
 
-    monkeypatch.setattr(_machine, "select", lambda *args, **kw: {"machine_type": "card_4pmesh", "source": "test"})
+    monkeypatch.setattr(_machine, "select", lambda *args, **kw: {"machine_type": "mesh_pcie", "source": "test"})
     monkeypatch.setattr(legacy, "require_native", lambda _: None)
     monkeypatch.setattr(public_elastic, "require_native", lambda _: None)
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)
@@ -181,14 +181,14 @@ def test_public_card_construction_checks_before_device_barrier(kind, fault, card
             lambda _, record: [record, ["peer 0 workspace unmapped"]] if isinstance(record, list) else [record, record],
         )
     public = getattr(deep_ep, kind)
-    kwargs = {"machine_type": "card_4pmesh", "num_bytes": 128 * 1024 * 1024}
+    kwargs = {"machine_type": "mesh_pcie", "num_bytes": 128 * 1024 * 1024}
     if fault:
         with pytest.raises(RuntimeError, match="mapping check failed collectively"):
             public(group, **kwargs)
         assert calls == ["native_init", "mapping", "abort"]
     else:
         result = public(group, **kwargs)
-        assert isinstance(result, public) and result.machine_type == "card_4pmesh"
+        assert isinstance(result, public) and result.machine_type == "mesh_pcie"
         assert result.transport == "mte"
         assert calls == ["native_init", "mapping"] + (["device_barrier"] if kind == "ElasticBuffer" else [])
         # The CPU double has no device resources to release.
@@ -198,8 +198,8 @@ def test_public_card_construction_checks_before_device_barrier(kind, fault, card
 def test_v2_card_hint_uses_migrated_layout(monkeypatch):
     pytest.importorskip("torch")
     from deep_ep.buffers import elastic
-    from deep_ep import _clos_adapter
+    from deep_ep.backends.direct import api as _clos_adapter
 
     monkeypatch.setattr(elastic, "require_native", lambda _: None)
     monkeypatch.setattr(_clos_adapter.ElasticBuffer, "get_buffer_size_hint", lambda *args: 123456)
-    assert elastic.ElasticBuffer.get_buffer_size_hint(None, 129, 6144, 8, machine_type="card_4pmesh") == 123456
+    assert elastic.ElasticBuffer.get_buffer_size_hint(None, 129, 6144, 8, machine_type="mesh_pcie") == 123456

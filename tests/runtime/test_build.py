@@ -12,6 +12,42 @@ import zipfile
 
 import pytest
 
+
+@pytest.mark.parametrize(
+    "old", ["backends/clos/buffer.py", "backends/pod/elastic.py", "_clos_adapter.py", "_card_adapter.py"]
+)
+@pytest.mark.parametrize("side", ["build_dir", "install_dir"])
+def test_install_rejects_renamed_backend_staging(build, tmp_path, monkeypatch, old, side):
+    from setuptools import Distribution
+
+    command = build.CheckedInstallLib(Distribution())
+    command.build_dir = str(tmp_path / "build")
+    command.install_dir = str(tmp_path / "install")
+    obsolete = Path(getattr(command, side)) / "deep_ep" / old
+    obsolete.parent.mkdir(parents=True)
+    obsolete.write_text("stale implementation")
+    monkeypatch.setattr(build.install_lib, "install", lambda _: pytest.fail("must reject before copying files"))
+    with pytest.raises(RuntimeError, match="Obsolete backend implementation"):
+        command.install()
+
+
+def test_native_topology_manifest_and_direct_source_paths():
+    import re
+
+    text = (ROOT / "CMakeLists.txt").read_text()
+    manifest = json.loads(text.split("CONTENT [=[", 1)[1].split("]=])", 1)[0])
+    entries = manifest["machine_backends"]
+    assert set(entries) == {"mesh_clos", "mesh_pcie", "global_clos"}
+    assert entries["mesh_pcie"]["transport"] == "mte"
+    assert entries["global_clos"]["transport"] == "udma"
+    assert entries["mesh_pcie"]["module"] == entries["global_clos"]["module"] == "deep_ep._clos_C"
+    for name in ("cmake/Direct.cmake", "cmake/device/CMakeLists.txt"):
+        cmake = (ROOT / name).read_text()
+        assert "csrc/direct" in cmake and "csrc/clos" not in cmake
+        for path in re.findall(r'"\$\{_direct(?:_root)?\}/([^"$]+)"', cmake):
+            assert (ROOT / "csrc/direct" / path).exists(), path
+
+
 ROOT = Path(__file__).resolve().parents[2]
 if not (ROOT / "build_support.py").is_file():
     pytest.skip("Build-source tests run before packaging", allow_module_level=True)

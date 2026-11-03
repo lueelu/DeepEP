@@ -1,8 +1,8 @@
-"""Upstream-named interfaces with compatibility aliases over the Clos backend."""
+"""Upstream-named interfaces with compatibility aliases over the direct MTE/UDMA implementation."""
 
-from .backends.clos.buffer import Buffer as SourceBuffer
-from .backends.clos.elastic import ElasticBuffer as SourceElasticBuffer
-from ._compat import keyword_aliases
+from .buffer import Buffer as SourceBuffer
+from .elastic import ElasticBuffer as SourceElasticBuffer
+from ..._compat import keyword_aliases
 
 
 class Buffer(SourceBuffer):

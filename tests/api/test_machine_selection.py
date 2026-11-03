@@ -17,7 +17,7 @@ from deep_ep._compat import keyword_aliases
 def topology(kind="clos"):
     levels = [{"net_type": "CLOS", "rank_addr_list": [{"addr_type": "EID", "addr": "00" * 16, "ports": ["0/0"]}]}]
     edges = [{"local_a": str(i), "local_a_ports": ["0/0"], "topo_type": "CLOS"} for i in range(16)]
-    if kind == "pod":
+    if kind == "mesh_clos":
         levels.append(dict(levels[0], net_type="MESH"))
         edges.append({"local_a": "8", "local_b": "9", "local_a_ports": ["0/1"]})
     root = {"rank_list": [{"device_id": 0, "local_id": 8, "level_list": levels}]}
@@ -26,10 +26,10 @@ def topology(kind="clos"):
 
 def test_clos_sixteen_does_not_assume_eight_card_servers():
     root, topo = topology()
-    assert _machine.classify_root(root, topo, 0) == "clos_only"
-    assert _machine.classify_root(*topology("pod"), 0) == "mesh_and_clos"
+    assert _machine.classify_root(root, topo, 0) == "global_clos"
+    assert _machine.classify_root(*topology("mesh_clos"), 0) == "mesh_and_clos"
     root["rank_list"][0]["level_list"][0]["net_type"] = "TOPO_FILE_DESC"
-    assert _machine.classify_root(root, topo, 0) == "clos_only"
+    assert _machine.classify_root(root, topo, 0) == "global_clos"
 
 
 @pytest.mark.parametrize("fault", ["device", "duplicate", "empty", "eid", "mismatch", "pcie"])
@@ -54,8 +54,20 @@ def test_incomplete_or_ambiguous_evidence_is_rejected(fault):
 
 def test_override_needs_no_runtime_or_rootinfo(monkeypatch):
     monkeypatch.setattr(_machine, "detect", lambda _: pytest.fail("unexpected detection"))
-    assert _machine.select("clos_only")["source"] == "explicit"
-    assert _machine.select("pod")["source"] == "explicit"
+    assert _machine.select("global_clos")["source"] == "explicit"
+    assert _machine.select("mesh_clos")["source"] == "explicit"
+
+
+@pytest.mark.parametrize("old,new", [("pod", "mesh_clos"), ("clos_only", "global_clos"), ("card_4pmesh", "mesh_pcie")])
+def test_legacy_machine_names_are_input_only_aliases(monkeypatch, old, new):
+    monkeypatch.setattr(_machine, "detect", lambda _: pytest.fail("explicit alias must not probe"))
+    assert _machine.select(old) == _machine.select(new) == {"machine_type": new, "source": "explicit"}
+    assert old not in _machine.KINDS
+
+
+def test_direct_is_implementation_not_machine_type():
+    with pytest.raises(RuntimeError, match="machine_type must be one of"):
+        _machine.select("direct")
 
 
 def test_consensus_rejects_mixed_backends_and_local_errors(monkeypatch):
@@ -63,11 +75,11 @@ def test_consensus_rejects_mixed_backends_and_local_errors(monkeypatch):
 
     class Group:
         def allgather(self, record):
-            return [record, {"selection": {"machine_type": "clos_only"}, "error": None}]
+            return [record, {"selection": {"machine_type": "global_clos"}, "error": None}]
 
     monkeypatch.setitem(sys.modules, "mpi4py.MPI", SimpleNamespace(Comm=Group))
     with pytest.raises(ValueError, match="different"):
-        _machine.select("pod", Group())
+        _machine.select("mesh_clos", Group())
     monkeypatch.setattr(_machine, "detect", lambda _: (_ for _ in ()).throw(ValueError("bad topology")))
     with pytest.raises(RuntimeError, match="collectively"):
         _machine.select("auto", Group())
@@ -85,7 +97,7 @@ def test_torch_process_group_uses_object_collective(monkeypatch):
 
     monkeypatch.setattr(dist, "get_world_size", lambda actual: 1 if actual is group else pytest.fail("wrong group"))
     monkeypatch.setattr(dist, "all_gather_object", gather)
-    assert _machine.select("clos_only", group)["machine_type"] == "clos_only"
+    assert _machine.select("global_clos", group)["machine_type"] == "global_clos"
     assert calls == [group]
 
 
@@ -98,7 +110,7 @@ def test_unrelated_allgather_object_is_rejected(monkeypatch):
             pytest.fail("must not call an unrelated allgather method")
 
     with pytest.raises(TypeError, match="ProcessGroup or MPI"):
-        _machine.select("pod", NotACommunicator())
+        _machine.select("mesh_clos", NotACommunicator())
     assert "mpi4py.MPI" not in sys.modules
 
 
@@ -142,7 +154,9 @@ def test_aliases_preserve_defaults_and_reject_conflicts():
 def test_backend_is_selected_once_and_constructor_defaults_are_preserved(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "require_native", lambda _: None, raising=False)
     calls = []
-    monkeypatch.setattr(_machine, "select", lambda *args, **kw: calls.append((args, kw)) or {"machine_type": "pod"})
+    monkeypatch.setattr(
+        _machine, "select", lambda *args, **kw: calls.append((args, kw)) or {"machine_type": "mesh_clos"}
+    )
 
     class ElasticBuffer(metaclass=_machine.MachineSelector):
         from deep_ep._compat import public_keywords
@@ -158,8 +172,10 @@ def test_backend_is_selected_once_and_constructor_defaults_are_preserved(monkeyp
     instance = ElasticBuffer(None, num_gpu_timeout_secs=9)
     assert instance.operation() == instance.operation() == 9
     assert len(calls) == 1
-    assert instance.machine_type == "pod"
-    monkeypatch.setitem(sys.modules, "deep_ep._clos_adapter", SimpleNamespace(buffer_class=lambda _: ElasticBuffer))
+    assert instance.machine_type == "mesh_clos"
+    monkeypatch.setitem(
+        sys.modules, "deep_ep.backends.direct.api", SimpleNamespace(buffer_class=lambda _: ElasticBuffer)
+    )
     assert isinstance(instance, ElasticBuffer)
 
 
@@ -173,7 +189,7 @@ def test_operation_aliases_do_not_inspect_signatures_on_each_call(monkeypatch):
 
 
 def test_runtime_detection_delegates_to_physical_probe(monkeypatch):
-    calls, selection = [], {"machine_type": "clos_only"}
+    calls, selection = [], {"machine_type": "global_clos"}
     monkeypatch.setattr(_machine, "physical_device", lambda: 13)
 
     def probe(physical, rootinfo):
@@ -209,7 +225,7 @@ def write_clos_files(tmp_path):
     return root_path
 
 
-@pytest.mark.parametrize("expected,code", [("clos_only", 0), ("pod", 1), ("card_4pmesh", 1)])
+@pytest.mark.parametrize("expected,code", [("global_clos", 0), ("mesh_clos", 1), ("mesh_pcie", 1)])
 def test_machine_cli_checks_expectation_without_overriding(tmp_path, expected, code):
     script = machine_script()
     root_path, output = write_clos_files(tmp_path), tmp_path / "report.json"
@@ -232,7 +248,7 @@ def test_machine_cli_checks_expectation_without_overriding(tmp_path, expected, c
     )
     report = json.loads(output.read_text())
     assert report["passed"] is (code == 0)
-    assert report["results"][0]["selection"]["machine_type"] == "clos_only"
+    assert report["results"][0]["selection"]["machine_type"] == "global_clos"
     assert report["results"][0]["selection"]["source"] == "rootinfo"
     assert len(report["selector"]["sha256"]) == 64
 
@@ -319,7 +335,7 @@ def test_machine_cli_rejects_mixed_machines(monkeypatch, tmp_path):
     selector = SimpleNamespace(
         detect_physical=lambda device, _: {
             "physical_device": device,
-            "machine_type": "pod" if device else "clos_only",
+            "machine_type": "mesh_clos" if device else "global_clos",
             "source": "stub",
         }
     )

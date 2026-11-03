@@ -13,15 +13,17 @@ Modified by Joyce_An 2026
 
 ## Machine-specific backends
 
-The Clos V1/V2 implementation and the POD backend share the same pinned CANN SHMEM
+Mesh+PCIe, Mesh+Clos, and Global Clos share the same pinned CANN SHMEM
 dependency and build workflow. Buffer constructors accept `machine_type="auto"`,
-`"pod"`, `"clos_only"`, or `"card_4pmesh"`; explicit selection is available when
+`"mesh_clos"`, `"global_clos"`, or `"mesh_pcie"`; explicit selection is available when
 reliable rootinfo is absent. The machine selects the communication engines:
-Clos uses UDMA for payload and MTE for metadata/local copies; CARD_4PMESH uses MTE,
-and POD uses its backend configuration. Public constructors do not accept
-`transport`; remove it from older calls. `ASCEND_DEEPEP_TRANSPORT` does not override
-this policy. See [backend selection and compatibility](docs/machine_backends.md).
-The HT/LL/MegaMoE descriptions below apply to the POD backend.
+Global Clos uses UDMA for payload and MTE for metadata/local copies; Mesh+PCIe uses MTE,
+and Mesh+Clos uses its backend configuration. Legacy `transport` arguments are accepted
+but do not override topology selection. `ASCEND_DEEPEP_TRANSPORT` does not override
+this policy. The `direct` implementation is shared by Mesh+PCIe and Global Clos;
+it denotes EP-peer communication, not physical direct links or a fourth machine type.
+See [backend selection and compatibility](docs/machine_backends.md).
+The HT/LL/MegaMoE descriptions below apply to the Mesh+Clos backend.
 
 ## News
 

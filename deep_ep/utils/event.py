@@ -39,7 +39,7 @@ class EventHandle:
 
 
 class EventOverlap:
-    """Upstream-compatible event wrapper shared by POD and CLOS.
+    """Upstream-compatible event wrapper shared by Mesh+Clos and CLOS.
 
     An empty wrapper is valid, but has no event to explicitly wait for.
     NPU tensor stream tracking is internal and does not narrow the public

@@ -9,4 +9,4 @@
 *.pdf binary
 *.whl binary
 # Preserve upstream whitespace in the hashed CATLASS/TLA header snapshot.
-csrc/clos/vendor/** whitespace=-blank-at-eol
+csrc/direct/vendor/** whitespace=-blank-at-eol

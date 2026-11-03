@@ -17,7 +17,7 @@ import torch.multiprocessing as mp
 import torch_npu  # noqa: F401
 
 from deep_ep import EventHandle, EventOverlap
-from deep_ep.backends.clos import Buffer, Config, ElasticBuffer
+from deep_ep.backends.direct import Buffer, Config, ElasticBuffer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import common as golden
@@ -32,12 +32,12 @@ def buffer_entrypoints(args, group):
     from deep_ep._machine import select
 
     if args.public_clos:
-        return PublicBuffer, PublicElasticBuffer, {"machine_type": "clos_only"}
+        return PublicBuffer, PublicElasticBuffer, {"machine_type": "global_clos"}
     # This golden checks the Clos layout. Fail collectively before constructing
     # a Buffer if the node belongs to another backend; never force Clos here.
     selection = select(group=group)
-    if selection["machine_type"] != "clos_only":
-        raise RuntimeError(f"This precision entry requires auto-detected clos_only, got {selection}")
+    if selection["machine_type"] != "global_clos":
+        raise RuntimeError(f"This precision entry requires auto-detected global_clos, got {selection}")
     return PublicBuffer, PublicElasticBuffer, {}
 
 
@@ -145,7 +145,7 @@ def run_rank(rank, args):
             args.num_tokens,
             args.hidden,
             args.num_topk,
-            **({"machine_type": "clos_only"} if args.public_clos else {}),
+            **({"machine_type": "global_clos"} if args.public_clos else {}),
         ),
     )
     common = dict(
@@ -197,7 +197,7 @@ def run_rank(rank, args):
             ),
             flush=True,
         )
-        assert selection["machine_type"] == "clos_only"
+        assert selection["machine_type"] == "global_clos"
         assert (selection["source"] == "explicit") == args.public_clos
         assert buffer.transport == "udma"
     x = golden._make_x(rank, args).to("npu")
@@ -351,7 +351,7 @@ def main():
     public.add_argument(
         "--public-auto",
         action="store_true",
-        help="Use public V1/V2 with automatic topology selection; requires a clos_only machine",
+        help="Use public V1/V2 with automatic topology selection; requires a global_clos machine",
     )
     public.add_argument(
         "--public-clos", action="store_true", help="Explicit public Clos backend; does not test topology detection"

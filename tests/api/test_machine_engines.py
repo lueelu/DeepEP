@@ -12,10 +12,10 @@ from deep_ep import _machine
 def public_runtime(monkeypatch):
     pytest.importorskip("torch")
     import deep_ep
-    from deep_ep import _card_adapter
+    from deep_ep.backends import mesh_pcie as _card_adapter
     from deep_ep import buffer as legacy
     from deep_ep.buffers import elastic
-    from deep_ep.backends.clos import buffer as source_v1, elastic as source_v2
+    from deep_ep.backends.direct import buffer as source_v1, elastic as source_v2
 
     calls = []
     group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
@@ -57,7 +57,7 @@ def public_runtime(monkeypatch):
 
 
 @pytest.mark.parametrize("api", ["Buffer", "ElasticBuffer"])
-@pytest.mark.parametrize("machine,engine", [("clos_only", "udma"), ("card_4pmesh", "mte")])
+@pytest.mark.parametrize("machine,engine", [("global_clos", "udma"), ("mesh_pcie", "mte")])
 @pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("environment", ["mte", "udma", "invalid"])
 @pytest.mark.parametrize(
@@ -81,7 +81,7 @@ def test_machine_fixes_engine_before_bootstrap(
     try:
         assert detections == ([True] if automatic else [])
         assert instance.machine_type == machine and instance.transport == engine
-        if machine == "clos_only":
+        if machine == "global_clos":
             policy = instance._udma_auto_policy
             assert (policy.peers_per_worker, policy.workers_per_peer, policy.wqes_per_visit) == (1, 2, 8)
             assert policy.config(20).num_aiv == 20
@@ -89,7 +89,7 @@ def test_machine_fixes_engine_before_bootstrap(
             assert instance._udma_auto_policy is None
         assert calls == (
             [("bootstrap", engine), ("native", engine)]
-            + ([("mapping",)] if machine == "card_4pmesh" else [])
+            + ([("mapping",)] if machine == "mesh_pcie" else [])
             + ([("barrier",)] if api == "ElasticBuffer" else [])
         )
     finally:
@@ -102,13 +102,13 @@ def test_machine_fixes_engine_before_bootstrap(
 @pytest.mark.parametrize("value", [None, "auto", "mte", "udma", "roce", "invalid"])
 def test_legacy_transport_does_not_reach_pod_constructor(public_runtime, monkeypatch, api, automatic, value):
     package, group, calls = public_runtime
-    monkeypatch.setattr(_machine, "detect", lambda _: {"machine_type": "pod", "source": "test"})
+    monkeypatch.setattr(_machine, "detect", lambda _: {"machine_type": "mesh_clos", "source": "test"})
     cls = getattr(package, api)
 
     def initialize(self, *args, **kwargs):
         calls.append((args, kwargs))
 
     monkeypatch.setattr(cls.__bases__[0], "__init__", initialize)
-    instance = cls(group, machine_type="auto" if automatic else "pod", transport=value, explicitly_destroy=True)
-    assert instance.machine_type == "pod"
+    instance = cls(group, machine_type="auto" if automatic else "mesh_clos", transport=value, explicitly_destroy=True)
+    assert instance.machine_type == "mesh_clos"
     assert calls == [((group,), {"explicitly_destroy": True})]

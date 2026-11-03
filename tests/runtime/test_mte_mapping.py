@@ -21,7 +21,7 @@ int aclrtMemGetAddressRange(void*, void**, std::size_t*);
 """)
     # Compile the actual helper after it was folded into BufferRuntime, without
     # pulling Torch/NPU runtime dependencies into this CPU boundary test.
-    runtime = (root / "csrc/clos/runtime/buffer_runtime.cpp").read_text(encoding="utf-8")
+    runtime = (root / "csrc/direct/runtime/buffer_runtime.cpp").read_text(encoding="utf-8")
     begin = runtime.index("inline std::string MteMappingError(")
     end = runtime.index("\n}\n", begin) + 3
     (tmp_path / "mapping_check.h").write_text(
@@ -74,7 +74,7 @@ int main() {
             "-Wextra",
             "-Werror",
             "-I" + str(tmp_path),
-            "-I" + str(root / "csrc/clos"),
+            "-I" + str(root / "csrc/direct"),
             str(source),
             "-o",
             str(binary),

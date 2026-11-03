@@ -54,7 +54,11 @@ def main(argv=None):
         required=True,
         help="Physical chip IDs to check, not LOCAL_RANK or visible logical device IDs",
     )
-    parser.add_argument("--expect", choices=("pod", "clos_only", "card_4pmesh"), help="Fail if auto-detection differs")
+    parser.add_argument(
+        "--expect",
+        choices=("mesh_clos", "global_clos", "mesh_pcie"),
+        help="Fail if auto-detection differs",
+    )
     parser.add_argument("--rootinfo", type=Path, help="Explicit rootinfo; missing/invalid files fail without fallback")
     parser.add_argument(
         "--implementation",

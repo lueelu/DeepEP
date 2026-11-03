@@ -29,10 +29,10 @@ Modified by Joyce_An 2026
 机型识别只检查分类，不启动通信算子；`--expect` 不会强制选择后端：
 
 ```bash
-python -I scripts/check_machine.py --physical-devices 0 1 2 3 4 5 6 7 --expect clos_only
+python -I scripts/check_machine.py --physical-devices 0 1 2 3 4 5 6 7 --expect global_clos
 ```
 
-POD 或 CARD_4PMESH 机器分别使用 `--expect pod` 或 `--expect card_4pmesh`。
+Mesh+Clos 或 Mesh+PCIe 机器分别使用 `--expect mesh_clos` 或 `--expect mesh_pcie`。
 安装待验证的 wheel 并加载 CANN/SHMEM 环境后，在空闲设备上运行：
 
 ```bash

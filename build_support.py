@@ -70,6 +70,16 @@ class CheckedInstallLib(install_lib):
         component_enabled = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
         for directory in (self.build_dir, self.install_dir):
             root = Path(directory)
+            # Renamed internal implementations must not survive in a reused
+            # wheel staging directory alongside the canonical topology packages.
+            for old in ("backends/clos", "backends/pod", "_clos_adapter.py", "_card_adapter.py"):
+                obsolete = root / "deep_ep" / old
+                files = obsolete.rglob("*") if obsolete.is_dir() else (obsolete,)
+                if any(path.is_file() and "__pycache__" not in path.parts for path in files):
+                    raise RuntimeError(
+                        f"Obsolete backend implementation at {obsolete}. "
+                        "Use a clean build/install directory for the topology package layout."
+                    )
             compatibility = root / "ascend_deepep"
             # Only ship the forwarding files from this source tree, never an
             # old implementation or its native libraries left in build staging.
@@ -289,7 +299,7 @@ def build_configuration(environment=None):
     import torch
     import torch_npu
 
-    result["clos"] = {
+    result["direct"] = {
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
         "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),

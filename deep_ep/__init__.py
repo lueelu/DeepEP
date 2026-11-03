@@ -17,9 +17,9 @@ __all__ = ["Buffer", "ElasticBuffer", "EPHandle", "Config", "EventHandle", "Even
 
 
 def __getattr__(name):
-    # Keep package import metadata-only; Clos helpers load Torch on demand.
+    # Keep package import metadata-only; Direct helpers load Torch on demand.
     if name in {"topk_idx_t", "ExpandHandle", "Handle", "Slot", "SlotState"}:
-        from .backends import clos
+        from .backends import direct
 
-        return getattr(clos, name)
+        return getattr(direct, name)
     raise AttributeError(name)

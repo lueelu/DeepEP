@@ -596,7 +596,7 @@ def _host_elastic_buffer(monkeypatch):
     from threading import RLock
     from types import SimpleNamespace
     import pytest
-    from deep_ep.backends.pod import elastic
+    from deep_ep.backends.mesh_clos import elastic
     from deep_ep.utils import event
 
     torch = pytest.importorskip("torch")
@@ -703,7 +703,7 @@ def _host_elastic_buffer(monkeypatch):
 
 def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
     import pytest
-    from deep_ep.backends.pod.elastic import _PERSISTENT
+    from deep_ep.backends.mesh_clos.elastic import _PERSISTENT
 
     torch = pytest.importorskip("torch")
     import torch.distributed as dist
@@ -741,7 +741,7 @@ def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
 
 def test_dispatch_benchmark_flags_and_restore(monkeypatch):
     import pytest
-    from deep_ep.backends.pod import elastic
+    from deep_ep.backends.mesh_clos import elastic
 
     torch = pytest.importorskip("torch")
     buffer, tensor, _ = _host_elastic_buffer(monkeypatch)
@@ -865,7 +865,7 @@ def test_ep8_combine_weights_use_mte(monkeypatch):
 
 def test_ep8_combine_weights_require_native_support(monkeypatch):
     import pytest
-    from deep_ep.backends.pod import elastic
+    from deep_ep.backends.mesh_clos import elastic
 
     torch = pytest.importorskip("torch")
     buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
@@ -1016,7 +1016,7 @@ int main()
 def test_collective_check_copies_one_summary(monkeypatch):
     from types import SimpleNamespace
     import pytest
-    from deep_ep.backends.pod.elastic import _collective_check
+    from deep_ep.backends.mesh_clos.elastic import _collective_check
 
     torch = pytest.importorskip("torch")
     import torch.distributed as dist
@@ -1056,7 +1056,7 @@ def _gloo_preflight_worker(rank, store_path):
     import pytest
     import torch
     import torch.distributed as dist
-    from deep_ep.backends.pod.elastic import _collective_check
+    from deep_ep.backends.mesh_clos.elastic import _collective_check
 
     dist.init_process_group(
         "gloo", init_method=Path(store_path).as_uri(), rank=rank, world_size=2, timeout=timedelta(seconds=30)
@@ -1285,7 +1285,7 @@ def test_dispatch_destination_initialization():
     import ast
     from types import SimpleNamespace
 
-    path = Path(__file__).resolve().parents[2] / "deep_ep/backends/pod/elastic.py"
+    path = Path(__file__).resolve().parents[2] / "deep_ep/backends/mesh_clos/elastic.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     # Execute the production initialization block without requiring an NPU.
     branch = next(

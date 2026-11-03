@@ -18,13 +18,13 @@ from deep_ep.utils import event as events
 
 @pytest.fixture(autouse=True)
 def select_existing_pod_backend(monkeypatch):
-    # These are the original POD runtime fault-injection tests. Real selection
+    # These are the original Mesh+Clos runtime fault-injection tests. Real selection
     # and mixed-rank rejection are tested independently in test_machine_selection.
     from deep_ep import _machine
     from deep_ep import buffer
     from deep_ep.buffers import elastic
 
-    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "pod", "source": "test"})
+    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "mesh_clos", "source": "test"})
     monkeypatch.setattr(buffer, "require_native", lambda _: None)
     monkeypatch.setattr(elastic, "require_native", lambda _: None)
 

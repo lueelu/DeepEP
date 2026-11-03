@@ -242,7 +242,7 @@ def git_identity():
 
 
 def loaded_identity():
-    from deep_ep.backends import clos
+    from deep_ep.backends import direct as clos
     import torch
     import torch_npu
 
@@ -345,7 +345,7 @@ def worker(args):
     import torch
     import torch.distributed as dist
     import torch_npu  # noqa: F401
-    from deep_ep._clos_adapter import ElasticBuffer
+    from deep_ep.backends.global_clos import ElasticBuffer
     from deep_ep import topk_idx_t
     import common as golden
     import profiling

@@ -17,24 +17,26 @@ def _selection_worker(rank, store, result_dir):
     try:
         # A subgroup must be passed through, not silently replaced by WORLD.
         group = dist.new_group([0, 1], backend="gloo", timeout=timedelta(seconds=30))
-        for kind in ("pod", "clos_only", "card_4pmesh"):
+        for kind, alias in (("mesh_clos", "pod"), ("global_clos", "clos_only"), ("mesh_pcie", "card_4pmesh")):
             assert _machine.select(kind, group)["machine_type"] == kind
+            assert _machine.select(alias if rank == 0 else kind, group)["machine_type"] == kind
             results.append(kind)
-        _machine.detect = lambda _: {"machine_type": "clos_only", "source": "test"}
-        assert _machine.select("auto", group)["machine_type"] == "clos_only"
+        _machine.detect = lambda _: {"machine_type": "global_clos", "source": "test"}
+        assert _machine.select("auto", group)["machine_type"] == "global_clos"
         results.append("auto")
         with pytest.raises(ValueError, match="different machine backends"):
-            _machine.select("pod" if rank == 0 else "clos_only", group)
+            _machine.select("mesh_clos" if rank == 0 else "global_clos", group)
         results.append("mixed_rejected")
         with pytest.raises(RuntimeError, match="failed collectively"):
-            _machine.select("pod" if rank == 0 else "invalid", group)
+            _machine.select("mesh_clos" if rank == 0 else "invalid", group)
         results.append("peer_error_rejected")
-        assert _machine.select("pod", group)["machine_type"] == "pod"
+        assert _machine.select("mesh_clos", group)["machine_type"] == "mesh_clos"
         results.append("collective_order_preserved")
         import deep_ep
         from deep_ep import buffer as legacy
         from deep_ep.buffers import elastic
-        from deep_ep import _clos_adapter, _card_adapter
+        from deep_ep.backends.direct import api as _clos_adapter
+        from deep_ep.backends import mesh_pcie as _card_adapter
 
         # Rank-local legacy arguments must not change the chosen engine or the
         # order of topology collectives. Constructors are CPU-only doubles.
@@ -52,18 +54,18 @@ def _selection_worker(rank, store, result_dir):
             patch.setattr(_card_adapter, "buffer_class", lambda _: Engine)
             for api in (deep_ep.Buffer, deep_ep.ElasticBuffer):
                 patch.setattr(api.__bases__[0], "__init__", pod_initialize)
-                for kind in ("auto", "pod", "clos_only", "card_4pmesh"):
+                for kind in ("auto", "mesh_clos", "global_clos", "mesh_pcie"):
                     for old_value in (None, "auto", "mte", "udma", "invalid"):
                         for options in (
                             {"transport": old_value} if rank == 0 else {},
                             {"transport": "mte" if rank == 0 else "udma"},
                         ):
                             instance = api(group, machine_type=kind, **options)
-                            expected = "clos_only" if kind == "auto" else kind
+                            expected = "global_clos" if kind == "auto" else kind
                             assert instance.machine_type == expected
-                            if expected != "pod":
-                                assert instance.transport == ("mte" if expected == "card_4pmesh" else "udma")
-        assert _machine.select("pod", group)["machine_type"] == "pod"
+                            if expected != "mesh_clos":
+                                assert instance.transport == ("mte" if expected == "mesh_pcie" else "udma")
+        assert _machine.select("mesh_clos", group)["machine_type"] == "mesh_clos"
         results.append("legacy_transport_ignored_collectively")
         from types import SimpleNamespace
 
@@ -118,9 +120,9 @@ def test_two_rank_gloo_selection(tmp_path):
                 process.join(timeout=5)
     for rank in range(2):
         assert json.loads((tmp_path / f"rank{rank}.json").read_text()) == [
-            "pod",
-            "clos_only",
-            "card_4pmesh",
+            "mesh_clos",
+            "global_clos",
+            "mesh_pcie",
             "auto",
             "mixed_rejected",
             "peer_error_rejected",
@@ -135,5 +137,5 @@ def test_real_mpi_communicator_selection():
     mpi = pytest.importorskip("mpi4py.MPI")
     from deep_ep import _machine
 
-    for kind in ("pod", "clos_only", "card_4pmesh"):
+    for kind in ("mesh_clos", "global_clos", "mesh_pcie"):
         assert _machine.select(kind, mpi.COMM_SELF)["machine_type"] == kind

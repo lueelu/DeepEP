@@ -16,7 +16,7 @@ def _load_package_shmem_libs() -> None:
     # Both native modules resolve the same SDK SONAME. Never ship a second SDK.
     from deep_ep._native import require_native
 
-    require_native("Clos SHMEM dependency")
+    require_native("Direct backend SHMEM dependency")
 
 
 def load_native_module() -> ModuleType:
