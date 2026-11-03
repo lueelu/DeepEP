@@ -110,6 +110,7 @@ def comparison_metadata(args, world, m):
     if runtime is None: return None  # CPU fixtures / legacy custom callers.
     return dict(**runtime, comparison_schema=1, sampling_protocol=SAMPLING_PROTOCOL,
                 exp_prefix_repeats=EXP_PREFIX_REPEATS, per_iteration_exp=0, per_iteration_all_reduce=False,
+                per_iteration_all_gather=True,
                 perf_enabled=not args.skip_perf_test, world_size=world,
                 local_world_size=int(os.environ.get('LOCAL_WORLD_SIZE',args.num_processes)),
                 case=case_config(args,m), route=args.route, seed=args.seed,
@@ -810,6 +811,29 @@ def completion_boundary(args=None):
     trace_call(args, "boundary.synchronize.after", torch.npu.synchronize)
 
 
+def aligned(operation, args):
+    """Run a full-rank all-gather before every call of `operation`.
+
+    The LL kernels poll their peers, so a rank that is still enqueueing makes
+    every other rank spin and inflates its measured time. The all-gather starts
+    only once all ranks arrive, which aligns fast and slow cards. It is placed
+    inside the measured loop on purpose: its cost is charged to each call, so the
+    numbers are aligned latency rather than pure kernel time.
+    """
+    import torch
+    import torch.distributed as dist
+
+    device = control_device(args, torch)
+    token = torch.zeros(1, dtype=torch.int32, device=device)
+    gathered = [torch.zeros_like(token) for _ in range(dist.get_world_size())]
+
+    def call(*values, **kwargs):
+        trace_call(args, "align.all_gather", dist.all_gather, gathered, token)
+        return operation(*values, **kwargs)
+
+    return call
+
+
 def record_case_progress(args, rank, m, mode, phase, error=None):
     """Persist case identity outside timed loops so interrupted runs remain diagnosable."""
     previous = getattr(args, "_case_phase", None)
@@ -975,7 +999,7 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
                         routing=routing_metadata(world, args.num_tokens, args.num_experts, args.seed, mode),
                         correctness="passed", config={**case_config(args, m),
                         "logical_group_size": logical_group},
-                        protocol="initial scalar all_reduce; fixed Exp100 batch prefix; no per-iteration prelude; deferred validation/export; excluded from profiler",
+                        protocol="initial scalar all_reduce; fixed Exp100 batch prefix; per-call all_gather rank alignment; deferred validation/export; excluded from profiler",
                         sampling=dict(after_perf=after_perf, warmup=args.warmup, settle_iters=args.num_iters,
                                       diagnostic_iters=args.ll_timer_iters, delay_rows=args.delay_rows,
                                       delay_cols=args.delay_cols, group_backend=args.group_backend,
@@ -983,6 +1007,7 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
                                       prefix_before='diagnostic_capture' if after_perf else 'settle_batch',
                                       initial_all_reduce='shared_with_perf' if after_perf else 'before_warmup',
                                       per_iteration_exp=0, per_iteration_all_reduce=False,
+                                      per_iteration_all_gather=True,
                                       expert_timer=bool(getattr(args,'ll_expert_timer',False)),
                                       reference_profile=reference))
         if reference:
@@ -1048,6 +1073,11 @@ def run_case(buffer, args, rank, world, m, mode):
             num_compute_units=args.num_sms,
             num_qps=args.num_qps,
         )
+
+    # Every dispatch/combine call is preceded by an all-gather so fast and slow
+    # cards enter the kernel together; correctness and sampling share this.
+    dispatch = aligned(dispatch, args)
+    combine = aligned(buffer.combine, args)
 
     import hashlib
 
@@ -1143,7 +1173,7 @@ def run_case(buffer, args, rank, world, m, mode):
         progress(f"combine.check.{repeat}")
         completion_boundary(args)
         out, returned_weights, completed = trace_call(
-            args, "combine.invoke", buffer.combine, expert_output, handle, topk_weights=None
+            args, "combine.invoke", combine, expert_output, handle, topk_weights=None
         )
         trace_call(args, "combine.event.wait", completed.current_stream_wait)
         trace_call(args, "device.synchronize", torch.npu.synchronize)
@@ -1189,7 +1219,7 @@ def run_case(buffer, args, rank, world, m, mode):
         trace_call(args, "device.synchronize", torch.npu.synchronize)
         expert_output = prepare_experts(recv, counts, rank, args.num_experts, world, expert_dtype)
         perf = sample_operation(buffer,
-            lambda: buffer.combine(expert_output, handle, topk_weights=None),
+            lambda: combine(expert_output, handle, topk_weights=None),
             check_timed_combine, args, 'combine', rank, m, mode, progress)
         if perf is not None:
             result['combine'] = perf
@@ -1419,7 +1449,8 @@ def main(argv=None):
         ]
         print(json.dumps({"world_size": world, "case_count": len(cases), "cases": cases,
                           "sampling": dict(protocol=SAMPLING_PROTOCOL, exp_prefix_repeats=EXP_PREFIX_REPEATS,
-                                           per_iteration_exp=0, per_iteration_all_reduce=False)}, indent=2))
+                                           per_iteration_exp=0, per_iteration_all_reduce=False,
+                                           per_iteration_all_gather=True)}, indent=2))
         return
     configure_endpoints(args, os.environ)
     if local is not None:
