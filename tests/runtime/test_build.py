@@ -16,6 +16,23 @@ ROOT = Path(__file__).resolve().parents[2]
 if not (ROOT / "build_support.py").is_file():
     pytest.skip("Build-source tests run before packaging", allow_module_level=True)
 
+CANN_VERSIONS = [
+    ("9.2", True),
+    ("9.2.0", True),
+    ("9.2.0.b080", True),
+    ("9.2.1", True),
+    ("9.2.1+build1", True),
+    ("9.2.1-custom", True),
+    ("9.10.0", True),
+    ("10.0.0", True),
+    ("9.1.99", False),
+    ("8.10.0", False),
+    ("", False),
+    ("9", False),
+    ("invalid", False),
+    ("9.2RC1", False),
+]
+
 
 def load(path):
     spec = importlib.util.spec_from_file_location(path.stem, path)
@@ -64,22 +81,25 @@ def test_beta_requires_sdk_and_timer_requires_beta(build):
 
 
 @pytest.mark.parametrize(
-    "fault",
-    [
-        None,
-        "missing",
-        "json",
-        "list",
-        "revision",
-        "header",
-        "checksum",
-        "coverage",
-        "path",
-        "missing_library",
-        "missing_device_header",
+    "fault,version,accepted",
+    [(None, version, accepted) for version, accepted in CANN_VERSIONS]
+    + [
+        (fault, "9.2.0", True)
+        for fault in (
+            "missing",
+            "json",
+            "list",
+            "revision",
+            "header",
+            "checksum",
+            "coverage",
+            "path",
+            "missing_library",
+            "missing_device_header",
+        )
     ],
 )
-def test_sdk_identity_warning(build, monkeypatch, tmp_path, fault):
+def test_sdk_identity_and_cann_version(build, monkeypatch, tmp_path, fault, version, accepted):
     import hashlib
     import warnings
     from types import SimpleNamespace
@@ -87,7 +107,7 @@ def test_sdk_identity_warning(build, monkeypatch, tmp_path, fault):
     cann, sdk = tmp_path / "cann", tmp_path / "shmem"
     files = {
         cann / "include/acl/acl.h": "",
-        cann / "compiler/version.info": "Version=9.2.0",
+        cann / "compiler/version.info": f"Version={version}",
         cann / "tools/bisheng_compiler/bin/bisheng": "compiler",
         sdk / "include/host/shmem_host_def.h": "host",
         sdk / "include/shmem.h": "public",
@@ -145,7 +165,12 @@ def test_sdk_identity_warning(build, monkeypatch, tmp_path, fault):
             with pytest.raises(RuntimeError, match="missing"):
                 build.build_configuration(env)
             return
+        if not accepted:
+            with pytest.raises(RuntimeError, match=r"requires CANN >= 9\.2\.0"):
+                build.build_configuration(env)
+            return
         result = build.build_configuration(env)
+    assert result["cann"]["version"] == version
     assert bool(messages) == (fault is not None)
     assert all("continuing with SHMEM_ROOT=" in str(message.message) for message in messages)
     assert (
@@ -157,6 +182,20 @@ def test_sdk_identity_warning(build, monkeypatch, tmp_path, fault):
     before = build.build_cache_key(result)
     result["shmem"]["sha256"]["lib/libshmem.so"] = "0" * 64
     assert build.build_cache_key(result) != before
+
+
+@pytest.mark.parametrize("version,accepted", CANN_VERSIONS)
+def test_shmem_cann_version(monkeypatch, tmp_path, version, accepted):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    builder = load(ROOT / "scripts/build_shmem.py")
+    (tmp_path / "compiler").mkdir()
+    (tmp_path / "compiler/version.info").write_text(f"Version={version}\ntimestamp=test\n")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path))
+    if accepted:
+        assert builder.cann_version("9.2.0") == {"Version": version, "timestamp": "test"}
+    else:
+        with pytest.raises(RuntimeError, match=r"requires CANN >= 9\.2\.0"):
+            builder.cann_version("9.2.0")
 
 
 def test_metadata_no_sdk_or_framework(tmp_path):

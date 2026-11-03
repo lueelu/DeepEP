@@ -275,10 +275,10 @@ def build_configuration(environment=None):
     version_file = Path(result["ASCEND_HOME_PATH"]) / "compiler/version.info"
     versions = dict(line.split("=", 1) for line in version_file.read_text().splitlines() if "=" in line)
     actual = versions.get("Version", "")
-    release = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[.+-].*)?", actual)
+    release = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?(?:[.+-].*)?", actual)
     minimum = tuple(int(part) for part in lock["cann_version"].split("."))
-    if release is None or tuple(map(int, release.groups())) <= minimum:
-        raise RuntimeError(f"This runtime build requires CANN > {lock['cann_version']}; detected {actual!r}")
+    if release is None or tuple(int(part or 0) for part in release.groups()) < minimum:
+        raise RuntimeError(f"This runtime build requires CANN >= {lock['cann_version']}; detected {actual!r}")
     result["cann"] = {
         "version": versions["Version"],
         "timestamp": versions.get("timestamp", "unknown"),
