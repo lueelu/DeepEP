@@ -7,9 +7,9 @@ scalar all_reduce；默认预热10次并同步后，连续提交固定100次Exp�
 `profiler.step()`，随后连续调用算子100次。采样循环内不再插入Exp或fill。
 不在Exp前缀之后额外同步，Exp次数不随算子迭代次数变化。尾50统计和profiler kernel Duration口径保持。
 
-当前每次 dispatch/combine 调用前都插入一次小张量 all-gather（`aligned()`），用于拉齐快慢卡：
+当前每次 dispatch/combine 调用前都插入一次标量 all_reduce（异步提交后 wait，`aligned()`），用于拉齐快慢卡：
 所有 rank 到齐后才进入 kernel，避免仍在入队的 rank 让对端空转。该集合通信位于测量循环内，
-开销计入每次调用，因此数值是“对齐后的端到端时延”，不再等于纯 kernel 时间；all-gather 自身
+开销计入每次调用，因此数值是“对齐后的端到端时延”，不再等于纯 kernel 时间；对齐用的 all_reduce
 kernel 名不匹配目标 kernel，不进入尾50统计。
 
 独立timer/reference采样同样在初始all_reduce、预热和同步后提交100次Exp，再连续执行

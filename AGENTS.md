@@ -56,8 +56,8 @@
 预热同步后、进入active的profiler.step前固定100次Exp，再连续调用算子；循环内没有Exp或
 采样all_reduce。独立timer/reference同样为初始all_reduce、预热、100次Exp、连续稳定/capture。
 perf后附加打点时另排100次Exp，共用perf初始all_reduce；不在Exp前缀后额外同步。
-2026-11-03新增：每次 dispatch/combine 调用前插入一次小张量 all_gather（`aligned()`）拉齐快慢卡，
-开销计入每次调用，样本 metadata 记录 `per_iteration_all_gather=true`；与旧样本不可直接同条件比较。
+2026-11-03新增：每次 dispatch/combine 调用前插入一次标量 all_reduce（异步提交 + wait）拉齐快慢卡，
+开销计入每次调用，样本 metadata 记录 `per_iteration_rank_align=all_reduce_async_wait`；与旧样本不可直接同条件比较。
 正确性/批次边界和算子内部必要复用协调保留，kernel/SDK不改。新旧采样协议不能混作同条件A/B。
 详见tests/ll_probe/PROFILING.md；本条覆盖本分支旧“每轮Exp+all_reduce”采样说明。
 

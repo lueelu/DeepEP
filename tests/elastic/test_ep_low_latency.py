@@ -110,7 +110,7 @@ def comparison_metadata(args, world, m):
     if runtime is None: return None  # CPU fixtures / legacy custom callers.
     return dict(**runtime, comparison_schema=1, sampling_protocol=SAMPLING_PROTOCOL,
                 exp_prefix_repeats=EXP_PREFIX_REPEATS, per_iteration_exp=0, per_iteration_all_reduce=False,
-                per_iteration_all_gather=True,
+                per_iteration_rank_align='all_reduce_async_wait',
                 perf_enabled=not args.skip_perf_test, world_size=world,
                 local_world_size=int(os.environ.get('LOCAL_WORLD_SIZE',args.num_processes)),
                 case=case_config(args,m), route=args.route, seed=args.seed,
@@ -812,23 +812,29 @@ def completion_boundary(args=None):
 
 
 def aligned(operation, args):
-    """Run a full-rank all-gather before every call of `operation`.
+    """Run a full-rank all-reduce before every call of `operation`.
 
     The LL kernels poll their peers, so a rank that is still enqueueing makes
-    every other rank spin and inflates its measured time. The all-gather starts
+    every other rank spin and inflates its measured time. The collective starts
     only once all ranks arrive, which aligns fast and slow cards. It is placed
     inside the measured loop on purpose: its cost is charged to each call, so the
     numbers are aligned latency rather than pure kernel time.
+
+    The op is submitted asynchronously and then waited on: enqueueing and waiting
+    are separate host steps, and a scalar all-reduce moves less data than an
+    all-gather of one tensor per rank.
     """
     import torch
     import torch.distributed as dist
 
-    device = control_device(args, torch)
-    token = torch.zeros(1, dtype=torch.int32, device=device)
-    gathered = [torch.zeros_like(token) for _ in range(dist.get_world_size())]
+    token = torch.zeros(1, dtype=torch.int32, device=control_device(args, torch))
 
     def call(*values, **kwargs):
-        trace_call(args, "align.all_gather", dist.all_gather, gathered, token)
+        work = trace_call(args, "align.all_reduce", dist.all_reduce, token,
+                          op=dist.ReduceOp.SUM, async_op=True)
+        # The async form only orders the enqueue; the wait is the rendezvous.
+        if work is not None:
+            trace_call(args, "align.wait", work.wait)
         return operation(*values, **kwargs)
 
     return call
@@ -894,7 +900,7 @@ def measure(invoke, args, operation, profile_dir, progress=None, after_profile=N
         # Do not synchronize after it: Host should enqueue the active batch.
         enqueue_exp_prefix(delay)
         profiler.step()
-        for _ in range(args.num_iters):
+        for _ in range(args.num_iters): 
             output = invoke()
         dist.barrier()
         torch.npu.synchronize()
@@ -999,7 +1005,7 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
                         routing=routing_metadata(world, args.num_tokens, args.num_experts, args.seed, mode),
                         correctness="passed", config={**case_config(args, m),
                         "logical_group_size": logical_group},
-                        protocol="initial scalar all_reduce; fixed Exp100 batch prefix; per-call all_gather rank alignment; deferred validation/export; excluded from profiler",
+                        protocol="initial scalar all_reduce; fixed Exp100 batch prefix; per-call async all_reduce+wait rank alignment; deferred validation/export; excluded from profiler",
                         sampling=dict(after_perf=after_perf, warmup=args.warmup, settle_iters=args.num_iters,
                                       diagnostic_iters=args.ll_timer_iters, delay_rows=args.delay_rows,
                                       delay_cols=args.delay_cols, group_backend=args.group_backend,
@@ -1007,7 +1013,7 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
                                       prefix_before='diagnostic_capture' if after_perf else 'settle_batch',
                                       initial_all_reduce='shared_with_perf' if after_perf else 'before_warmup',
                                       per_iteration_exp=0, per_iteration_all_reduce=False,
-                                      per_iteration_all_gather=True,
+                                      per_iteration_rank_align='all_reduce_async_wait',
                                       expert_timer=bool(getattr(args,'ll_expert_timer',False)),
                                       reference_profile=reference))
         if reference:
@@ -1450,7 +1456,7 @@ def main(argv=None):
         print(json.dumps({"world_size": world, "case_count": len(cases), "cases": cases,
                           "sampling": dict(protocol=SAMPLING_PROTOCOL, exp_prefix_repeats=EXP_PREFIX_REPEATS,
                                            per_iteration_exp=0, per_iteration_all_reduce=False,
-                                           per_iteration_all_gather=True)}, indent=2))
+                                           per_iteration_rank_align='all_reduce_async_wait')}, indent=2))
         return
     configure_endpoints(args, os.environ)
     if local is not None:

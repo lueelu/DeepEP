@@ -93,7 +93,7 @@ Git checkout中只纳入已跟踪测试文件，其他分支遗留的未跟踪�
 
 默认reference模式：reference ON wheel，10次预热、100次稳定调用、1轮独立capture。
 每个批次只在开始做一次all_reduce；预热后固定100次Exp，再连续稳定调用和capture。
-每次 dispatch/combine 调用前另插入一次小张量 all-gather 拉齐快慢卡，开销计入每次调用，
+每次 dispatch/combine 调用前另插入一次标量 all_reduce（异步 + wait）拉齐快慢卡，开销计入每次调用，
 因此数值是对齐后的时延而非纯 kernel 时间。默认Exp缓冲约13.53GiB/卡，此模式不运行正式profiler。
 
 结果目录：`results/ll-ndr/<run名>-reference/`。
