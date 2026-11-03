@@ -11,6 +11,18 @@ Modified by Joyce_An 2026
 
 **DeepEP on Ascend** (`Ascend/DeepEP`) is an expert-parallel (EP) communication library for mixture-of-experts (MoE) inference on Ascend NPUs. It provides high-throughput **prefill** and low-latency **decode** communication, together with experimental **MegaMoE** fused inference.
 
+## Machine-specific backends
+
+The Clos V1/V2 implementation and the POD backend share the same pinned CANN SHMEM
+dependency and build workflow. Buffer constructors accept `machine_type="auto"`,
+`"pod"`, `"clos_only"`, or `"card_4pmesh"`; explicit selection is available when
+reliable rootinfo is absent. The machine selects the communication engines:
+Clos uses UDMA for payload and MTE for metadata/local copies; CARD_4PMESH uses MTE,
+and POD uses its backend configuration. Public constructors do not accept
+`transport`; remove it from older calls. `ASCEND_DEEPEP_TRANSPORT` does not override
+this policy. See [backend selection and compatibility](docs/machine_backends.md).
+The HT/LL/MegaMoE descriptions below apply to the POD backend.
+
 ## News
 
 ---
@@ -310,13 +322,3 @@ We thank [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) for the upstre
 ---
 
 Project material for which Lu Lu holds the relevant rights is licensed under the [BSD 2-Clause License](LICENSE). Other source material retains its own copyright notices and license texts.
-# Machine-specific backends
-
-This branch adds the Clos V1/V2 implementation alongside the existing POD backend,
-using the same pinned CANN SHMEM dependency and build workflow. Buffer constructors
-accept `machine_type="auto"`, `"pod"`, `"clos_only"`, or `"card_4pmesh"`; explicit
-selection is available when reliable rootinfo is absent. The machine selects the
-communication engines: Clos uses MTE + UDMA, CARD_4PMESH uses MTE, and POD keeps its
-existing configuration. Public constructors do not accept `transport`; remove it
-from older calls. `ASCEND_DEEPEP_TRANSPORT` does not override this policy.
-See [backend selection and compatibility](docs/machine_backends.md).

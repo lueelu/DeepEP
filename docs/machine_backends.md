@@ -3,9 +3,9 @@
 一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
 `836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7`。POD 保留本仓已有的 HT、LL、
 实验组件和接口限制。全 Clos 实现包含 V1 Buffer、V2 ElasticBuffer、
-MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及原有资源接口。
+MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
-PR（`CARD_4PMESH`，board `0x6c`）复用迁入实现的 MTE kernel，不另建一份 SHMEM。
+PR（`CARD_4PMESH`，board `0x6c`）复用 Clos 后端的 MTE kernel，不另建一份 SHMEM。
 
 V1 的统一入口为 `deep_ep/buffer.py`，V2 的统一入口为
 `deep_ep/buffers/elastic.py`；POD 与 Clos 的实现分别位于
@@ -30,11 +30,11 @@ combine 未指定核数时沿用 handle 中的核数，包括显式 64 核的 ha
 继续使用本仓的[编译安装流程](build.md)，同一 Python 环境需有匹配的 Torch/torch_npu。
 POD 和 Clos 共用一份 SHMEM SDK。
 构建产物包括 `_C`、`_clos_C` 和各自的 device library；二者加载同一 SDK 的 `libshmem.so`。
-本迁移构建面向 Ascend950，统一使用 64-bit top-k 索引。
+构建面向 Ascend950，统一使用 64-bit top-k 索引。
 
 ## 运行前检查机型
 
-在已安装本分支的 Python 环境中，检查本机参与任务的物理卡号，例如预期全 Clos 的八卡：
+在已安装本项目的 Python 环境中，检查本机参与任务的物理卡号，例如预期全 Clos 的八卡：
 
 ```bash
 python -u scripts/check_machine.py --physical-devices 0 1 2 3 4 5 6 7 \
@@ -82,7 +82,7 @@ print(buffer.machine_type, buffer.machine_selection)
 旧调用须删除 `transport=...`，包括 `None`、`"auto"` 和与机型匹配的值。
 传入 EP group 时，该参数错误在现有机型选择 collective 中统一报告，发生在 SHMEM
 初始化前。`ASCEND_DEEPEP_TRANSPORT` 不改变上述公开接口的引擎选择。
-迁入实现内部保留引擎参数供后端调用和原有内部测试使用，不是新的机型选择入口。
+后端内部保留引擎参数供内部调用和测试使用；公开接口通过 `machine_type` 选择机型。
 
 `auto` 读取当前物理 device 对应的 `/etc/hccl_rootinfo.json` 及其中引用的 topo 文件。
 `TOPO_FILE_DESC` 按 topo 边声明解释；有 Clos 且无 NPU Mesh 的设备选择 `clos_only`。
@@ -199,8 +199,9 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 32 --nnodes 2 --node-rank
     --master-addr <NODE0_IP> --run-id clos_v2_ep32 --output clos_v2_ep32_node0
 ```
 
-两个入口共用 `bandwidth_multinode.py`、`route_workloads.py` 和 `stage_metrics.py`，
-分别负责多机协调与结果收集、路由生成、采样和阶段计时。
+两个入口共用四个辅助模块：`bandwidth_multinode.py` 负责多机协调与结果收集，
+`route_workloads.py` 负责路由生成，`profiling.py` 负责采样执行，
+`stage_metrics.py` 负责采样标记、profiler 解析和阶段指标统计。
 
 V1/V2 带宽脚本在每轮预热和 profiling 调用后等待本卡 NPU 执行完成，再提交下一轮，
 避免未完成输出和分配持续积压。该 Host 等待位于采样结束标记之外，不计入 kernel
