@@ -69,8 +69,7 @@ buffer = deep_ep.ElasticBuffer(
 print(buffer.machine_type, buffer.machine_selection)
 ```
 
-公开 `deep_ep.Buffer` / `deep_ep.ElasticBuffer` 的通信引擎由机型决定，不接受
-`transport` 入参：
+公开 `deep_ep.Buffer` / `deep_ep.ElasticBuffer` 的通信引擎由机型决定：
 
 | `machine_type` | 通信引擎 |
 | --- | --- |
@@ -78,11 +77,6 @@ print(buffer.machine_type, buffer.machine_selection)
 | `pod` | 保留 POD 实现原有配置，V2 使用 MTE + UDMA |
 | `clos_only` | UDMA payload，MTE 元数据/本地搬运；SHMEM 启用 MTE + UDMA |
 | `card_4pmesh` | 仅 MTE，不创建 UDMA QP/Jetty |
-
-旧调用须删除 `transport=...`，包括 `None`、`"auto"` 和与机型匹配的值。
-传入 EP group 时，该参数错误在现有机型选择 collective 中统一报告，发生在 SHMEM
-初始化前。`ASCEND_DEEPEP_TRANSPORT` 不改变上述公开接口的引擎选择。
-后端内部保留引擎参数供内部调用和测试使用；公开接口通过 `machine_type` 选择机型。
 
 `auto` 读取当前物理 device 对应的 `/etc/hccl_rootinfo.json` 及其中引用的 topo 文件。
 `TOPO_FILE_DESC` 按 topo 边声明解释；有 Clos 且无 NPU Mesh 的设备选择 `clos_only`。

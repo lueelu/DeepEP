@@ -60,8 +60,11 @@ def public_runtime(monkeypatch):
 @pytest.mark.parametrize("machine,engine", [("clos_only", "udma"), ("card_4pmesh", "mte")])
 @pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("environment", ["mte", "udma", "invalid"])
+@pytest.mark.parametrize(
+    "legacy", [{}, *({"transport": value} for value in (None, "auto", "mte", "udma", "roce", "invalid"))]
+)
 def test_machine_fixes_engine_before_bootstrap(
-    public_runtime, monkeypatch, api, machine, engine, automatic, environment
+    public_runtime, monkeypatch, api, machine, engine, automatic, environment, legacy
 ):
     package, group, calls = public_runtime
     detections = []
@@ -74,7 +77,7 @@ def test_machine_fixes_engine_before_bootstrap(
     monkeypatch.setenv("ASCEND_DEEPEP_TRANSPORT", environment)
     cls = getattr(package, api)
     assert "transport" not in inspect.signature(cls).parameters
-    instance = cls(group, machine_type="auto" if automatic else machine, num_bytes=128 * 1024 * 1024)
+    instance = cls(group, machine_type="auto" if automatic else machine, num_bytes=128 * 1024 * 1024, **legacy)
     try:
         assert detections == ([True] if automatic else [])
         assert instance.machine_type == machine and instance.transport == engine
@@ -95,18 +98,17 @@ def test_machine_fixes_engine_before_bootstrap(
 
 
 @pytest.mark.parametrize("api", ["Buffer", "ElasticBuffer"])
-@pytest.mark.parametrize("machine", ["auto", "pod", "clos_only", "card_4pmesh"])
+@pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("value", [None, "auto", "mte", "udma", "roce", "invalid"])
-def test_removed_transport_rejected_before_detection_and_native(public_runtime, monkeypatch, api, machine, value):
+def test_legacy_transport_does_not_reach_pod_constructor(public_runtime, monkeypatch, api, automatic, value):
     package, group, calls = public_runtime
-    monkeypatch.setattr(_machine, "detect", lambda _: pytest.fail("old argument must fail before topology queries"))
-    with pytest.raises(RuntimeError, match="transport is selected by machine_type; remove the transport argument"):
-        getattr(package, api)(group, machine_type=machine, transport=value)
-    assert calls == []
+    monkeypatch.setattr(_machine, "detect", lambda _: {"machine_type": "pod", "source": "test"})
+    cls = getattr(package, api)
 
+    def initialize(self, *args, **kwargs):
+        calls.append((args, kwargs))
 
-@pytest.mark.parametrize("machine", ["auto", "pod", "clos_only", "card_4pmesh"])
-def test_removed_transport_without_group_is_also_rejected(machine, monkeypatch):
-    monkeypatch.setattr(_machine, "detect", lambda _: pytest.fail("unexpected topology query"))
-    with pytest.raises(RuntimeError, match="remove the transport argument"):
-        _machine.select(machine, transport_provided=True)
+    monkeypatch.setattr(cls.__bases__[0], "__init__", initialize)
+    instance = cls(group, machine_type="auto" if automatic else "pod", transport=value, explicitly_destroy=True)
+    assert instance.machine_type == "pod"
+    assert calls == [((group,), {"explicitly_destroy": True})]

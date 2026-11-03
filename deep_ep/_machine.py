@@ -212,11 +212,9 @@ def gather_records(group, record):
     return group.allgather(record)
 
 
-def select(machine_type="auto", group=None, rootinfo_path=None, *, transport_provided=False):
+def select(machine_type="auto", group=None, rootinfo_path=None):
     error, result = None, None
     try:
-        if transport_provided:
-            raise TypeError("transport is selected by machine_type; remove the transport argument")
         if machine_type not in KINDS:
             raise ValueError(f"machine_type must be one of {KINDS}")
         result = (
@@ -250,10 +248,12 @@ class MachineSelector(type):
             group = options.get("comm")
         # The target's explicit-rank MPI path has no ProcessGroup. Native
         # SHMEM bootstrap remains responsible for its collective configuration.
-        # Reject the removed public option in the same collective as topology
-        # selection, so a rank-local old argument cannot strand the other ranks
-        # inside SHMEM initialization. Even None/auto/matching values are errors.
-        selection = select(machine_type, group, rootinfo, transport_provided="transport" in options)
+        # Accept transport only for legacy keyword-call compatibility. Ignore
+        # every value (including None and conflicting defaults); machine_type
+        # alone determines the engine. Do not forward it to the POD constructor
+        # or include it in rank consensus, even if only one rank supplies it.
+        options.pop("transport", None)
+        selection = select(machine_type, group, rootinfo)
         with LOCK:
             if selection["machine_type"] in ("clos_only", "card_4pmesh"):
                 from ._clos_adapter import buffer_class

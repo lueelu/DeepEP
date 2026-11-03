@@ -34,19 +34,37 @@ def _selection_worker(rank, store, result_dir):
         import deep_ep
         from deep_ep import buffer as legacy
         from deep_ep.buffers import elastic
+        from deep_ep import _clos_adapter, _card_adapter
 
-        # An old argument on just one rank must stop both before any backend
-        # initializes. Matching/None values are removed arguments too.
+        # Rank-local legacy arguments must not change the chosen engine or the
+        # order of topology collectives. Constructors are CPU-only doubles.
         elastic.require_native = legacy.require_native = lambda _: None
-        for api in (deep_ep.Buffer, deep_ep.ElasticBuffer):
-            for kind in ("auto", "pod", "clos_only", "card_4pmesh"):
-                for old_value in (None, "auto", "mte", "udma"):
-                    options = {"transport": old_value} if rank == 0 else {}
-                    with pytest.raises(RuntimeError, match="transport is selected by machine_type"):
-                        api(group, machine_type=kind, **options)
+
+        class Engine:
+            def __init__(self, *args, **kwargs):
+                self.transport = kwargs["transport"]
+
+        def pod_initialize(self, *args, **kwargs):
+            assert "transport" not in kwargs
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(_clos_adapter, "buffer_class", lambda _: Engine)
+            patch.setattr(_card_adapter, "buffer_class", lambda _: Engine)
+            for api in (deep_ep.Buffer, deep_ep.ElasticBuffer):
+                patch.setattr(api.__bases__[0], "__init__", pod_initialize)
+                for kind in ("auto", "pod", "clos_only", "card_4pmesh"):
+                    for old_value in (None, "auto", "mte", "udma", "invalid"):
+                        for options in (
+                            {"transport": old_value} if rank == 0 else {},
+                            {"transport": "mte" if rank == 0 else "udma"},
+                        ):
+                            instance = api(group, machine_type=kind, **options)
+                            expected = "clos_only" if kind == "auto" else kind
+                            assert instance.machine_type == expected
+                            if expected != "pod":
+                                assert instance.transport == ("mte" if expected == "card_4pmesh" else "udma")
         assert _machine.select("pod", group)["machine_type"] == "pod"
-        results.append("removed_transport_rejected_collectively")
-        from deep_ep import _card_adapter
+        results.append("legacy_transport_ignored_collectively")
         from types import SimpleNamespace
 
         _card_adapter.host_identity = lambda: "same-host"
@@ -107,7 +125,7 @@ def test_two_rank_gloo_selection(tmp_path):
             "mixed_rejected",
             "peer_error_rejected",
             "collective_order_preserved",
-            "removed_transport_rejected_collectively",
+            "legacy_transport_ignored_collectively",
             "card_collective_guards",
         ]
 
