@@ -31,7 +31,7 @@ STAGE_INFO = {
     'receiver': {'label': '接收 payload 完成', 'start': 18, 'end': 19, 'kind': 'difference', 'boundary': 'Receiver.Process，含构建任务、轮询、接收及收尾', 'relationship': '接收主阶段', 'reference_formula': '(w19-w18)/1000'},
     'final_drain': {'label': '最终 drain/恢复 CTRL', 'start': 20, 'end': 21, 'kind': 'difference', 'boundary': 'Counts.Finish，包含现有 PIPE_ALL', 'relationship': '主阶段', 'reference_formula': '(w21-w20)/1000'},
     'count_ready_poll': {'label': '计数 ready 轮询', 'start': 24, 'end': 25, 'kind': 'difference', 'boundary': 'WaitDispatch 轮询至最后一次 V_S 完成', 'relationship': '计数接收/归约的细分', 'reference_formula': '(w25-w24)/1000'},
-    'cumsum_join': {'label': 'cumsum 跨核等待/清理提交', 'start': 26, 'end': 27, 'kind': 'difference', 'boundary': 'GetCumSum，包含等待片段总数和清标记提交', 'relationship': 'cumsum 汇合/发布提交的细分', 'reference_formula': '(w27-w26)/1000'},
+    'cumsum_join': {'label': 'cumsum 跨核等待/清理提交', 'start': 26, 'end': 27, 'kind': 'difference', 'boundary': 'GetCumSum，包含等待片段总数；子槽回收在后续前缀屏障后执行', 'relationship': 'cumsum 汇合/发布提交的细分', 'reference_formula': '(w27-w26)/1000'},
     'prefix_ready': {'label': '前缀 ready 等待/清理提交', 'start': 28, 'end': 29, 'kind': 'difference', 'boundary': 'WaitCumSumFlag 等待及清理提交', 'relationship': '前缀就绪/加载/输出提交的细分', 'reference_formula': '(w29-w28)/1000'},
     'recv_prefix_load': {'label': '接收前缀加载', 'start': 18, 'end': 30, 'kind': 'difference', 'boundary': 'Receiver reset / 前缀 DMA，结束 MTE2_S', 'relationship': '接收 payload 完成的细分', 'reference_formula': '(w30-w18)/1000'},
     'recv_tasks': {'label': '接收任务构建', 'start': 30, 'end': 31, 'kind': 'difference', 'boundary': 'ReceiveTasks.Build', 'relationship': '接收 payload 完成的细分', 'reference_formula': '(w31-w30)/1000'},

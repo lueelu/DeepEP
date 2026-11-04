@@ -68,6 +68,9 @@ DISPATCH_DEDUP_EP_DEDUP_INLINE EpServerDedupCountLayout DispatchServerDedupCount
 {
     EpServerDedupCountLayout layout{};
     const uint32_t recvCores = coreNum / 2U;
+    // The subtotal scoreboard now uses one writer-owned 32B slot per receiver
+    // core at cumsumOffset; the historical matrix footprint stays reserved so
+    // prefix and flag offsets, capacities and the protocol layout are unchanged.
     const uint64_t matrixBytes = uint64_t(recvCores) * recvCores * kEpServerDedupCountRecordBytes;
     layout.cntOffset = kEpServerDedupControlPrefixBytes;
     layout.cumsumOffset = uint64_t(experts) * kEpServerDedupCountGmStride;

@@ -157,7 +157,7 @@ flowchart TD
 | `receiver` / 接收 payload 完成 | `(w19-w18)/1000` | Receiver.Process，含构建任务、轮询、接收及收尾 | 接收主阶段 |
 | `final_drain` / 最终 drain/恢复 CTRL | `(w21-w20)/1000` | Counts.Finish，包含现有 PIPE_ALL | 主阶段 |
 | `count_ready_poll` / 计数 ready 轮询 | `(w25-w24)/1000` | WaitDispatch 轮询至最后一次 V_S 完成 | 计数接收/归约的细分 |
-| `cumsum_join` / cumsum 跨核等待/清理提交 | `(w27-w26)/1000` | GetCumSum，包含等待片段总数和清标记提交 | cumsum 汇合/发布提交的细分 |
+| `cumsum_join` / cumsum 跨核等待/清理提交 | `(w27-w26)/1000` | GetCumSum，包含等待片段总数；子槽回收在后续前缀屏障后执行 | cumsum 汇合/发布提交的细分 |
 | `prefix_ready` / 前缀 ready 等待/清理提交 | `(w29-w28)/1000` | WaitCumSumFlag 等待及清理提交 | 前缀就绪/加载/输出提交的细分 |
 | `recv_prefix_load` / 接收前缀加载 | `(w30-w18)/1000` | Receiver reset / 前缀 DMA，结束 MTE2_S | 接收 payload 完成的细分 |
 | `recv_tasks` / 接收任务构建 | `(w31-w30)/1000` | ReceiveTasks.Build | 接收 payload 完成的细分 |

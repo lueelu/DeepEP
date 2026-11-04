@@ -162,9 +162,16 @@ def test_shared_prefix_publication_and_consumers_keep_the_ready_dependency():
     receive = _block(_source("dispatch_server_dedup_recv.h"), "void Process(")
     assert "counts.cntOffset + counts.prefixOffset" in receive
     assert "counts.prefixStride" not in receive
-    # Sum/readiness matrices still have their independent consumer rows.
-    assert "newAivId * UB_ALIGN" in _block(counts, "uint32_t ServerDedupCounts::GetCumSum(")
-    assert "(aivId_ - aivUsedAllToAll_) * aivUsedCumSum_ * UB_ALIGN" in _block(counts, "void ServerDedupCounts::WaitCumSumFlag()")
+    # Subtotals use one writer-owned slot per receiver, consumers read one contiguous
+    # burst, and the slot is reclaimed only after the following shared barrier.
+    get_cumsum = _block(counts, "uint32_t ServerDedupCounts::GetCumSum(")
+    assert "DataCopyParams sumIntriParams{static_cast<uint16_t>(activeCumSumCores_), 1, 0, 0}" in get_cumsum
+    assert "newAivId * UB_ALIGN" not in get_cumsum
+    assert "layout_.cumsumOffset + newAivId * UB_ALIGN" in _block(counts, "void ServerDedupCounts::PublishRecvCntSum(")
+    wait_flag = _block(counts, "void ServerDedupCounts::WaitCumSumFlag()")
+    assert "newAivId * aivUsedCumSum_ * UB_ALIGN" in wait_flag
+    assert "if (newAivId < activeCumSumCores_)" in wait_flag
+    assert "layout_.cumsumOffset + newAivId * UB_ALIGN" in wait_flag
 
 
 def test_shared_prefix_layout_and_delayed_fragments(tmp_path):

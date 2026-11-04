@@ -530,33 +530,31 @@ __aicore__ inline void ServerDedupCounts::GatherSumRecvCnt(LocalTensor<float>& g
     PublishRecvCntSum(sumOfRecvCnt);
 }
 
-// 摘要：将本核片段总数和就绪标记写入本 rank 的跨核汇总矩阵；空片段也必须发布。
+// 摘要：将本核片段总数和就绪标记写入本 rank 的紧凑记分板；空片段也必须发布。
 __aicore__ inline void ServerDedupCounts::PublishRecvCntSum(float sumOfRecvCnt)
 {
     uint32_t newAivId = aivId_ - aivUsedAllToAll_;
 
-    LocalTensor<float> sumCoreFP32Tensor = sumCoreBuf_.Get<float>();
-    uint64_t maskArrayCount[2] = {0x0101010101010101, 0};
-    uint8_t repeatTimes = Ceil(activeCumSumCores_, 8);
-
-    Duplicate<float>(sumCoreFP32Tensor, sumOfRecvCnt, maskArrayCount, repeatTimes, 1, 8);
-    uint64_t maskArrayFlag[2] = {0x0202020202020202, 0};
-    Duplicate<float>(sumCoreFP32Tensor, static_cast<float>(1.0), maskArrayFlag, repeatTimes, 1, 8);
-    // Keep the matrix row stride, but publish only to active cumsum consumers.
-    DataCopyParams sumIntriParams{static_cast<uint16_t>(activeCumSumCores_), 1, 0, 0};
-    SyncFunc<AscendC::HardEvent::V_MTE3>();
-    DataCopy(selfRankWinInGMTensor_[(layout_.cumsumOffset + newAivId * aivUsedCumSum_ * UB_ALIGN) / sizeof(float)],
-             sumCoreFP32Tensor, sumIntriParams);
+    // Compact scoreboard: one writer-owned 32B slot per receiver core, so
+    // consumers read a single contiguous burst instead of a transposed row.
+    LocalTensor<float> sumSlot = sumCoreBuf_.Get<float>();
+    for (uint32_t i = 0; i < UB_ALIGN_DATA_COUNT; ++i) sumSlot.SetValue(i, static_cast<float>(0));
+    sumSlot.SetValue(0, sumOfRecvCnt);
+    sumSlot.SetValue(1, static_cast<float>(1.0));
+    SyncFunc<AscendC::HardEvent::S_MTE3>();
+    DataCopyParams slotParams{1U, 1U, 0U, 0U};
+    DataCopy(selfRankWinInGMTensor_[(layout_.cumsumOffset + newAivId * UB_ALIGN) / sizeof(float)],
+             sumSlot, slotParams);
     // sumCoreBuf_ stays immutable until CalRecvAndSetFlag reuses it. Polling
     // incoming sums must not wait here for this core's outgoing cnt.
 }
 
-// 摘要：等待所有接收核总数就绪，求本核之前各片段之和，再清理本核消费的汇总标记。
+// 摘要：等待所有接收核总数就绪，求本核之前各片段之和；槽位回收在后续屏障后执行。
 __aicore__ inline uint32_t ServerDedupCounts::GetCumSum(uint32_t newAivId)
 {
     uint32_t offset = 0;
-    DataCopyParams sumIntriParams{static_cast<uint16_t>(activeCumSumCores_), 1,
-                                  static_cast<uint16_t>(aivUsedCumSum_ - 1), 0};
+    // Subtotals are contiguous 32B slots, so one burst covers every active core.
+    DataCopyParams sumIntriParams{static_cast<uint16_t>(activeCumSumCores_), 1, 0, 0};
     LocalTensor<float> sumLocalTensor = sumLocalBuf_.Get<float>();
     LocalTensor<uint32_t> gatherSumPattern = scalarBuf_.GetWithOffset<uint32_t>(UB_ALIGN / sizeof(uint32_t), 0);
     LocalTensor<float> sumContinueTensor = sumContinueBuf_.Get<float>();
@@ -571,7 +569,7 @@ __aicore__ inline uint32_t ServerDedupCounts::GetCumSum(uint32_t newAivId)
     SyncFunc<AscendC::HardEvent::S_V>();
 
     while (true) {
-        DataCopy(sumLocalTensor, selfRankWinInGMTensor_[(layout_.cumsumOffset + newAivId * UB_ALIGN) / sizeof(float)],
+        DataCopy(sumLocalTensor, selfRankWinInGMTensor_[layout_.cumsumOffset / sizeof(float)],
                  sumIntriParams);
         SyncFunc<AscendC::HardEvent::MTE2_V>();
         GatherMask(sumContinueTensor, sumLocalTensor, gatherSumPattern, true, mask,
@@ -600,16 +598,8 @@ __aicore__ inline uint32_t ServerDedupCounts::GetCumSum(uint32_t newAivId)
         offset = uint32_t(recvCntSumOutTensor.ReinterpretCast<int32_t>().GetValue(0));
     }
 
-    LocalTensor<float> sumCoreFp32Tensor = sumLocalBuf_.Get<float>();
-
-    uint8_t repeatTimes = Ceil(activeCumSumCores_, 8);
-
-    Duplicate<float>(sumCoreFp32Tensor, static_cast<float>(0), 64, repeatTimes, 1, 8);
-    DataCopyParams cleanParams{static_cast<uint16_t>(activeCumSumCores_), 1, 0,
-                               static_cast<uint16_t>(aivUsedCumSum_ - 1)};
-    SyncFunc<AscendC::HardEvent::V_MTE3>();
-    DataCopy(selfRankWinInGMTensor_[(layout_.cumsumOffset + newAivId * UB_ALIGN) / sizeof(float)], sumCoreFp32Tensor,
-             cleanParams);
+    // The subtotal slots are reclaimed after WaitCumSumFlag, when every receiver
+    // has already consumed them; no per-consumer column clear remains here.
     return offset;
 }
 
@@ -720,8 +710,9 @@ __aicore__ inline void ServerDedupCounts::WaitCumSumFlag()
 {
     int32_t cumSumFlag = 0;
     int32_t targetFlag = activeCumSumCores_ * UB_ALIGN_DATA_COUNT;
+    const uint32_t newAivId = aivId_ - aivUsedAllToAll_;
     uint32_t cumSumFlagOffset =
-        (layout_.cumsumFlagOffset + (aivId_ - aivUsedAllToAll_) * aivUsedCumSum_ * UB_ALIGN) / sizeof(float);
+        (layout_.cumsumFlagOffset + newAivId * aivUsedCumSum_ * UB_ALIGN) / sizeof(float);
     uint32_t innerSumParams = activeCumSumCores_ * UB_ALIGN / sizeof(float);
     SumParams sumFlagParams{1, innerSumParams, activeCumSumCores_ * UB_ALIGN_DATA_COUNT};
     LocalTensor<float> statusSumOutTensor = scalarBuf_.Get<float>();
@@ -743,6 +734,17 @@ __aicore__ inline void ServerDedupCounts::WaitCumSumFlag()
     SyncFunc<HardEvent::V_MTE3>();
     DataCopy(selfRankWinInGMTensor_[cumSumFlagOffset], statusCleanFp32Tensor_,
              activeCumSumCores_ * UB_ALIGN_DATA_COUNT);
+
+    // This barrier opens only after every receiver has completed GetCumSum, so
+    // each publisher may reclaim its own subtotal slot. The next use of this
+    // bank then starts from zeros without an extra epoch tag.
+    if (newAivId < activeCumSumCores_) {
+        LocalTensor<float> cleanSlot =
+            cleanBuf_.GetWithOffset<float>(UB_ALIGN_DATA_COUNT, newAivId * UB_ALIGN);
+        DataCopyParams slotParams{1U, 1U, 0U, 0U};
+        DataCopy(selfRankWinInGMTensor_[(layout_.cumsumOffset + newAivId * UB_ALIGN) / sizeof(float)],
+                 cleanSlot, slotParams);
+    }
 }
 
 }  // namespace DispatchDedup
