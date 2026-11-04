@@ -185,6 +185,6 @@ R核的 `receiver` 包含前缀加载、任务构建、缓冲准备、循环清�
 
 ## 5. 构建与历史数据
 
-两台目标机拉取同一提交后正常运行 `one_click.sh`，默认重编reference完整wheel；不要对旧wheel使用 `--skip-build`。`--reference-iters N` 控制capture轮数；`--mode perf` 仍测试完整dispatch+BF16 combine。SDK、launch结构大小、采样协议initial-reduce-sleep-batch-v4保持不变；当前通信协议14，详见[路由SO与8QP](ROCE_SO_ROUTE_8QP.md)。
+两台目标机拉取同一提交后正常运行 `one_click.sh`，默认重编reference完整wheel；不要对旧wheel使用 `--skip-build`。`--reference-iters N` 控制capture轮数；`--mode perf` 仍测试完整dispatch+BF16 combine。SDK、launch结构大小、采样协议initial-reduce-exp200-batch-v3保持不变；当前通信协议14，详见[路由SO与8QP](ROCE_SO_ROUTE_8QP.md)。
 
 旧timer结果仅保留离线解码支持，可用 `one_click.sh --analyze-only RUN_DIR --output-dir NEW_DIR`。历史47阶段不是当前33阶段，不能跨格式直接A/B。

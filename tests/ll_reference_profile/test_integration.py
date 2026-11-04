@@ -192,9 +192,8 @@ class SamplingTests(unittest.TestCase):
         dist = SimpleNamespace(get_world_size=lambda: 32, ReduceOp=SimpleNamespace(SUM=0),
                                all_reduce=lambda *a, **k: events.append('reduce'))
         torch = SimpleNamespace(float32=0, zeros=lambda *a, **k: Tensor(), ones=lambda *a, **k: Tensor(),
-                                distributed=dist,
-                                npu=SimpleNamespace(synchronize=lambda: events.append('sync'),
-                                                    _sleep=lambda cycles: events.append('sleep')))
+                                exp=lambda *a, **k: events.append('exp'), distributed=dist,
+                                npu=SimpleNamespace(synchronize=lambda: events.append('sync')))
         def invoke():
             reference.attach(buffer, {'input': Tensor()}, 'dispatch')
             events.append('invoke')
@@ -202,7 +201,7 @@ class SamplingTests(unittest.TestCase):
         args = SimpleNamespace(run_directory=str(ROOT / '.tmp/reference-cpu'), case_id=0,
                                ll_reference_profile=True, ll_timer_iters=2, ll_timer_mode='observe',
                                ll_timer_frequency_hz=1e9, seed=0, num_tokens=8, num_experts=384, warmup=2, num_iters=3,
-                               device_busy_cycles=20_000_000, group_backend='hccl',
+                               delay_rows=1, delay_cols=1, group_backend='hccl',
                                reference_profile_seed=0, reference_route_sha256='a' * 64)
         with ExitStack() as stack:
             stack.enter_context(patch.dict(sys.modules, {'torch': torch, 'torch.distributed': dist}))
@@ -214,7 +213,7 @@ class SamplingTests(unittest.TestCase):
             stack.enter_context(patch.object(st, 'case_config', return_value=dict(B=8)))
             st.diagnostic_calls(buffer, invoke, lambda _: events.append('check'), args, 'dispatch', 17, 256, 'normal')
         expected = ['allocate'] * 2 + ['boundary', 'reduce'] + ['invoke'] * 2 + ['sync']
-        expected += ['sleep'] + ['invoke'] * 3
+        expected += ['exp'] * 200 + ['invoke'] * 3
         expected += ['invoke', 'wait'] * 2
         expected += ['boundary'] + ['copy', 'check', 'save'] * 2
         self.assertEqual(events, expected)

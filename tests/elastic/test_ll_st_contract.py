@@ -296,24 +296,26 @@ def test_json_fp8_scale_matrix_covers_sync_modes(tmp_path):
 
 
 @pytest.mark.parametrize("iterations", [1, 40, 41, 100, 101])
-def test_device_busy_cycles_stays_fixed_independent_of_operator_iterations(iterations):
+def test_exp_prefix_stays_fixed_independent_of_operator_iterations(iterations):
     args = st.parse_args(["--num-iters", str(iterations)])
-    assert args.device_busy_cycles == st.DEVICE_BUSY_CYCLES
+    assert (args.delay_exp_before, args.delay_exp_after) == (200, 0)
 
 
-def test_device_busy_defaults_honor_json_and_explicit_overrides(tmp_path):
+def test_delay_defaults_honor_json_and_explicit_overrides(tmp_path):
     import json
 
-    path = tmp_path / "busy.json"
-    path.write_text(json.dumps({"loops": 100, "device_busy_cycles": 12_345}))
+    path = tmp_path / "delay.json"
+    path.write_text(json.dumps({"loops": 100, "delay_exp_before": 200}))
     args = st.parse_args(["--config", str(path)])
-    assert args.device_busy_cycles == 12_345
-    args = st.parse_args(["--config", str(path), "--device-busy-cycles", "777"])
-    assert args.device_busy_cycles == 777
+    assert (args.delay_exp_before, args.delay_exp_after) == (200, 0)
+    args = st.parse_args(["--config", str(path), "--num-iters", "80", "--delay-exp-after", "7"])
+    assert (args.delay_exp_before, args.delay_exp_after) == (200, 7)
+    with pytest.raises(ValueError, match="Reference profiler requires"):
+        st.validate_args(args, 16)
 
 
-@pytest.mark.parametrize("count", [0, -1, 100_000_000_001])
-def test_device_busy_cycles_must_be_positive(count):
-    args = st.parse_args(["--device-busy-cycles", str(count)])
-    with pytest.raises(ValueError, match="device-busy-cycles"):
+@pytest.mark.parametrize('count', [0, 1, 199, 201, 1000])
+def test_cannot_change_the_fixed_exp200_prefix(count):
+    args = st.parse_args(['--delay-exp-before', str(count)])
+    with pytest.raises(ValueError, match='fixed batch'):
         st.validate_args(args, 16)

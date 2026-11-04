@@ -2,8 +2,8 @@
 
 > 2026-10-28更新：当前协议14，路由表同WQE尾FLAG发布，每对跨机卡共8个QP；本文旧QP/独立commit描述作为历史记录。当前实现见 [ROCE_SO_ROUTE_8QP.md](ROCE_SO_ROUTE_8QP.md)。
 
-后续采样更新：当前ST已按用户要求切换为`initial-reduce-sleep-batch-v4`，每批初始一次
-all_reduce、active profiler.step前调用一次`torch.npu._sleep`，循环内不再插入采样通信。
+后续采样更新：当前ST已按用户要求切换为`initial-reduce-exp200-batch-v3`，每批初始一次
+all_reduce、active profiler.step前固定200次Exp，循环内不再插入采样通信。
 旧协议9/10的历史结果若采用逐轮Exp+all_reduce，不能直接与新结果作为同条件A/B；
 比较SO kernel时，两版须使用一致的新采样脚本重测。参见[采样协议](../ll_probe/PROFILING.md)。
 

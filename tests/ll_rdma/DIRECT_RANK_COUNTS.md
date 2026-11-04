@@ -89,5 +89,5 @@ bash tests/ll_rdma/one_click.sh "$NODE" "$MASTER" ndr-direct-count-ref-001 \
   --hidden 3584 --topk 8 --experts 384 --dtype fp8 --reference-iters 5
 ```
 
-采样协议仍为initial-reduce-exp100-batch-v3，reference schema4不变。
+采样协议仍为initial-reduce-exp200-batch-v3，reference schema4不变。
 完整原始结果留目标机，按原入口回传单个≤60000字节报告。

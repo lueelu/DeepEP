@@ -50,17 +50,16 @@
 
 # 目标RoCE通信契约
 
-## NDR采样方式（2026-11-04最新用户要求）
+## NDR采样方式（2026-10-27最新用户要求）
 
-本分支ST采用`initial-reduce-sleep-batch-v4`：每个操作的采样批次只在开始all_reduce一次，
-预热同步后、进入active的profiler.step前调用一次`torch.npu._sleep(--device-busy-cycles)`，
-再连续调用算子；循环内没有sleep或采样all_reduce。独立timer/reference同样为初始all_reduce、
-预热、一次npu sleep、连续稳定/capture。perf后附加打点时另排一次npu sleep，共用perf初始all_reduce；
-不在sleep前缀后额外同步。sleep cycles不随算子迭代次数变化，默认13,200,000,000（1_650_000_000×8），需在目标机标定。
+本分支ST采用`initial-reduce-exp200-batch-v3`：每个操作的采样批次只在开始all_reduce一次，
+预热同步后、进入active的profiler.step前固定200次Exp，再连续调用算子；循环内没有Exp或
+采样all_reduce。独立timer/reference同样为初始all_reduce、预热、200次Exp、连续稳定/capture。
+perf后附加打点时另排200次Exp，共用perf初始all_reduce；不在Exp前缀后额外同步。
 2026-11-03新增：每次 dispatch/combine 调用前插入一次标量 all_reduce（异步提交 + wait）拉齐快慢卡，
 开销计入每次调用，样本 metadata 记录 `per_iteration_rank_align=all_reduce_async_wait`；与旧样本不可直接同条件比较。
 正确性/批次边界和算子内部必要复用协调保留，kernel/SDK不改。新旧采样协议不能混作同条件A/B。
-详见tests/ll_probe/PROFILING.md；本条覆盖本分支旧“每轮Exp+all_reduce”与exp100采样说明。
+详见tests/ll_probe/PROFILING.md；本条覆盖本分支旧“每轮Exp+all_reduce”采样说明。
 
 ## SO发布
 

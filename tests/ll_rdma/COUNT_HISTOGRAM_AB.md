@@ -57,7 +57,7 @@ DEEPEP_LL_COUNT_HISTOGRAM=ON bash tests/ll_rdma/one_click.sh "$NODE" "$MASTER" c
 
 逐核诊断可分别使用新run名、改成`--mode reference --reference-iters 5`，仍完整构建相应wheel。
 比较count_send和完整OFF dispatch，不能只看某核统计变短；FP8配置的combine仍是BF16。
-采样initial-reduce-exp100-batch-v3不变，原始数据留目标机，回传单个<=60000字节报告。
+采样initial-reduce-exp200-batch-v3不变，原始数据留目标机，回传单个<=60000字节报告。
 
 构建配置/缓存key和_build_info记录ll_count_histogram，Host与Device身份28/29互检，
 one_click核验请求值/安装身份/元数据并在跨节点握手中比较count_histogram字段。

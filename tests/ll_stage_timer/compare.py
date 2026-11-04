@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 DIFFERENCES={'implementation','transport','rdma_compiled','source_revision','source_dirty','logical_group'}
 REQUIRED={'implementation','transport','world_size','logical_group','active_aiv','core_protocol',
-          'case','warmup','num_iters','perf_tail','device_busy','device_busy_cycles','stage_capture','expert_capture',
+          'case','warmup','num_iters','perf_tail','delay_rows','delay_cols','stage_capture','expert_capture',
           'timer_mode','stage_timer','stage_timer_schema','frequency_hz','seed','route','use_1g_huge_pages',
           'comparison_schema','sampling_protocol','perf_enabled'}
 
