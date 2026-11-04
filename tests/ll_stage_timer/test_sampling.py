@@ -23,8 +23,9 @@ def test_tail_has_prelude_and_defers_all_checks(monkeypatch, tmp_path, after_per
     dist = SimpleNamespace(get_world_size=lambda: 16, ReduceOp=SimpleNamespace(SUM=0),
                            all_reduce=lambda *a, **k: events.append('reduce'))
     torch = SimpleNamespace(float32=0, zeros=lambda *a, **k: Tensor(), ones=lambda *a, **k: Tensor(),
-                            exp=lambda *a, **k: events.append('exp'), distributed=dist,
-                            npu=SimpleNamespace(synchronize=lambda: events.append('sync')))
+                            distributed=dist,
+                            npu=SimpleNamespace(synchronize=lambda: events.append('sync'),
+                                                _sleep=lambda cycles: events.append('sleep')))
     monkeypatch.setitem(sys.modules, 'torch', torch)
     monkeypatch.setitem(sys.modules, 'torch.distributed', dist)
     monkeypatch.setattr(_native, 'require_native', lambda _: SimpleNamespace(low_latency_ranks_per_group=lambda world: 4))
@@ -53,21 +54,22 @@ def test_tail_has_prelude_and_defers_all_checks(monkeypatch, tmp_path, after_per
         events.append('check')
     args=SimpleNamespace(run_directory=str(tmp_path), case_id=0, ll_timer_iters=2,
                          ll_timer_mode='observe', ll_timer_frequency_hz=1e9, seed=0, num_tokens=8, num_experts=384,
-                         warmup=2, num_iters=3, delay_rows=1, delay_cols=1, group_backend=backend)
+                         warmup=2, num_iters=3, device_busy_cycles=20_000_000, group_backend=backend)
     st.diagnostic_calls(object(), invoke, check, args, operation, 0, 256, 'normal',
-                        prelude_buffers=(Tensor(), Tensor()) if after_perf else None)
+                        after_perf=after_perf)
     prefix=['allocate']*2
     if not after_perf:
         prefix += ['boundary', 'reduce'] + ['invoke']*2 + ['sync']
-        prefix += ['exp']*100 + ['invoke']*3
+        prefix += ['sleep'] + ['invoke']*3
     else:
-        prefix += ['exp']*100
+        prefix += ['sleep']
     assert events == prefix + ['capture', 'invoke', 'wait']*2 + ['boundary'] + ['copy', 'check', 'save']*2
     assert [item['iteration'] for item in saved]==[0, 1]
     assert all(item['sampling']['after_perf']==after_perf for item in saved)
     assert events.count('reduce') == (0 if after_perf else 1)
-    assert all(item['sampling']['sampling_protocol'] == 'initial-reduce-exp100-batch-v3' for item in saved)
-    assert all(item['sampling']['exp_prefix_repeats'] == 100 and not item['sampling']['per_iteration_all_reduce'] for item in saved)
+    assert all(item['sampling']['sampling_protocol'] == 'initial-reduce-sleep-batch-v4' for item in saved)
+    assert all(item['sampling']['device_busy'] == 'npu_sleep' and item['sampling']['device_busy_cycles'] == 20_000_000
+               and not item['sampling']['per_iteration_all_reduce'] for item in saved)
 
 
 def test_deferred_context_preserves_records_until_complete(monkeypatch):
@@ -94,14 +96,14 @@ def test_sample_operation_selects_one_schedule(monkeypatch, tmp_path, skip_perf,
     events=[]
     monkeypatch.setattr(timer, 'StageTrace', lambda *a: events.append('allocate') or object())
     monkeypatch.setattr(st, 'agree_check', lambda fn, *a: fn())
-    def diagnostic(*a, prepared, prelude_buffers):
+    def diagnostic(*a, prepared, after_perf):
         assert len(prepared)==2
-        assert (prelude_buffers is None)==skip_perf
+        assert after_perf==(not skip_perf)
         events.append('diagnostic')
     def measure(*a, after_profile):
         events.append('perf100')
         if after_profile is not None:
-            after_profile('delay', 'alignment')
+            after_profile()
         return {'samples': 100}
     monkeypatch.setattr(st, 'diagnostic_calls', diagnostic)
     monkeypatch.setattr(st, 'measure', measure)

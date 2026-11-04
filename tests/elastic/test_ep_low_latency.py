@@ -36,8 +36,8 @@ def validate_stage_timer_capability(requested, capability):
         raise RuntimeError("LL byte diagnostics require timer schema 3; rebuild/install the matching wheel on every rank")
 
 
-EXP_PREFIX_REPEATS = 100
-SAMPLING_PROTOCOL = 'initial-reduce-exp100-batch-v3'
+DEVICE_BUSY_CYCLES = 1_650_000_000 * 8
+SAMPLING_PROTOCOL = 'initial-reduce-sleep-batch-v4'
 BALANCED_ROUTE_SEED = 20261014
 
 
@@ -109,7 +109,8 @@ def comparison_metadata(args, world, m):
     runtime=getattr(args,'runtime_identity',None)
     if runtime is None: return None  # CPU fixtures / legacy custom callers.
     return dict(**runtime, comparison_schema=1, sampling_protocol=SAMPLING_PROTOCOL,
-                exp_prefix_repeats=EXP_PREFIX_REPEATS, per_iteration_exp=0, per_iteration_all_reduce=False,
+                device_busy='npu_sleep', device_busy_cycles=args.device_busy_cycles,
+                per_iteration_all_reduce=False,
                 per_iteration_rank_align='all_reduce_async_wait',
                 perf_enabled=not args.skip_perf_test, world_size=world,
                 local_world_size=int(os.environ.get('LOCAL_WORLD_SIZE',args.num_processes)),
@@ -117,7 +118,7 @@ def comparison_metadata(args, world, m):
                 routing=routing_metadata(world, args.num_tokens, args.num_experts, args.seed, args.route),
                 route_sha256=getattr(args, 'sample_route_sha256', None),
                 warmup=args.warmup, num_iters=args.num_iters, perf_tail=args.perf_tail,
-                delay_rows=args.delay_rows, delay_cols=args.delay_cols, group_backend=args.group_backend,
+                group_backend=args.group_backend,
                 timer_mode=('reference' if getattr(args, 'll_reference_profile', False) else args.ll_timer_mode) if diagnostic_requested(args) else None,
                 timer_iters=args.ll_timer_iters if diagnostic_requested(args) else 0,
                 frequency_hz=args.ll_timer_frequency_hz, stage_capture=args.ll_stage_timer,
@@ -213,13 +214,11 @@ def make_parser():
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument("--skip-perf-test", action="store_true")
     parser.add_argument("--test-first-only", action="store_true")
-    parser.add_argument("--delay-rows", type=int, default=118260)
-    parser.add_argument("--delay-cols", type=int, default=30720)
     parser.add_argument(
-        "--delay-exp-before", type=int, default=None, help="Compatibility: only 100 is accepted; fixed Exp prefix once per batch"
-    )
-    parser.add_argument(
-        "--delay-exp-after", type=int, default=None, help="Compatibility: zero post-call Exp"
+        "--device-busy-cycles",
+        type=int,
+        default=DEVICE_BUSY_CYCLES,
+        help="torch.npu._sleep cycles enqueued before each batch; calibrate on the target host",
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--num-iters", type=int, default=100)
@@ -447,7 +446,6 @@ def parse_args(argv=None):
     tail_explicit = any(option == "--perf-tail" or option.startswith("--perf-tail=") for option in configured + argv)
     if not tail_explicit:
         args.perf_tail = min(args.perf_tail, args.num_iters)
-    resolve_delay_counts(args)
     if args.shmem_port is not None:
         if not 0 < args.shmem_port < 65536:
             raise ValueError("Invalid shmem_port")
@@ -476,14 +474,7 @@ def launch_config(args, environ):
     return nodes * args.num_processes, node * args.num_processes, None
 
 
-def resolve_delay_counts(args):
-    for name, default in (("delay_exp_before", EXP_PREFIX_REPEATS), ("delay_exp_after", 0)):
-        if getattr(args, name) is None:
-            setattr(args, name, default)
-
-
 def validate_args(args, world):
-    resolve_delay_counts(args)
     if any(isinstance(getattr(args, key), list) for key in MATRIX_FIELDS):
         capacities = []
         for case in matrix_cases(args):
@@ -526,10 +517,8 @@ def validate_args(args, world):
         raise ValueError("num-cpu-timeout-secs must be in [1,300]")
     if not (2 << 20) <= args.num_bytes <= (32 << 30) or args.num_bytes % (2 << 20):
         raise ValueError("num-bytes must be 2 MiB aligned and between 2 MiB and 32 GiB")
-    if args.delay_rows <= 0 or args.delay_cols <= 0 or min(args.delay_exp_before, args.delay_exp_after) < 0:
-        raise ValueError("Delay tensor dimensions must be positive and exp counts nonnegative")
-    if (args.delay_exp_before, args.delay_exp_after) != (EXP_PREFIX_REPEATS, 0):
-        raise ValueError("Reference profiler requires fixed batch delay-exp-before=100 and delay-exp-after=0; remove old per-iteration delay flags")
+    if not 1 <= args.device_busy_cycles <= 100_000_000_000:
+        raise ValueError("device-busy-cycles must be a positive cycle count")
     if not 0 <= args.perf_tail <= args.num_iters:
         raise ValueError("Require 0 <= perf-tail <= num-iters")
     if args.output and Path(args.output).exists():
@@ -862,11 +851,14 @@ def record_case_progress(args, rank, m, mode, phase, error=None):
         print("[LL ST] " + json.dumps(entry, ensure_ascii=False), flush=True)
 
 
-def enqueue_exp_prefix(delay):
-    """Queue the fixed batch prefix, without a host wait or collective after it."""
+def enqueue_device_busy(cycles):
+    """Queue the batch prefix without a host wait or a following collective.
+
+    torch.npu._sleep spins the device for the given cycles, the NPU counterpart
+    of torch.cuda._sleep: it absorbs Host launch overhead without touching HBM.
+    """
     import torch
-    for _ in range(EXP_PREFIX_REPEATS):
-        torch.exp(delay, out=delay)
+    torch.npu._sleep(cycles)
 
 
 def measure(invoke, args, operation, profile_dir, progress=None, after_profile=None):
@@ -880,7 +872,6 @@ def measure(invoke, args, operation, profile_dir, progress=None, after_profile=N
         progress(f"{operation}.warmup")
     completion_boundary(args)
     Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    delay = torch.zeros(args.delay_rows, args.delay_cols, dtype=torch.float32, device="npu")
     alignment = torch.ones(1, dtype=torch.float32, device=control_device(args, torch))
     dist.all_reduce(alignment, op=dist.ReduceOp.SUM, async_op=False)
     with torch_npu.profiler.profile(
@@ -898,7 +889,7 @@ def measure(invoke, args, operation, profile_dir, progress=None, after_profile=N
         torch.npu.synchronize()
         # Submit the padding while the profiler is still in its warmup step.
         # Do not synchronize after it: Host should enqueue the active batch.
-        enqueue_exp_prefix(delay)
+        enqueue_device_busy(args.device_busy_cycles)
         profiler.step()
         for _ in range(args.num_iters): 
             output = invoke()
@@ -907,8 +898,8 @@ def measure(invoke, args, operation, profile_dir, progress=None, after_profile=N
         profiler.step()
     if after_profile is not None:
         # Append diagnostics only after profiler closes, before parsing/filesystem work.
-        after_profile(delay, alignment)
-    del output, delay, alignment
+        after_profile()
+    del output, alignment
     if progress:
         progress(f"{operation}.read_profile")
     samples = []
@@ -949,7 +940,7 @@ def new_stage_trace(buffer, operation, args, rank):
 
 
 def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
-                     *, prepared=None, prelude_buffers=None):
+                     *, prepared=None, after_perf=False):
     """Sample a stabilized tail, retaining outputs/timers until all launches finish."""
     reference = bool(getattr(args, 'll_reference_profile', False))
     if reference:
@@ -970,23 +961,21 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
             for _ in range(args.ll_timer_iters):
                 prepared.append(new_stage_trace(buffer, operation, args, rank))
         agree_check(allocate, args, rank)
-    after_perf = prelude_buffers is not None
+    after_perf = bool(after_perf)
     if not after_perf:
         completion_boundary(args)
-        delay = torch.zeros(args.delay_rows, args.delay_cols, dtype=torch.float32, device='npu')
         alignment = torch.ones(1, dtype=torch.float32, device=control_device(args, torch))
         dist.all_reduce(alignment, op=dist.ReduceOp.SUM, async_op=False)
         for _ in range(args.warmup):
             output = invoke()
         torch.npu.synchronize()
-        enqueue_exp_prefix(delay)
+        enqueue_device_busy(args.device_busy_cycles)
         for _ in range(args.num_iters):
             output = invoke()
     else:
-        delay, alignment = prelude_buffers
         # Profiler export can leave an idle gap. Prefix the diagnostic batch
         # once, sharing the original startup all_reduce, not adding another.
-        enqueue_exp_prefix(delay)
+        enqueue_device_busy(args.device_busy_cycles)
     pending = []
     for iteration, trace in enumerate(prepared):
         with capture(buffer, operation, capture_mode, args.ll_timer_frequency_hz,
@@ -1005,14 +994,15 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
                         routing=routing_metadata(world, args.num_tokens, args.num_experts, args.seed, mode),
                         correctness="passed", config={**case_config(args, m),
                         "logical_group_size": logical_group},
-                        protocol="initial scalar all_reduce; fixed Exp100 batch prefix; per-call async all_reduce+wait rank alignment; deferred validation/export; excluded from profiler",
+                        protocol="initial scalar all_reduce; npu sleep batch prefix; per-call async all_reduce+wait rank alignment; deferred validation/export; excluded from profiler",
                         sampling=dict(after_perf=after_perf, warmup=args.warmup, settle_iters=args.num_iters,
-                                      diagnostic_iters=args.ll_timer_iters, delay_rows=args.delay_rows,
-                                      delay_cols=args.delay_cols, group_backend=args.group_backend,
-                                      sampling_protocol=SAMPLING_PROTOCOL, exp_prefix_repeats=EXP_PREFIX_REPEATS,
+                                      diagnostic_iters=args.ll_timer_iters,
+                                      device_busy='npu_sleep', device_busy_cycles=args.device_busy_cycles,
+                                      group_backend=args.group_backend,
+                                      sampling_protocol=SAMPLING_PROTOCOL,
                                       prefix_before='diagnostic_capture' if after_perf else 'settle_batch',
                                       initial_all_reduce='shared_with_perf' if after_perf else 'before_warmup',
-                                      per_iteration_exp=0, per_iteration_all_reduce=False,
+                                      per_iteration_all_reduce=False,
                                       per_iteration_rank_align='all_reduce_async_wait',
                                       expert_timer=bool(getattr(args,'ll_expert_timer',False)),
                                       reference_profile=reference))
@@ -1030,17 +1020,17 @@ def sample_operation(buffer, invoke, check, args, operation, rank, m, mode, prog
             for _ in range(args.ll_timer_iters):
                 prepared.append(new_stage_trace(buffer, operation, args, rank))
         agree_check(allocate, args, rank)
-    def diagnostic(delay=None, alignment=None):
+    def diagnostic(after_perf):
         diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode, prepared=prepared,
-                         prelude_buffers=None if delay is None else (delay, alignment))
+                         after_perf=after_perf)
     if args.skip_perf_test:
         if diagnostic_requested(args):
             progress(f'{operation}.diagnostic')
-            diagnostic()
+            diagnostic(after_perf=False)
         return None
     profile = Path(args.run_directory) / f'case_{args.case_id:05d}' / mode / operation / f'rank_{rank:03d}'
     return measure(invoke, args, operation, profile, progress,
-                   after_profile=diagnostic if diagnostic_requested(args) else None)
+                   after_profile=(lambda: diagnostic(after_perf=True)) if diagnostic_requested(args) else None)
 
 
 def run_case(buffer, args, rank, world, m, mode):
@@ -1454,8 +1444,9 @@ def main(argv=None):
             {"case_id": i, **case_config(case, validate_args(case, world))} for i, case in enumerate(matrix_cases(args))
         ]
         print(json.dumps({"world_size": world, "case_count": len(cases), "cases": cases,
-                          "sampling": dict(protocol=SAMPLING_PROTOCOL, exp_prefix_repeats=EXP_PREFIX_REPEATS,
-                                           per_iteration_exp=0, per_iteration_all_reduce=False,
+                          "sampling": dict(protocol=SAMPLING_PROTOCOL, device_busy='npu_sleep',
+                                           device_busy_cycles=args.device_busy_cycles,
+                                           per_iteration_all_reduce=False,
                                            per_iteration_rank_align='all_reduce_async_wait')}, indent=2))
         return
     configure_endpoints(args, os.environ)

@@ -58,7 +58,7 @@ combine partial的远端任务集中给4个核后，某核任务数可能超过�
 
 仍为dispatch的29项阶段、每核64word；没有新增clock、逐包打点或业务屏障。`w38`之前包含归属计划构造，`w38→w39`包含跨机归属发送及原机内发送。协议12的`w43`记录本核source路由/元数据任务数加实际分配的remote packet任务数，用于识别没有原token分片但确有远端发送工作的核。它是工作量计数，不是去重后全局包数；原始word名称暂保留`send_route_count`，不能与协议11的该计数直接等同。
 
-协议、源码、负载构造和QP数都写入运行身份。默认负载仍为 `balanced-rank-distinct-roundrobin-v1`；采样仍为 `initial-reduce-exp100-batch-v3`。阶段为ON诊断，完整OFF profiler task才用于性能结论。
+协议、源码、负载构造和QP数都写入运行身份。默认负载仍为 `balanced-rank-distinct-roundrobin-v1`；采样仍为 `initial-reduce-sleep-batch-v4`。阶段为ON诊断，完整OFF profiler task才用于性能结论。
 
 ## 5. 本地检查与目标机命令
 

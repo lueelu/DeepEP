@@ -53,7 +53,7 @@ fi
 不是参考文件中的 EP64 实验。去掉 `--tokens 1 --dtype fp8` 将按入口默认 B8、
 BF16和预量化FP8分别运行，不把不同dtype/shape合成一个表。
 `--reference-iters` 控制独立诊断轮数，默认1；10次预热和100次稳定调用后再采集，
-批次开始只做一次all_reduce；预热并同步后固定100次Exp，再连续稳定调用和capture，算子之间不插入采样all_reduce/Exp。当前采样协议为initial-reduce-exp100-batch-v3，
+批次开始只做一次all_reduce；预热并同步后调用一次`torch.npu._sleep`，再连续稳定调用和capture，算子之间不插入采样all_reduce/sleep。当前采样协议为initial-reduce-sleep-batch-v4，
 不把参考 ZIP 或历史表格的 50 轮/尾30当作本入口的采样配置。
 
 所有节点都须参与运行；脚本不通过 SSH 启动另一机。每机解析本机16个 global ranks，

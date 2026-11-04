@@ -92,9 +92,9 @@ Git checkout中只纳入已跟踪测试文件，其他分支遗留的未跟踪�
 实际构建目录中的源码/头文件仍完整计入。根目录的 `core` 文件从未参与该指纹。
 
 默认reference模式：reference ON wheel，10次预热、100次稳定调用、1轮独立capture。
-每个批次只在开始做一次all_reduce；预热后固定100次Exp，再连续稳定调用和capture。
+每个批次只在开始做一次all_reduce；预热后提交一次`torch.npu._sleep`（`--device-busy-cycles`，默认13200000000，即1_650_000_000×8），再连续稳定调用和capture。
 每次 dispatch/combine 调用前另插入一次标量 all_reduce（异步 + wait）拉齐快慢卡，开销计入每次调用，
-因此数值是对齐后的时延而非纯 kernel 时间。默认Exp缓冲约13.53GiB/卡，此模式不运行正式profiler。
+因此数值是对齐后的时延而非纯 kernel 时间。此模式不运行正式profiler。
 
 结果目录：`results/ll-ndr/<run名>-reference/`。
 每机的报告在其下`table-analysis/`，统一打开`stage-times.xlsx`；多个case按sheet前缀区分，

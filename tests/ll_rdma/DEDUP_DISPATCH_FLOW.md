@@ -752,12 +752,12 @@ count tensor属性保持None；实际T以send_counts末值为准。
 
 ## 16 当前采样与打点入口
 
-当前ST采样协议为`initial-reduce-exp100-batch-v3`：每个操作的采样批次只在开始做一次all_reduce；
-预热并同步后，在进入active的profiler.step之前固定100次Exp，然后连续调用算子，循环内无采样
-Exp/all_reduce。默认10预热、100采集、每rank尾50；算子内部必要复用协调保持。
+当前ST采样协议为`initial-reduce-sleep-batch-v4`：每个操作的采样批次只在开始做一次all_reduce；
+预热并同步后，在进入active的profiler.step之前调用一次`torch.npu._sleep(--device-busy-cycles)`，
+然后连续调用算子，循环内无采样sleep/all_reduce。默认10预热、100采集、每rank尾50；算子内部必要复用协调保持。
 
-独立timer/reference同样为初始all_reduce、预热、100次Exp、连续稳定调用和capture。
-若perf后追加打点，则另排一次100次Exp前缀，共用perf初始all_reduce；不混入正式perf统计。
+独立timer/reference同样为初始all_reduce、预热、一次npu sleep、连续稳定调用和capture。
+若perf后追加打点，则另排一次npu sleep前缀，共用perf初始all_reduce；不混入正式perf统计。
 `--mode reference`只测LL dispatch、默认1轮capture，并导出29阶段逐核表；该表是核内cycle，
 不能替代完整OFF profiler task时间。旧timer/reference与新采样协议的结果不可直接同条件A/B。
 

@@ -102,8 +102,8 @@ def test_native_st_reference_schedule(monkeypatch,tmp_path,with_tail):
     dist=SimpleNamespace(all_reduce=lambda *a,**k:calls.append('reduce'),barrier=lambda:calls.append('barrier'),
                          ReduceOp=SimpleNamespace(SUM=0),get_rank=lambda:0,get_world_size=lambda:1,all_gather_object=gather)
     torch=SimpleNamespace(float32=0,zeros=lambda *a,**k:Tensor(),ones=lambda *a,**k:Tensor(),
-                          npu=SimpleNamespace(synchronize=lambda:calls.append('sync')),distributed=dist,
-                          exp=lambda *a,**k:calls.append('exp'))
+                          npu=SimpleNamespace(synchronize=lambda:calls.append('sync'),
+                                              _sleep=lambda cycles:calls.append('sleep')),distributed=dist)
     npu=SimpleNamespace(profiler=SimpleNamespace(profile=profile,schedule=lambda **kw:kw,
         tensorboard_trace_handler=lambda path:None,_ExperimentalConfig=lambda **kw:kw,
         AiCMetrics=SimpleNamespace(PipeUtilization=0),ProfilerLevel=SimpleNamespace(Level1=0),
@@ -115,9 +115,9 @@ def test_native_st_reference_schedule(monkeypatch,tmp_path,with_tail):
     st.kernel_durations=lambda *args:calls.append('parse') or [1.0]*100
     args=st.parse_args([])
     assert (args.warmup,args.num_iters,args.perf_tail)==(10,100,50)
-    tail=(lambda delay,alignment:calls.append('tail')) if with_tail else None
+    tail=(lambda:calls.append('tail')) if with_tail else None
     st.measure(lambda:calls.append('invoke'),args,'dispatch',tmp_path,after_profile=tail)
-    assert calls==['reduce']+['invoke']*10+['sync']+['exp']*100+['step']+['invoke']*100+['barrier','sync','step','profile_closed']+(['tail'] if with_tail else [])+['parse']
+    assert calls==['reduce']+['invoke']*10+['sync']+['sleep']+['step']+['invoke']*100+['barrier','sync','step','profile_closed']+(['tail'] if with_tail else [])+['parse']
 
 
 def test_moved_checkout_with_spaces_and_other_cwd(tmp_path):

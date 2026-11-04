@@ -41,19 +41,18 @@ def test_attribute_and_function_group_queries():
         with pytest.raises(RuntimeError):st.compiled_group(SimpleNamespace(low_latency_ranks_per_group=bad),16)
 
 
-@pytest.mark.parametrize('key,value',[('active_aiv',64),('seed',2),('delay_rows',1),
+@pytest.mark.parametrize('key,value',[('active_aiv',64),('seed',2),('device_busy_cycles',40_000_000),
                                     ('timer_mode','drain'),('stage_timer',False),('perf_enabled',False),('num_iters',50)])
 def test_mismatched_experiments_cannot_report_speedup(key,value):
     left,right=reports();right['comparison'][key]=value
     with pytest.raises(ValueError,match='Incomparable'):comparison.compare(left,right,'stage')
 
 
-def test_old_per_iteration_reduce_cannot_be_compared_with_exp100_batch():
+def test_old_per_iteration_reduce_cannot_be_compared_with_sleep_batch():
     left, right = reports()
     left['comparison']['sampling_protocol'] = 'exp-reduce-stable-tail-v2'
-    for key in ('exp_prefix_repeats', 'per_iteration_exp', 'per_iteration_all_reduce'):
-        left['comparison'].pop(key)
-    assert right['comparison']['sampling_protocol'] == 'initial-reduce-exp100-batch-v3'
+    assert right['comparison']['sampling_protocol'] == 'initial-reduce-sleep-batch-v4'
+    assert left['comparison']['device_busy_cycles'] == right['comparison']['device_busy_cycles']
     with pytest.raises(ValueError, match='sampling_protocol'):
         comparison.compare(left, right, 'stage')
 

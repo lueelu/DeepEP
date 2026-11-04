@@ -158,7 +158,7 @@ normal 全 rank 通过后，将 `--route normal` 改为 `--route hotspot` 再执
 
 打点额外构建 `DEEPEP_LL_STAGE_TIMER=ON`，运行增加 `--ll-stage-timer --ll-timer-iters 5 --ll-timer-mode observe --skip-perf-test`；见 [打点指南](../ll_stage_timer/README.md)。metadata 记录实际选定 G。机内 send_issue 为 MTE 下发区间；跨机 send_issue 包含对称暂存和两次 quiet，不能混称纯网络时间。
 
-正式基线重建 timer OFF，正确性通过后移除 `--skip-perf-test`。保持 10 warmup、100 capture、批次初始一次all_reduce，预热后在active profiler.step前固定100次Exp，采样循环内无Exp/all_reduce，每 kernel/task 最后 50 条独立统计。Exp 默认 118260×30720 FP32（约 13.53GiB/卡）。Event/API 与 kernel 时间分开；原语和 stage timer 不替代正式性能。比较时记录实际 G/key、核数、shape、page policy 和负载；G 可由用户作为实验变量，无匹配实测不报告加速。
+正式基线重建 timer OFF，正确性通过后移除 `--skip-perf-test`。保持 10 warmup、100 capture、批次初始一次all_reduce，预热后在active profiler.step前提交一次`torch.npu._sleep`（`--device-busy-cycles`，默认13200000000，即1_650_000_000×8），采样循环内无sleep/all_reduce，每 kernel/task 最后 50 条独立统计。Event/API 与 kernel 时间分开；原语和 stage timer 不替代正式性能。比较时记录实际 G/key、核数、shape、page policy 和负载；G 可由用户作为实验变量，无匹配实测不报告加速。
 
 回传所有主机的 Git SHA、SDK manifest、构建开关/ABI、G/key、实际 AIV、物理 rank 分布、环境前检、原语日志、完整 LL cases/summary/progress/loaded-library hashes、原始 profiler task/trace/样本及实际命令。A5 结果只说明可运行性；跨机 RDMA 写、完整 LL 和性能仍由目标机验收。
 
