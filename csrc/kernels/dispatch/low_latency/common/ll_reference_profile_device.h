@@ -50,7 +50,7 @@ public:
     }
     template <uint32_t Word> __aicore__ inline void Value(uint64_t value)
     {
-        static_assert(Word <= 21U || (Word >= 24U && Word <= 43U) || Word == 57U,
+        static_assert(Word <= 21U || (Word >= 24U && Word <= 47U) || Word == 57U,
                       "reference point/counter index");
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
         if (!record_) return;

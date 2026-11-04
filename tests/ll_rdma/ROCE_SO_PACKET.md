@@ -62,7 +62,7 @@ H3584/K8预量化FP8 dispatch仍为4096B包，去掉额外32B gate传输；BF16 
 
 旧timer schema3的`send_rdma_body_post`现在包含整个packet；`body_wait`为消息源/CQ完成等待。
 `flag_post/flag_wait`在这些packet路径不再有记录，不能把缺失阶段当成单独的性能收益。
-reference的29项边界不变，其“尾batch收尾”包含新的消息quiet。
+reference原有29项边界不变（新增w44–w47四个计数延迟探针后共33项），其“尾batch收尾”包含新的消息quiet。
 
 ## 范围和部署
 

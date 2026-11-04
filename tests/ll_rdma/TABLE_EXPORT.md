@@ -13,7 +13,7 @@ reference左侧依次为Rank、核号、收发角色、任务数、核总耗时�
 timer及相关均值/调用次数/明细sheet同步精简，并冻结已有身份字段、任务数和kernel列；
 timer未记录任务数时不补造该列。原始Cycle冻结保留的身份字段，不将原始word伪称核总耗时。
 run/case和选轮信息仍在采样汇总中，原始JSON及CSV保留完整字段供追溯，多轮长表Excel省略轮次后应回查CSV。
-合并stage-times.xlsx继承同样的布局。reference保留实际29阶段及中文标签；
+合并stage-times.xlsx继承同样的布局。reference保留实际33阶段及中文标签；
 timer使用其实际累计阶段，不用缺失的参考时点拼出29阶段。默认模式为reference；旧timer仅用于历史结果离线解析。
 perf模式没有逐核诊断数据，不生成虚构的阶段表。没有OFF对照数据时使用“采样汇总”，不宣称性能对照。
 

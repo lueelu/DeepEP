@@ -281,7 +281,7 @@ def export_workbook(output_path, report, selected_saved, timer):
     definitions += [
         ['有效性', 'w58 valid_mask', '未执行点mask未置位且word为0；执行时刻或累计为0仍保留有效位。'],
         ['任务 / 次数', '发送任务w43；接收任务w37；packet batch w41', 'w33/w34的calls对应w41批次数，不是packet总数。'],
-        ['原始精度', '超过15位整数保存为文本', 'BO列起保留Python整数域作差得到的29项ticks；大时钟公式引用这些差值，避免Excel大数消减。'],
+        ['原始精度', '超过15位整数保存为文本', 'BO列起保留Python整数域作差得到的33项ticks；大时钟公式引用这些差值，避免Excel大数消减。'],
         ['核时钟', '仅同核相减', '不做跨rank绝对时钟对齐；不从嵌套阶段之和推算总时长。'],
         ['NDR边界', '参考阶段命名保留', '同名SendCnt包含当前NDR已有路由交换；payload提交可能包含RDMA post/quiet；不移植参考业务逻辑。'],
         ['接收批次', '标量累计两段', '只对完整ready批次和加载消费区间累计，不对每次空扫描插点。'],

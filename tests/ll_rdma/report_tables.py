@@ -78,7 +78,7 @@ def native_workbook(output, report, selected, timer):
                ['配置', json.dumps(report.get('configurations', {}), ensure_ascii=False)],
                ['采样', json.dumps(report.get('sampling'), ensure_ascii=False)]]
     definitions = [['阶段换算', '累计ticks / 每µs cycles'], ['每µs cycles', frequency/1e6 if frequency else None],
-                   ['格式', f"stage schema {report['schema']}；与reference的29阶段不是同一打点布局"],
+                   ['格式', f"stage schema {report['schema']}；与reference的33阶段不是同一打点布局"],
                    ['缺失与零', '空白=无记录；0=已执行且累计为0。calls页记录选轮调用次数。'],
                    ['阶段标签', '含义']]
     definitions += [[s, '累计区间；可能与父子阶段嵌套，不能求和'] for s in stages]

@@ -45,7 +45,7 @@ LL生产轮询不使用GetSystemCycle，锁定SHMEM SDK保持原实现。
 
 两机各一条命令的构建/测试/本机解析入口见 [ONE_CLICK.md](ONE_CLICK.md)：
 `bash tests/ll_rdma/one_click.sh NODE_RANK MASTER_IP RUN_NAME`，默认ON诊断，`--mode perf`为OFF性能。
-只测LL dispatch、按参考29阶段记录并导出逐核Excel，使用 `--mode reference`，见
+只测LL dispatch、按参考33阶段记录并导出逐核Excel，使用 `--mode reference`，见
 [参考式逐核打点](../ll_reference_profile/README.md)。该构建关闭旧stage/expert计时。
 timer/reference结束后统一输出`RUN_DIR/table-analysis/stage-times.xlsx`，全部case合为多sheet；
 `stages.csv`改为单轮每核一行、阶段为列。已有样本可通过`one_click.sh --analyze-only`重导出，

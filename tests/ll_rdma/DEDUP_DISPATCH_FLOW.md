@@ -758,7 +758,7 @@ count tensor属性保持None；实际T以send_counts末值为准。
 
 独立timer/reference同样为初始all_reduce、预热、一次npu sleep、连续稳定调用和capture。
 若perf后追加打点，则另排一次npu sleep前缀，共用perf初始all_reduce；不混入正式perf统计。
-`--mode reference`只测LL dispatch、默认1轮capture，并导出29阶段逐核表；该表是核内cycle，
+`--mode reference`只测LL dispatch、默认1轮capture，并导出33阶段逐核表；该表是核内cycle，
 不能替代完整OFF profiler task时间。旧timer/reference与新采样协议的结果不可直接同条件A/B。
 
 目前reference会在正确性多轮检查后恢复声明seed并记录实际路由指纹；perf/旧timer仍沿用最后一轮

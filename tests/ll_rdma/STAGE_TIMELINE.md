@@ -21,7 +21,7 @@
 ```mermaid
 flowchart TD
   s0["w0 入口 → w1 配置完成 → w2 magic开始"] --> s1["w3 magic结束 → w4 counts.Init结束 → w5 sender.Init结束"]
-  s1 --> s2["w6 SendCnt开始 → w7 计数统计/发送提交结束"]
+  s1 --> s2["w6 SendCnt开始 → w7 计数统计/发送提交结束；远端帧w44首帧/w45末帧"]
   s2 --> s3["w8 Sender.Process开始，跨机路径先规划peer核归属并记录w43"]
   s3 --> empty{"本核有发送任务？"}
   empty -->|有| s4["完成lane与flag准备 → w38"]
@@ -33,6 +33,8 @@ flowchart TD
   s8 --> s9["退出kernel对象作用域 → w57 Finish开始 → 诊断记录发布"]
 ```
 
+`w44` 与 `w45` 位于 `w6→w7` 内的远端 count 帧循环：前者是本核首帧提交完成，后者是本核步长内末帧提交完成，用于区分“首帧延迟”和“逐帧下发跨度”。两帧均在 `retirement_.Posted` 之后取时，只额外增加两次 scalar 打点；仅 `DEEPEP_LL_REFERENCE_PROFILE` 生效，不改变发送协议。
+
 `sender = w9-w8` 包含三段 `w38-w8`、`w39-w38`、`w40-w39`，还包含 `w9-w40` 的返回间隙。w39之前的发送循环可能已经执行满批次 Flush；最后未满的 RDMA 批次在 w39→w40 中完成。协议12的w43为本核source路由/元数据任务数加实际remote packet任务数，不能当作全局网络包数；原token分片为空时仍可能有远端任务，须先规划后判空。跨机归属计划包含在w8→w38，8核轮转发送包含在w38→w39。
 
 ### 2.2 R 核
@@ -40,7 +42,7 @@ flowchart TD
 ```mermaid
 flowchart TD
   r0["w0 → w1 → w2 → w3 → w4 → w5：公共初始化，最后为receiver.Init"] --> r1["w6 SendCnt → w7"]
-  r1 --> r2["w10 RecvCnt开始：其中w24→w25为ready轮询；w11结束"]
+  r1 --> r2["w10 RecvCnt开始：其中w24→w25为ready轮询（w46首次ready、w47首轮扫描）；w11结束"]
   r2 --> r3["w12 CalcCumsum开始：其中w26→w27为GetCumSum汇合；w13结束"]
   r3 --> r4["w14 CompleteCumsum开始：其中w28→w29等待前缀ready；w15结束"]
   r4 --> r5["w16 → 原有PIPE_ALL → w17"]
@@ -56,6 +58,8 @@ flowchart TD
   empty -->|无，w33/34/41为0，无w32/35/36/42| r10
   r10 --> r11["w20 Counts.Finish → PIPE_ALL / CTRL恢复 → w21 → w57 → 诊断发布"]
 ```
+
+`w46` 是轮询中首次观测到非零 ready 汇总的时刻，`w47` 是首轮 MTE2/V_S 扫描完成的时刻；`w46-w10` 描述 count 数据到达延迟，`w47-w24` 描述单轮扫描开销，两者都落在 `w24→w25` 内。它们同样是可选点：核心无分配专家时轮询不执行，解析器按缺失处理。
 
 计数任务分配与 payload 任务分配不同；w24/25、w26/27、w28/29是按实际执行路径出现的可选成对点，不能由 w37 推断其必然存在。每个 ready 批次只有三个 clock，空扫描和逐 packet 没有额外打点。w33/w34覆盖循环内的两个累计区间；`w35-w32`还包括循环管理、打点开销、lane回收和清标记提交。`w42-w32`是首批等待，已经包含在整个接收循环中，不能再加一次。
 
@@ -105,6 +109,10 @@ flowchart TD
 | w41 | `receive_probe_batch_count` | 计数 |
 | w42 | `first_packet_ready` | 时间戳 |
 | w43 | `send_route_count` | 计数 |
+| w44 | `send_count_first_frame_issued` | 时间戳 |
+| w45 | `send_count_last_frame_issued` | 时间戳 |
+| w46 | `recv_count_first_ready` | 时间戳 |
+| w47 | `recv_count_poll_first_iter_end` | 时间戳 |
 | w50 | `rank` | 身份/有效性元数据 |
 | w51 | `AIV_core` | 身份/有效性元数据 |
 | w52 | `EP` | 身份/有效性元数据 |
@@ -129,7 +137,7 @@ flowchart TD
 
 ## 3. core_stage_timings.xlsx 每列对应哪一段
 
-每个case的 `core_stage_timings.xlsx` 保留，run级 `stage-times.xlsx` 将各case合为多sheet。逐核耗时默认选择末次capture，每个rank/core一行；多轮均值独立列在均值页/CSV。以下与解析器 `STAGE_INFO` 的29列一一对应；公式以1GHz为例。任务数列S取w43，R取w37。
+每个case的 `core_stage_timings.xlsx` 保留，run级 `stage-times.xlsx` 将各case合为多sheet。逐核耗时默认选择末次capture，每个rank/core一行；多轮均值独立列在均值页/CSV。以下与解析器 `STAGE_INFO` 的33列一一对应；公式以1GHz为例。任务数列S取w43，R取w37。
 
 | CSV阶段 / Excel列名 | 微秒公式 | 覆盖内容 | 层级 |
 |---|---|---|---|
@@ -162,10 +170,14 @@ flowchart TD
 | `send_packets` / 路由/packet 发送提交 | `(w39-w38)/1000` | 协议12跨机8核归属发送及 SendWithDedup / SendWithoutDedup 机内发送，包含已有 lane 依赖 | 发送 payload/元数据完成的细分 |
 | `send_drain_metadata` / 发送 drain/元数据完成 | `(w40-w39)/1000` | 尾 RDMA batch Flush（消息完成quiet）、lane 回收、source metadata 写回及已有 MTE3_S；无尾批次时不执行 Flush | 发送 payload/元数据完成的细分 |
 | `recv_first_packet` / 首次 packet 就绪等待 | `(w42-w32)/1000` | 接收缓冲准备完至首个 packet batch ready | 接收 payload 完成的细分 |
+| `send_count_first_frame` / 远端计数首帧下发 | `(w44-w6)/1000` | SendCnt 开始至本核首个远端 count 帧提交完成 | 计数统计/发送提交的细分 |
+| `send_count_last_frame` / 远端计数逐帧下发跨度 | `(w45-w44)/1000` | 本核首个远端 count 帧提交完成至本核末个远端帧提交完成 | 计数统计/发送提交的细分 |
+| `recv_count_arrive` / 计数 ready 首次到达 | `(w46-w10)/1000` | RecvCnt 开始至首次观测到非零 ready 汇总 | 计数接收/归约的细分 |
+| `recv_count_poll_iter` / 首轮 ready 轮询 | `(w47-w24)/1000` | ready 轮询开始至首轮 MTE2/V_S 扫描完成 | 计数 ready 轮询的细分 |
 
 ## 4. 为什么阶段相加不等于核总耗时
 
-`kernel=(w21-w0)` 是总区间，`before_finalize=(w57-w0)` 是另一总区间，二者不能相加；父阶段与细分阶段重复覆盖。公共主阶段之间仍有 w5→w6、w7→角色入口以及各函数返回/下个调用之间的间隙。对同一capture、同一核，可以按图中真实顺序插入这些间隙，使所有相邻时间差望远镜求和得到 w21-w0；不能把29列直接SUM。
+`kernel=(w21-w0)` 是总区间，`before_finalize=(w57-w0)` 是另一总区间，二者不能相加；父阶段与细分阶段重复覆盖。公共主阶段之间仍有 w5→w6、w7→角色入口以及各函数返回/下个调用之间的间隙。对同一capture、同一核，可以按图中真实顺序插入这些间隙，使所有相邻时间差望远镜求和得到 w21-w0；不能把33列直接SUM。
 
 R核的 `receiver` 包含前缀加载、任务构建、缓冲准备、循环清理、最终drain及函数返回间隙；w33/w34、首次就绪等待都是其中子区间。S核的 sender 三段边界已在2.1说明。未执行的点不能补造时间，必要点缺失由解析器报错。
 
@@ -175,4 +187,4 @@ R核的 `receiver` 包含前缀加载、任务构建、缓冲准备、循环清�
 
 两台目标机拉取同一提交后正常运行 `one_click.sh`，默认重编reference完整wheel；不要对旧wheel使用 `--skip-build`。`--reference-iters N` 控制capture轮数；`--mode perf` 仍测试完整dispatch+BF16 combine。SDK、launch结构大小、采样协议initial-reduce-sleep-batch-v4保持不变；当前通信协议14，详见[路由SO与8QP](ROCE_SO_ROUTE_8QP.md)。
 
-旧timer结果仅保留离线解码支持，可用 `one_click.sh --analyze-only RUN_DIR --output-dir NEW_DIR`。历史47阶段不是当前29阶段，不能跨格式直接A/B。
+旧timer结果仅保留离线解码支持，可用 `one_click.sh --analyze-only RUN_DIR --output-dir NEW_DIR`。历史47阶段不是当前33阶段，不能跨格式直接A/B。

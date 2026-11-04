@@ -222,6 +222,9 @@ __aicore__ inline void ServerDedupCounts::SendCnt()
     SyncFunc<HardEvent::MTE2_V>();
     if (remoteOwner) {
         auto remoteFrame = workBuf_.Get<int32_t>();
+#ifdef DEEPEP_LL_REFERENCE_PROFILE
+        uint32_t firstFrameIssued = 0U;
+#endif
         for (uint32_t task = aivId_; task < epWorldSize_ - kLlPhysicalRanksPerHost; task += coreNum_) {
             const uint32_t destination = CountRemotePeer(epRankId_, epWorldSize_, task);
             const uint32_t first = destination * moeExpertNumPerRank_;
@@ -232,6 +235,14 @@ __aicore__ inline void ServerDedupCounts::SendCnt()
             LlTransport::DirectCountFrame(args_, destination, stateOffset_ + frame.frameOffset,
                 remoteFrame.ReinterpretCast<uint8_t>(), moeExpertNumPerRank_, dstExpBuf_.Get<uint8_t>(), countWindow_);
             retirement_.Posted(task);
+#ifdef DEEPEP_LL_REFERENCE_PROFILE
+            if (profile_) {
+                if (!firstFrameIssued) { profile_->Mark<44>(); firstFrameIssued = 1U; }  // w44: send_count_first_frame_issued
+                // Only the last frame of this core's stride gets a clock so the
+                // per-frame post cost is not inflated by repeated scalar stores.
+                if (task + coreNum_ >= epWorldSize_ - kLlPhysicalRanksPerHost) profile_->Mark<45>();  // w45: send_count_last_frame_issued
+            }
+#endif
             // Source GM slots are disjoint. Acquire the SDK's retired UB scratch
             // before the next Vector pass; no network completion wait here.
             SyncFunc<HardEvent::S_V>();
@@ -622,6 +633,9 @@ __aicore__ inline void ServerDedupCounts::WaitDispatch()
                                static_cast<uint16_t>(CNT_GM_STRIDE_BLOCKS - 1U), 0};
     SyncFunc<AscendC::HardEvent::S_V>();
     if (profile_) profile_->Mark<24>();  // w24: count_ready_poll_begin
+#ifdef DEEPEP_LL_REFERENCE_PROFILE
+    uint32_t firstReadySeen = 0U, firstIterDone = 0U;
+#endif
     while (sumOfFlag != compareTarget) {
         if (packedFrames_) {
             ReadCountFrames(statusFp32Tensor_, windowInstatusFp32Tensor_, readPlan, false);
@@ -632,6 +646,14 @@ __aicore__ inline void ServerDedupCounts::WaitDispatch()
         ReduceSum(statusSumOutTensor, statusFp32Tensor_, gatherMaskOutTensor, mask, recStatusNumPerCore_, 1U);
         SyncFunc<AscendC::HardEvent::V_S>();
         sumOfFlag = statusSumOutTensor.GetValue(0);
+#ifdef DEEPEP_LL_REFERENCE_PROFILE
+        if (profile_) {
+            // Partial arrival plus the first full poll iteration separate "count
+            // data is late on the fabric" from "one scan is expensive".
+            if (!firstReadySeen && sumOfFlag != 0.0f) { profile_->Mark<46>(); firstReadySeen = 1U; }  // w46: recv_count_first_ready
+            if (!firstIterDone) { profile_->Mark<47>(); firstIterDone = 1U; }  // w47: recv_count_poll_first_iter_end
+        }
+#endif
     }
     if (profile_) profile_->Mark<25>();  // w25: count_ready_poll_end_after_V_S
 
