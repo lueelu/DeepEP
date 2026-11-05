@@ -58,13 +58,9 @@ public:
         GM_ADDR localState = args_->peerMems[epRankId_] + stateOffset_;
         windowInstatusFp32Tensor_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(localState));
         selfRankWinInGMTensor_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(localState));
-        if (LlTransport::Rdma(args_)) {
-            // 计数记录由跨机 RDMA 与本机 MTE3 共同写入，读侧必须绕过 L2。
-            windowInstatusFp32Tensor_.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
-            // cumsum 槽位只由本 rank 的 MTE3 写入，读侧不能绕 L2：写入落在共享
-            // L2，绕过 L2 的读会一直看到未回写的 HBM，表现为十几微秒的“发布不可见”。
-            // 该张量不承载 RDMA 写入，因此保持默认缓存视图。
-        }
+        // 计数记录与 cumsum 槽位都由本机 L2 可达的写者更新（远端 RDMA 与同机 MTE3），
+        // 读侧保持默认缓存视图才能立即看到新值；绕过 L2 会读到尚未回写的 HBM，
+        // 表现为 ready 轮询多等十几微秒。
         recvCntWorkspaceGM_ = localState + layout_.prefixOffset;
         sendCountsOutGM_ = sendCountsOut;
         expertIdsGMTensor_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(expertIds));
