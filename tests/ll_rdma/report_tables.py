@@ -19,10 +19,17 @@ def csv_table(path, headers, rows):
         output.writerows(rows)
 
 
+# 非阶段类原始计数，追加在阶段列之后，便于把阶段耗时与同一核的任务量对照。
+REFERENCE_COUNTER_WORDS = (37, 41, 43, 48, 49)
+
+
 def wide_records(selected, timer, frequency):
     """One row for each operation/rank/core, from exactly one capture iteration."""
     stages = tuple(s for s in timer.STAGES if s != 'header')
-    headers = ['operation', 'rank', 'host_group', 'local_rank', 'core', 'role', 'iteration', 'unit', *stages]
+    # 旧 stage timer 没有 reference 的 word 名与 valid_mask，仅输出占位列。
+    names = getattr(timer, 'WORDS', None)
+    counters = tuple(f'w{w} {names[w]}' if names else f'w{w}' for w in REFERENCE_COUNTER_WORDS)
+    headers = ['operation', 'rank', 'host_group', 'local_rank', 'core', 'role', 'iteration', 'unit', *stages, *counters]
     rows, calls, raw_rows = [], [], []
     for saved in sorted(selected, key=lambda v: (v['operation'], v['metadata']['rank'])):
         parsed = timer.parse_records(saved['raw'], saved['operation'], frequency)
@@ -34,9 +41,15 @@ def wide_records(selected, timer, frequency):
             identity = [saved['operation'], rank, rank//16, rank%16, core,
                         'send' if core < parsed['active_aiv']//2 else 'receive', iteration,
                         'us' if frequency is not None else 'ticks']
-            rows.append(identity + [records[s].get('total_us', records[s]['total_ticks']) if s in records else None for s in stages])
-            calls.append(identity[:7] + ['calls'] + [records[s]['calls'] if s in records else None for s in stages])
             words = [v for block in saved['raw'][core] for v in block]
+            valid = words[58] if names and len(words) > 58 else 0
+            # 未置有效位的计数按缺失输出，不能把“未执行”写成 0。
+            observed = [words[w] if valid >> w & 1 and w < len(words) else None
+                        for w in REFERENCE_COUNTER_WORDS]
+            rows.append(identity + [records[s].get('total_us', records[s]['total_ticks']) if s in records else None
+                                    for s in stages] + observed)
+            calls.append(identity[:7] + ['calls'] + [records[s]['calls'] if s in records else None
+                                                    for s in stages] + [None] * len(counters))
             raw_rows.append(identity[:7] + words)
     keys = [tuple(r[i] for i in (0, 1, 4)) for r in rows]
     if len(keys) != len(set(keys)):
@@ -49,11 +62,13 @@ def mean_rows(report, headers, stages):
     for r in report['per_rank_core_stage']:
         key = (r.get('operation', 'dispatch'), r['rank'], r['core'], r['role'])
         groups.setdefault(key, {})[r['stage']] = r
+    # 均值页没有逐轮原始计数，仅在尾部补齐占位列，保持与宽表同一列数。
+    padding = len(headers) - 8 - len(stages)
     result = []
     for (operation, rank, core, role), records in sorted(groups.items()):
         result.append([operation, rank, rank//16, rank%16, core, role, 'all_mean',
                        'us' if report['frequency_hz'] is not None else 'ticks'] +
-                      [records[s]['mean'] if s in records else None for s in stages])
+                      [records[s]['mean'] if s in records else None for s in stages] + [None] * padding)
     return result
 
 
@@ -96,7 +111,7 @@ def native_workbook(output, report, selected, timer):
         specs.append(('逐核均值'+suffix, [head]+[[*r[:8], *[r[8+i] for i in indices]] for r in means if r[0] == operation], [16, 10, 12, 10, 10, 12, 12, 10, 24], False, 9))
     specs += [('阶段说明', definitions, [36, 110], True, None),
               ('原始Cycle', [chinese[:7]+[f'w{i}' for i in range(len(raw[0])-7)]]+raw, [16, 10, 12, 10, 10, 12, 12, 25], False, None),
-              ('阶段调用次数', [chinese+list(stages)]+calls, [16, 10, 12, 10, 10, 12, 12, 10, 24], False, None)]
+              ('阶段调用次数', [chinese+list(stages)]+[r[:8+len(stages)] for r in calls], [16, 10, 12, 10, 10, 12, 12, 10, 24], False, None)]
     for filename, title in [('stages_long.csv', '阶段统计'), ('bandwidth.csv', '通信计数'),
                             ('recv_core_samples.csv', '接收明细'), ('experts.csv', '专家统计'), ('expert_cores.csv', '专家逐核')]:
         source = output/filename

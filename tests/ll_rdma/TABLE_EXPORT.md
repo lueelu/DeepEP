@@ -50,6 +50,8 @@ reference运行将路径后缀改为`-reference`。也可直接调用
 | 通信计数、接收明细、专家统计、专家逐核 | timer中实际存在的相应明细；无专家数据不伪造 |
 
 timer同时包含dispatch/combine时，逐核耗时和均值分别按算子分sheet。
+
+`stages.csv`/`stages_mean.csv` 在阶段列后固定追加 5 个原始计数列：`w37 receive_task_count`、`w41 receive_probe_batch_count`、`w43 send_route_count`、`w48 receive_first_hop_tokens`、`w49 receive_relay_members`。只有置了有效位的计数才有值，未执行或旧 schema 样本留空（均值页这 5 列固定为空）。
 CSV位于`case_001/`等目录；中间`core_stage_timings.xlsx`保留，但只需打开根目录的`stage-times.xlsx`。
 空白表示无记录，0表示实际记录为零。父子累计阶段不可相加，异步提交不等于完成，不跨rank相减时钟。
 原始JSON不修改；多轮原始数据保留目标机。一个run的`return_report.md`不超过60000 UTF-8字节，
