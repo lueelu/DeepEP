@@ -381,8 +381,7 @@ private:
                 auto diff = sub.template ReinterpretCast<float>();
                 auto absDiff = dst.template ReinterpretCast<float>();
                 Abs(absDiff, diff, index);
-                // Mins 的两个操作数必须同 dtype：这里用 int32 视图，非零差异统一夹成 1。
-                Mins(sub, dst, 1, index);
+                Mins(sub, absDiff, 1, index);
                 ReduceSum(scalar[slot * 8U], diff, work, index);
             }
             Sync<HardEvent::V_S>();
