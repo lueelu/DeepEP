@@ -151,7 +151,9 @@ def parse_packet_detail(words, role, frequency_hz):
         local_expert=(slot // words[105]) % words[106]
         if ((slot // words[105]) // words[106] - words[50]) % words[52] != source:
             raise ValueError('Receive slot/source mismatch')
-        entries.append(dict(task=j, output_row=words[104]+j, ready_order=found, ready_batch=batch,
+        # 任务按固定步长交错分配，输出行 = 首行 + task * 接收核数。
+        recv_cores = words[53] // 2
+        entries.append(dict(task=j, output_row=words[104] + j * recv_cores, ready_order=found, ready_batch=batch,
                             process_order=order, source_rank=source, source_token=token, header_k=k,
                             packet_role={1:'DIRECT',2:'FIRST_HOP',3:'TERMINAL'}[packet_role],
                             forward_members=members, destination_expert=words[50]*words[106]+local_expert,

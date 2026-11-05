@@ -362,7 +362,7 @@ private:
         WaitFlag<HardEvent::MTE2_S>(lane);
 
         auto wire = lanesBuf_.Get<uint8_t>()[lane * laneStride_];
-        const uint32_t row = tasks_.Begin() + j;
+        const uint32_t row = tasks_.Begin() + j * tasks_.Stride();
         const uint32_t headerOffset = uint32_t(keepFlags ? data_.headerWireOffset : data_.headerPayloadOffset);
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
         RecordProcessed(j, wire, headerOffset, keepFlags);
