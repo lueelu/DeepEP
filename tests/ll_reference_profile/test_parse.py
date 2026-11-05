@@ -115,7 +115,7 @@ def test_zero_timestamp_and_executed_zero_differ_from_absent():
     assert zero['total_ticks'] == 0 and zero['calls'] == 0
 
 
-@pytest.mark.parametrize('index,value', [(55,1),(56,2),(59,0),(60,2),(61,0),(62,1),(53,56),(50,16),(52,8),(48,1)])
+@pytest.mark.parametrize('index,value', [(55,1),(56,2),(59,0),(60,2),(61,0),(62,1),(53,56),(50,16),(52,8),(22,1)])
 def test_header_and_reserved_damage_rejected(index, value):
     raw = sample()['raw']; setword(raw,0,index,value)
     with pytest.raises(ValueError): timer.parse_records(raw)

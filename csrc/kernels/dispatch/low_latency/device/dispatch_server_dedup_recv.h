@@ -87,6 +87,8 @@ public:
                 profile->Value<33>(0U);  // w33: receive_packet_poll_accum_cycles
                 profile->Value<34>(0U);  // w34: receive_load_consume_submit_accum_cycles
                 profile->Value<41>(0U);  // w41: receive_probe_batch_count
+                profile->Value<48>(0U);  // w48: receive_first_hop_tokens
+                profile->Value<49>(0U);  // w49: receive_relay_members
             }
             return;
         }
@@ -221,6 +223,10 @@ public:
             profile->Value<33>(pollCycles);  // w33: receive_packet_poll_accum_cycles
             profile->Value<34>(consumeCycles);  // w34: receive_load_consume_submit_accum_cycles
             profile->Value<41>(batches);  // w41: receive_probe_batch_count
+            // 本核消费的 FirstHop token 数与 relay 成员总数，用于区分
+            // consume 长尾来自 relay 转发量还是批次稀疏。
+            profile->Value<48>(firstHopTokens_);  // w48: receive_first_hop_tokens
+            profile->Value<49>(relayMembers_);  // w49: receive_relay_members
         }
 #endif
 
@@ -287,6 +293,8 @@ private:
     TBuf<> packetTraceBuf_;
     bool traceEnabled_ = false;
     uint32_t traceCapacity_ = 0U, traceReady_ = 0U, traceProcessed_ = 0U, traceBatches_ = 0U;
+    // 本核消费的 FirstHop token 数与 relay 成员总数。
+    uint32_t firstHopTokens_ = 0U, relayMembers_ = 0U;
 #endif
     static constexpr uint32_t kProbeBatch = 16U;
     struct ProbeResult {
@@ -421,6 +429,10 @@ private:
             const uint32_t sourceRank = tail.Header().GetValue(0U);
             const uint32_t ranks = uint32_t(args_->rankSize);
             const uint32_t members = tail.ReadIndex().GetValue(0U);
+#ifdef DEEPEP_LL_REFERENCE_PROFILE
+            ++firstHopTokens_;
+            relayMembers_ += members;
+#endif
             for (uint32_t i = 0U; i < members; ++i) {
                 const uint32_t index = tail.Entry(i).GetValue(0U);
                 const uint32_t expertId = index & 0xffffU;

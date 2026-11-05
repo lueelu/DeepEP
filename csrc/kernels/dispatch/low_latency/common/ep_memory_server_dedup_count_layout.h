@@ -48,6 +48,8 @@ constexpr uint64_t kEpServerDedupWindowUsableBytes =
 struct EpServerDedupCountLayout {
     uint64_t cntOffset;
     uint64_t cumsumOffset;
+    // 完成标记必须保持“写列、读行、清本行”的转置结构：每个核只读自己那一行，
+    // 清理对其它核不可见。合并成共享槽位会让清理影响他核读取，需要额外的 epoch。
     uint64_t cumsumFlagOffset;
     uint64_t prefixOffset;  // One shared, read-only prefix begins here.
     uint64_t prefixStride;  // Retained replica reservation: keep control offsets/capacity unchanged.

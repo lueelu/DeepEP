@@ -63,6 +63,10 @@ flowchart TD
 
 计数任务分配与 payload 任务分配不同；w24/25、w26/27、w28/29是按实际执行路径出现的可选成对点，不能由 w37 推断其必然存在。每个 ready 批次只有三个 clock，空扫描和逐 packet 没有额外打点。w33/w34覆盖循环内的两个累计区间；`w35-w32`还包括循环管理、打点开销、lane回收和清标记提交。`w42-w32`是首批等待，已经包含在整个接收循环中，不能再加一次。
 
+`w48`/`w49` 是本核在 Receiver 内消费的 FirstHop token 数与 relay 成员总数，均为计数而非时间戳。它们与 `w34` 对照可区分 consume 长尾来自 relay 转发量还是批次稀疏：若 `w34` 与 `w48`/`w49` 强相关则是 relay，若与 `w37`/`w41` 相关则是批次粒度。空任务核两者记为 0。
+
+前缀完成标记仍保留独立的转置矩阵（写列、读本行、清本行）：它同时是“所有核已读完片段总数”的屏障，合并进共享 cumsum 槽会让槽位回收对他核可见，需要额外的 epoch 才安全。
+
 ### 2.3 各个 word 的定义与源码
 
 | Word | 内容 / 边界 | 类型 |
@@ -113,6 +117,8 @@ flowchart TD
 | w45 | `send_count_last_frame_issued` | 时间戳 |
 | w46 | `recv_count_first_ready` | 时间戳 |
 | w47 | `recv_count_poll_first_iter_end` | 时间戳 |
+| w48 | `receive_first_hop_tokens` | 计数 |
+| w49 | `receive_relay_members` | 计数 |
 | w50 | `rank` | 身份/有效性元数据 |
 | w51 | `AIV_core` | 身份/有效性元数据 |
 | w52 | `EP` | 身份/有效性元数据 |
