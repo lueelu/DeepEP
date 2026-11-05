@@ -341,7 +341,8 @@ private:
         auto wire = lanesBuf_.Get<uint8_t>()[lane * laneStride_];
         GlobalTensor<uint8_t> source;
         source.SetGlobalBuffer(Slot(j));
-        if (LlTransport::Rdma(args_)) source.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+        // payload 由远端 RDMA 写入，读侧保持默认缓存视图，避免绕过 L2 读到
+        // 尚未回写的 HBM 而多等一轮；就绪判定已由 flags 的独立读取完成。
         if (keepFlags) {
             DataCopy(wire, source, uint32_t(data_.tokenStride));
         } else {
