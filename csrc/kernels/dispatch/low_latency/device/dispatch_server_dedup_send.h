@@ -123,9 +123,6 @@ public:
         Allocate(qDstBuf_, scratchBytes);
         Allocate(qSubBuf_, scratchBytes);
         Allocate(qWorkBuf_, qBytes);
-        // 每批 8 条路由的归约结果（8×32B）与全部路由的 q 序号表。
-        Allocate(qScalarBuf_, 8U * 32U);
-        Allocate(qRouteBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 4U, 32U)));
         if (needQuantize_) Allocate(quantBuf_, uint32_t(data_.packedPayloadBytes));
         Allocate(weightInBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 4U, 32U)));
         Allocate(weightOutBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 4U, 32U)));
@@ -148,7 +145,6 @@ public:
         if (packetProfile_) packetProfile_->SendLanes(lanes_);
 #endif
         routeIds_ = idsBuf_.Get<int32_t>();
-        tokenQ_ = qRouteBuf_.Get<int32_t>();
         if (count_ != 0U) routeWeights_ = weightInBuf_.Get<float>();
         if (count_ != 0U) {
             sourceWeights_ = weightOutBuf_.Get<float>();
@@ -220,8 +216,6 @@ public:
 
         const uint32_t rankInGroup = uint32_t(args_->rank) % Group;
         const uint32_t sendCore = GetBlockIdx();
-        // 本核负责的全部路由 q 一次性算完，后续首跳/DIRECT/成员都只查表。
-        ComputeLocalQ();
         for (uint32_t token = 0; token < count_; ++token) {
             uint32_t directMask = 0, firstHopCount = 0;
 
@@ -236,7 +230,7 @@ public:
                                                          k_, localExperts_, mask, fullMeshFirstHop_);
                 const uint32_t index = (start_ + token) * k_ + firstK;
                 const uint32_t expert = uint32_t(routeIds_.GetValue(index));
-                SendPacket(input, start_ + token, firstK, expert, uint32_t(tokenQ_.GetValue(token * k_ + firstK)), mask);
+                SendPacket(input, start_ + token, firstK, expert, CalTokenSendExpertCnt(expert, index), mask);
                 sourceMask |= uint32_t(1) << firstK;
                 // 源端仅标记实际发出的首跳路由；该位置输出权重 1，原路由权重另存包尾。
                 sourceWeights_.SetValue(token * k_ + firstK, 1.0f);
@@ -275,7 +269,7 @@ public:
                 const uint32_t expert = directTasks_.GetValue(task * 4U + 2U);
                 const uint32_t token = directTasks_.GetValue(task * 4U);
                 const uint32_t k = directTasks_.GetValue(task * 4U + 1U);
-                const uint32_t q = uint32_t(tokenQ_.GetValue(token * k_ + k));
+                const uint32_t q = CalTokenSendExpertCnt(expert, (start_ + token) * k_ + k);
                 SendPacket(input, start_ + token, k, expert, q, 0U);
                 sourceWeights_.SetValue(token * k_ + k, routeWeights_.GetValue(token * k_ + k));
             }
@@ -357,42 +351,6 @@ private:
             }
         }
     }
-    // 摘要：一次算完本核负责的全部路由 q（每 expert 在完整路由序列中的出现序号）。
-    // 原先每条路由单独调用、每次带一次 V->S 等待；这里按 8 条一批下发，每批只同步一次。
-    static constexpr uint32_t kQRoutesPerSync = 8U;
-    __aicore__ inline void ComputeLocalQ()
-    {
-        LocalTensor<float> scalar = qScalarBuf_.Get<float>();
-        LocalTensor<int32_t> dst = qDstBuf_.Get<int32_t>();
-        LocalTensor<int32_t> sub = qSubBuf_.Get<int32_t>();
-        LocalTensor<float> work = qWorkBuf_.Get<float>();
-        auto bits = scalar.template ReinterpretCast<int32_t>();
-        const uint32_t routes = count_ * k_;
-        const uint32_t firstRoute = start_ * k_;
-        for (uint32_t batch = 0; batch < routes; batch += kQRoutesPerSync) {
-            const uint32_t last = routes - batch < kQRoutesPerSync ? routes - batch : kQRoutesPerSync;
-            for (uint32_t slot = 0; slot < last; ++slot) {
-                const uint32_t index = firstRoute + batch + slot;
-                // 首个 token 的路由恒为首次出现，q 为 0，无需向量归约。
-                if (index < k_) continue;
-                const uint32_t expert = uint32_t(routeIds_.GetValue(index));
-                Duplicate<int32_t>(dst, int32_t(expert), index);
-                Sub(sub, routeIds_, dst, index);
-                auto diff = sub.template ReinterpretCast<float>();
-                auto absDiff = dst.template ReinterpretCast<float>();
-                Abs(absDiff, diff, index);
-                Mins(sub, absDiff, 1, index);
-                ReduceSum(scalar[slot * 8U], diff, work, index);
-            }
-            Sync<HardEvent::V_S>();
-            for (uint32_t slot = 0; slot < last; ++slot) {
-                const uint32_t index = firstRoute + batch + slot;
-                const uint32_t other = index < k_ ? 0U : uint32_t(bits.GetValue(slot * 8U));
-                tokenQ_.SetValue(batch + slot, int32_t(index - other));
-            }
-        }
-    }
-
     // Compute q by the original Vector prefix reduction on demand.
     __aicore__ inline uint32_t CalTokenSendExpertCnt(uint32_t expert, uint32_t index)
     {
@@ -458,7 +416,7 @@ private:
                 const bool traceQ = packetProfile_ && packetProfile_->SecondRemote();
                 const uint64_t qBegin = traceQ ? packetProfile_->Clock() : 0U;
 #endif
-                const uint32_t q = uint32_t(tokenQ_.GetValue(token * k_ + k));
+                const uint32_t q = CalTokenSendExpertCnt(expert, routeIndex);
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
                 if (traceQ) packetProfile_->MemberQ(packetProfile_->Clock() - qBegin);
 #endif
@@ -632,11 +590,8 @@ private:
     GlobalTensor<float> weights_, weightOut_;
     GlobalTensor<uint32_t> maskOut_;
     TBuf<> idsBuf_, qDstBuf_, qSubBuf_, qWorkBuf_, quantBuf_;
-    TBuf<> qScalarBuf_, qRouteBuf_;
     TBuf<> weightInBuf_, weightOutBuf_, maskBuf_, directBuf_, serverBuf_, firstHopBuf_, outBuf_;
     LocalTensor<int32_t> routeIds_;
-    // 本核每条路由的 q 序号，按 token*k_+k 索引。
-    LocalTensor<int32_t> tokenQ_;
     LocalTensor<float> routeWeights_, sourceWeights_;
     LocalTensor<uint32_t> sourceMasks_, directTasks_, serverState_, firstHopMasks_;
 };
