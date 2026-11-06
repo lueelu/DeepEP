@@ -65,7 +65,7 @@ PY
 
 物理设备列表通过位置参数传入，EP 等于列表长度；worker 使用映射后的逻辑 local rank。常用 EP2/4/8，实际结论仅覆盖本轮运行规模。多机需要单独确认网络和启动方式，不把单机通过扩大为多机通过。
 
-当前公开清单保留 12 条典型尺寸：Flash、Pro、GLM 各取每 rank M=512、2048、4096、8192，统一 balanced 路由、BF16 路由权重、BF16 保存和固定 seed。`priority`、`model` 选择这 12 条；`dtype` 另有 24 条 BF16/FP32 路由权重、保存模式和 clipping 组合，`gather` 有 6 条 FP32 源窗口边界，`all` 选择全部 42 条。旧 smoke/core/extended 已移出，其他历史用例不自动恢复或加载。运行前用当前入口核对实际配置：
+当前公开清单包含 12 条典型尺寸：Flash、Pro、GLM 各取每 rank M=512、2048、4096、8192，统一 balanced 路由、BF16 路由权重、BF16 保存和固定 seed。`priority`、`model` 选择这 12 条；`dtype` 另有 24 条 BF16/FP32 路由权重、保存模式和 clipping 组合，`gather` 有 6 条 FP32 源窗口边界，`all` 选择全部 42 条。运行前用当前入口核对实际配置：
 
 ```bash
 : "${MEGAMOE_TEST_DEVICES:?填写本轮用户指定的物理设备列表}"
@@ -124,7 +124,7 @@ ATK 对每个 rank 的 `y`、`dx`、`dtopk_weights`、`dw1`、`dw2` 分别比较
 - benchmark：`fp32-boundaries-v3-topk-dtype` NPU BigOp，BF16 GMM 输入输出与 FP32 激活、导数、dp 及有序 Y/dX 归并；p/dp 保持输入 BF16 或 FP32 类型。
 - golden：独立 Torch CPU FP64 真值。
 
-显式最大/平均相对误差及 RMSE 比例门限为 5/1.5/1.5，`number_count_radio=2`。ATK 是唯一双标杆；另外仍须通过 `megamoe_contract` 混合容差与精确 counts。BF16 保存时，BigOp 与混合容差共用同一份小算子结果。不要合并不同输出或 rank 的数据后判定，不恢复已删除的自写双标杆，也不为得到 PASS 修改真值、融合结果或门限。参考数值规则升级须记录新版本，保留旧报告。
+显式最大/平均相对误差及 RMSE 比例门限为 5/1.5/1.5，`number_count_radio=2`。ATK 是唯一双标杆；另外仍须通过 `megamoe_contract` 混合容差与精确 counts。BF16 保存时，BigOp 与混合容差共用同一份小算子结果。逐 rank、逐输出判定并使用上述私有双标杆比较器，不为得到 PASS 修改真值、融合结果或门限。参考数值规则升级须记录新版本，保留旧报告。
 
 只修改 BigOp 参考而融合算子与 CPU FP64 真值均未改变时，可复用已有 actual/golden 缓存，仅重算 BigOp 后调用同一 ATK 比较器。核对输入哈希、case、dtype/布局、融合产物及真值来源；新输出目录记录缓存来源和参考版本。缓存只覆盖部分输出时，报告按实际覆盖记录，不记为完整套件通过。
 

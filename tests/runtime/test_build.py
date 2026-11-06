@@ -90,6 +90,100 @@ def build(monkeypatch):
     return module
 
 
+@pytest.fixture
+def training_source_tree(tmp_path):
+    import shutil
+
+    source = tmp_path / "source"
+    for name in (
+        "VERSION",
+        "setup.py",
+        "pyproject.toml",
+        "build_support.py",
+        "CMakeLists.txt",
+        "dependencies.lock.json",
+        "MANIFEST.in",
+        "requirements-dev.txt",
+        "requirements-build.txt",
+        "pytest.ini",
+        ".gitmodules",
+        "LICENSE",
+        "README.md",
+        "third-party/deepseek-deepep.LICENSE",
+        "third-party/cann.LICENSE",
+        "deep_ep/__init__.py",
+        "ascend_deepep/__init__.py",
+        "experiments/ep_gmm_fused/tests/requirements.txt",
+        "experiments/megamoe_train/CMakeLists.txt",
+        "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.cpp",
+        "experiments/megamoe_train/python/deep_ep_experimental/__init__.py",
+        "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/__init__.py",
+        "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+        "experiments/megamoe_train/docs/visual/data/00-overview.json",
+    ):
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, target)
+    visual = source / "experiments/megamoe_train/docs/visual"
+    for name in ("node_modules", "site", ".artifacts", "out", "dist"):
+        directory = visual / name / "nested"
+        directory.mkdir(parents=True)
+        for filename in ("package.json", "README.md", "generated.cpp"):
+            (directory / filename).write_text("local documentation output\n")
+    assert not (source / ".git").exists()
+    return source
+
+
+def test_training_fingerprint_excludes_visual_outputs(build, training_source_tree, monkeypatch):
+    source = training_source_tree
+    monkeypatch.setattr(build, "ROOT", source)
+    baseline = build.source_fingerprint()
+    visual = source / "experiments/megamoe_train/docs/visual"
+    for name in ("node_modules", "site", ".artifacts", "out", "dist"):
+        (visual / name / "nested/package.json").write_text("changed dependency\n")
+    assert build.source_fingerprint() == baseline
+    kernel = source / "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.cpp"
+    kernel.write_bytes(kernel.read_bytes() + b"\n// Updated kernel source.\n")
+    updated = build.source_fingerprint()
+    assert updated != baseline
+    (visual / "data/00-overview.json").write_text('{"title":"Updated formal source guide"}\n')
+    assert build.source_fingerprint() != updated
+
+
+def test_training_sdist_excludes_visual_outputs(training_source_tree, tmp_path):
+    import os
+    import tarfile
+
+    source = training_source_tree
+    metadata, dist = tmp_path / "metadata", tmp_path / "dist"
+    metadata.mkdir()
+    result = subprocess.run(
+        [sys.executable, "setup.py", "egg_info", "--egg-base", str(metadata), "sdist", "--dist-dir", str(dist)],
+        cwd=source,
+        env={
+            **os.environ,
+            "DEEPEP_BUILD_MEGAMOE_TRAIN": "ON",
+            "DEEPEP_BUILD_MEGAMOE": "OFF",
+            "DEEPEP_BUILD_EP_GMM_FUSED": "OFF",
+            "PYTHONIOENCODING": "utf-8",
+        },
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(next(dist.glob("*.tar.gz"))) as archive:
+        names = {"/".join(Path(name).parts[1:]) for name in archive.getnames()}
+    prefix = "experiments/megamoe_train/"
+    assert prefix + "csrc/kernels/bf16/mega_moe_bf16_forward.cpp" in names
+    assert prefix + "python/deep_ep_experimental/megamoe_train/bf16.py" in names
+    assert prefix + "docs/visual/data/00-overview.json" in names
+    for directory in ("node_modules", "site", ".artifacts", "out", "dist"):
+        assert not any(name.startswith(prefix + f"docs/visual/{directory}/") for name in names)
+
+
 def test_platform_and_architecture_rejected(build, monkeypatch):
     with pytest.raises(RuntimeError, match="DEEPEP_NPU_ARCH"):
         build.build_configuration({})

@@ -34,7 +34,7 @@ CATLASS/SHMEM、兼容的 PyTorch/torch_npu，并通过 wheel 安装，见
 [MegaMoE 训练说明](../experiments/megamoe_train/README.md)。它与推理开关独立。
 EpGmmFused 通过 `DEEPEP_BUILD_EP_GMM_FUSED=ON` 构建 AllToAllV → GMM 和 GMM → AllToAllV，
 需要单独准备 CatCCOS、其 CATLASS 依赖及 SHMEM SDK，见 [EpGmmFused 使用说明](../experiments/ep_gmm_fused/README.md#构建)。
-基础包使用下面的通用构建流程，两个实验组件默认均关闭。
+基础包使用下面的通用构建流程，这些可选组件默认均关闭。
 
 ## 分步骤构建（外部 SDK、打包或 CI）
 
@@ -186,6 +186,6 @@ python scripts/validate_package.py --output /path/to/another-new-directory \
 
 ## CI 与产物
 
-当前仓库未配置自动 CI 流水线。请手动运行 pre-commit，并按变更范围运行 CPU API、参考、运行时和构建预检。CPU fault-injection 使用 Linux/g++，不等于 CANN ABI 或 NPU 测试。检查命令见[开发指南](development.md#提交前检查与-ci)。
+[MegaMoE Train 文档 CI](../.github/workflows/megamoe-train-visual.yml) 自动检查源码导览、离线阅读与编辑器集成。构建、CPU 与 NPU 验证仍由执行者按变更范围完成：运行 pre-commit、CPU API、参考、运行时和构建预检，并在匹配环境中执行设备检查。CPU fault-injection 使用 Linux/g++，不等于 CANN ABI 或 NPU 测试。检查命令见[开发指南](development.md#提交前检查与-ci)。
 
 在具备 CANN、SHMEM、框架与已分配 NPU 的环境执行本页验证命令。保留 `source-tests.xml`、`installed-tests.xml`、`validation.json` 和逐 rank 输出，wheel/sdist 作为独立产物归档。安装成功、CPU 通过和设备算子通过分别记录，不互相替代。
