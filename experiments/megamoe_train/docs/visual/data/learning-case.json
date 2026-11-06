@@ -1,0 +1,74 @@
+{
+  "id": "bf16-ep8-sparse-case-v2",
+  "title": "EP8、32 个专家、同一 token 的六条 route",
+  "evidence": "固定稀疏输入的 CPU 数值教学",
+  "shape": {
+    "platform": "Ascend950",
+    "ep": 8,
+    "tokensPerRank": 4096,
+    "totalExperts": 32,
+    "expertsPerRank": 4,
+    "topk": 6,
+    "hidden": 7168,
+    "ffn": 3072,
+    "recvCapacity": 24576,
+    "saveMode": "bf16",
+    "clipping": false,
+    "forceExpertReady": false
+  },
+  "routing": {
+    "ids": "expert(slot) = (token + rank + slot) % 32",
+    "probabilities": [0.25, 0.25, 0.125, 0.125, 0.125, 0.125],
+    "sourceOrder": "expert 升序；同 expert 按本源 rank 的 token、slot 升序",
+    "receiveOrder": "每个 expert 先 source rank 升序，再按该源中的 expert 行序",
+    "reference": "tests/bf16/cpu_reference.py::run_reference 的 (ids == expert).nonzero(as_tuple=True) 按 token、slot 遍历约定",
+    "rowMeaning": "本页行号使用上述 CPU 参考排列；设备同专家键的顺序以前向生成的实际索引为准。",
+    "expectedRowsPerSourceExpert": 768,
+    "expectedRowsPerExpert": 6144,
+    "expectedRowsPerRank": 24576
+  },
+  "numeric": {
+    "activeHidden": [0, 1],
+    "activeFfn": [0, 1],
+    "x": "X[0]=(1+(token+rank)%3)/2; X[1]=(1+(token+2*rank)%4)/4; 其他列为0",
+    "dy": [0.25, 0.5],
+    "rounding": "本教学案例固定使用BF16 p。R表示先按FP32值取BF16最近偶数舍入；GMM输出、Hp、dHp、dGate/dUp、dXroute 保留该边界。H、dH和dHp×H乘积保持FP32；Y、dX和dp均在FP32归约后最终舍入BF16。实际接口也支持FP32 p，此时dp以FP32写出。",
+    "zeroRule": "各专家按编号循环选取下列 8 组 2×2 权重子块，其余权重、X 和 dY 坐标为 0。",
+    "weightPatterns": [
+      {"expert": 0, "wg": [[1, 0], [0, 1]], "wu": [[1, 0], [0, 0.5]], "w2": [[1, 0], [0, 0.5]]},
+      {"expert": 1, "wg": [[0.5, 0], [0, 1]], "wu": [[1, 0], [0, 1]], "w2": [[0.5, 0], [0, 1]]},
+      {"expert": 2, "wg": [[1, 0], [0, 0.5]], "wu": [[0.5, 0], [0, 1]], "w2": [[1, 0], [0, 1]]},
+      {"expert": 3, "wg": [[0.5, 0], [0, 0.5]], "wu": [[1, 0], [0, 0.5]], "w2": [[1, 0], [0, 0.5]]},
+      {"expert": 4, "wg": [[0.5, 0], [0, 1]], "wu": [[0.5, 0], [0, 1]], "w2": [[1, 0], [0, 0.5]]},
+      {"expert": 5, "wg": [[1, 0], [0, 0.5]], "wu": [[1, 0], [0, 0.5]], "w2": [[0.5, 0], [0, 1]]},
+      {"expert": 6, "wg": [[1, 0], [0, 1]], "wu": [[0.5, 0], [0, 0.5]], "w2": [[1, 0], [0, 1]]},
+      {"expert": 7, "wg": [[0.5, 0], [0, 0.5]], "wu": [[1, 0], [0, 1]], "w2": [[0.5, 0], [0, 0.5]]}
+    ]
+  },
+  "focusTokens": [
+    {"id": "r0-t0", "rank": 0, "token": 0, "label": "rank0 · token0", "expectedRoutes": [
+      {"expert": 0, "slot": 0, "p": 0.25, "sortedRow": 0, "expertRow": 0},
+      {"expert": 1, "slot": 1, "p": 0.25, "sortedRow": 768, "expertRow": 0},
+      {"expert": 2, "slot": 2, "p": 0.125, "sortedRow": 1536, "expertRow": 0},
+      {"expert": 3, "slot": 3, "p": 0.125, "sortedRow": 2304, "expertRow": 0},
+      {"expert": 4, "slot": 4, "p": 0.125, "sortedRow": 3072, "expertRow": 0},
+      {"expert": 5, "slot": 5, "p": 0.125, "sortedRow": 3840, "expertRow": 0}
+    ]},
+    {"id": "r0-t1", "rank": 0, "token": 1, "label": "rank0 · token1", "expectedRoutes": [
+      {"expert": 1, "slot": 0, "p": 0.25, "sortedRow": 769, "expertRow": 1},
+      {"expert": 2, "slot": 1, "p": 0.25, "sortedRow": 1537, "expertRow": 1},
+      {"expert": 3, "slot": 2, "p": 0.125, "sortedRow": 2305, "expertRow": 1},
+      {"expert": 4, "slot": 3, "p": 0.125, "sortedRow": 3073, "expertRow": 1},
+      {"expert": 5, "slot": 4, "p": 0.125, "sortedRow": 3841, "expertRow": 1},
+      {"expert": 6, "slot": 5, "p": 0.125, "sortedRow": 4608, "expertRow": 0}
+    ]},
+    {"id": "r1-t0", "rank": 1, "token": 0, "label": "rank1 · token0", "expectedRoutes": [
+      {"expert": 1, "slot": 0, "p": 0.25, "sortedRow": 768, "expertRow": 768},
+      {"expert": 2, "slot": 1, "p": 0.25, "sortedRow": 1536, "expertRow": 768},
+      {"expert": 3, "slot": 2, "p": 0.125, "sortedRow": 2304, "expertRow": 768},
+      {"expert": 4, "slot": 3, "p": 0.125, "sortedRow": 3072, "expertRow": 768},
+      {"expert": 5, "slot": 4, "p": 0.125, "sortedRow": 3840, "expertRow": 768},
+      {"expert": 6, "slot": 5, "p": 0.125, "sortedRow": 4608, "expertRow": 768}
+    ]}
+  ]
+}

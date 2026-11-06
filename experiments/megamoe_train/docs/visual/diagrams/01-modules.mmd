@@ -1,0 +1,30 @@
+flowchart TB
+  subgraph lane_python["Python 接口"]
+    m_python["公开 Module 与 autograd"]
+  end
+  subgraph lane_host["C++ Host / 绑定"]
+    m_binding["训练扩展注册对象"]
+    m_host["Host 执行器与启动桥接"]
+    m_tiling["Host tiling 与共享布局"]
+  end
+  subgraph lane_device["AscendC Device"]
+    m_device["前反向设备主控"]
+    m_catlass["计算、激活与路由组件"]
+  end
+  subgraph lane_resource["资源与构建"]
+    m_runtime["根 Runtime 管理所有权"]
+    m_session["Session 持有 SHMEM 窗口"]
+    m_build["根构建选择训练组件"]
+  end
+  m_python --> m_binding
+  m_binding --> m_host
+  m_host --> m_tiling
+  m_host --> m_device
+  m_device --> m_catlass
+  m_python --> m_runtime
+  m_runtime --> m_session
+  m_session --> m_host
+  m_tiling --> m_device
+  m_build -.-> m_binding
+  m_build -.-> m_device
+  m_build -.-> m_session

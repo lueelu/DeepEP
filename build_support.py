@@ -129,10 +129,23 @@ class CheckedInstallLib(install_lib):
                         f"Move {root} outside the build tree and rebuild; "
                         "use separate --build-lib paths for different component configurations."
                     )
+        for directory in (self.build_dir, self.install_dir):
+            root = Path(directory)
+            for component in root.glob("**/deep_ep_experimental/megamoe_train"):
+                if (
+                    not enabled("DEEPEP_BUILD_MEGAMOE_TRAIN")
+                    or component.relative_to(root).as_posix() != "deep_ep_experimental/megamoe_train"
+                ):
+                    raise RuntimeError(f"Stale MegaMoE training staging at {component}; use separate build-lib paths")
         return super().install()
 
 
 def source_fingerprint():
+    # Documentation dependencies and generated attachments are not build inputs.
+    visual_outputs = tuple(
+        ROOT / "experiments/megamoe_train/docs/visual" / name
+        for name in ("node_modules", "site", ".artifacts", "out", "dist")
+    )
     files = [
         ROOT / name
         for name in (
@@ -159,6 +172,7 @@ def source_fingerprint():
         "tests",
         "benchmarks",
         "experiments/megamoe",
+        "experiments/megamoe_train",
         "experiments/ep_gmm_fused",
     ):
         files.extend(
@@ -166,6 +180,7 @@ def source_fingerprint():
             for path in (ROOT / name).rglob("*")
             if (path.suffix in {".sh", ".py", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
             and path.name != "_build_info.json"
+            and not any(path.is_relative_to(directory) for directory in visual_outputs)
         )
     digest = hashlib.sha256()
     for path in sorted(files):
@@ -241,6 +256,10 @@ def build_configuration(environment=None):
         raise RuntimeError("Native wheels require Linux with an Ascend SDK")
     if env.get("DEEPEP_NPU_ARCH") != "Ascend950":
         raise RuntimeError("DEEPEP_NPU_ARCH must be Ascend950; other targets are unqualified")
+    train = enabled("DEEPEP_BUILD_MEGAMOE_TRAIN", env)
+    force_expert_ready = enabled("DEEPEP_BF16_FORCE_EXPERT_READY", env)
+    if force_expert_ready and not train:
+        raise RuntimeError("DEEPEP_BF16_FORCE_EXPERT_READY requires DEEPEP_BUILD_MEGAMOE_TRAIN=ON")
     beta = env.get("DEEPEP_BUILD_MEGAMOE", "OFF")
     timer = env.get("DEEPEP_MEGAMOE_TIMER", "OFF")
     if beta not in {"ON", "OFF"} or timer not in {"ON", "OFF"}:
@@ -291,7 +310,7 @@ def build_configuration(environment=None):
         if "lib/libshmem.so" not in hashes or not any(key.startswith("include/") for key in hashes):
             raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
-        if beta == "ON":
+        if beta == "ON" or train:
             raise
         warnings.warn(f"{exc}; continuing with SHMEM_ROOT={manifest.parent}", RuntimeWarning, stacklevel=2)
     library = manifest.parent / "lib/libshmem.so"
@@ -336,8 +355,15 @@ def build_configuration(environment=None):
     }
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
+    result["megamoe_train"] = {
+        "enabled": train,
+        "force_expert_ready": force_expert_ready,
+        "source_commit": "b8cff14854d12aef77b6ae54b5890123759b4d28",
+        "gmm1_schedule": "expert-ready" if force_expert_ready else "adaptive-auto",
+        "swiglu_decouple": "auto",
+    }
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
-    if beta == "ON":
+    if beta == "ON" or train:
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
             raise RuntimeError(
@@ -420,6 +446,10 @@ class VariantBuild(ConfiguredBuild):
         beta = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
         timer = os.environ.get("DEEPEP_MEGAMOE_TIMER", "OFF") == "ON"
         variant = "megamoe-timer" if beta and timer else ("megamoe" if beta else "core")
+        if enabled("DEEPEP_BUILD_MEGAMOE_TRAIN"):
+            variant += "-megamoe-train"
+            if enabled("DEEPEP_BF16_FORCE_EXPERT_READY"):
+                variant += "-expert-ready"
         self.build_base = str(Path(self.build_base) / variant)
         super().finalize_options()
 
@@ -479,8 +509,11 @@ def publish_source_native(destination):
 class CMakeBuild(build_ext):
     def run(self):
         # Check before setuptools temporarily clears inplace during run().
-        if enabled("DEEPEP_BUILD_EP_GMM_FUSED") and (self.inplace or self.editable_mode):
-            raise RuntimeError("EP_GMM_FUSED requires a wheel; editable/inplace builds are not supported")
+        if (enabled("DEEPEP_BUILD_EP_GMM_FUSED") or enabled("DEEPEP_BUILD_MEGAMOE_TRAIN")) and (
+            self.inplace or self.editable_mode
+        ):
+            component = "EP_GMM_FUSED" if enabled("DEEPEP_BUILD_EP_GMM_FUSED") else "MEGAMOE_TRAIN"
+            raise RuntimeError(f"{component} requires a wheel; editable/inplace builds are not supported")
         self._publish_source_links = not (self.inplace or self.editable_mode)
         super().run()
 
@@ -515,6 +548,8 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
+            f"-DDEEPEP_BUILD_MEGAMOE_TRAIN={'ON' if configuration.get('megamoe_train', {}).get('enabled', False) else 'OFF'}",
+            f"-DDEEPEP_BF16_FORCE_EXPERT_READY={'ON' if configuration.get('megamoe_train', {}).get('force_expert_ready', False) else 'OFF'}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
         ]

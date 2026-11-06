@@ -1,0 +1,376 @@
+{
+  "id": "01-modules",
+  "title": "模块关系与构建边界",
+  "layer": "L2",
+  "summary": "Python 协调 autograd，Host 分配与启动，Device 执行融合流程；Runtime 管理通信资源，构建依赖与运行调用分开表示。",
+  "lanes": [
+    {
+      "id": "python",
+      "label": "Python 接口",
+      "color": "python"
+    },
+    {
+      "id": "host",
+      "label": "C++ Host / 绑定",
+      "color": "host"
+    },
+    {
+      "id": "device",
+      "label": "AscendC Device",
+      "color": "cube"
+    },
+    {
+      "id": "resource",
+      "label": "资源与构建",
+      "color": "memory"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "m_python",
+      "lane": "python",
+      "step": 0,
+      "title": "公开 Module 与 autograd",
+      "subtitle": "Module / Function 分工",
+      "symbol": "MegaMoeBF16Train",
+      "description": [
+        "MegaMoeBF16Train 继承 nn.Module，管理通信窗口、执行器和参数检查。调用 op(...) 时，PyTorch 先进入这个 Module 的 forward，再由它调用 _MegaMoeBF16TrainFunction.apply(...)。",
+        "_MegaMoeBF16TrainFunction 继承 autograd.Function，分别定义前向和反向如何调用自定义 kernel。启用梯度且有浮点输入需要求导时，apply 把这个 Function 记录为计算图节点，并将输出 y 与该节点关联。",
+        "训练代码执行 loss.backward() 后，autograd 沿计算图传回 grad_y，并调度 Function.backward。反向接口由 Function 提供，Module 负责公开调用和资源管理。"
+      ],
+      "reads": [
+        "Tensor 输入、保存模式、EP group"
+      ],
+      "writes": [
+        "autograd 节点、y/counts"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "class MegaMoeBF16Train(torch.nn.Module):",
+          "after": 15
+        },
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "class _MegaMoeBF16TrainFunction(torch.autograd.Function):",
+          "after": 29
+        },
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "        return _MegaMoeBF16TrainFunction.apply(",
+          "before": 1,
+          "after": 2
+        }
+      ],
+      "formula": "op(...) → MegaMoeBF16Train.forward\n        → Function.apply → Function.forward\n        → op._executor.forward → 前向 kernel\n\nloss.backward() → autograd 引擎传回 grad_y\n                → Function.backward\n                → op._executor.backward → 反向 kernel"
+    },
+    {
+      "id": "m_runtime",
+      "lane": "resource",
+      "step": 0,
+      "title": "根 Runtime 管理所有权",
+      "subtitle": "deep_ep/_runtime.py",
+      "symbol": "Runtime / _TrainRuntime",
+      "description": [
+        "训练包装类选择根 Runtime 的训练工厂，检查各 rank 的配置和设备身份，并参与进程级 SHMEM 所有者互斥。它与 Host BF16Executor 的计算职责分离。"
+      ],
+      "reads": [
+        "EP rank/world、窗口容量、endpoint"
+      ],
+      "writes": [
+        "Runtime.native、进程所有者记录"
+      ],
+      "waits": [
+        "EP 配置交换"
+      ],
+      "sources": [
+        {
+          "path": "deep_ep/_runtime.py",
+          "anchor": "        if self._megamoe_train:",
+          "occurrence": 1,
+          "before": 2,
+          "after": 9
+        }
+      ]
+    },
+    {
+      "id": "m_binding",
+      "lane": "host",
+      "step": 1,
+      "title": "训练扩展注册对象",
+      "subtitle": "csrc/bindings.cpp",
+      "symbol": "PYBIND11_MODULE(_C, module)",
+      "description": [
+        "训练包自己的 _C 注册 BF16Executor 的构造、forward/backward/close，并把 ForwardResult、BackwardResult 字段映射给 Python。它与根 deep_ep._C 是两个用途不同的扩展。"
+      ],
+      "reads": [
+        "Host 类型与方法声明"
+      ],
+      "writes": [
+        "_C.BF16、结果类型绑定"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bindings.cpp",
+          "anchor": "PYBIND11_MODULE(_C, module)",
+          "after": 18
+        }
+      ]
+    },
+    {
+      "id": "m_session",
+      "lane": "resource",
+      "step": 1,
+      "title": "Session 持有 SHMEM 窗口",
+      "subtitle": "csrc/runtime/session.cpp",
+      "symbol": "Session::workspace_address / close",
+      "description": [
+        "根原生 Session 创建和持有对称窗口。训练扩展得到的是可借用的基址，关闭窗口和 SHMEM finalization 仍由 Session 完成。模块不再建立第二个独立 SHMEM 生命周期。"
+      ],
+      "reads": [
+        "rank/world、容量、endpoint"
+      ],
+      "writes": [
+        "对称窗口、peer 地址"
+      ],
+      "waits": [
+        "Session 集合初始化/关闭"
+      ],
+      "sources": [
+        {
+          "path": "csrc/runtime/session.cpp",
+          "anchor": "uintptr_t Session::workspace_address() const",
+          "after": 6
+        },
+        {
+          "path": "csrc/bindings/module.cpp",
+          "anchor": "        \"create_megamoe_train_runtime\",",
+          "before": 1,
+          "after": 7
+        }
+      ]
+    },
+    {
+      "id": "m_host",
+      "lane": "host",
+      "step": 2,
+      "title": "Host 执行器与启动桥接",
+      "subtitle": "training.cpp / launcher.cpp",
+      "symbol": "BF16Executor / LaunchMegaMoeBF16ForwardKernel",
+      "description": [
+        "执行器保留窗口身份和通信 context，forward/backward 函数做布局校验与分配。launcher 将 Tensor 转为地址，并在当前 NPU stream 调用 C 导出启动符号。"
+      ],
+      "reads": [
+        "Tensor、context、借用窗口"
+      ],
+      "writes": [
+        "输出 Tensor、启动参数"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "ops::ForwardResult BF16Executor::forward(",
+          "after": 10
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/launcher.cpp",
+          "anchor": "void LaunchMegaMoeBF16ForwardKernel(",
+          "after": 16
+        }
+      ]
+    },
+    {
+      "id": "m_tiling",
+      "lane": "host",
+      "step": 3,
+      "title": "Host tiling 与共享布局",
+      "subtitle": "tiling + layout/",
+      "symbol": "MakeMegaMoeHostTiling / TrainingSavedStateLayout",
+      "description": [
+        "Host 查询 AIC/AIV/UB 资源，解析形状与保存模式，计算通信、持久状态和临时空间容量。共享布局公式被 Host 和 Device 使用，具体设备地址视图在 workspace_view 中建立。"
+      ],
+      "reads": [
+        "M/H/F/T、EP、E、max_recv_tokens",
+        "设备资源、保存模式"
+      ],
+      "writes": [
+        "MegaMoeTilingData、各区间大小和偏移"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/tiling.cpp",
+          "anchor": "MegaMoeHostTiling MakeMegaMoeHostTiling(",
+          "after": 18
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_layout.hpp",
+          "anchor": "struct TrainingSavedStateLayout {",
+          "after": 16
+        }
+      ]
+    },
+    {
+      "id": "m_device",
+      "lane": "device",
+      "step": 3,
+      "title": "前反向设备主控",
+      "subtitle": "mega_moe_bf16_*",
+      "symbol": "MegaMoeBF16Forward / MegaMoeBF16Backward",
+      "description": [
+        "AscendC MIX 入口创建设备对象，调用 Init 和 Process。主控组织路由、Dispatch、GEMM、激活反向、回源以及真实同步；同一流程在 AIC 与两个配对 AIV 上承担不同角色。"
+      ],
+      "reads": [
+        "tiling、context、Tensor 地址"
+      ],
+      "writes": [
+        "Y 或四类梯度",
+        "算法状态与ready计数"
+      ],
+      "waits": [
+        "数据依赖与内存复用边界"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.cpp",
+          "anchor": "    void mega_moe_bf16_forward(",
+          "after": 14
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.cpp",
+          "anchor": "    void mega_moe_bf16_backward(",
+          "after": 12
+        }
+      ]
+    },
+    {
+      "id": "m_catlass",
+      "lane": "device",
+      "step": 4,
+      "title": "计算、激活与路由组件",
+      "subtitle": "GEMM、激活、路由与调度",
+      "symbol": "GroupMatmulSwiglu / GroupMatmul2",
+      "description": [
+        "catlass 目录适配 BF16 MMAD，epilogue 负责 SwiGLU/梯度和保存格式，routing 负责路由与回源，schedule 表达 ready 和任务坐标。它们由设备主控直接调用，数据经 GM/UB 和事件交接。"
+      ],
+      "reads": [
+        "tile、专家参数、路由元数据"
+      ],
+      "writes": [
+        "计算 tile、回源片段"
+      ],
+      "waits": [
+        "对应ready和槽归还"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_forward_catlass_impl.hpp",
+          "anchor": "__aicore__ inline void GroupMatmulSwiglu(",
+          "after": 13
+        }
+      ]
+    },
+    {
+      "id": "m_build",
+      "lane": "resource",
+      "step": 4,
+      "title": "根构建选择训练组件",
+      "subtitle": "DEEPEP_BUILD_MEGAMOE_TRAIN",
+      "symbol": "add_subdirectory(experiments/megamoe_train)",
+      "description": [
+        "根 CMake 的训练开关控制根扩展中的训练 Runtime 工厂和训练子目录。子目录分别编译 Device 对象与训练 Host 扩展，链接 CATLASS 头、SHMEM/CANN、Torch/NPU 依赖，并安装同一组产物。构建边不表示运行调用顺序。"
+      ],
+      "reads": [
+        "根 SDK 依赖与构建选项"
+      ],
+      "writes": [
+        "训练 Host _C 与 BF16 SO"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "CMakeLists.txt",
+          "anchor": "if(DEEPEP_BUILD_MEGAMOE_TRAIN)",
+          "after": 4
+        },
+        {
+          "path": "experiments/megamoe_train/CMakeLists.txt",
+          "anchor": "foreach(source mega_moe_bf16_forward mega_moe_bf16_backward)",
+          "after": 16
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "m_python",
+      "to": "m_binding",
+      "kind": "flow",
+      "label": "方法调用"
+    },
+    {
+      "from": "m_binding",
+      "to": "m_host",
+      "kind": "flow"
+    },
+    {
+      "from": "m_host",
+      "to": "m_tiling",
+      "kind": "flow",
+      "label": "规划"
+    },
+    {
+      "from": "m_host",
+      "to": "m_device",
+      "kind": "flow",
+      "label": "当前stream启动"
+    },
+    {
+      "from": "m_device",
+      "to": "m_catlass",
+      "kind": "flow"
+    },
+    {
+      "from": "m_python",
+      "to": "m_runtime",
+      "kind": "flow",
+      "label": "构造/关闭"
+    },
+    {
+      "from": "m_runtime",
+      "to": "m_session",
+      "kind": "flow"
+    },
+    {
+      "from": "m_session",
+      "to": "m_host",
+      "kind": "data",
+      "label": "借用窗口地址"
+    },
+    {
+      "from": "m_tiling",
+      "to": "m_device",
+      "kind": "data",
+      "label": "tiling/布局"
+    },
+    {
+      "from": "m_build",
+      "to": "m_binding",
+      "kind": "build"
+    },
+    {
+      "from": "m_build",
+      "to": "m_device",
+      "kind": "build"
+    },
+    {
+      "from": "m_build",
+      "to": "m_session",
+      "kind": "build",
+      "label": "训练工厂"
+    }
+  ]
+}
