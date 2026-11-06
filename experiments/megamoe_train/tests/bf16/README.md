@@ -106,7 +106,7 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 
 | `backward` | 窗口外先跑一次前向建图（不计时），窗口内只圈 `y.backward(dy)` |
 | `complete` | 一次窗口内前向 + 反向 |
 
-`--warmup N --loops M` 对三个口径和 baseline 共用。**不构建、不开启、不读取任何设备 Timer**。
+`--warmup N --loops M` 对三个口径和 baseline 共用，`--loops` 默认 20。**不构建、不开启、不读取任何设备 Timer**。
 
 `--baseline on`（默认）额外计时移植过来的 dropless 小算子链（permute、alltoall dispatch、
 GMM1、带路由权重的 SwiGLU、GMM2、combine、unpermute），与算子共用同一份路由、权重
@@ -201,8 +201,8 @@ MFU 差异的关键量。
 
 | 现象 | 说明 / 规避 |
 | --- | --- |
-| `process_group_setup` 花 40–50 s | Gloo 建组，多网卡机器上常见；设 `GLOO_SOCKET_IFNAME=<内网网卡>` 后再试 |
-| `--loops` 较大时性能段卡住（不报错） | 已定位到与迭代次数相关，`--loops ≤ 10` 可稳定运行；卡住时用 `--log rank0` 看 `[PERF] stage` 停在哪个阶段 |
+| `process_group_setup` 较慢 | 核对 Gloo 的网卡选择；多网卡机器可显式设置 `GLOO_SOCKET_IFNAME=<内网网卡>` 后复测 |
+| 性能阶段长时间无输出 | 用 `--log rank0` 确认最后的 `[PERF] stage`；记录源码与 SO 版本、shape、EP、保存模式、`warmup/loops`、设备状态和日志，按相同配置复现 |
 | `max_recv_tokens` 与预期不符 | 先看 `[INPUT]` 的 `received_rows`/`empty_experts`，路由不符合预期时后面的时间不可信 |
 | `local_mem_size` 不足 | 入口按 shape 自动算窗口；需要时显式传 `--local-mem-size`（2 MiB 对齐） |
 | 大 shape 主机内存吃紧 | CPU 输入快照与参考计算在 host 侧；`glm` 的 E/rank=8 权重更大 |

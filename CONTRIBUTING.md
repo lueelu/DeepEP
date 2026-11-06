@@ -34,7 +34,7 @@ pre-commit run --all-files --show-diff-on-failure
 
 钩子检查行尾空白、文件末尾换行、YAML/JSON、文件大小、合并冲突标记、私钥标记和拼写。Ruff 检查 Python 常规错误并格式化代码；clang-format 格式化 C/C++/AscendC。格式化工具可能改写文件，应检查并暂存这些修改，再次运行检查。钩子在隔离环境中运行，首次使用需要网络，不依赖 Torch 或 NPU。
 
-当前仓库未配置自动 CI 流水线，请在提交前手动运行上述全仓 pre-commit 命令，纯文档修改也应检查。暂存文件和 PR 改动范围的检查命令见[开发指南](docs/development.md)。
+仓库的 [MegaMoE Train 文档 CI](.github/workflows/megamoe-train-visual.yml) 自动构建和检查源码导览、离线阅读与编辑器集成。提交前仍需手动运行上述全仓 pre-commit，并按变更范围验证 CPU 和 NPU 功能；文档 CI 不替代这些检查。暂存文件和 PR 改动范围的检查命令见[开发指南](docs/development.md)。
 
 API 契约、资源/事件、HT dispatch/combine 和 LL 的测试入口见[测试说明](tests/README.md)。构建安装及其检查见[构建指南](docs/build.md)，各入口的通过范围分别记录。
 

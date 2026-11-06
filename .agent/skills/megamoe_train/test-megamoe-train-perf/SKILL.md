@@ -76,7 +76,7 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py "$MEGAMOE_TEST_D
 - 单条复测用 `--case-id`；要改 shape/路由/保存模式就去掉 `--suite`，按 README 传单 case 参数。
 - 怀疑会卡住时把 `--log` 换成 `rank0`：保留 rank 0 的阶段日志与 `[PERF] stage` 标记。
 - 单条只看趋势时 `--baseline off`；需要 speedup 时必须保持默认 `on`。
-- 同一 shape 建议 `warmup ≥ 2`、`loops ≥ 10`；样本少时跨进程重复，不要用单次结果下结论。
+- `--loops` 默认 20。同一 shape 建议 `warmup ≥ 2`、`loops ≥ 10`；样本少时跨进程重复，不要用单次结果下结论。
 - 运行期间不更新源码、不重装 wheel；异常后完整重启自己的作业，不只重启部分 rank。
 
 ## 4. 判读
@@ -108,8 +108,8 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py "$MEGAMOE_TEST_D
 
 ## 6. 已知问题
 
-- `process_group_setup` 花 40–50 s：Gloo 建组；设 `GLOO_SOCKET_IFNAME=<内网网卡>` 可消除。
-- `--loops` 较大时性能段卡住且无输出：`--loops ≤ 10` 可稳定运行；用 `--log rank0` 看
-  `[PERF] stage` 停在哪一段，把最后一行连同 `npu-smi info` 一起记录。
+- `process_group_setup` 较慢：核对 Gloo 的网卡选择；多网卡机器可显式设置 `GLOO_SOCKET_IFNAME=<内网网卡>` 后复测。
+- 性能阶段长时间无输出时，用 `--log rank0` 确认最后的 `[PERF] stage`；记录源码与 SO 版本、shape、EP、保存模式、
+  `warmup/loops`、设备状态和完整日志，按相同配置复现。
 - `[INPUT]` 的 `received_rows` 与 balanced 预期不符、或 `empty_experts > 0` 时，后面的时延不可信，
   先查路由与容量。
