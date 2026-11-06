@@ -1,0 +1,52 @@
+<!doctype html>
+<!-- Copyright (c) 2026, Lu Lu
+     Modified by xixing 2026
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="从公共接口到 AIC / AIV 流水，逐层学习 DeepEP MegaMoE BF16 训练源码。">
+  <title>MegaMoE BF16 · 训练源码导览</title>
+  <style>/*__STYLE__*/</style>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">跳到图解</a>
+  <header class="masthead">
+    <div class="brand-mark" aria-hidden="true">M</div>
+    <div class="brand-copy"><div class="eyebrow">DeepEP / 源码学习</div><h1>MegaMoE BF16 <span>训练源码导览</span></h1></div>
+    <a class="repository" id="repository" target="_blank" rel="noopener">打开源码仓库 ↗</a>
+  </header>
+  <section class="intro" aria-label="学习场景">
+    <p>从整体结构走到一次前反向，再进入三核分工与内存复用。点开节点，把图里的每一步对应到真实源码。</p>
+    <div class="scenario"><span>Ascend950</span><span>save = bf16</span><span>H7168 / F3072</span><span>clipping 关闭</span><span>默认 Dispatch 策略</span><a id="revision" target="_blank" rel="noopener"></a></div>
+  </section>
+  <div class="reader-layout" id="reader-layout">
+  <div class="chapter-column"><button type="button" id="nav-toggle" aria-controls="navigation" aria-expanded="false">章节目录</button><nav id="navigation" aria-label="源码阅读导航"></nav></div>
+  <main id="workspace">
+    <section class="diagram-panel" aria-labelledby="view-title">
+      <div class="view-heading"><div><div class="eyebrow" id="view-layer"></div><h2 id="view-title"></h2></div><span id="node-count"></span></div>
+      <p class="view-summary" id="view-summary"></p>
+      <div class="learning-controls" id="learning-controls" hidden>
+        <label>追踪 token <select id="case-token"></select></label>
+        <label id="case-phase-control">阶段 <select id="case-phase"><option value="forward">前向</option><option value="backward">反向</option></select></label>
+        <span id="case-context" aria-live="polite"></span>
+      </div>
+      <div class="toolbar" id="graph-toolbar">
+        <div class="zoom-controls"><button id="fit" type="button">适合宽度</button><button id="zoom-out" aria-label="缩小" type="button">−</button><output id="zoom-label">100%</output><button id="zoom-in" aria-label="放大" type="button">＋</button></div>
+        <label class="search"><span aria-hidden="true">⌕</span><input id="query" type="search" placeholder="找函数、缓冲或 flag" aria-label="搜索当前图"></label>
+        <label class="sync-control"><input id="show-sync" type="checkbox" checked>显示依赖</label>
+        <button id="expand" type="button" aria-pressed="false">展开整图</button>
+      </div>
+      <div class="legend"><span><i class="solid"></i>流程 / 数据推进</span><span><i class="dashed"></i>等待 / 复用 / 构建关系</span><span class="stage-note">阶段位置表达依赖顺序</span></div>
+      <div class="viewport" id="viewport" tabindex="0" aria-label="可缩放的源码流程图"><div id="canvas"></div></div>
+      <div class="diagram-footer"><span id="search-status" aria-live="polite">点击节点查看说明和源码</span><div id="graph-exports"><button id="svg-download" type="button">下载 SVG</button><button id="mmd-download" type="button">下载 Mermaid</button></div></div>
+    </section>
+    <aside class="inspector" id="inspector" aria-label="节点详情" aria-live="polite"></aside>
+  </main>
+  </div>
+  <footer class="page-footer"><span>图、讲解和源码片段由同一份节点数据生成。</span><a id="source-map" href="source-map.json">源码映射</a></footer>
+  <script id="reader-data" type="application/json">/*__DATA__*/</script>
+  <script>/*__APP__*/</script>
+</body>
+</html>

@@ -68,6 +68,7 @@ class Runtime:
     """One explicit collective lifetime per process; a live owner is retained."""
 
     _megamoe = False
+    _megamoe_train = False
 
     def __init__(
         self,
@@ -118,17 +119,27 @@ class Runtime:
         if dense_qps not in ("0", "1"):
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap
-        store_group = self._megamoe and isinstance(group, StoreGroup)
+        store_group = (self._megamoe or self._megamoe_train) and isinstance(group, StoreGroup)
         if self._megamoe and (group is None or udma):
             raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
+        if self._megamoe_train and (udma or bootstrap != "default"):
+            raise ValueError("MegaMoE training requires the MTE/default runtime")
         if store_group:
             if rank is not None or world_size is not None:
                 raise ValueError("Pass either group or rank/world_size, not both")
             rank, size = group.rank(), group.size()
+        elif self._megamoe_train and group is None:
+            size = integer("world_size", world_size, 2, 1024)
+            rank = integer("rank", rank, 0, size - 1)
         else:
             rank, size = rank_and_world(group, rank, world_size)
         factory = native.Runtime
-        if self._megamoe:
+        if self._megamoe_train:
+            integer("world_size", size, 2, 1024)
+            factory = getattr(native, "create_megamoe_train_runtime", None)
+            if factory is None:
+                raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE_TRAIN=ON")
+        elif self._megamoe:
             integer("world_size", size, 2, 128)
             factory = getattr(native, "create_megamoe_runtime", None)
             if factory is None:
@@ -162,7 +173,7 @@ class Runtime:
                     return int.from_bytes(hashlib.sha256(value.encode()).digest()[:7], "little")
 
                 local_values = [capacity, timeout, digest(address), int(busy)]
-                if self._megamoe:
+                if self._megamoe or self._megamoe_train:
                     host_id = _host_boot_id()
                     local_values.extend(
                         [
@@ -177,6 +188,7 @@ class Runtime:
                     + 4 * int(dense_qps)
                     + 8 * int(use_1g_huge_pages)
                     + 16 * int(debug_collectives)
+                    + 32 * int(self._megamoe_train)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -196,7 +208,7 @@ class Runtime:
                     raise ValueError(
                         "Ranks disagree on MTE/URMA runtime engines, QP configuration, page size or debug_collectives"
                     )
-                if self._megamoe:
+                if self._megamoe or self._megamoe_train:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
                         raise RuntimeError(

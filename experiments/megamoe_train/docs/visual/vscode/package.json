@@ -1,0 +1,38 @@
+{
+  "name": "megamoe-train-source-guide",
+  "displayName": "MegaMoE Train 源码导览",
+  "description": "在 VS Code 中阅读 MegaMoE BF16 训练图解，并直接打开对应源码与行号。",
+  "version": "0.2.0",
+  "publisher": "deepep-local",
+  "license": "BSD-2-Clause",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "main": "./extension.cjs",
+  "activationEvents": [
+    "onCustomEditor:megamoeTrain.sourceGuide",
+    "onCommand:megamoeTrain.openSourceGuide"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "megamoeTrain.openSourceGuide",
+        "title": "MegaMoE: 打开训练源码导览"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "megamoeTrain.sourceGuide",
+        "displayName": "MegaMoE 训练源码导览",
+        "selector": [
+          {
+            "filenamePattern": "**/experiments/megamoe_train/docs/visual/index.html"
+          }
+        ],
+        "priority": "default"
+      }
+    ]
+  }
+}

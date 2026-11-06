@@ -6,7 +6,7 @@ Modified by Joyce_An 2026
 # 构建、打包与安装
 
 wheel 包含 Host 运行时、Notify 及 HT/LL dispatch/combine kernel。输入和执行约束见 [Elastic 接口](elastic.md)，资源与事件见 [API 指南](api.md)。
-MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说明。
+MegaMoE 推理、MegaMoE 训练和 EpGmmFused 通过独立开关选择构建，见下文实验组件说明。
 包名为 `ascend-deepep`，导入名仍为 `deep_ep`；不要与其他提供 `deep_ep` 的包装在同一环境。
 
 ## 前置条件
@@ -29,6 +29,9 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
 
 MegaMoE 的构建和多机测试入口位于 `experiments/megamoe/scripts/`，
 命令、依赖和环境配置见 [MegaMoE 使用说明](../experiments/megamoe/README.md#2-编译安装)。
+Ascend950 BF16 训练使用 `DEEPEP_BUILD_MEGAMOE_TRAIN=ON`，默认关闭；需根仓锁定的
+CATLASS/SHMEM、兼容的 PyTorch/torch_npu，并通过 wheel 安装，见
+[MegaMoE 训练说明](../experiments/megamoe_train/README.md)。它与推理开关独立。
 EpGmmFused 通过 `DEEPEP_BUILD_EP_GMM_FUSED=ON` 构建 AllToAllV → GMM 和 GMM → AllToAllV，
 需要单独准备 CatCCOS、其 CATLASS 依赖及 SHMEM SDK，见 [EpGmmFused 使用说明](../experiments/ep_gmm_fused/README.md#构建)。
 基础包使用下面的通用构建流程，两个实验组件默认均关闭。
@@ -115,7 +118,7 @@ python -m pip install --force-reinstall --no-deps /path/to/shared/wheels/实际�
 
 `pip wheel` 只编译打包，不安装。第一条仅执行一次，第二条在每个独立 Python 环境执行；
 使用本次生成的实际文件名，不要硬编码旧版本，也不要在多台机器同时编译同一共享 checkout。
-每台运行节点都需要加载匹配的 CANN/SHMEM 环境并设置运行时共享 endpoint，详见
+每台运行节点都需要加载匹配的 CANN 环境并设置运行时共享 endpoint；SHMEM 使用同一 wheel 内附的运行库，详见
 [单机/多机测试](../tests/README.md)。
 
 若需要同时交付源码包与 wheel，可在安装构建依赖后执行

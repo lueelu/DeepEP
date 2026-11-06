@@ -109,6 +109,23 @@ def test_missing_sdk_rejected(build):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950"})
 
 
+def test_expert_ready_requires_training(build):
+    with pytest.raises(RuntimeError, match="requires DEEPEP_BUILD_MEGAMOE_TRAIN=ON"):
+        build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950", "DEEPEP_BF16_FORCE_EXPERT_READY": "ON"})
+
+
+@pytest.mark.parametrize("value", ["auto", "yes", "2", ""])
+def test_expert_ready_rejects_unknown_policy(build, value):
+    with pytest.raises(ValueError, match="DEEPEP_BF16_FORCE_EXPERT_READY"):
+        build.build_configuration(
+            {
+                "DEEPEP_NPU_ARCH": "Ascend950",
+                "DEEPEP_BUILD_MEGAMOE_TRAIN": "ON",
+                "DEEPEP_BF16_FORCE_EXPERT_READY": value,
+            }
+        )
+
+
 def test_beta_requires_sdk_and_timer_requires_beta(build):
     with pytest.raises(RuntimeError, match="ASCEND_HOME_PATH"):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950", "DEEPEP_BUILD_MEGAMOE": "ON"})

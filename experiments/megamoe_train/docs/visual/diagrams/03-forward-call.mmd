@@ -1,0 +1,30 @@
+flowchart TB
+  subgraph lane_python["Python / autograd"]
+    fc_public["公开 forward 进入 autograd"]
+    fc_function["Function.forward 调执行器"]
+    fc_return["保存反向状态，公开返回Y和counts"]
+  end
+  subgraph lane_host["绑定 / Host"]
+    fc_binding["pybind 转入 BF16Executor"]
+    fc_host["检查Tensor与容量边界"]
+    fc_tiling["生成设备tiling与空间预算"]
+    fc_launch["当前NPU stream上的启动桥接"]
+    fc_export["C导出函数提交MIX kernel"]
+  end
+  subgraph lane_memory["Tensor 资源"]
+    fc_allocate["分配输出、持久状态与临时区"]
+  end
+  subgraph lane_device["AscendC 设备"]
+    fc_device["设备入口初始化前向对象"]
+    fc_pipeline["Process执行融合前向"]
+  end
+  fc_public --> fc_function
+  fc_function --> fc_binding
+  fc_binding --> fc_host
+  fc_host --> fc_tiling
+  fc_tiling --> fc_allocate
+  fc_allocate --> fc_launch
+  fc_launch --> fc_export
+  fc_export --> fc_device
+  fc_device --> fc_pipeline
+  fc_pipeline --> fc_return

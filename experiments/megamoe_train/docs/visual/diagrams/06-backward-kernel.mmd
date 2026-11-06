@@ -1,0 +1,56 @@
+flowchart TB
+  subgraph lane_b_all["所有 AIV / rank 边界"]
+    b_saved["读取匹配前向的持久状态"]
+    b_gather["按排序 route 复制原始 dY"]
+    b_restore_counts["恢复前向计数与 source 分段"]
+    b_dz_ready["两路 AIV 退休本专家全部 P1 输出"]
+    b_dx_arrived["所有 rank 确认 dX 回传结束"]
+    b_unpermute_dx["源 rank 用 FP32 累加 route dX"]
+    b_reuse_ptrd["所有 dX 读者结束后才能复用 ptrD"]
+    b_reduce_dp["归约 dp partial，再批量回送"]
+    b_dp_output["恢复 dtopk_weights，清理后退出"]
+  end
+  subgraph lane_b_aiv0["AIV0：Dispatch / P1 / 回传"]
+    b_dispatch_do["专家卡拉取各源 rank 的 dY"]
+    b_do_ready["发布真实 dO 行进度与专家完成"]
+    b_epi0["AIV0 执行 SwiGLU Grad"]
+    b_dx_send["将 dX route 贡献送回源 rank"]
+  end
+  subgraph lane_b_aic["AIC：dHp、dW2、dX、dW1"]
+    b_dhp["计算 dHp，写到临时借用的 Hp 平面"]
+    b_dhp_retire["本专家所有 dHp 写退休"]
+    b_wait_dz["等待 DZReady 后算 dW2"]
+    b_dw2["提前计算并保存专家 dW2"]
+    b_do_release["所有 AIC 共同释放 dO 行段"]
+    b_dx["计算 dX 并覆盖已释放的 dO"]
+    b_dw1["计算专家 dW1，留在专家 rank"]
+  end
+  subgraph lane_b_aiv1["AIV1：P1 激活梯度"]
+    b_epi1["AIV1 执行 SwiGLU Grad"]
+  end
+  subgraph lane_b_gm["GM 中间量与精度边界"]
+    b_numeric["产出 Hp、dZ 与 FP32 dp partial"]
+  end
+  b_saved --> b_gather
+  b_gather -.-> b_restore_counts
+  b_restore_counts --> b_dispatch_do
+  b_dispatch_do -.-> b_do_ready
+  b_do_ready -.-> b_dhp
+  b_dhp -.-> b_dhp_retire
+  b_dhp_retire -.-> b_epi0
+  b_dhp_retire -.-> b_epi1
+  b_epi0 --> b_numeric
+  b_epi1 --> b_numeric
+  b_numeric -.-> b_dz_ready
+  b_dz_ready -.-> b_wait_dz
+  b_wait_dz --> b_dw2
+  b_dw2 -.-> b_do_release
+  b_do_release -.-> b_dx
+  b_dx -.-> b_dx_send
+  b_dx --> b_dw1
+  b_dx_send -.-> b_dx_arrived
+  b_dx_arrived --> b_unpermute_dx
+  b_unpermute_dx -.-> b_reuse_ptrd
+  b_reuse_ptrd --> b_reduce_dp
+  b_numeric --> b_reduce_dp
+  b_reduce_dp -.-> b_dp_output

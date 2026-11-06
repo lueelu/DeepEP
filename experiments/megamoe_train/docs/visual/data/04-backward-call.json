@@ -1,0 +1,411 @@
+{
+  "id": "04-backward-call",
+  "title": "一次反向的跨文件调用",
+  "layer": "L4",
+  "summary": "autograd将dY与前向状态送入Host反向入口；Host规划scratch并提交同一套设备库，设备计算完成的数据依赖由stream和kernel内部同步保证。",
+  "lanes": [
+    {
+      "id": "python",
+      "label": "Python / autograd",
+      "color": "python"
+    },
+    {
+      "id": "host",
+      "label": "绑定 / Host",
+      "color": "host"
+    },
+    {
+      "id": "memory",
+      "label": "Tensor 资源",
+      "color": "memory"
+    },
+    {
+      "id": "device",
+      "label": "AscendC 设备",
+      "color": "cube"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "bc_autograd",
+      "lane": "python",
+      "step": 0,
+      "title": "loss.backward() 触发反向",
+      "subtitle": "autograd → Function.backward",
+      "symbol": "_MegaMoeBF16TrainFunction.backward",
+      "description": [
+        "训练代码先用 y 构造 loss，再执行 loss.backward()。autograd 沿计算图算出 dL/dY，并将它作为 grad_y 传给 _MegaMoeBF16TrainFunction.backward(ctx, grad_y)。",
+        "Module 的 forward 在调用 Function.apply 时已建立这个节点与输出 y 的关系，因此这里由 autograd 引擎直接调度 Function.backward。",
+        "统一测试直接执行 y.backward(dy)，为每个 y 元素指定上游梯度。这等价于构造 loss=(y*dy).sum() 再反向。counts 已标记不可微；本算子为 x、p、W1、W2 返回梯度。"
+      ],
+      "reads": [
+        "grad_y [M,H]",
+        "ctx"
+      ],
+      "writes": [
+        "反向Host调用"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "    def backward(ctx, grad_y, grad_counts=None):",
+          "before": 2,
+          "after": 18
+        },
+        {
+          "path": "experiments/megamoe_train/tests/bf16/test_mega_moe.py",
+          "anchor": "    with phase(\"fused_forward_backward\"):",
+          "before": 1,
+          "after": 9
+        }
+      ],
+      "formula": "y, counts = op(...)\ny.backward(dy)\n\nautograd → Function.backward(ctx, grad_y=dy)\n         → op._executor.backward(...)"
+    },
+    {
+      "id": "bc_saved",
+      "lane": "memory",
+      "step": 1,
+      "title": "恢复本次前向的保存Tensor",
+      "subtitle": "状态、packed X/p、参数与计数",
+      "symbol": "ctx.saved_tensors",
+      "description": [
+        "ctx取回与该前向对应的weights、W1、W2、counts、saved_state和dispatch_output。grad_y被整理为连续Tensor后进入执行器。saved-bf16包含原始Gate/Up，反向因此跳过GMM1重算；none/mxfp8的差异在内核分支中处理。"
+      ],
+      "reads": [
+        "p、W1、W2、counts",
+        "saved_state、dispatch_output",
+        "grad_y"
+      ],
+      "writes": [
+        "连续grad_y、反向输入引用"
+      ],
+      "waits": [
+        "Module仍存活且stream一致"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "        weights, w1, w2, counts, saved, dispatch = ctx.saved_tensors",
+          "after": 17
+        }
+      ]
+    },
+    {
+      "id": "bc_binding",
+      "lane": "host",
+      "step": 2,
+      "title": "绑定转入执行器backward",
+      "subtitle": "_C.BF16.backward",
+      "symbol": "BF16Executor::backward",
+      "description": [
+        "训练扩展把Python方法绑定到C++执行器。执行器带上同一窗口基址、rank/world和context调用ops::MegaMoeBF16Backward，并返回具名BackwardResult。"
+      ],
+      "reads": [
+        "反向Tensor、保存状态、执行器资源"
+      ],
+      "writes": [
+        "ops反向调用"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bindings.cpp",
+          "anchor": "        .def(\"backward\", &BF16Executor::backward)",
+          "before": 2,
+          "after": 1
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "ops::BackwardResult BF16Executor::backward(",
+          "after": 12
+        }
+      ]
+    },
+    {
+      "id": "bc_host",
+      "lane": "host",
+      "step": 3,
+      "title": "检查梯度输入与保存状态",
+      "subtitle": "ops::MegaMoeBF16Backward",
+      "symbol": "MegaMoeBF16Backward",
+      "description": [
+        "Host从grad_y和权重恢复形状，检查dtype、连续性、有效保存状态、dispatch_output容量和路由边界。保存状态来自对应前向，不能被其他调用的scratch或通信窗口内容替代。"
+      ],
+      "reads": [
+        "gradY、p、W1/W2、counts",
+        "saved_state、dispatch_output"
+      ],
+      "writes": [
+        "反向shape与布局选择"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "BackwardResult MegaMoeBF16Backward(",
+          "after": 22
+        }
+      ]
+    },
+    {
+      "id": "bc_layout",
+      "lane": "host",
+      "step": 4,
+      "title": "规划反向scratch与ready后缀",
+      "subtitle": "布局取决于保存模式与构建策略",
+      "symbol": "MegaMoeBF16BackwardWorkspaceLayout",
+      "description": [
+        "Host复用共享tiling规则、检查各阶段UB占用，再按保存模式和splitExperts计算scratch。默认FORCE_EXPERT_READY=OFF保留自动选择；统一整专家构建则令splitExperts=0。这里规划容量，并不表示所有输入已完成搬运。"
+      ],
+      "reads": [
+        "tiling、savedMode、splitExperts",
+        "UB资源"
+      ],
+      "writes": [
+        "反向workspace各区间大小"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "struct MegaMoeBF16BackwardWorkspaceLayout {",
+          "after": 21
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "    const MegaMoeBF16BackwardWorkspaceLayout backwardLayout(tiling, splitExperts);",
+          "before": 3,
+          "after": 3
+        }
+      ]
+    },
+    {
+      "id": "bc_allocate",
+      "lane": "memory",
+      "step": 5,
+      "title": "分配四项梯度与scratch",
+      "subtitle": "kernel完整写输出，空专家清零",
+      "symbol": "AllocateBackwardWorkspace",
+      "description": [
+        "Host分配gradX、gradTopkWeights、gradWeight1、gradWeight2与backwardWorkspace。kernel覆盖所有输出行和非空专家权重梯度，空专家对应权重梯度由设备清零；不把所有输出都预清零。"
+      ],
+      "reads": [
+        "backwardLayout、输入Tensor options"
+      ],
+      "writes": [
+        "dx [M,H]、dp [M,T]",
+        "dw1、dw2、backward scratch"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "    auto gradX = torch::empty({m, k}, gradY.options());",
+          "before": 5,
+          "after": 8
+        }
+      ]
+    },
+    {
+      "id": "bc_launch",
+      "lane": "host",
+      "step": 6,
+      "title": "Host桥接到反向C启动符号",
+      "subtitle": "同一NPU stream、同一构建",
+      "symbol": "LaunchMegaMoeBF16BackwardKernel",
+      "description": [
+        "launcher取得当前Acl stream，把梯度输入、输出、持久状态、scratch、tiling和splitExperts转为C导出启动参数。Host与Device采用同一ready构建策略。"
+      ],
+      "reads": [
+        "context、Tensor地址、tiling、splitExperts"
+      ],
+      "writes": [
+        "C导出调用参数"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/launcher.cpp",
+          "anchor": "    auto kernel = &deepep_train_mega_moe_bf16_backward_ready_k_kernel_do;",
+          "before": 2,
+          "after": 10
+        }
+      ]
+    },
+    {
+      "id": "bc_export",
+      "lane": "host",
+      "step": 7,
+      "title": "导出函数提交反向MIX kernel",
+      "subtitle": "kernel_do → <<<...>>>",
+      "symbol": "deepep_train_mega_moe_bf16_backward_ready_k_kernel_do",
+      "description": [
+        "设备库的Host导出端解包tiling，在当前stream启动mega_moe_bf16_backward。C入口与前向入口彼此独立，但属于同一训练设备库。"
+      ],
+      "reads": [
+        "裸地址、tiling_host、split_experts"
+      ],
+      "writes": [
+        "反向kernel提交"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.cpp",
+          "anchor": "extern \"C\" ASCEND_MEGAMOE_EXPORT void deepep_train_mega_moe_bf16_backward_ready_k_kernel_do(",
+          "after": 14
+        }
+      ]
+    },
+    {
+      "id": "bc_device",
+      "lane": "device",
+      "step": 8,
+      "title": "设备对象恢复前向状态视图",
+      "subtitle": "MegaMoeBF16Backward::Init",
+      "symbol": "mega_moe_bf16_backward",
+      "description": [
+        "MIX入口创建反向主控对象。Init把保存状态、dispatch_output、backwardWorkspace及梯度输出地址映射为设备视图，并记录本次splitExperts策略，然后进入Process。"
+      ],
+      "reads": [
+        "context、输入输出地址、tiling",
+        "保存状态与scratch"
+      ],
+      "writes": [
+        "反向主控对象与地址视图"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.cpp",
+          "anchor": "    void mega_moe_bf16_backward(",
+          "after": 13
+        }
+      ]
+    },
+    {
+      "id": "bc_pipeline",
+      "lane": "device",
+      "step": 9,
+      "title": "Process执行四项梯度流程",
+      "subtitle": "默认saved-BF16先dW2再复用dO",
+      "symbol": "MegaMoeBF16Backward::Process",
+      "description": [
+        "主控分发原始dY形成dO，计算dHp和SwiGLU反向得到dZ/Hp/dp partial。保存路径按专家先算dW2，退休dO读者后原地写dX并回传，再计算dW1；AIV归并dX并归约回传dp。函数大阶段标题不等于所有核同时跨越的全局barrier。"
+      ],
+      "reads": [
+        "dY、W1/W2、前向持久状态"
+      ],
+      "writes": [
+        "源rank的dx/dp",
+        "专家rank的dw1/dw2"
+      ],
+      "waits": [
+        "输入ready、dzReady、doReleased、dxReady",
+        "跨rank读写与复用边界"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "__aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()",
+          "after": 16
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "__aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM1GradReuseDOPhase()",
+          "after": 18
+        }
+      ]
+    },
+    {
+      "id": "bc_return",
+      "lane": "python",
+      "step": 10,
+      "title": "按原输入顺序返回梯度",
+      "subtitle": "dp保留TopK槽，IDs返回None",
+      "symbol": "_MegaMoeBF16TrainFunction.backward return",
+      "description": [
+        "Host把四个Tensor组织为BackwardResult并记录当前stream，Python按forward输入位置返回梯度。x得到dx，路由权重得到dtopk_weights，两个专家参数得到dw1/dw2；op、IDs、容量、limit和模式没有梯度返回。",
+        "返回位置与 Function.apply 的输入位置一一对应。autograd 将 dX、dp、dW1、dW2 继续传向各自上游；对于需要梯度的叶子 Tensor，loss.backward() 会将梯度累积到对应的 .grad。"
+      ],
+      "reads": [
+        "BackwardResult.dx/dtopk_weights/dw1/dw2"
+      ],
+      "writes": [
+        "对应输入的autograd梯度"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "        return None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None, None, None",
+          "before": 3,
+          "after": 1
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "    return {gradX, gradTopkWeights, gradWeight1, gradWeight2};",
+          "before": 8,
+          "after": 1
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "bc_autograd",
+      "to": "bc_saved",
+      "kind": "data"
+    },
+    {
+      "from": "bc_saved",
+      "to": "bc_binding",
+      "kind": "data"
+    },
+    {
+      "from": "bc_binding",
+      "to": "bc_host",
+      "kind": "flow"
+    },
+    {
+      "from": "bc_host",
+      "to": "bc_layout",
+      "kind": "flow"
+    },
+    {
+      "from": "bc_layout",
+      "to": "bc_allocate",
+      "kind": "data",
+      "label": "容量/布局"
+    },
+    {
+      "from": "bc_allocate",
+      "to": "bc_launch",
+      "kind": "data",
+      "label": "Tensor地址"
+    },
+    {
+      "from": "bc_launch",
+      "to": "bc_export",
+      "kind": "flow"
+    },
+    {
+      "from": "bc_export",
+      "to": "bc_device",
+      "kind": "flow",
+      "label": "kernel启动"
+    },
+    {
+      "from": "bc_device",
+      "to": "bc_pipeline",
+      "kind": "flow"
+    },
+    {
+      "from": "bc_pipeline",
+      "to": "bc_return",
+      "kind": "data",
+      "label": "四类梯度"
+    }
+  ]
+}

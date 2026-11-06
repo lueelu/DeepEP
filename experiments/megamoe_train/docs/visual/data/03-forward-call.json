@@ -1,0 +1,393 @@
+{
+  "id": "03-forward-call",
+  "title": "一次前向的跨文件调用",
+  "layer": "L4",
+  "summary": "从Module调用逐层走到MIX设备入口，再沿保存结果返回autograd；箭头表达调用或数据关系，stage坐标不代表实测耗时。",
+  "lanes": [
+    {
+      "id": "python",
+      "label": "Python / autograd",
+      "color": "python"
+    },
+    {
+      "id": "host",
+      "label": "绑定 / Host",
+      "color": "host"
+    },
+    {
+      "id": "memory",
+      "label": "Tensor 资源",
+      "color": "memory"
+    },
+    {
+      "id": "device",
+      "label": "AscendC 设备",
+      "color": "cube"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "fc_public",
+      "lane": "python",
+      "step": 0,
+      "title": "公开 forward 进入 autograd",
+      "subtitle": "Module → Function.apply",
+      "symbol": "MegaMoeBF16Train.forward",
+      "description": [
+        "调用 op(...) 时，nn.Module 的调用机制进入 MegaMoeBF16Train.forward。它校验 max_recv_tokens、clipping limit 与保存模式，再调用 _MegaMoeBF16TrainFunction.apply(self, x, IDs, p, W1, W2, ...)。",
+        "启用梯度且有浮点输入需要求导时，apply 建立自定义 autograd 节点并执行 Function.forward。PyTorch 因此知道后续反传应调用哪个 Function.backward。",
+        "这里的 save_gmm1_output 默认 bf16；本图选择 canonical 权重、H7168、F3072 和关闭 clipping。"
+      ],
+      "reads": [
+        "X、IDs、p、W1、W2、max_recv_tokens"
+      ],
+      "writes": [
+        "自定义autograd调用"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "        return _MegaMoeBF16TrainFunction.apply(",
+          "before": 7,
+          "after": 3
+        }
+      ],
+      "formula": "op(...) → Module.forward(...) → Function.apply(...) → Function.forward(...)"
+    },
+    {
+      "id": "fc_function",
+      "lane": "python",
+      "step": 1,
+      "title": "Function.forward 调执行器",
+      "subtitle": "检查实例与stream状态",
+      "symbol": "_MegaMoeBF16TrainFunction.forward",
+      "description": [
+        "Function.forward 先调用 op._check_ready，默认只在本地检查 p dtype 是否为 BF16 或 FP32，再调用 op._executor.forward。_executor 是训练包 _C.BF16 对象，负责启动前向 kernel。整数 IDs 用于路由，p 是 BF16 或 FP32 的可微浮点输入。",
+        "构造时设置 debug_collectives=True，才在每次原生调用前集体核对当前前向／反向阶段和 p dtype。各 rank 仍须保证 dtype 和调用顺序相容；该检查不核对图身份、全部调用参数或完整操作序列。",
+        "ctx 是本次 Function 调用的上下文。前向结束后，它保存本次反向需要的 Tensor 和调用配置；反向时由 autograd 把同一个 ctx 交给 Function.backward。"
+      ],
+      "reads": [
+        "op、所有前向输入"
+      ],
+      "writes": [
+        "ForwardResult引用"
+      ],
+      "waits": [
+        "Module存活、创建stream一致"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "    def forward(ctx, op, x, ids, weights, w1, w2, max_recv, limit, mode):",
+          "after": 8
+        }
+      ]
+    },
+    {
+      "id": "fc_binding",
+      "lane": "host",
+      "step": 2,
+      "title": "pybind 转入 BF16Executor",
+      "subtitle": "_C.BF16.forward",
+      "symbol": "BF16Executor::forward",
+      "description": [
+        "pybind把Python方法映射到C++执行器。执行器检查借用地址仍有效，取得通信context，再调用ops命名空间的MegaMoeBF16Forward。"
+      ],
+      "reads": [
+        "Tensor对象、执行器rank/world/窗口"
+      ],
+      "writes": [
+        "Host前向调用"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bindings.cpp",
+          "anchor": "        .def(\"forward\", &BF16Executor::forward)",
+          "before": 3,
+          "after": 2
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "ops::ForwardResult BF16Executor::forward(",
+          "after": 11
+        }
+      ]
+    },
+    {
+      "id": "fc_host",
+      "lane": "host",
+      "step": 3,
+      "title": "检查Tensor与容量边界",
+      "subtitle": "ops::MegaMoeBF16Forward",
+      "symbol": "MegaMoeBF16Forward",
+      "description": [
+        "Host检查NPU、连续性、dtype、权重布局、token和专家范围，计算M/H/2F/T。接收容量由max_recv_tokens指定，Host据此规划缓冲；它不等于运行时每个专家实际收到的行数。"
+      ],
+      "reads": [
+        "输入Tensor与shape",
+        "借用SHMEM容量"
+      ],
+      "writes": [
+        "前向形状、weightLayout"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "ForwardResult MegaMoeBF16Forward(",
+          "after": 21
+        }
+      ]
+    },
+    {
+      "id": "fc_tiling",
+      "lane": "host",
+      "step": 4,
+      "title": "生成设备tiling与空间预算",
+      "subtitle": "MakeMegaMoeHostTiling",
+      "symbol": "detail::MakeMegaMoeHostTiling",
+      "description": [
+        "查询平台AIC/AIV/UB资源，解析保存模式、路由容量与前向调度参数。前向GM/UB策略由构建设备SO查询参与Host临时区规划，本图H7168且保存BF16使用UB交接。"
+      ],
+      "reads": [
+        "shape、保存模式、平台资源"
+      ],
+      "writes": [
+        "MegaMoeTilingData、workspace/peer字节数"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/tiling.cpp",
+          "anchor": "MegaMoeHostTiling MakeMegaMoeHostTiling(",
+          "after": 18
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/launcher.cpp",
+          "anchor": "bool MegaMoeBF16SwigluDecoupled(",
+          "after": 4
+        }
+      ]
+    },
+    {
+      "id": "fc_allocate",
+      "lane": "memory",
+      "step": 5,
+      "title": "分配输出、持久状态与临时区",
+      "subtitle": "三类Tensor生命周期分开",
+      "symbol": "AllocateTrainingSavedState / AllocateForwardTransientWorkspace",
+      "description": [
+        "Y/counts为公开输出；saved_state和dispatch_output需要保留至反向；forwardTransientWorkspace只服务当前前向。Host按布局清理控制区，数据输出由kernel完整写入。"
+      ],
+      "reads": [
+        "saved-state、dispatch、transient布局"
+      ],
+      "writes": [
+        "Y [M,H]、counts [E]",
+        "saved_state、dispatch_output、forward scratch"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "    auto y = torch::empty({m, k}, x.options());",
+          "after": 11
+        }
+      ]
+    },
+    {
+      "id": "fc_launch",
+      "lane": "host",
+      "step": 6,
+      "title": "当前NPU stream上的启动桥接",
+      "subtitle": "Tensor → BytePtr",
+      "symbol": "LaunchMegaMoeBF16ForwardKernel",
+      "description": [
+        "launcher取当前Acl stream，将Tensor data_ptr转为设备地址，把tiling_host和block_dim传入设备库导出函数。它是Host桥接层，尚不是设备主控Process本身。"
+      ],
+      "reads": [
+        "context、输入输出Tensor、tiling"
+      ],
+      "writes": [
+        "C导出启动参数"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/launcher.cpp",
+          "anchor": "    auto kernel = &deepep_train_mega_moe_bf16_forward_kernel_do;",
+          "before": 3,
+          "after": 10
+        }
+      ]
+    },
+    {
+      "id": "fc_export",
+      "lane": "host",
+      "step": 7,
+      "title": "C导出函数提交MIX kernel",
+      "subtitle": "设备SO的Host启动端",
+      "symbol": "deepep_train_mega_moe_bf16_forward_kernel_do",
+      "description": [
+        "C导出函数把Host tiling重解释为MegaMoeTilingData，以指定block数和stream提交mega_moe_bf16_forward。函数调用返回表示启动流程完成，不在图中额外添加一个全设备完成barrier。"
+      ],
+      "reads": [
+        "裸地址、tiling_host、stream"
+      ],
+      "writes": [
+        "已提交的MIX kernel"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.cpp",
+          "anchor": "extern \"C\" ASCEND_MEGAMOE_EXPORT void deepep_train_mega_moe_bf16_forward_kernel_do(",
+          "after": 13
+        }
+      ]
+    },
+    {
+      "id": "fc_device",
+      "lane": "device",
+      "step": 8,
+      "title": "设备入口初始化前向对象",
+      "subtitle": "Init → EnableDispatchTileReady",
+      "symbol": "mega_moe_bf16_forward",
+      "description": [
+        "MIX入口初始化设备状态，构造MegaMoeBF16Forward，将持久、dispatch和transient地址映射到设备视图，再启用当前构建选择的Dispatch ready机制。"
+      ],
+      "reads": [
+        "context、Tensor地址、tiling"
+      ],
+      "writes": [
+        "前向主控对象、地址视图"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.cpp",
+          "anchor": "    void mega_moe_bf16_forward(",
+          "after": 14
+        }
+      ]
+    },
+    {
+      "id": "fc_pipeline",
+      "lane": "device",
+      "step": 9,
+      "title": "Process执行融合前向",
+      "subtitle": "AIC、AIV0、AIV1分工",
+      "symbol": "MegaMoeBF16Forward::ProcessWithSaveMode",
+      "description": [
+        "Process先解析保存模式与权重布局，再进入选定GM/UB模板流程。默认路径完成路由整理、计数、Dispatch、Gate/Up、SwiGLU×p、GMM2、回传与Unpermute；真实同步保护输入可见性和缓冲复用。"
+      ],
+      "reads": [
+        "X、IDs、p、W1、W2"
+      ],
+      "writes": [
+        "Y、counts、packed X/p、保存Gate/Up"
+      ],
+      "waits": [
+        "当前输入ready、配对事件、跨rank边界"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.hpp",
+          "anchor": "__aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessWithSaveMode()",
+          "after": 18
+        }
+      ]
+    },
+    {
+      "id": "fc_return",
+      "lane": "python",
+      "step": 10,
+      "title": "保存反向状态，公开返回Y和counts",
+      "subtitle": "ctx保持必要Tensor引用",
+      "symbol": "ctx.save_for_backward / mark_non_differentiable",
+      "description": [
+        "Host通过recordStream保持异步调用所需的Tensor寿命，Function把反向需要的数据保存到ctx，公开只返回Y和不可微counts。反向将使用这次调用对应的状态，不从当前通信窗口猜测历史路由。"
+      ],
+      "reads": [
+        "ForwardResult、p、W1、W2"
+      ],
+      "writes": [
+        "ctx.saved_tensors",
+        "(y, counts)"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/python/deep_ep_experimental/megamoe_train/bf16.py",
+          "anchor": "        ctx.save_for_backward(weights, w1, w2, result.counts, result.saved_state, result.dispatch_output)",
+          "before": 2,
+          "after": 3
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/bf16/training.cpp",
+          "anchor": "    return {y, expertTokenNums, trainingSavedState, dispatchOutput};",
+          "before": 7,
+          "after": 1
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "fc_public",
+      "to": "fc_function",
+      "kind": "flow"
+    },
+    {
+      "from": "fc_function",
+      "to": "fc_binding",
+      "kind": "flow"
+    },
+    {
+      "from": "fc_binding",
+      "to": "fc_host",
+      "kind": "flow"
+    },
+    {
+      "from": "fc_host",
+      "to": "fc_tiling",
+      "kind": "flow"
+    },
+    {
+      "from": "fc_tiling",
+      "to": "fc_allocate",
+      "kind": "data",
+      "label": "布局/容量"
+    },
+    {
+      "from": "fc_allocate",
+      "to": "fc_launch",
+      "kind": "data",
+      "label": "Tensor地址"
+    },
+    {
+      "from": "fc_launch",
+      "to": "fc_export",
+      "kind": "flow"
+    },
+    {
+      "from": "fc_export",
+      "to": "fc_device",
+      "kind": "flow",
+      "label": "kernel启动"
+    },
+    {
+      "from": "fc_device",
+      "to": "fc_pipeline",
+      "kind": "flow"
+    },
+    {
+      "from": "fc_pipeline",
+      "to": "fc_return",
+      "kind": "data",
+      "label": "结果/状态"
+    }
+  ]
+}
