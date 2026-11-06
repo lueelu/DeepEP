@@ -1,0 +1,30 @@
+flowchart TB
+  subgraph lane_python["Python / autograd"]
+    bc_autograd["loss.backward() 触发反向"]
+    bc_return["按原输入顺序返回梯度"]
+  end
+  subgraph lane_host["绑定 / Host"]
+    bc_binding["绑定转入执行器backward"]
+    bc_host["检查梯度输入与保存状态"]
+    bc_layout["规划反向scratch与ready后缀"]
+    bc_launch["Host桥接到反向C启动符号"]
+    bc_export["导出函数提交反向MIX kernel"]
+  end
+  subgraph lane_memory["Tensor 资源"]
+    bc_saved["恢复本次前向的保存Tensor"]
+    bc_allocate["分配四项梯度与scratch"]
+  end
+  subgraph lane_device["AscendC 设备"]
+    bc_device["设备对象恢复前向状态视图"]
+    bc_pipeline["Process执行四项梯度流程"]
+  end
+  bc_autograd --> bc_saved
+  bc_saved --> bc_binding
+  bc_binding --> bc_host
+  bc_host --> bc_layout
+  bc_layout --> bc_allocate
+  bc_allocate --> bc_launch
+  bc_launch --> bc_export
+  bc_export --> bc_device
+  bc_device --> bc_pipeline
+  bc_pipeline --> bc_return

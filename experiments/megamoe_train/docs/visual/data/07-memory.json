@@ -1,0 +1,739 @@
+{
+  "id": "07-memory",
+  "title": "内存与生命周期：哪些保存，哪些复用",
+  "layer": "L5",
+  "summary": "按一次前向及匹配反向追踪内存。R 是预留接收容量，M_e 是当前专家实际行数；SHMEM窗口、持久状态、调用临时GM、核内UB有不同所有者。复用成立依赖生产者和所有读者退休，不能仅凭两个指针相同或本核执行完判断安全。",
+  "lanes": [
+    {
+      "id": "m_host",
+      "label": "Host 容量 / 地址契约",
+      "color": "host"
+    },
+    {
+      "id": "m_saved",
+      "label": "前向持久 GM 张量",
+      "color": "memory"
+    },
+    {
+      "id": "m_scratch",
+      "label": "调用临时 GM",
+      "color": "memory"
+    },
+    {
+      "id": "m_ub",
+      "label": "核内 UB 与完成信号",
+      "color": "vector"
+    },
+    {
+      "id": "m_peer",
+      "label": "SHMEM 通信窗口",
+      "color": "comm"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "m_sizes",
+      "lane": "m_host",
+      "step": 0,
+      "title": "用容量 R 计算布局，用 M_e 执行任务",
+      "subtitle": "容量不等于本次真实接收行数",
+      "symbol": "DispatchOutputLayout / TrainingSavedStateLayout",
+      "description": [
+        "Host按max_recv_tokens=R、hidden=H、中间宽F、保存模式和p类型预留张量空间；p每项BF16为2B、FP32为4B。每个专家实际M_e和行前缀由本轮计数决定。布局按字节对齐，不能用M×TopK替换所有R，也不能把capacity当作专家GEMM的实际M。"
+      ],
+      "reads": [
+        "R、H、F、TopK、EP、E_local",
+        "resolved savedMode"
+      ],
+      "writes": [
+        "对齐后的各平面偏移和总字节数"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_layout.hpp",
+          "anchor": "struct DispatchOutputLayout {",
+          "before": 0,
+          "after": 16
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_layout.hpp",
+          "anchor": "struct TrainingSavedStateLayout {",
+          "before": 0,
+          "after": 20
+        }
+      ]
+    },
+    {
+      "id": "m_dispatch_persist",
+      "lane": "m_saved",
+      "step": 1,
+      "title": "独立 dispatch_output 保留 packed X/p",
+      "subtitle": "反向 dW1 与激活梯度要继续读取",
+      "symbol": "ForwardWorkspaceInfo：dispatchOutputBase",
+      "description": [
+        "普通BF16采用split-state：packed X与原类型BF16/FP32 packed p放在独立dispatch_output字节张量中。p类型与Gate/Up保存模式独立，none也保留p。前向Dispatch写入它们，反向分别用X计算dW1、用p计算Hp与dH。其生命周期跨越forward返回，不能当成forward transient随即释放。"
+      ],
+      "reads": [
+        "dispatchOutputBase",
+        "DispatchOutputLayout offsets"
+      ],
+      "writes": [
+        "ptrA [R,H] BF16",
+        "ptrDispatchedTopkWeights [R]，与 p 同类型"
+      ],
+      "waits": [
+        "匹配反向读完之前保存该张量"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_workspace_view.hpp",
+          "anchor": "    __aicore__ inline ForwardWorkspaceInfo(GM_ADDR savedStateBase, GM_ADDR dispatchOutputBase,",
+          "before": 3,
+          "after": 15
+        }
+      ]
+    },
+    {
+      "id": "m_saved_state",
+      "lane": "m_saved",
+      "step": 2,
+      "title": "training_saved_state 保存数值与路由状态",
+      "subtitle": "Gate/Up、计数、置换对应本次调用",
+      "symbol": "ForwardWorkspaceInfo::InitSavedState / SaveGateUp",
+      "description": [
+        "saved-bf16将原始Gate/Up保存在持久GM，保留源计数、前缀、置换和模式元数据。这里没有保存专家权重副本，也不属于balanced planner的执行池。反向读取本次状态即可重建H，无需保留前向Hp或重算GMM1。"
+      ],
+      "reads": [
+        "原始 Gate/Up tile",
+        "前向 route/count 状态"
+      ],
+      "writes": [
+        "BF16 savedGate/savedUp [R,F]",
+        "当前调用的路由与计数快照"
+      ],
+      "waits": [
+        "Gate/Up Fixpipe 完成",
+        "保存读者结束后才覆盖 UB"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/epilogue/block_epilogue_swiglu_forward_bf16.hpp",
+          "anchor": "        // Save raw BF16 gate/up before clipping, activation, or route weighting.",
+          "before": 2,
+          "after": 9
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.hpp",
+          "anchor": "__aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::SaveForwardState()",
+          "before": 0,
+          "after": 18
+        }
+      ]
+    },
+    {
+      "id": "m_forward_transient",
+      "lane": "m_scratch",
+      "step": 2,
+      "title": "前向 Hp 与 ready flags 属于临时 GM",
+      "subtitle": "BackwardSavedStateInfo 不借用它们",
+      "symbol": "ForwardTransientWorkspaceLayout / BackwardSavedStateInfo",
+      "description": [
+        "前向ptrA2是加权后Hp，供GMM2读取；SwiGLU→GMM2和Dispatch→GMM1 flags也在transient区域。反向使用persistent-only视图，不依赖forward scratch跨调用存活。反向自己的Hp由Gate/Up和p重建。"
+      ],
+      "reads": [
+        "forward transient base"
+      ],
+      "writes": [
+        "ptrA2 [R,F] BF16",
+        "forward ready counters"
+      ],
+      "waits": [
+        "本次 forward 对临时区的使用退休后才能释放"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_workspace_view.hpp",
+          "anchor": "// Persistent view of the state retained by forward for the matching backward.",
+          "before": 0,
+          "after": 18
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_layout.hpp",
+          "anchor": "struct ForwardTransientWorkspaceLayout {",
+          "before": 0,
+          "after": 17
+        }
+      ]
+    },
+    {
+      "id": "m_peer_input",
+      "lane": "m_peer",
+      "step": 3,
+      "title": "SHMEM ptrA0 保存源端排序 payload",
+      "subtitle": "前向是 X，反向是 raw dY",
+      "symbol": "PeermemInfo / GatherRoutes",
+      "description": [
+        "同一对称窗口偏移在每rank都可被同组peer寻址。ptrA0前向放排序X，匹配反向重新写入排序raw dY；p有独立ptrRoutedTopkWeights段。各peer先按本轮计数和前缀定位源段，再拉入自己的packed接收矩阵。"
+      ],
+      "reads": [
+        "source X 或 raw dY",
+        "SHMEM base 与 layout"
+      ],
+      "writes": [
+        "ptrA0",
+        "ptrRoutedTopkWeights"
+      ],
+      "waits": [
+        "前一用途的远端读者结束",
+        "本轮 gather 完成后再允许 peer 消费"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_workspace_view.hpp",
+          "anchor": "struct PeermemInfo {",
+          "before": 0,
+          "after": 18
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "    ptrA0.SetGlobalBuffer((__gm__ QuantOutType*)params_.peermemInfo.ptrA0);",
+          "before": 5,
+          "after": 7
+        }
+      ]
+    },
+    {
+      "id": "m_fwd_ub",
+      "lane": "m_ub",
+      "step": 4,
+      "title": "GMM1 的两块 UB 是 Gate 与 Up",
+      "subtitle": "一对输入，不是两个可独立激活的任务",
+      "symbol": "GroupMatmulSwiglu：tensorBlockUbFirst / Second",
+      "description": [
+        "H7168 saved-bf16走UB交接：AIC把同一逻辑tile的Gate和Up写到两块AIV0 UB，再NotifyVector。AIV0保存并激活后NotifyCube归还存储；下一任务AIC的WaitForVector保护覆盖。不要把这两块解释成前后两个任务的ping-pong输出，它们在此处是一对SwiGLU输入。"
+      ],
+      "reads": [
+        "X tile 与 Wg/Wu"
+      ],
+      "writes": [
+        "AIV0 Gate UB",
+        "AIV0 Up UB"
+      ],
+      "waits": [
+        "旧 Gate/Up 消费者归还存储"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_forward_catlass_impl.hpp",
+          "anchor": "            auto tensorBlockUbFirst =",
+          "before": 5,
+          "after": 13
+        }
+      ]
+    },
+    {
+      "id": "m_dispatch_buffers",
+      "lane": "m_ub",
+      "step": 5,
+      "title": "token 与 p 使用不同 staging 事件",
+      "subtitle": "容量与实际 DMA 字节数分开看",
+      "symbol": "CopyGMToGMPerTokenV2 / CopyGMToGMTopkWeights",
+      "description": [
+        "AIV1 token staging使用事件0/1交替；p staging用事件2，保留4KiB。p每次搬运有效字节为fragment行数×2，并不总搬4KiB。不同event保护不同buffer依赖，不代表存在三套独立物理DMA引擎。"
+      ],
+      "reads": [
+        "远端排序 X/p"
+      ],
+      "writes": [
+        "本地 packed X/p"
+      ],
+      "waits": [
+        "MTE3 旧读者完成后才能 MTE2 重填槽"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.hpp",
+          "anchor": "__aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CopyGMToGMTopkWeights(",
+          "before": 0,
+          "after": 21
+        }
+      ]
+    },
+    {
+      "id": "m_ub_handoff",
+      "lane": "m_ub",
+      "step": 6,
+      "title": "Dispatch 退出后 GMM2 才占 AIV1 UB",
+      "subtitle": "本核释放信号与 Hp ready 各管一件事",
+      "symbol": "GMM2_UB_READY_FLAG / GroupMatmul2",
+      "description": [
+        "AIV1销毁Dispatch firstPipe后发本核释放信号，AIC才能将GMM2 Fixpipe输出指向这段存储。GMM2随后用两个UB槽按任务轮转，让计算与Combine发送重叠。槽归还由AIV1发送完成后的NotifyCube保证，和GMM1的一对Gate/Up输入是不同用途。"
+      ],
+      "reads": [
+        "本核 Dispatch staging 退休状态",
+        "本专家 Hp ready"
+      ],
+      "writes": [
+        "GMM2 AIV1 ping-pong UB"
+      ],
+      "waits": [
+        "本核 GMM2_UB_READY_FLAG",
+        "某输出槽旧发送读者退休"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.hpp",
+          "anchor": "                // GMM2 only needs this core's AIV1 to release the overlapping",
+          "before": 4,
+          "after": 5
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_forward_catlass_impl.hpp",
+          "anchor": "            if (vecSetSyncCom >= 2) {",
+          "before": 0,
+          "after": 11
+        }
+      ]
+    },
+    {
+      "id": "m_backward_planes",
+      "lane": "m_scratch",
+      "step": 7,
+      "title": "反向按 R 预留 dO、dZ、Hp、partial",
+      "subtitle": "默认 bf16 不分配重算 Gate/Up",
+      "symbol": "BackwardWorkspaceInfo",
+      "description": [
+        "默认saved-bf16的主要临时平面是dO[R,H]、dZ[R,2F]、Hp[R,F]和dpPartial[R,ceil(F/256)]。前三者BF16，partial为FP32；none模式另需重算Gate/Up且使用不同交接。大小按R预留，但GEMM只计算各专家实际M_e。"
+      ],
+      "reads": [
+        "R、H、2F、savedMode"
+      ],
+      "writes": [
+        "backward scratch offsets",
+        "各专家 ready/retirement flags"
+      ],
+      "waits": [],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_workspace_view.hpp",
+          "anchor": "    __aicore__ inline BackwardWorkspaceInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t splitExperts)",
+          "before": 0,
+          "after": 22
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_workspace_view.hpp",
+          "anchor": "        ptrGradZ = base + offset;",
+          "before": 0,
+          "after": 15
+        }
+      ]
+    },
+    {
+      "id": "m_dhp_alias",
+      "lane": "m_scratch",
+      "step": 8,
+      "title": "ptrHp 第一生命期：dHp GM 输出",
+      "subtitle": "所有 AIC 写完，AIV 才能读取",
+      "symbol": "GMM2GradSwiGLUGradGM",
+      "description": [
+        "AIC 暂借 Hp 平面写入 dHp = R(dO · W2)，先用 FP32 累加，再舍入到 BF16。各专家的行段独立，本专家所有 AIC 完成写入并发布 dHpReady 后，AIV 才开始消费。"
+      ],
+      "reads": [
+        "dO 与 W2"
+      ],
+      "writes": [
+        "ptrHp 当前内容=dHp BF16"
+      ],
+      "waits": [
+        "真实 dO 行就绪",
+        "dHpReady 达到 blockNum 才开始消费"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_backward_catlass_impl.hpp",
+          "anchor": "// dHpBase aliases this expert's Hp plane: each tile has one AIV owner, which",
+          "before": 0,
+          "after": 11
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_backward_catlass_impl.hpp",
+          "anchor": "        AtomicAdd(dHpReadyFlag, int32_t(1));",
+          "before": 4,
+          "after": 2
+        }
+      ]
+    },
+    {
+      "id": "m_hp_overwrite",
+      "lane": "m_scratch",
+      "step": 9,
+      "title": "ptrHp 第二生命期：重建的前向 Hp",
+      "subtitle": "读入完整 dHp tile 后才能覆盖",
+      "symbol": "LoadDHpFromGM / RunFusedFullTile",
+      "description": [
+        "每个tile只有一个AIV owner；它先把该tile全部dHp搬入私有UB，再用前向Gate/Up与p生成BF16 Hp，覆盖同一GM位置。因为所有AIC dHp写已经退休，且其他AIV不读这个tile，所以不需要额外分配第二个[R,F]平面。后续dW2等待全部P1输出退休。"
+      ],
+      "reads": [
+        "ptrHp 当前 dHp tile",
+        "saved Gate/Up、packed p"
+      ],
+      "writes": [
+        "相同 ptrHp 地址上的 BF16 Hp"
+      ],
+      "waits": [
+        "该 tile dHp GM→UB 完成",
+        "本专家 dHp 所有生产者退休"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_backward_catlass_impl.hpp",
+          "anchor": "            epilogueOp.LoadDHpFromGM(dHpBase + (static_cast<int64_t>(row) * n + col) * sizeof(bfloat16_t), shape.m(),",
+          "before": 1,
+          "after": 7
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/epilogue/block_epilogue_swiglu_backward_bf16.hpp",
+          "anchor": "        AscendC::DataCopyPad(hpGm_[(rowBase_ + mLoc) * outputF_ + nLoc], extraA_, hpCopy);",
+          "before": 4,
+          "after": 5
+        }
+      ]
+    },
+    {
+      "id": "m_dz_partials",
+      "lane": "m_scratch",
+      "step": 10,
+      "title": "dZ 与 dp partial 保持独立平面",
+      "subtitle": "dZ给GEMM，partial留到P6",
+      "symbol": "RunFusedFullTile：gradZGm_ / dpPartialsGm_",
+      "description": [
+        "dGate和dUp分别以BF16落入dZ行的前F列和后F列，供dX及dW1读取。dp 用 FP32 乘积按 256 列归约为 FP32 标量，每个tile写独占位置，P6才跨tile求最终route梯度。ptrDpProducts这个历史名字当前存的是partial，不是完整[R,F]乘积矩阵。"
+      ],
+      "reads": [
+        "dGate/dUp UB",
+        "每个 F tile 的 FP32 dp partial，乘积和求和都用 FP32"
+      ],
+      "writes": [
+        "ptrGradZ [R,2F] BF16",
+        "ptrDpProducts [R,ceil(F/256)] FP32"
+      ],
+      "waits": [
+        "MTE3写退休后发布DZReady"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/epilogue/block_epilogue_swiglu_backward_bf16.hpp",
+          "anchor": "        AscendC::DataCopyExtParams partialCopy{static_cast<uint16_t>(rows), sizeof(float), 0U,",
+          "before": 2,
+          "after": 14
+        }
+      ]
+    },
+    {
+      "id": "m_do_last_reader",
+      "lane": "m_scratch",
+      "step": 11,
+      "title": "先完成 dW2 对原始 dO 的读取",
+      "subtitle": "dHp完成后仍不能立即覆盖dO",
+      "symbol": "GMM1GradReuseDOPhase：GMM2DW",
+      "description": [
+        "P1 的 dHp GEMM 读过 dO 后，原始 dO 还供 dW2 = R(dOᵀ · Hp) 使用。AIC 等 P1 写完 Hp 和 dZ，再算本专家的 dW2，以 FP32 累加并舍入到 BF16。全部 AIC 排空 dO 读取和 dW2 写入并发布 DOReleased 后，才允许 dX 覆盖该专家行段。"
+      ],
+      "reads": [
+        "原始 ptrDO",
+        "重建 ptrHp"
+      ],
+      "writes": [
+        "grad_weight2",
+        "DOReleased"
+      ],
+      "waits": [
+        "DZReady 达到2×blockNum",
+        "DOReleased 达到blockNum"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "                GMM2DW(dw2Params, dwShape, dwAddr, dw2StartBlockIdx, expertIdx);",
+          "before": 5,
+          "after": 10
+        }
+      ]
+    },
+    {
+      "id": "m_dx_alias",
+      "lane": "m_scratch",
+      "step": 12,
+      "title": "ptrDX=ptrDO：切换为 dX 平面",
+      "subtitle": "同地址、不同生命期",
+      "symbol": "BackwardWorkspaceInfo：ptrDX / GMM1GradCombineGM",
+      "description": [
+        "saved模式直接将ptrDX设为ptrDO，少分配一个[R,H] BF16平面。完成DOReleased门槛后，dX GEMM才覆盖它。dX存于GM直到回传读者完成，AIC可继续执行后续dW1；不能把none模式的UB双槽回传协议套到这里。"
+      ],
+      "reads": [
+        "ptrGradZ 与 W1"
+      ],
+      "writes": [
+        "原 dO 地址上的 BF16 dX"
+      ],
+      "waits": [
+        "全部 AIC 的 dW2 原始 dO 读者退休",
+        "AIV0等DXReady后读取GM dX"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/layout/mega_moe_workspace_view.hpp",
+          "anchor": "(savedMode) ? ptrDO : nullptr;",
+          "before": 3,
+          "after": 3
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "            GMM1GradCombineGM<WeightLayout>(dxParams, params_, problemShape_, dxAddr,",
+          "before": 3,
+          "after": 5
+        }
+      ]
+    },
+    {
+      "id": "m_return_dx",
+      "lane": "m_peer",
+      "step": 13,
+      "title": "ptrD 在 P5 存 routed dX 矩阵",
+      "subtitle": "源 rank 才把 TopK 贡献相加",
+      "symbol": "GMM1GradCombineGM / UnpermuteBackward",
+      "description": [
+        "专家rank将各route的BF16 dX回写源rank ptrD，布局是本源的排序route行×H。源rank按逆置换读回，FP32累加TopK后一次舍入BF16得到grad_x。AIC的dW1可与这段发送/本地归并重叠，ptrD的生命周期由AIV发送和读取边界保护。"
+      ],
+      "reads": [
+        "专家 GM dX",
+        "原 route 逆置换"
+      ],
+      "writes": [
+        "源 ptrD [M×TopK,H] BF16",
+        "grad_x"
+      ],
+      "waits": [
+        "整专家 DXReady",
+        "本地排空、核间到达、跨rank回传完成"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_backward_catlass_impl.hpp",
+          "anchor": "            MegaMoeCombineImpl::CombineTokens<bfloat16_t, Catlass::GemmCoord>(",
+          "occurrence": 1,
+          "before": 3,
+          "after": 4
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "__aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::UnpermuteBackward()",
+          "before": 0,
+          "after": 14
+        }
+      ]
+    },
+    {
+      "id": "m_ptrd_switch",
+      "lane": "m_peer",
+      "step": 14,
+      "title": "P5所有读者完成后ptrD才能改用途",
+      "subtitle": "本地SyncAll不等于远端读者结束",
+      "symbol": "Process：P5→P6 retirement boundary",
+      "description": [
+        "AIV排空Unpermute最后读写，销毁UB pipe并本地汇合，再跨rank同步，确认没有任何源rank仍读取routed dX。只有经过此边界，P6才能覆写ptrD开头。发送方结束不等于接收方读完，两个完成条件分别存在。"
+      ],
+      "reads": [
+        "各 rank 的 ptrD dX 读者退休状态"
+      ],
+      "writes": [
+        "可覆写 ptrD 的跨 rank 边界"
+      ],
+      "waits": [
+        "所有 rank P5 最后读者退出"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "        TopkGradBuffInit(&topkGradPipe);",
+          "before": 6,
+          "after": 8
+        }
+      ]
+    },
+    {
+      "id": "m_ptrd_dp",
+      "lane": "m_peer",
+      "step": 15,
+      "title": "P6复用ptrD开头存紧凑dp表",
+      "subtitle": "一条 route 一个原类型标量，不带H步长",
+      "symbol": "ReduceAndRouteTopkGrad / UnpermuteTopkGrad",
+      "description": [
+        "P6将FP32 partial以FP32归约，按p类型生成BF16或FP32 route标量，回写源rank ptrD连续位置。此时ptrD不再解释为[M×TopK,H]矩阵，而是一维排序route表。dp发送全局完成后，UnpermuteTopkGrad按16/32位原样逆置换复制到[M,TopK]，不把TopK槽相加。"
+      ],
+      "reads": [
+        "FP32 dp partial",
+        "原 route 逆置换"
+      ],
+      "writes": [
+        "ptrD [M×TopK] BF16 或 FP32 dp",
+        "grad_topk_weights [M,TopK]"
+      ],
+      "waits": [
+        "P5读者全退出",
+        "P6发送完成跨rank同步"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "                    AscendC::DataCopyPad(remoteD[dstExpertOffset + coreRowBegin + batchBegin], routeBuf, copyParams);",
+          "before": 4,
+          "after": 3
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "    __gm__ GradientBits* routedDp = reinterpret_cast<__gm__ GradientBits*>(params_.peermemInfo.ptrD);",
+          "before": 2,
+          "after": 8
+        }
+      ]
+    },
+    {
+      "id": "m_window_exit",
+      "lane": "m_peer",
+      "step": 16,
+      "title": "表清理和退出同步保护下一轮",
+      "subtitle": "窗口可复用，保存张量由框架管理",
+      "symbol": "Process：ResetTokenPerExpert / CrossRankSyncInWorldSize",
+      "description": [
+        "反向最后的route表读者退出后，清理token计数表，建立退出同步边界，保证下一次前向可以在干净通信表上开始。对称窗口是runtime资源；单次调用保存张量属于autograd状态。前反向完成并排空后再close，避免仍有设备读者时释放通信资源。"
+      ],
+      "reads": [
+        "本轮通信表最后读者状态"
+      ],
+      "writes": [
+        "清零token表",
+        "下一轮窗口复用边界"
+      ],
+      "waits": [
+        "最终MTE/Scalar访问退休",
+        "所有rank退出边界"
+      ],
+      "sources": [
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
+          "anchor": "        ResetTokenPerExpert();",
+          "before": 1,
+          "after": 17
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "from": "m_sizes",
+      "to": "m_dispatch_persist",
+      "kind": "data"
+    },
+    {
+      "from": "m_sizes",
+      "to": "m_saved_state",
+      "kind": "data"
+    },
+    {
+      "from": "m_sizes",
+      "to": "m_forward_transient",
+      "kind": "data"
+    },
+    {
+      "from": "m_peer_input",
+      "to": "m_dispatch_persist",
+      "kind": "data",
+      "label": "Dispatch"
+    },
+    {
+      "from": "m_dispatch_persist",
+      "to": "m_fwd_ub",
+      "kind": "data"
+    },
+    {
+      "from": "m_fwd_ub",
+      "to": "m_saved_state",
+      "kind": "data",
+      "label": "原始Gate/Up"
+    },
+    {
+      "from": "m_fwd_ub",
+      "to": "m_forward_transient",
+      "kind": "data",
+      "label": "加权Hp"
+    },
+    {
+      "from": "m_dispatch_buffers",
+      "to": "m_ub_handoff",
+      "kind": "reuse"
+    },
+    {
+      "from": "m_saved_state",
+      "to": "m_backward_planes",
+      "kind": "flow",
+      "label": "匹配反向"
+    },
+    {
+      "from": "m_backward_planes",
+      "to": "m_dhp_alias",
+      "kind": "data"
+    },
+    {
+      "from": "m_dhp_alias",
+      "to": "m_hp_overwrite",
+      "kind": "reuse",
+      "label": "先读dHp再写Hp"
+    },
+    {
+      "from": "m_hp_overwrite",
+      "to": "m_dz_partials",
+      "kind": "data"
+    },
+    {
+      "from": "m_hp_overwrite",
+      "to": "m_do_last_reader",
+      "kind": "data",
+      "label": "Hp给dW2"
+    },
+    {
+      "from": "m_do_last_reader",
+      "to": "m_dx_alias",
+      "kind": "reuse",
+      "label": "DOReleased"
+    },
+    {
+      "from": "m_dx_alias",
+      "to": "m_return_dx",
+      "kind": "data"
+    },
+    {
+      "from": "m_return_dx",
+      "to": "m_ptrd_switch",
+      "kind": "reuse"
+    },
+    {
+      "from": "m_ptrd_switch",
+      "to": "m_ptrd_dp",
+      "kind": "reuse",
+      "label": "矩阵→标量表"
+    },
+    {
+      "from": "m_dz_partials",
+      "to": "m_ptrd_dp",
+      "kind": "data",
+      "label": "保留partial至P6"
+    },
+    {
+      "from": "m_ptrd_dp",
+      "to": "m_window_exit",
+      "kind": "sync"
+    }
+  ]
+}

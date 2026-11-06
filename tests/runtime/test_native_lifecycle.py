@@ -54,6 +54,7 @@ def lifecycle_binary(tmp_path_factory):
         "normal",
         "udma",
         "megamoe",
+        "megamoe-train",
         "low-latency",
         "ll-rank-bias-16",
         "ll-rank-bias-32",

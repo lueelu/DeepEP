@@ -1,0 +1,48 @@
+flowchart TB
+  subgraph lane_m_host["Host 容量 / 地址契约"]
+    m_sizes["用容量 R 计算布局，用 M_e 执行任务"]
+  end
+  subgraph lane_m_saved["前向持久 GM 张量"]
+    m_dispatch_persist["独立 dispatch_output 保留 packed X/p"]
+    m_saved_state["training_saved_state 保存数值与路由状态"]
+  end
+  subgraph lane_m_scratch["调用临时 GM"]
+    m_forward_transient["前向 Hp 与 ready flags 属于临时 GM"]
+    m_backward_planes["反向按 R 预留 dO、dZ、Hp、partial"]
+    m_dhp_alias["ptrHp 第一生命期：dHp GM 输出"]
+    m_hp_overwrite["ptrHp 第二生命期：重建的前向 Hp"]
+    m_dz_partials["dZ 与 dp partial 保持独立平面"]
+    m_do_last_reader["先完成 dW2 对原始 dO 的读取"]
+    m_dx_alias["ptrDX=ptrDO：切换为 dX 平面"]
+  end
+  subgraph lane_m_ub["核内 UB 与完成信号"]
+    m_fwd_ub["GMM1 的两块 UB 是 Gate 与 Up"]
+    m_dispatch_buffers["token 与 p 使用不同 staging 事件"]
+    m_ub_handoff["Dispatch 退出后 GMM2 才占 AIV1 UB"]
+  end
+  subgraph lane_m_peer["SHMEM 通信窗口"]
+    m_peer_input["SHMEM ptrA0 保存源端排序 payload"]
+    m_return_dx["ptrD 在 P5 存 routed dX 矩阵"]
+    m_ptrd_switch["P5所有读者完成后ptrD才能改用途"]
+    m_ptrd_dp["P6复用ptrD开头存紧凑dp表"]
+    m_window_exit["表清理和退出同步保护下一轮"]
+  end
+  m_sizes --> m_dispatch_persist
+  m_sizes --> m_saved_state
+  m_sizes --> m_forward_transient
+  m_peer_input --> m_dispatch_persist
+  m_dispatch_persist --> m_fwd_ub
+  m_fwd_ub --> m_saved_state
+  m_fwd_ub --> m_forward_transient
+  m_dispatch_buffers -.-> m_ub_handoff
+  m_saved_state --> m_backward_planes
+  m_backward_planes --> m_dhp_alias
+  m_dhp_alias -.-> m_hp_overwrite
+  m_hp_overwrite --> m_dz_partials
+  m_hp_overwrite --> m_do_last_reader
+  m_do_last_reader -.-> m_dx_alias
+  m_dx_alias --> m_return_dx
+  m_return_dx -.-> m_ptrd_switch
+  m_ptrd_switch -.-> m_ptrd_dp
+  m_dz_partials --> m_ptrd_dp
+  m_ptrd_dp -.-> m_window_exit

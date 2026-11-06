@@ -1,0 +1,24 @@
+flowchart TB
+  subgraph lane_api["公开接口"]
+    o_contract["传入 token、路由与专家参数"]
+    o_counts["计数与整数路由不求导"]
+    o_gradients["autograd 对齐四类梯度"]
+  end
+  subgraph lane_operator["融合训练算子"]
+    o_experts["本 rank 持有本地专家参数"]
+    o_forward["融合前向"]
+    o_backward["融合反向"]
+  end
+  subgraph lane_resource["运行资源与构建"]
+    o_runtime["一个显式 SHMEM 资源所有者"]
+    o_build["可选训练组件与独立设备库"]
+  end
+  o_contract --> o_forward
+  o_experts --> o_forward
+  o_runtime --> o_forward
+  o_forward --> o_counts
+  o_forward --> o_backward
+  o_contract --> o_backward
+  o_backward --> o_gradients
+  o_build -.-> o_forward
+  o_build -.-> o_backward

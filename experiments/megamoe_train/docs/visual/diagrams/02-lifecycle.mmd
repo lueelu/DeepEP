@@ -1,0 +1,26 @@
+flowchart TB
+  subgraph lane_python["Module / autograd"]
+    lc_construct["构造 Module，记录当前 stream"]
+    lc_forward["提交一次前向"]
+    lc_saved["持久状态跟随本次计算图"]
+    lc_backward["autograd 提交对应反向"]
+    lc_drain["结束使用后排空创建 stream"]
+  end
+  subgraph lane_runtime["Runtime / Session"]
+    lc_owner["建立共享通信所有者"]
+    lc_release["Session 集合释放窗口"]
+  end
+  subgraph lane_host["Host / Tensor 资源"]
+    lc_context["执行器借用窗口并建立 context"]
+    lc_scratch["临时 workspace 按 stream 保活"]
+    lc_closed["执行器清除借用地址和 context"]
+  end
+  lc_construct --> lc_owner
+  lc_owner --> lc_context
+  lc_context --> lc_forward
+  lc_forward --> lc_saved
+  lc_forward --> lc_scratch
+  lc_saved --> lc_backward
+  lc_backward --> lc_drain
+  lc_drain -.-> lc_release
+  lc_release --> lc_closed
