@@ -10,6 +10,44 @@ constexpr uint32_t kListsOffset = kDispatchSenderBytes;
 static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
+// Each producer owns one 512-byte local flag slot. Before Begin, zero is
+// drained by every core. After both SIMT outputs drain, producers publish one.
+template <class Resource>
+__aicore__ inline void StorePackedScaleReady(Resource& resource, const DispatchTilingData& td,
+    uint32_t core, uint64_t value)
+{
+    auto scratch = resource.template GetBufferByByte<uint64_t>(0);
+    scratch.SetValue(0, value);
+    AscendC::GlobalTensor<uint64_t> flag;
+    flag.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(td.packed_scale_ready + uint64_t(core) * 512U));
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID4);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID4);
+    AscendC::DataCopyExtParams copy{1, 8U, 0, 0, 0};
+    AscendC::DataCopyPad(flag, scratch, copy);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+}
+
+__aicore__ inline void WaitPackedScaleReady(const DispatchTilingData& td, uint32_t core, uint32_t cores)
+{
+    const uint32_t first = MetadataFirst(td.world_size, td.udma_peers_per_worker, cores,
+        td.udma_peer_order, td.udma_ranks_per_group, td.udma_workers_per_peer);
+    const uint64_t started = static_cast<uint64_t>(AscendC::GetSystemCycle());
+    for (uint32_t producer = first; producer < cores; ++producer) {
+        auto* address = reinterpret_cast<__gm__ uint64_t*>(td.packed_scale_ready + uint64_t(producer) * 512U);
+        AscendC::GlobalTensor<uint64_t> flag;
+        flag.SetGlobalBuffer(address);
+        while (true) {
+            dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(address));
+            if (flag.GetValue(0) == 1U) break;
+            if (static_cast<uint64_t>(AscendC::GetSystemCycle()) - started >= kIncomingTimeoutCycles) {
+                AscendC::printf("[CLOS_SCALE_TIMEOUT] rank=%u core=%u producer=%u\n", td.rank, core, producer);
+                trap(); return;
+            }
+        }
+    }
+}
+
 template <uint32_t Capacity, uint32_t Qps, class Resource>
 __aicore__ inline void DispatchRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
@@ -29,7 +67,7 @@ __aicore__ inline void DispatchRemoteImpl(
     const uint32_t max_tile = 65536U / td.world_size < kTileTokens ? 65536U / td.world_size : kTileTokens;
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
     const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
-    const uint32_t fields = td.has_x_scales && scale_bytes ? 2U : 1U;
+    const uint32_t fields = td.has_x_scales && scale_bytes && !td.packed_peer_scales ? 2U : 1U;
     // Lanes own disjoint existing notify channels; destination row order is unchanged.
     for (uint32_t ch = core % td.udma_workers_per_peer; sender.Count() && ch < td.num_channels; ch += td.udma_workers_per_peer) {
         const uint32_t begin = ch * channel_tokens < td.num_tokens ? ch * channel_tokens : td.num_tokens;
@@ -89,6 +127,22 @@ __aicore__ inline void DispatchRemoteImpl(
                         visit -= count;
                     }
                 }
+            }
+        }
+    }
+    if (td.packed_peer_scales) {
+        // Both builders reuse the same UB: drain payload requests first.
+        sender.Flush();
+        if (td.packed_scale_ready && sender.Count())
+            WaitPackedScaleReady(td, core, cores);
+        for (uint32_t p = 0; p < sender.Count(); ++p) {
+            const uint32_t peer = sender.Rank(p);
+            const uint32_t base = td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0;
+            for (uint32_t ch = core % td.udma_workers_per_peer; ch < td.num_channels;
+                 ch += td.udma_workers_per_peer) {
+                const uint32_t first = ch ? channel_gm.GetValue(peer * td.num_channels + ch - 1) : 0;
+                const uint32_t last = channel_gm.GetValue(peer * td.num_channels + ch);
+                sender.PutPackedScales(p, first, last - first, base);
             }
         }
     }

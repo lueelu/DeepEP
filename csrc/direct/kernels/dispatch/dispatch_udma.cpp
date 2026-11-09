@@ -86,23 +86,36 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     rank_prefix_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix));
     local_shmem_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(symmetric_buffer));
 
-    if (tiling.has_x_scales != 0) {
-        if (tiling.needs_x_scales_pack != 0) {
-            __gm__ uint8_t* packed_x_scales =
-                reinterpret_cast<__gm__ uint8_t*>(symmetric_buffer) + tiling.x_scales_input_buffer_offset;
+    const bool overlap_scales = tiling.packed_scale_ready != 0;
+    if (tiling.has_x_scales && tiling.needs_x_scales_pack) {
+        dispatch_scales = symmetric_buffer + tiling.x_scales_input_buffer_offset;
+        if (!overlap_scales) {
             asc_vf_call<ascend_deepep::PackV1DispatchScalesSimtVf>(
-                dim3(ascend_deepep::kDispatchScalePackThreads), reinterpret_cast<const __gm__ uint32_t*>(x_scales),
-                reinterpret_cast<__gm__ uint32_t*>(packed_x_scales), tiling.num_tokens, tiling.num_scales,
-                tiling.scale_token_stride, tiling.scale_hidden_stride, static_cast<uint32_t>(core_idx),
-                static_cast<uint32_t>(core_num));
+                dim3(128), reinterpret_cast<const __gm__ uint32_t*>(x_scales),
+                reinterpret_cast<__gm__ uint32_t*>(dispatch_scales), tiling.num_tokens, tiling.num_scales,
+                tiling.scale_token_stride, tiling.scale_hidden_stride, uint32_t(core_idx), uint32_t(core_num));
             AscendC::SyncAll<true>();
-            dispatch_scales = packed_x_scales;
         }
     }
-
+    if (tiling.packed_peer_scales && !overlap_scales) {
+        const uint32_t channel_tokens = (tiling.num_tokens + tiling.num_channels - 1U) / tiling.num_channels;
+        asc_vf_call<ascend_deepep::PackDispatchPeerScalesVf>(dim3(128),
+            reinterpret_cast<const __gm__ uint32_t*>(dispatch_scales),
+            reinterpret_cast<__gm__ uint32_t*>(tiling.packed_peer_scales),
+            reinterpret_cast<const __gm__ int32_t*>(dispatch_plan),
+            reinterpret_cast<const __gm__ int32_t*>(channel_prefix_matrix),
+            tiling.rank, tiling.world_size, tiling.num_channels, (channel_tokens + 7U) / 8U * 8U,
+            tiling.num_tokens, tiling.num_scales, tiling.num_scales, 1U,
+            uint32_t(core_idx), uint32_t(core_num));
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+        // Existing Begin joins all producers before senders can read staging.
+    }
     const uint32_t staging_capacity = kDispatchStageBytes;
     const int32_t staging_buffer_mask = staging_buffer_stride * 2U <= staging_capacity ? 1 : 0;
     ascend_deepep::UbWorkspace resource;
+    if (overlap_scales)
+        ascend_deepep::udma::StorePackedScaleReady(resource, tiling, uint32_t(core_idx), 0U);
     auto staging_pingpong_ub = resource.template GetBufferByByte<uint8_t>(0);
     AscendC::DataCopyPadExtParams<uint8_t> uint8_pad_params{false, 0, 0, 0};
 
@@ -122,6 +135,38 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
         core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
         tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
+
+    if (overlap_scales) {
+        const uint32_t first = ascend_deepep::udma::MetadataFirst(world_size, tiling.udma_peers_per_worker,
+            core_num, tiling.udma_peer_order, tiling.udma_ranks_per_group, tiling.udma_workers_per_peer);
+        if (uint32_t(core_idx) >= first) {
+            const uint32_t worker = uint32_t(core_idx) - first, workers = uint32_t(core_num) - first;
+            // Both producers read immutable original input independently. No
+            // normalization-to-peer-pack barrier is needed on this path.
+            if (tiling.needs_x_scales_pack) {
+                asc_vf_call<ascend_deepep::PackV1DispatchScalesSimtVf>(dim3(128),
+                    reinterpret_cast<const __gm__ uint32_t*>(x_scales),
+                    reinterpret_cast<__gm__ uint32_t*>(dispatch_scales), tiling.num_tokens, tiling.num_scales,
+                    tiling.scale_token_stride, tiling.scale_hidden_stride, worker, workers);
+                AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            }
+            const uint32_t channel_tokens = (tiling.num_tokens + tiling.num_channels - 1U) / tiling.num_channels;
+            asc_vf_call<ascend_deepep::PackDispatchPeerScalesVf>(dim3(128),
+                reinterpret_cast<const __gm__ uint32_t*>(x_scales),
+                reinterpret_cast<__gm__ uint32_t*>(tiling.packed_peer_scales),
+                reinterpret_cast<const __gm__ int32_t*>(dispatch_plan),
+                reinterpret_cast<const __gm__ int32_t*>(channel_prefix_matrix),
+                tiling.rank, tiling.world_size, tiling.num_channels, (channel_tokens + 7U) / 8U * 8U,
+                tiling.num_tokens, tiling.num_scales, tiling.scale_token_stride, tiling.scale_hidden_stride,
+                worker, workers);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            ascend_deepep::udma::StorePackedScaleReady(resource, tiling, uint32_t(core_idx), 1U);
+            // Self-copy metadata reads normalized rows from every producer.
+            ascend_deepep::udma::WaitPackedScaleReady(tiling, uint32_t(core_idx), uint32_t(core_num));
+        }
+    }
 
     // With spare cores, payload owners skip this helper and immediately start
     // UDMA while the other cores build metadata and copy self channels.

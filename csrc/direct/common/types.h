@@ -95,6 +95,10 @@ struct alignas(8) DispatchTilingData {
     uint64_t v2_dst_slots;
     // Buffer-owned symmetric address mailbox; never part of a cached handle.
     uint64_t udma_output_control;
+    // Reserved symmetric scale staging, owned until dispatch completion.
+    uint64_t packed_peer_scales = 0;
+    // Cache-isolated local producer flags in the unused self-peer interval.
+    uint64_t packed_scale_ready = 0;
 };
 
 struct alignas(8) CombineTilingData {

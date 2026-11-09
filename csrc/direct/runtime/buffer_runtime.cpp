@@ -153,9 +153,10 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
         if (use_1g_huge_pages_) {
             // The fixed prefix owns the workspace; the tail owns comm metadata
             // and, for UDMA, the independently-lived output address mailbox.
-            const auto control_bytes =
-                transport_ == "udma" ? ascend_deepep::udma::OutputControlBytes(static_cast<uint32_t>(num_ranks_)) : 0;
-            shmem_->Init(static_cast<int64_t>(kCommMetaBytes + control_bytes), num_bytes_);
+            // The metadata heap retains SHMEM's 2 MiB alignment even when
+            // the payload workspace is independently allocated with 1 GiB pages.
+            const auto metadata_heap_bytes = ValidateAndGetLocalMemSize(rank_, num_ranks_, 0, transport_);
+            shmem_->Init(metadata_heap_bytes, num_bytes_);
         } else {
             shmem_->Init(local_mem_size_);
         }

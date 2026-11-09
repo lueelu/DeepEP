@@ -419,7 +419,19 @@ def split_cache_flush(rows, trace, iterations, device, *, sample_host_ranges=Non
     return kept, intervals, excluded
 
 
-def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flush_l2_cache=False, sample_markers=False):
+def parse_profile(
+    root,
+    op,
+    expanded,
+    iterations,
+    device,
+    aiv,
+    *,
+    api="v2",
+    flush_l2_cache=False,
+    sample_markers=False,
+    require_combine_notify=False,
+):
     """Fail closed on missing, duplicated or unrecognizable profiler samples."""
     if api not in ("v1", "v2") or iterations <= 0:
         raise ValueError("invalid API or iteration count")
@@ -459,9 +471,13 @@ def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flus
     if fused:
         main = "v1_combine_udma_kernel"
     required = [main]
-    # Fixed-header UDMA combine folds its entry synchronization into Begin().
-    # Accept old reports too, but reject partial/mixed notify sequences below.
-    combine_notify = ["cached_notify_combine_kernel"] if early or counts["cached_notify_combine_kernel"] else []
+    # New V2 runs require a separate all-AIV entry rendezvous. Archived reports
+    # without it remain readable; partial/mixed sequences always fail below.
+    combine_notify = (
+        ["cached_notify_combine_kernel"]
+        if early or counts["cached_notify_combine_kernel"] or (combine and require_combine_notify)
+        else []
+    )
     required += (
         combine_notify + ([] if fused else ["v1_combine_udma_reduce_kernel"])
         if combine
@@ -570,8 +586,8 @@ def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flus
                 raise ValueError("nonfinite kernel timestamp")
             if (
                 STAGES.get(name) in ("early_submit", "comm", "expand", "aggregate", "reduce", "fused_combine")
-                and int(row["Block Num"]) != aiv
-            ):
+                or name == "cached_notify_combine_kernel"
+            ) and int(row["Block Num"]) != aiv:
                 raise ValueError("unexpected launch AIV count")
             times[STAGES.get(name, "other") + "_us"] += duration
             kernels.append(

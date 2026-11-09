@@ -582,6 +582,44 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_completion_signal_offset = static_cast<uint64_t>(dispatch_workspace.udma_completion_signal_offset);
     tiling.udma_output_control = use_udma ? reinterpret_cast<uint64_t>(dispatch_output_control) : 0;
     tiling.dispatch_workspace_bytes = static_cast<uint64_t>(dispatch_workspace.total_bytes);
+    // Owned mailbox outputs leave the symmetric receive-scale region unused.
+    // Reuse it as immutable peer-ordered send staging for wide FP8 rows. Other
+    // layouts keep per-row scale transport, including graph/zero-copy calls.
+    bool packed_scales = use_udma && !shmem.TokenSchedule() && x_scales.has_value() && num_scales &&
+                         x_element_bytes == 1 && scale_element_bytes == sizeof(uint32_t) && hidden_bytes >= 4096 &&
+                         hidden_bytes + scale_row_bytes <= 8192 && resolved_num_aiv >= 32 && !zero_copy && !capturing &&
+                         dispatch_output_control && shmem.Use1gHugePages() && symmetric_buffer == shmem.WorkspacePtr();
+    const auto workspace_base = reinterpret_cast<uintptr_t>(symmetric_buffer);
+    if (packed_scales) {
+        // Workspace-backed inputs may alias this otherwise unused region.
+        for (const auto& input :
+             {c10::optional<torch::Tensor>(x), x_scales, topk_idx, topk_weights, num_tokens_per_rank,
+              c10::optional<torch::Tensor>(is_token_in_rank), num_tokens_per_expert, cached_rank_prefix_matrix,
+              cached_channel_prefix_matrix, cached_dispatch_plan}) {
+            if (!input.has_value() || input->numel() == 0) continue;
+            const auto address = reinterpret_cast<uintptr_t>(input->data_ptr());
+            if (address >= workspace_base && address - workspace_base < symmetric_buffer_bytes) packed_scales = false;
+        }
+    }
+    if (packed_scales) {
+        const int64_t peer_bytes = CheckedMulInt64(num_tokens, scale_row_bytes, "packed peer scale bytes");
+        const int64_t bytes = CheckedMulInt64(world_size, peer_bytes, "packed scale bytes");
+        TORCH_CHECK(peer_bytes <= std::numeric_limits<uint32_t>::max(), "Packed scale interval exceeds WQE size");
+        TORCH_CHECK(bytes <= CheckedMulInt64(recv_buffer_tokens, scale_row_bytes, "scale staging capacity"),
+                    "Packed scales exceed symmetric scale capacity");
+        tiling.packed_peer_scales = workspace_base + dispatch_workspace.x_scales_buffer_offset;
+        const uint32_t first = ascend_deepep::udma::MetadataFirst(world_size, udma_peers_per_worker, resolved_num_aiv,
+                                                                  shmem.DispatchPeerOrder(), shmem.RanksPerGroup(),
+                                                                  shmem.WorkersPerPeer());
+        // Self scales go straight to owned output; their unused packed interval
+        // holds one cache-isolated flag per AIV. Otherwise pack serially.
+        const uint64_t self = tiling.packed_peer_scales + uint64_t(rank) * uint64_t(peer_bytes);
+        const uint64_t padding = (512U - self % 512U) % 512U;
+        const uint64_t flag_bytes = uint64_t(resolved_num_aiv) * 512U;
+        if (first && first < resolved_num_aiv && padding <= uint64_t(peer_bytes) &&
+            flag_bytes <= uint64_t(peer_bytes) - padding)
+            tiling.packed_scale_ready = self + padding;
+    }
 
     if (cached_mode) {
         LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());

@@ -102,7 +102,11 @@ def arguments(argv=None, *, description=None):
         ("case-timeout", 1800),
     ]:
         p.add_argument("--" + name, type=int, default=default)
-    p.add_argument("--huge-pages", action="store_true", help="explicitly request 1 GiB SHMEM pages")
+    p.add_argument(
+        "--huge-pages",
+        action="store_true",
+        help="request 1 GiB SHMEM pages; eligible FP8 dispatches also use packed scale staging",
+    )
     p.add_argument(
         "--output", type=Path, default=Path("bandwidth_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     )
@@ -364,6 +368,7 @@ def worker(args):
     args.expert_alignment = 1
     args.profile_warmup, args.profile_iters = args.warmup, args.iterations
     args.profile_sample_markers = True
+    args.combine_notify = True
     device = args.first_device + local_rank
     destination = args.output / f"rank{rank}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -600,6 +605,7 @@ def worker(args):
                 args.num_aiv,
                 flush_l2_cache=args.flush_l2_cache,
                 sample_markers=True,
+                require_combine_notify=True,
             )
             # Independent caller-stream samples; do not subtract from profiler kernel times.
             profile["sampling"]["host_sync_each_iteration"] = True
@@ -767,6 +773,7 @@ def report(root):
                 ("flush_l2_cache", False),
                 ("combine_bias", "two"),
                 ("profile_sample_markers", False),
+                ("combine_notify", False),
             ):
                 if config.get(key, default) != plan["arguments"].get(key, default):
                     raise ValueError(f"peer order configuration mismatch: {key}")
@@ -837,6 +844,7 @@ def report(root):
                     api=api,
                     flush_l2_cache=config.get("flush_l2_cache", False),
                     sample_markers=config.get("profile_sample_markers", False),
+                    require_combine_notify=config.get("combine_notify", False),
                 )
                 import_size = plan["topk_idx_bytes"]
                 expected = byte_ledger(
@@ -1088,6 +1096,7 @@ def launch(args, *, entrypoint=None):
     ]
     api = getattr(args, "api", "v2")
     args.profile_sample_markers = True
+    args.combine_notify = api == "v2"
     plan = dict(
         format_version=2,
         api=api,

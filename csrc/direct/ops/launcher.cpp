@@ -119,12 +119,12 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
 
     aclrtStream stream = GetCurrentAclStream();
-    // Ordinary UDMA combine resets only its fixed control header, then Begin()
-    // synchronizes every rank/AIV before any payload overwrite. The previous
-    // operation's local consumers and outgoing QPs have completed in stream
-    // order. Keep the separate entry barrier for all other communication paths.
-    const bool has_udma_begin = use_udma && (phase == CombinePhase::Fused || phase == CombinePhase::Communication);
-    if (!has_udma_begin && phase != CombinePhase::Reduction && phase != CombinePhase::Remaining) {
+    // V2 communication gets a separate all-rank/all-AIV rendezvous on this
+    // stream. It isolates arrival skew from the payload kernel; Begin still
+    // clears and synchronizes its control header before payload overwrite.
+    // Fused V1 UDMA already performs its entry rendezvous inside Begin.
+    const bool fused_udma = use_udma && phase == CombinePhase::Fused;
+    if (!fused_udma && phase != CombinePhase::Reduction && phase != CombinePhase::Remaining) {
         cached_notify_combine_kernel_do(tiling.block_dim, stream, ffts_addr);
     }
     auto* combine_kernel_do = use_udma ? &v1_combine_udma_kernel_do : &v1_combine_kernel_do;

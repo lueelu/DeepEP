@@ -222,7 +222,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(AlignUpInt64(hidden_bytes, kCombineAlignmentBytes) <= communication_ub_bytes,
                 "one combine token row requires ", hidden_bytes,
                 " bytes plus alignment, but the combine staging area provides ", communication_ub_bytes, " bytes");
-    auto recv_x = allocator.Zeros({num_tokens, hidden}, x.options());
+    // The ordinary UDMA V2 epilogue writes every original token, including
+    // tokens with no contributors. Its UB accumulators remain zero-initialized;
+    // no previous output contents are read. Other paths retain their allocation.
+    const bool overwrite_output =
+        use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule();
+    auto recv_x = overwrite_output ? allocator.Empty({num_tokens, hidden}, x.options())
+                                   : allocator.Zeros({num_tokens, hidden}, x.options());
 
     c10::optional<torch::Tensor> recv_topk_weights = c10::nullopt;
     int64_t num_topk = 0;
@@ -234,7 +240,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         TORCH_CHECK(num_topk > 0, "topk_weights second dim must be greater than zero");
         TORCH_CHECK(num_topk <= kMaxCombineTopk, "num_topk must not exceed ", kMaxCombineTopk,
                     " for the combine UB layout");
-        recv_topk_weights = allocator.Zeros({num_tokens, num_topk}, topk_weights->options());
+        recv_topk_weights = overwrite_output ? allocator.Empty({num_tokens, num_topk}, topk_weights->options())
+                                             : allocator.Zeros({num_tokens, num_topk}, topk_weights->options());
     }
     if (bias_0.has_value()) {
         TORCH_CHECK(bias_0->dim() == 2 && bias_0->size(0) == num_tokens && bias_0->size(1) == hidden,
