@@ -22,7 +22,13 @@ def load_config(name, bs_values=None):
     required = {"schema_version", "model", "bs_values", "warmup", "iters", "seed"}
     if not required <= set(config) or set(config) - required - {"alignment"} or config["schema_version"] != 1:
         raise ValueError("Invalid config schema; see the packaged smoke.json")
-    if set(config["model"]) != {"hidden", "intermediate_hidden", "num_experts", "num_topk", "num_shared_experts"}:
+    if set(config["model"]) - {"shared_intermediate_hidden", "shared_output_rounding"} != {
+        "hidden",
+        "intermediate_hidden",
+        "num_experts",
+        "num_topk",
+        "num_shared_experts",
+    }:
         raise ValueError("Model must specify H, intermediate width, global experts, top-k and shared experts")
     if bs_values is not None:
         config["bs_values"] = [int(part) for part in bs_values.split(",")]
@@ -58,6 +64,10 @@ def inputs(config, rank, bs, routing="balanced", *, world):
         route_start = rank * bs * model["num_topk"]
         routes = np.arange(route_start, route_start + bs * model["num_topk"], dtype=np.int64)
         ids = ((routes % world) * local_experts + (routes // world) % local_experts).reshape(bs, model["num_topk"])
+    elif routing == "random-balanced":
+        from .random_balanced import random_balanced_indices
+
+        ids = random_balanced_indices(bs, world, model["num_experts"], model["num_topk"], rank)
     elif routing == "skewed":
         ids = np.broadcast_to(np.arange(model["num_topk"]), (bs, model["num_topk"]))
     elif routing == "random":
@@ -121,7 +131,7 @@ def main():
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
         "--routing",
-        choices=("balanced", "random", "skewed"),
+        choices=("balanced", "random", "skewed", "random-balanced"),
         default="balanced",
         help="Reproducible accuracy stress pattern; record the same pattern for performance comparisons",
     )
@@ -133,6 +143,7 @@ def main():
         "--golden-dir", type=Path, default=Path("benchmark-golden"), help="Precomputed CPU Golden cache"
     )
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
+    parser.add_argument("--dual-reference", action="store_true", help="Compare CPU Golden and NPU cascade")
     args = parser.parse_args()
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
@@ -154,6 +165,12 @@ def main():
 
 
 def run(args, config, group):
+    from .backend import select_backend
+
+    if select_backend(group) == "ubx":
+        from .ubx_benchmark import run as run_ubx
+
+        return run_ubx(args, config, group)
     import torch
     from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
@@ -218,11 +235,15 @@ def run(args, config, group):
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     model = config["model"]
+    if model.get("shared_intermediate_hidden", model["intermediate_hidden"]) != model["intermediate_hidden"]:
+        raise ValueError("POD shared width must match routed width")
+    if getattr(args, "dual_reference", False) and args.mode != "accuracy":
+        raise ValueError("--dual-reference requires --mode accuracy")
     buffer = SymmBuffer(
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
-        **model,
+        **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding")},
     )
 
     def device_pair(pair):
@@ -242,6 +263,13 @@ def run(args, config, group):
         )
         shared = transform_weights_for_mega_moe(*map(device_pair, shared_raw), shared=True)
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
+    cascade = None
+    cascade_owned = False
+    if getattr(args, "dual_reference", False):
+        from .cascade import CascadeReference, init_process_group
+
+        cascade_owned = init_process_group(group)
+        cascade = CascadeReference(model, raw, shared_raw, host_group=group)
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
@@ -323,6 +351,31 @@ def run(args, config, group):
                 golden_dir=args.golden_dir,
                 input_kind=args.input,
             )
+            if cascade is not None:
+                from .golden import contract, load
+                from .urma_accuracy import compare_outputs
+
+                expected, expected_counts, selected = load(
+                    args.golden_dir, contract(config, world, bs, args.input, args.routing, args.check_tokens), rank
+                )
+                other, other_counts = cascade.forward(
+                    activation,
+                    buffer.topk_idx[:bs],
+                    buffer.topk_weights[:bs],
+                    input_kind=args.input,
+                    quantized=(buffer.x[:bs], buffer.x_sf[:bs]) if activation is None else None,
+                )
+                dual = compare_outputs(
+                    result.float().cpu().numpy(),
+                    other.float().cpu().numpy(),
+                    expected,
+                    counts.cpu().numpy(),
+                    other_counts.cpu().numpy(),
+                    expected_counts,
+                    selected,
+                )
+                dual["passed"] &= bool((stats == 7 + 2 * counts).all().item())
+                reports = group.all_gather(dual, f"dual reference BS={bs}")
             (case / "accuracy.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
             if not all(item["passed"] for item in reports):
                 raise AssertionError(f"BS={bs}: accuracy FAILED; see {case / 'accuracy.json'}")
@@ -393,6 +446,10 @@ def run(args, config, group):
         group.barrier(f"case complete BS={bs}")
     group.barrier("before SHMEM teardown")
     buffer.destroy()
+    if cascade_owned:
+        import torch.distributed as dist
+
+        dist.destroy_process_group()
     group.close()
 
 

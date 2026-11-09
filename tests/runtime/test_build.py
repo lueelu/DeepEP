@@ -344,6 +344,7 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
         "deep_ep_experimental/megamoe/configs/smoke.json",
         "deep_ep_experimental/megamoe/_C.fake.so",
         "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
+        "deep_ep_experimental/megamoe/libmegamoe_urma_kernel.so",
         "deep_ep_experimental/megamoe/cann.LICENSE",
     }
     wheel = tmp_path / "combined.whl"

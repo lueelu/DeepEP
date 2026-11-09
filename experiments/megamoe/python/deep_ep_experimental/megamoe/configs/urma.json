@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "model": {
+    "hidden": 3584,
+    "intermediate_hidden": 1280,
+    "num_experts": 384,
+    "num_topk": 8,
+    "num_shared_experts": 0
+  },
+  "bs_values": [2048, 4096, 8192],
+  "warmup": 2,
+  "iters": 10,
+  "seed": 1234
+}

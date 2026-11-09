@@ -19,7 +19,8 @@ namespace deepep {
 class Session {
 public:
     Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
-            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false);
+            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false,
+            bool megamoe_urma = false);
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
@@ -101,6 +102,14 @@ public:
     {
         return udma_;
     }
+    bool megamoe_urma() const
+    {
+        return megamoe_urma_;
+    }
+    const std::string& megamoe_urma_topology_error() const
+    {
+        return megamoe_urma_topology_error_;
+    }
 
 private:
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
@@ -123,6 +132,8 @@ private:
     int rank_ = 0;
     int world_ = 0;
     bool udma_ = false;
+    bool megamoe_urma_ = false;
+    std::string megamoe_urma_topology_error_;
     bool combine_only_ = false;
     bool sparse_qp_enabled_ = false;
     bool peer_table_ = false;

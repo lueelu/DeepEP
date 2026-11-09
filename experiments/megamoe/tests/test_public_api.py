@@ -413,6 +413,7 @@ def test_store_group_public_configuration_and_prepare_without_process_group(back
     buffer.prepare(17)
     buffer.destroy()
     assert stages == [
+        "check:MegaMoE product selection",
         "check:configuration",
         "check:input allocation",
         "check:input preflight",
@@ -443,3 +444,37 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     backend.ext.Plan = plan_type
     backend.buffer.prepare(17)
     assert backend.buffer._plan_bs == 17
+
+
+@pytest.mark.parametrize(
+    "world,bs,expected",
+    [
+        (16, 1024, 128),
+        (16, 2048, 128),
+        (16, 1023, 256),
+        (16, 1025, 256),
+        (16, 2047, 256),
+        (16, 2049, 256),
+        (16, 1536, 256),
+        (8, 1024, 256),
+        (8, 2048, 256),
+        (4, 1024, 256),
+    ],
+)
+def test_ubx_cv_policy_exact_points(world, bs, expected):
+    from deep_ep_experimental.megamoe.backend import cv_rows
+
+    assert cv_rows(world, bs) == expected
+
+
+@pytest.mark.parametrize("board,expected", [(0x44, "ubx"), (7, "pod"), (3, "pod"), (None, "pod"), (0x6C, "pod")])
+def test_megamoe_product_selection(monkeypatch, board, expected):
+    from deep_ep_experimental.megamoe import backend as selector
+    from deep_ep import _machine
+
+    calls = []
+    monkeypatch.setattr(_machine, "physical_device", lambda: 17)
+    monkeypatch.setattr(_machine, "board_id", lambda physical: board)
+    monkeypatch.setattr(selector, "collective_check", lambda group, stage, error, value: calls.append(value))
+    assert selector.select_backend(object()) == expected
+    assert calls == [expected]

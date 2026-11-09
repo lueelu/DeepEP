@@ -30,7 +30,7 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
 
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
-    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed"):
+    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed", "random-balanced"):
         raise ValueError("Invalid Golden input/routing")
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
@@ -159,7 +159,12 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 yield token, weights[token, slot], pair
         shared = model["num_shared_experts"]
         if shared:
-            raw = make_weights(shared, model["hidden"], model["intermediate_hidden"], config["seed"] + 100000)
+            raw = make_weights(
+                shared,
+                model["hidden"],
+                model.get("shared_intermediate_hidden", model["intermediate_hidden"]),
+                config["seed"] + 100000,
+            )
             for expert in range(shared):
                 yield np.arange(len(x)), None, tuple((data[expert], scale[expert]) for data, scale in raw)
 
@@ -271,7 +276,7 @@ def main():
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
-    parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
+    parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--chunk-tokens", type=int, default=256)

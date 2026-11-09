@@ -88,6 +88,34 @@ class SymmBuffer:
         if not isinstance(group, (StoreGroup, dist.ProcessGroup)):
             raise TypeError("Pass a StoreGroup or an initialized ProcessGroup explicitly")
         size = group.size() if isinstance(group, StoreGroup) else dist.get_world_size(group)
+        from .backend import select_backend, UbxBuffer
+
+        self._backend_name = select_backend(group)
+        if self._backend_name == "ubx":
+            self._ubx = UbxBuffer(
+                group,
+                num_experts,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden,
+                intermediate_hidden,
+                num_shared_experts,
+                mma_type,
+                activation,
+                ranks_per_node,
+                timeout,
+            )
+            self.group, self.num_experts = group, num_experts
+            self.num_max_tokens_per_rank, self.num_topk = num_max_tokens_per_rank, num_topk
+            self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
+            self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
+            self.ranks_per_node = ranks_per_node
+            self._device, self._runtime = self._ubx._device, self._ubx._runtime
+            self._lock = self._ubx._lock
+            self._plan = self._plan_bs = None
+            self.x, self.x_sf = self._ubx.x, self._ubx.x_sf
+            self.topk_idx, self.topk_weights = self._ubx.topk_idx, self._ubx.topk_weights
+            return
         error = None
         try:
             integer("num_experts", num_experts, 1, 16384)
@@ -166,6 +194,9 @@ class SymmBuffer:
         return self
 
     def _prepare(self, bs):
+        if getattr(self, "_backend_name", "pod") == "ubx":
+            self._ubx.prepare(bs)
+            return
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
         if self._plan_bs == bs:
             return
@@ -213,6 +244,8 @@ class SymmBuffer:
     @property
     def workspace_bytes(self) -> int:
         """Prepared local scratch only; excludes symmetric heap, inputs and weights."""
+        if getattr(self, "_backend_name", "pod") == "ubx":
+            return self._ubx.workspace_bytes
         return self._plan.workspace_bytes if self._plan is not None else 0
 
     @property
@@ -221,6 +254,8 @@ class SymmBuffer:
 
     @property
     def timer_enabled(self) -> bool:
+        if getattr(self, "_backend_name", "pod") == "ubx":
+            return self._ubx.timer_enabled
         return bool(_extension().timer_enabled and self.mma_type == "fp8xfp4")
 
     def allocate_timer(self) -> Tensor:
@@ -230,6 +265,8 @@ class SymmBuffer:
         self._runtime.ensure_alive()
         if not self.timer_enabled:
             raise RuntimeError("W4A8 timer requires DEEPEP_MEGAMOE_TIMER=ON")
+        if getattr(self, "_backend_name", "pod") == "ubx":
+            return self._ubx.allocate_timer()
         return torch.zeros(_extension().timer_numel, dtype=torch.int64, device=self._device)
 
     def validate_inputs(self, bs: int, *, x: Tensor | None = None) -> None:
@@ -273,6 +310,10 @@ class SymmBuffer:
         collective_check(self.group, "input preflight", error, (bs, x is not None))
 
     def destroy(self):
+        if getattr(self, "_backend_name", "pod") == "ubx":
+            self._ubx.destroy()
+            self.x = self.x_sf = self.topk_idx = self.topk_weights = None
+            return
         with self._lock:
             self._runtime.close()
             self._plan = self._plan_bs = None
@@ -431,6 +472,19 @@ def _run(
 
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
+    if getattr(sym_buffer, "_backend_name", "pod") == "ubx":
+        return sym_buffer._ubx.run(
+            x,
+            topk_idx,
+            topk_weights,
+            l1_weights,
+            l2_weights,
+            shared_l1_weights=shared_l1_weights,
+            shared_l2_weights=shared_l2_weights,
+            out=out,
+            timer=timer,
+            cumulative_stats=cumulative_stats,
+        )
     data, scales = _pair(x, "x") if isinstance(x, tuple) else (x, None)
     w1, s1 = _pair(l1_weights, "l1_weights")
     w2, s2 = _pair(l2_weights, "l2_weights")
