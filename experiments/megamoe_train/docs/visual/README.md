@@ -2,7 +2,7 @@
 
 按项目结构、调用链、三核流水和内存复用逐层阅读。默认场景为 Ascend950、save=bf16、H7168/F3072、BF16 路由权重 p、关闭 clipping。
 
-源码快照：[0b5f385](https://github.com/xixing-321/DeepEP/tree/0b5f385fd404a09446d317235d5e31c01471ed94)。
+源码快照：[4b7b58b](https://github.com/xixing-321/DeepEP/tree/4b7b58b4dcf2bf3f6cebba6b99b370f1aa1c57a4)。
 
 [离线交互页面](index.html) · [完整调用点与源码](CALLPOINTS.md) · [维护方法](MAINTAINING.md)
 
