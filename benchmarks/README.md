@@ -9,6 +9,8 @@ Modified by Joyce_An 2026
 
 HT 和 LL 有独立的设备正确性与 kernel 测量入口，运行方式见[测试说明](../tests/README.md)，统计口径见[性能说明](../docs/performance.md)。
 
+排查 global Clos 的环境差异可使用独立的 [UDMA 微基准](udma/README.md)：一次 SHMEM/QP 初始化连续测单对端、一对一并发和全互发，支持大小 WQE 对照、逐 rank 计时和全量数据校验。
+
 ## 无设备运行
 
 从仓库根目录使用 Python 3.11+，无需 Torch、NumPy 或 NPU：
