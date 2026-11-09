@@ -360,29 +360,6 @@ struct ForwardTransientWorkspaceLayout {
     }
 };
 
-// UDMA keeps packed X and routed TopK weights in SHMEM. Routing metadata
-// lives in TrainingSavedStateLayout, leaving only GMM2 input and flags here.
-struct UDMAForwardTransientWorkspaceLayout {
-    uint64_t ptrA2Offset;
-    uint64_t swigluToGmm2FlagOffset;
-    uint64_t dispatchToGmm1FlagOffset;
-    uint64_t combineReadyOffset;
-    uint64_t totalBytes;
-
-    MEGA_MOE_BF16_HOST_DEVICE constexpr UDMAForwardTransientWorkspaceLayout(uint64_t n, uint64_t expertPerRank,
-                                                                            uint64_t maxRecvTokens)
-        : ptrA2Offset(0),
-          swigluToGmm2FlagOffset(AlignUp(maxRecvTokens * (n / 2) * kBf16Bytes, kAlignment512)),
-          dispatchToGmm1FlagOffset(swigluToGmm2FlagOffset +
-                                   AlignUp(expertPerRank * kIntCacheline * kInt32Bytes, kAlignment128)),
-          combineReadyOffset(dispatchToGmm1FlagOffset +
-                             AlignUp(expertPerRank * kIntCacheline * kInt32Bytes, kAlignment128)),
-          totalBytes(combineReadyOffset +
-                     AlignUp(expertPerRank * ((maxRecvTokens + 127) / 128) * kInt32Bytes, kAlignment512))
-    {
-    }
-};
-
 // Backward-only per-producer row-progress suffix; preceding workspace and
 // saved-state offsets remain fixed. Host allocation zeros these counters
 // before backward Dispatch publishes readiness. These are synchronization

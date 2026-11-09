@@ -1118,7 +1118,7 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessWithSaveMode()
         &params_.tilingData->moeInitRoutingTilingData, params_.tilingData->moeInitRoutingTilingData.tilingKey);
 
     // Finish and release the optional gather-only UB phase before Dispatch
-    // buffer allocation. UDMA invokes the same helper in its Process.
+    // buffer allocation.
     bool routedWeightsReady = false;
     if constexpr (g_coreType == AscendC::AIV) {
         routedWeightsReady = MegaMoeBF16Routing::TryGatherTopkWeights<TopkWeightT>(
