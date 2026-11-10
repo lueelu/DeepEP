@@ -6,8 +6,8 @@
  * \brief Tiling structures for MoE routing sort, token counting and gather stages.
  */
 
-#ifndef __MOE_INIT_ROUTING_V3_ARCH35_TILING_DEF_HPP
-#define __MOE_INIT_ROUTING_V3_ARCH35_TILING_DEF_HPP
+#ifndef MOE_INIT_ROUTING_V3_ARCH35_TILING_DEF_HPP
+#define MOE_INIT_ROUTING_V3_ARCH35_TILING_DEF_HPP
 
 // 单核排序阶段
 struct MoeV3Arch35VBSComputeTilingData {
@@ -92,4 +92,4 @@ struct MoeInitRoutingV3Arch35TilingData {
     MoeV3Arch35GatherOutComputeTilingData gatherOutComputeParamsOp;
 };
 
-#endif  // __MOE_INIT_ROUTING_V3_ARCH35_TILING_DEF_HPP
+#endif  // MOE_INIT_ROUTING_V3_ARCH35_TILING_DEF_HPP
