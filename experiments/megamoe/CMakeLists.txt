@@ -62,16 +62,16 @@ add_custom_command(OUTPUT "${kernel_library}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 set(urma_kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_urma_kernel.so")
 set(urma_kernel_flags ${kernel_flags})
-list(PREPEND urma_kernel_flags "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/ubx")
-list(APPEND urma_kernel_flags -fvisibility=hidden)
+list(PREPEND urma_kernel_flags "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe_urma")
+list(APPEND urma_kernel_flags -fvisibility=hidden -DDEEPEP_MEGAMOE_URMA=1)
 list(REMOVE_ITEM urma_kernel_flags -Wl,-soname,libmegamoe_kernel.so)
 list(APPEND urma_kernel_flags -Wl,-soname,libmegamoe_urma_kernel.so)
 add_custom_command(OUTPUT "${urma_kernel_library}"
-    COMMAND "${BISHENG}" ${urma_kernel_flags} csrc/kernels/ubx/urma/launcher.cpp
+    COMMAND "${BISHENG}" ${urma_kernel_flags} csrc/kernels/mega_moe_urma/launcher.cpp
         "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
         -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
         -o "${urma_kernel_library}"
-    DEPENDS csrc/kernels/ubx/urma/launcher.cpp ${kernel_headers}
+    DEPENDS csrc/kernels/mega_moe_urma/launcher.cpp ${kernel_headers}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 add_custom_target(megamoe_device DEPENDS "${kernel_library}" "${urma_kernel_library}")
 pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/kernel_launch.cpp)

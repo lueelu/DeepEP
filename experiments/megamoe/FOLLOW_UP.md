@@ -44,7 +44,7 @@
 | `csrc/runtime/udma_peer_masks.hpp` | Elastic peer QP masks 的生成 |
 | `csrc/kernels/common.hpp` | Elastic 调度映射与 `CombineQpMask`，包含默认 QP0 保留规则 |
 | `csrc/kernels/udma_layout.hpp` | Elastic QP 数量与 owner/lane 到 QP 的映射 |
-| `experiments/megamoe/csrc/kernels/ubx/urma/transport.hpp` | UBX QP0 的 RO 数据发送、SO flag 发布和 `quiet` |
+| `experiments/megamoe/csrc/kernels/mega_moe_urma/transport.hpp` | UBX QP0 的 RO 数据发送、SO flag 发布和 `quiet` |
 | `dependencies.lock.json` | 确定核实所依据的 SHMEM 版本 |
 
 ### 验收与处理方向
@@ -60,7 +60,7 @@
 
 状态：待统一命名规范。
 
-当前 backend 使用 `ubx`，部分 kernel、trace 工具及内部符号使用 `urma`。两者含义不同：UBX 是机型，URMA 是通信方案，不应在代码命名中默认等价。
+当前 backend 使用 `ubx`，实现目录已改为 `kernels/mega_moe_urma`，公共实现放在 `kernels/mega_moe_common`。内部命名空间暂时保留原符号以隔离两个编译目标；部分 kernel、trace 工具及内部符号使用 `urma`。两者含义不同：UBX 是机型，URMA 是通信方案，不应在代码命名中默认等价。
 
 待确定并执行：
 

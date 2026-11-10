@@ -7,8 +7,8 @@
 #endif
 #include "basic_api/kernel_basic_intf.h"
 #include "kernel_launch.hpp"
-#include "mega_moe_tiling.hpp"
-#include "common/mega_moe_constants.hpp"
+#include "kernels/mega_moe_common/mega_moe_tiling.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 #if defined(__NPU_DEVICE__)
 #include "mega_moe_wave_a8w8.hpp"
 #include "mega_moe_wave_a8w4.hpp"

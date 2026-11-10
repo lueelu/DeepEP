@@ -9,7 +9,7 @@
 #include <string>
 #include "kernel_launch.hpp"
 #include <torch/extension.h>
-#include "kernels/mega_moe/mega_moe_tiling.hpp"
+#include "kernels/mega_moe_common/mega_moe_tiling.hpp"
 
 namespace deepep::megamoe {
 

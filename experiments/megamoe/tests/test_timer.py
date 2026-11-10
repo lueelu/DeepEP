@@ -20,7 +20,9 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_device_schema_and_extended_size():
-    header = (ROOT / "experiments/megamoe/csrc/kernels/mega_moe/common/ascend_timer_v2.hpp").read_text(encoding="utf-8")
+    header = (ROOT / "experiments/megamoe/csrc/kernels/mega_moe_common/common/ascend_timer_v2.hpp").read_text(
+        encoding="utf-8"
+    )
 
     def names(enum, sentinel):
         body = re.search(r"enum\s+" + enum + r"\s*\{(.*?)\};", header, re.S)[1]

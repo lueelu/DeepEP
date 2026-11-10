@@ -8,8 +8,8 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
-#include "kernels/ubx/urma/compute_contract.hpp"
-#include "kernels/ubx/urma/device_route_plan.hpp"
+#include "kernels/mega_moe_urma/compute_contract.hpp"
+#include "kernels/mega_moe_urma/device_route_plan.hpp"
 
 #include <acl/acl.h>
 #include "shmem.h"
@@ -18,10 +18,10 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include "check.hpp"
-#include "kernels/mega_moe/common/ascend_timer_v2.hpp"
-#include "kernels/mega_moe/common/mega_moe_constants.hpp"
-#include "kernels/mega_moe/common/mega_moe_workspace.hpp"
-#include "kernels/mega_moe/mc2_common/mc2_moe_context.hpp"
+#include "kernels/mega_moe_common/common/ascend_timer_v2.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
+#include "kernels/mega_moe_common/mc2_common/mc2_moe_context.hpp"
 
 namespace deepep::megamoe {
 namespace {

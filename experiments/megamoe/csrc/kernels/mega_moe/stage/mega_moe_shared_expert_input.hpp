@@ -4,7 +4,7 @@
 #ifndef MEGA_MOE_SHARED_EXPERT_INPUT_H
 #define MEGA_MOE_SHARED_EXPERT_INPUT_H
 
-#include "../common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 #include "mega_moe_token_quant.hpp"
 
 namespace MegaMoeImpl {
