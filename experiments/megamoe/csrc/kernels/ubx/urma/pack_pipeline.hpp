@@ -112,7 +112,7 @@ public:
             // previous batch may remain in flight while the next segment
             // submits its first five rows and retires the old Pack quota.
             // Batch limits are 96 rows or the current expert boundary; bank
-            // reuse and Close still carry explicit MTE3_S prototype costs.
+            // reuse and Close wait for MTE3_S before their metadata buffers are reused.
             const uint32_t inverseBank = nextInverseBank_;
             RetireInverseMetadata(inverseBank);
             LocalTensor<int64_t> inverseRows(TPosition::VECCALC,

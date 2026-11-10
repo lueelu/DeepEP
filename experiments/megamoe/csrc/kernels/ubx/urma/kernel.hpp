@@ -24,7 +24,7 @@ using namespace AscendC;
 // reorder can execute with submitted Combine PUTs still in flight.
 constexpr uint32_t kCommunicationSignalOffset = kPackUbBase + kPackUbBytes;
 // Counters become live only after Pack closes. Reuse the region after both
-// span bitmaps, below the signal slot, so BS16384 also fits 192KiB UB.
+// span bitmaps, below the signal slot. The bounds below check the usable UB.
 constexpr uint32_t kCommunicationSubmittedOffset = kPackUbBase + 2U * kPeerReorderBitmapBytes;
 constexpr uint32_t kCommunicationPendingOffset = kCommunicationSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t);
 static_assert(kCommunicationSignalOffset % 32U == 0U);

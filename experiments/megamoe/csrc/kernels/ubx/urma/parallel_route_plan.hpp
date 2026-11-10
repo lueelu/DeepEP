@@ -1,4 +1,4 @@
-// Experimental commfirst parallel descriptor compiler. No task stealing or
+// Parallel route descriptor construction. No task stealing or
 // atomic append: each worker owns contiguous ranges of every output table.
 #pragma once
 #include "device_route_plan.hpp"

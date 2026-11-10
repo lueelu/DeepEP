@@ -4,7 +4,8 @@
 #include "kernel_operator.h"
 #include <c_api/asc_simd.h>
 namespace MegaMoeUrma {
-// Hardware channels follow Yancy/DeepEP's AIC->paired-AIV1 completion protocol.
+// Protocol source: Yancy/DeepEP (source revision was not recorded).
+// AIC and its paired AIV1 exchange ownership of the FIX output mailbox.
 // B supply uses AIV0 full4..7, empty8..11; these channels use AIV1 full12,
 // empty14. One low-UB mailbox stays owned until activation/scatter completes.
 struct RoutedFixChannel {

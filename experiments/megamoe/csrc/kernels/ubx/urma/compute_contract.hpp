@@ -17,9 +17,9 @@ constexpr uint32_t kComputeTileN = 256U;
 // result. Shared experts keep their separate planar N256 gate/up projections.
 constexpr uint32_t kGmm1LogicalTileN = 128U;
 // Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
-// slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
+// slices. The W4 AIV0 prologue defines its input/output banks independently.
 constexpr uint32_t kActivationTileM = 128U;
-// The URMA v1 input is H3584: each row has 112 E8M0 bytes. GM stays
+// The H3584 specialization has 112 E8M0 bytes per input row. GM stays
 // compact while DMA uses 32-byte-aligned rows in phase-private activation UB.
 constexpr uint32_t kInputScaleBytes = 3584U / 32U;
 constexpr uint32_t kInputScaleUbStride = ((kInputScaleBytes + 31U) / 32U) * 32U;

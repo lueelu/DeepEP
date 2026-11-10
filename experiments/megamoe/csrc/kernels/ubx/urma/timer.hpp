@@ -8,9 +8,11 @@
 namespace MegaMoeUrma {
 enum Phase : uint32_t { Pack = 0, Dispatch, Gmm1, Activation, Gmm2, Combine, Barrier, ReducePhase };
 
-// Each engine/phase owns a complete 128B cache line. Values are raw system
-// counter ticks: first start, last end, sum of measured intervals, bytes,
-// interval count, reserved, schema. No cross-rank clock subtraction is valid.
+// Each engine/phase owns a 128B record. Words 0..6 contain first start, last
+// end, accumulated ticks, submitted bytes, interval count, timing kind and
+// schema. Word 7 records outbound completion, or Dispatch receive observation
+// for kind 2; words 8..9 hold received bytes/rows for kind 2. No cross-rank
+// clock subtraction is valid.
 struct NoopTimer {
     __aicore__ inline uint64_t TraceWaitBegin() const
     {

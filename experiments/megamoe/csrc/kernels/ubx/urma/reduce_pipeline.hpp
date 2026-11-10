@@ -20,7 +20,7 @@ struct ReduceUbContract {
     static constexpr uint32_t maxRoutes = maxTokens * topk;
     static constexpr uint32_t maxRemoteDependencies = kWorld * 512U;
     // Conservative bound across EP4/8/16: at most 16*8192*8 received rows
-    // and at most 96 local experts, each contributing one partial M256 group.
+    // and kMaxLocalExperts experts, each contributing one partial M256 group.
     static constexpr uint32_t maxSelfDependencies = kWorld * 8192U * topk / kComputeTileM + kMaxLocalExperts;
     static constexpr uint32_t bf16RowBytes = hidden * sizeof(uint16_t);
     static constexpr uint32_t fp32RowBytes = hidden * sizeof(float);
