@@ -186,6 +186,6 @@ python scripts/validate_package.py --output /path/to/another-new-directory \
 
 ## CI 与产物
 
-[MegaMoE Train 文档 CI](../.github/workflows/megamoe-train-visual.yml) 自动检查源码导览、离线阅读与编辑器集成。构建、CPU 与 NPU 验证仍由执行者按变更范围完成：运行 pre-commit、CPU API、参考、运行时和构建预检，并在匹配环境中执行设备检查。CPU fault-injection 使用 Linux/g++，不等于 CANN ABI 或 NPU 测试。检查命令见[开发指南](development.md#提交前检查与-ci)。
+按变更范围运行 pre-commit、CPU API、参考、运行时和构建预检，并在匹配环境中执行设备检查。CPU fault-injection 使用 Linux/g++；CANN ABI 和 NPU 测试在目标环境单独执行。检查命令见[开发指南](development.md#提交前检查与-ci)。
 
 在具备 CANN、SHMEM、框架与已分配 NPU 的环境执行本页验证命令。保留 `source-tests.xml`、`installed-tests.xml`、`validation.json` 和逐 rank 输出，wheel/sdist 作为独立产物归档。安装成功、CPU 通过和设备算子通过分别记录，不互相替代。

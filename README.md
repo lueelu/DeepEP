@@ -63,7 +63,7 @@ DeepEP/
 └── figures/                 # 架构与性能图
 ```
 
-模块职责见[架构文档](docs/architecture.md)；训练算子从接口到核内实现的分层阅读入口见[MegaMoE BF16 训练源码导览](experiments/megamoe_train/docs/visual/README.md)。
+模块职责见[架构文档](docs/architecture.md)；训练算子的前后向计算、内存复用与同步协议见[MegaMoE BF16 训练设计](experiments/megamoe_train/docs/mega_moe_bf16_design.md)。
 
 ## 快速开始
 

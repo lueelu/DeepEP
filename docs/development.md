@@ -68,4 +68,4 @@ pre-commit run --show-diff-on-failure --from-ref "$PRE_COMMIT_BASE" --to-ref HEA
 
 行尾修复、ruff-format 和 clang-format 可能改写文件。检查差异、重新暂存并提交后，重复检查直到退出码为 0 且没有新的改写。首次运行会从 GitHub 上游仓库获取 hook，并从 Python 包源安装各自的隔离环境；下载失败同样会使检查失败。更新版本时需同步核对版本注释并执行全仓检查。
 
-[MegaMoE Train 文档 CI](../.github/workflows/megamoe-train-visual.yml) 自动检查源码导览、离线阅读与编辑器集成。提交前仍需手动运行上述 pre-commit，并按变更范围执行 CPU 正确性、benchmark dry-run、运行时、构建预检及设备验证。pre-commit 不启动 NPU；文档 CI 与 pre-commit 均不代替设备验证。
+提交前运行上述 pre-commit，并按变更范围执行 CPU 正确性、benchmark dry-run、运行时、构建预检及设备验证。pre-commit 不启动 NPU，设备验证需单独执行。

@@ -10,7 +10,6 @@ differentiable. It targets Ascend950; other Ascend generations are unsupported.
 | [Quickstart (中文)](docs/BF16_QUICKSTART_ZH.md) | Minimal runnable example and the meaning of each parameter |
 | [User guide (中文)](docs/BF16_USER_GUIDE_ZH.md) | Field-level contract, framework integration, capacity planning and limits |
 | [Design (中文)](docs/mega_moe_bf16_design.md) | Architecture, forward/backward pipeline, numerical boundaries and synchronization |
-| [Source guide (中文)](docs/visual/README.md) | Interactive walkthrough of call chains, AIC/AIV lanes and buffer lifetimes |
 | [Test entry](tests/bf16/README.md) · [Test spec](tests/bf16/TEST_SPEC.md) | How to run precision and performance checks, and how the results are judged |
 
 ## Build and installation

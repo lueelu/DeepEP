@@ -141,11 +141,6 @@ class CheckedInstallLib(install_lib):
 
 
 def source_fingerprint():
-    # Documentation dependencies and generated attachments are not build inputs.
-    visual_outputs = tuple(
-        ROOT / "experiments/megamoe_train/docs/visual" / name
-        for name in ("node_modules", "site", ".artifacts", "out", "dist")
-    )
     files = [
         ROOT / name
         for name in (
@@ -180,7 +175,6 @@ def source_fingerprint():
             for path in (ROOT / name).rglob("*")
             if (path.suffix in {".sh", ".py", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
             and path.name != "_build_info.json"
-            and not any(path.is_relative_to(directory) for directory in visual_outputs)
         )
     digest = hashlib.sha256()
     for path in sorted(files):

@@ -174,4 +174,3 @@ def plan_bf16_window_bytes(m, hidden, topk, ep_size, experts_per_rank,
 - 字段级契约、保存模式、容量与限制：[用户指南](BF16_USER_GUIDE_ZH.md)
 - 数值边界、内存复用与同步协议：[前后向设计](mega_moe_bf16_design.md)
 - 精度与性能测试：[测试入口](../tests/bf16/README.md)、[测试规范](../tests/bf16/TEST_SPEC.md)
-- 可交互源码导览：[visual/README.md](visual/README.md)

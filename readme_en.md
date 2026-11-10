@@ -73,7 +73,7 @@ DeepEP/
 └── figures/                 # Architecture and performance figures
 ```
 
-See the [architecture guide](docs/architecture.md) for module responsibilities; the training operator's layered source walkthrough is in the [MegaMoE BF16 training source guide](experiments/megamoe_train/docs/visual/README.md).
+See the [architecture guide](docs/architecture.md) for module responsibilities, and the [MegaMoE BF16 training design](experiments/megamoe_train/docs/mega_moe_bf16_design.md) for forward/backward computation, memory reuse and synchronization.
 
 ## Quick start
 

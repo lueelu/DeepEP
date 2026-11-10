@@ -24,8 +24,3 @@ include experiments/__init__.py
 include experiments/ep_gmm_fused/tests/requirements.txt
 recursive-include experiments/ep_gmm_fused *.py *.cpp *.hpp *.h *.cmake CMakeLists.txt *.md *.json LICENSE
 recursive-include experiments/megamoe_train *.py *.cpp *.hpp *.h *.cmake CMakeLists.txt *.md *.json *.csv
-prune experiments/megamoe_train/docs/visual/node_modules
-prune experiments/megamoe_train/docs/visual/site
-prune experiments/megamoe_train/docs/visual/.artifacts
-prune experiments/megamoe_train/docs/visual/out
-prune experiments/megamoe_train/docs/visual/dist
