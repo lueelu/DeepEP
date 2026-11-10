@@ -1,6 +1,6 @@
 flowchart TB
   subgraph lane_m_host["Host 容量 / 地址契约"]
-    m_sizes["用容量 R 计算布局，用 M_e 执行任务"]
+    m_sizes["用容量 C 计算布局，用 M_e 执行任务"]
   end
   subgraph lane_m_saved["前向持久 GM 张量"]
     m_dispatch_persist["独立 dispatch_output 保留 packed X/p"]
@@ -8,15 +8,16 @@ flowchart TB
   end
   subgraph lane_m_scratch["调用临时 GM"]
     m_forward_transient["前向 Hp 与 ready flags 属于临时 GM"]
-    m_backward_planes["反向按 R 预留 dO、dZ、Hp、partial"]
+    m_fwd_gm_alias["前向GM：按保存模式安排Gate与Hp"]
+    m_backward_planes["反向按 C 预留 dO、dZ、Hp、partial"]
     m_dhp_alias["ptrHp 第一生命期：dHp GM 输出"]
     m_hp_overwrite["ptrHp 第二生命期：重建的前向 Hp"]
-    m_dz_partials["dZ 与 dp partial 保持独立平面"]
+    m_dz_partials["dZ 与 dP partial 保持独立平面"]
     m_do_last_reader["先完成 dW2 对原始 dO 的读取"]
     m_dx_alias["ptrDX=ptrDO：切换为 dX 平面"]
   end
   subgraph lane_m_ub["核内 UB 与完成信号"]
-    m_fwd_ub["GMM1 的两块 UB 是 Gate 与 Up"]
+    m_fwd_ub["AIV0：原始Gate片改存Hp输出"]
     m_dispatch_buffers["token 与 p 使用不同 staging 事件"]
     m_ub_handoff["Dispatch 退出后 GMM2 才占 AIV1 UB"]
   end
@@ -46,3 +47,4 @@ flowchart TB
   m_ptrd_switch -.-> m_ptrd_dp
   m_dz_partials --> m_ptrd_dp
   m_ptrd_dp -.-> m_window_exit
+  m_forward_transient -.-> m_fwd_gm_alias

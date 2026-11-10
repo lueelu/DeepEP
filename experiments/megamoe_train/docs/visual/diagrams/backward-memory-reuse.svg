@@ -1,0 +1,81 @@
+<svg width="1100" height="460" style="width:1100px;height:460px;min-width:0;max-width:none" class="learning-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 460" role="img" aria-label="dHp到Hp、dO到dX和ptrD的三次复用"><style>/* Copyright (c) 2026, Lu Lu
+ * Modified by xixing 2026
+ */
+
+/* These rules style only the three learning scenes, not the existing graphs. */
+.learning-scene{max-width:1220px;margin:0 auto;padding:20px 22px 30px;color:#263750;line-height:1.65}
+[hidden]{display:none!important}
+.learning-context{display:flex;align-items:center;gap:9px 18px;flex-wrap:wrap;padding:10px 13px;border-left:3px solid #4269a6;background:#eef4fc;border-radius:0 7px 7px 0;font-size:12px;color:#4d6587}
+.learning-context strong{font-size:13px;color:#2f5182}
+.learning-caption{font-size:12px;color:#6f7d90;line-height:1.75;margin:9px 0 16px}
+.learning-routing-note{padding-bottom:12px;border-bottom:1px solid #e1e7ef}
+.learning-lead{font-size:14px;color:#3c526e;margin:9px 0 14px}
+.learning-section-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:24px 0 13px}
+.learning-section-heading h3{font-size:17px;font-weight:650;line-height:1.5;margin:0;color:#2b3f5b}
+.learning-section-number{width:25px;height:25px;border-radius:50%;display:grid;place-items:center;background:#eaf0fa;color:#315b99;font-size:12px;font-weight:700;flex:none}
+.learning-source-chip{border:0;border-bottom:1px dotted #9ab0cc;border-radius:0;background:none;padding:2px 0;color:#476c9b;cursor:pointer;font:inherit;font-size:11px;white-space:normal;text-align:left;line-height:1.5}
+.learning-section-heading .learning-source-chip{margin-left:auto}
+.learning-source-chip:hover{color:#214f8c;border-bottom-color:#214f8c;background:none}
+.learning-source-chip:focus-visible{outline:2px solid #7fa8de;outline-offset:4px}
+.learning-diagram{overflow-x:auto;margin:13px 0 9px;border:1px solid #e2e8f0;border-radius:9px;background:#fff}
+.learning-svg{width:100%;height:auto;display:block;min-width:780px;color:#304764}
+.learning-svg text{font-family:Inter,"Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;fill:#405773;font-size:15px}
+.learning-svg .learning-svg-title{font-size:19px;font-weight:650;fill:#2c435f}
+.learning-svg .learning-strong{font-size:18px;font-weight:650;fill:#2d4868}
+.learning-svg .learning-medium{font-size:16px;font-weight:550}
+.learning-svg .learning-small{font-size:14px;fill:#627791}
+.learning-svg .learning-tiny{font-size:12px;fill:#6e8097}
+.learning-svg .learning-code{font-family:"Cascadia Code",Consolas,monospace;font-size:15px;fill:#34516e}
+.learning-fill-blue{fill:#edf3fc;stroke:#a9bedb;stroke-width:1.25}
+.learning-fill-teal{fill:#edf8f5;stroke:#9dc8bd;stroke-width:1.25}
+.learning-fill-orange{fill:#fff5eb;stroke:#d7b798;stroke-width:1.25}
+.learning-fill-violet{fill:#f3eef9;stroke:#beafd0;stroke-width:1.25}
+.learning-fill-neutral{fill:#f3f5f8;stroke:#c6cdd7;stroke-width:1.25;stroke-dasharray:5 3}
+.learning-stroke-blue{stroke:#7195c3}
+.learning-stroke-teal{stroke:#6aab9b}
+.learning-stroke-orange{stroke:#bb956c}
+.learning-stroke-violet{stroke:#a28bb8}
+.learning-arrow{fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.learning-boundary{stroke:#9d80b3;stroke-width:2;stroke-dasharray:5 4;fill:none}
+.learning-lane{fill:#fafbfd;stroke:#e0e6ef;stroke-width:1}
+.learning-hotspot{cursor:pointer}
+.learning-hotspot:hover>rect,.learning-hotspot:focus>rect{stroke:#456b9c;stroke-width:2.5}
+.learning-hotspot:focus{outline:none}
+[data-learning-node].selected>rect,[data-learning-node].learning-selected>rect,[data-learning-node].is-selected>rect{stroke:#2a61a7;stroke-width:3;filter:drop-shadow(0 1px 3px #315d9e24)}
+button[data-learning-node].selected,button[data-learning-node].learning-selected,button[data-learning-node].is-selected{background:#eaf2ff;color:#224f87;border-bottom-color:#224f87}
+.learning-table-wrap{max-width:100%;overflow-x:auto;border:1px solid #dfe6ef;border-radius:7px;background:#fff;margin:10px 0 13px}
+.learning-table{width:100%;border-collapse:collapse;font-size:12px;text-align:left;white-space:nowrap}
+.learning-table th{padding:10px 12px;background:#f2f6fb;color:#526b8d;border-bottom:1px solid #dfe6ef;font-weight:600}
+.learning-table td{padding:10px 12px;border-bottom:1px solid #eaf0f6;color:#405975;vertical-align:middle}
+.learning-table tbody tr:last-child td{border-bottom:0}
+.learning-table tbody tr:nth-child(even){background:#fbfcfe}
+.learning-table strong{color:#2f5b8c;font-weight:650}
+.learning-reuse-paths .learning-table{table-layout:fixed;white-space:normal;line-height:1.65}
+.learning-numeric .learning-table{font-family:"Cascadia Code",Consolas,"Microsoft YaHei",monospace;font-size:11px}
+.learning-numeric .learning-table th{font-family:Inter,"Microsoft YaHei",sans-serif;font-size:11px}
+.learning-backward-numeric .learning-table th{white-space:pre-line}
+.learning-backward-numeric .learning-table td{white-space:normal}
+.learning-weights-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:25px;margin:12px 0 18px}
+.learning-weight-set{min-width:0;padding-bottom:6px;border-bottom:1px solid #dde6f0}
+.learning-weight-set h4{font-size:13px;margin:0 0 10px;font-weight:650;color:#3f5877}
+.learning-weight-triple{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:start}
+.learning-weight-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+.learning-matrix{width:100%;border-collapse:separate;border-spacing:3px;margin-top:7px;padding:2px 6px;border-left:2px solid #bac9dc;border-right:2px solid #bac9dc;font-family:"Cascadia Code",Consolas,monospace;font-size:12px}
+.learning-matrix td{padding:4px 5px;text-align:center;background:#f2f6fb;min-width:24px;color:#355b85}
+.learning-matrix th{font-size:10px;font-weight:500;color:#778aa2;padding-right:5px;text-align:left}
+.learning-equation{font-size:13px;color:#536c8c;padding:13px 15px;margin:12px 0;border-left:3px solid #b5c8e0;background:#f3f7fc;overflow-wrap:anywhere}
+.learning-equation strong{color:#2b568a}
+.learning-gradient-result{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px;margin:13px 0 20px}
+.learning-gradient-result>div{display:flex;flex-direction:column;gap:5px;padding:13px 0;border-top:2px solid #a7c5d0;border-bottom:1px solid #dfebef}
+.learning-gradient-result strong{font-family:"Cascadia Code",Consolas,monospace;font-size:17px;color:#315c7f}
+.learning-gradient-result span{font-size:12px;color:#6c8095}
+.learning-expand{padding:10px 0;font-size:12px;color:#647d9a}
+.learning-expand summary{cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:4px}
+.learning-expand[open] summary{margin-bottom:12px}
+.learning-snapshot{display:flex;gap:7px 18px;flex-wrap:wrap;padding:12px 14px;border-left:3px solid #a998bd;background:#f6f2fa;color:#65587d;font-size:12px;margin-bottom:15px}
+.learning-snapshot strong{color:#5d4d76}
+.learning-memory-footer{display:flex;flex-direction:column;gap:7px;border-left:3px solid #b6c7db;padding:9px 13px;color:#657d97;font-size:12px;background:#f7f9fc;margin-top:15px}
+.learning-memory-footer strong{font-weight:600;color:#435f82}
+@media(max-width:1000px){.learning-scene{padding:15px 14px 24px}.learning-weights-grid{grid-template-columns:1fr;gap:17px}.learning-weight-triple{max-width:650px}.learning-svg{min-width:850px}.learning-section-heading h3{font-size:15px}.learning-section-heading .learning-source-chip{margin-left:35px}}
+@media(max-width:600px){.learning-context{gap:6px 10px;font-size:11px}.learning-gradient-result{grid-template-columns:1fr;gap:8px}.learning-weight-triple{gap:8px}.learning-matrix{font-size:11px;padding:2px}.learning-weight-pair{grid-template-columns:1fr}.learning-section-heading{gap:8px}.learning-table td,.learning-table th{padding:8px 9px}}
+</style><rect width="100%" height="100%" fill="white"/><defs><marker id="learning-arrow-18" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#74839a"/></marker></defs><text x="25" y="27" class="learning-svg-title" text-anchor="start">反向：三个复用位置与各自的旧读者</text><text x="25" y="51" class="learning-small" text-anchor="start">每行表达同一内存的用途切换；等待条件决定何时可以覆写。</text><text x="25" y="124" class="learning-code" text-anchor="start">dHp / Hp 共用区</text><g class="learning-hotspot" data-learning-node="b_dhp" tabindex="0" role="button" aria-label="暂存 dHp = Rbf16(dO×W2)"><title>暂存 dHp = Rbf16(dO×W2)</title><rect x="220" y="90" width="330" height="70" rx="12" class="learning-fill-blue"/><text x="239" y="119" class="learning-strong" text-anchor="start">暂存 dHp = Rbf16(dO×W2)</text><text x="239" y="144" class="learning-small" text-anchor="start">整专家 dHpReady 后，先读入 tile UB</text></g><g class="learning-hotspot" data-learning-node="m_hp_overwrite" tabindex="0" role="button" aria-label="本 tile dHp 已读入 UB"><title>本 tile dHp 已读入 UB</title><path d="M575 84 V167" class="learning-boundary"/><text x="578" y="77" class="learning-tiny" text-anchor="middle">本 tile dHp 已读入 UB</text></g><path d="M550 125 H625" class="learning-arrow learning-stroke-violet" marker-end="url(#learning-arrow-18)"/><g class="learning-hotspot" data-learning-node="b_numeric" tabindex="0" role="button" aria-label="改存重建 Hp = Rbf16(H×p)"><title>改存重建 Hp = Rbf16(H×p)</title><rect x="630" y="90" width="430" height="70" rx="12" class="learning-fill-teal"/><text x="648" y="119" class="learning-strong" text-anchor="start">改存重建 Hp = Rbf16(H×p)</text><text x="648" y="144" class="learning-small" text-anchor="start">各 tile 独占；重建 Hp 用于 dW2</text></g><text x="25" y="241" class="learning-code" text-anchor="start">dO / dXroute 共用区</text><g class="learning-hotspot" data-learning-node="b_dw2" tabindex="0" role="button" aria-label="保留原始 dO"><title>保留原始 dO</title><rect x="220" y="207" width="330" height="70" rx="12" class="learning-fill-blue"/><text x="239" y="236" class="learning-strong" text-anchor="start">保留原始 dO</text><text x="239" y="261" class="learning-small" text-anchor="start">dHp GEMM 与 dW2 都需要读取</text></g><g class="learning-hotspot" data-learning-node="b_do_release" tabindex="0" role="button" aria-label="全部 AIC 完成 dO 读取"><title>全部 AIC 完成 dO 读取</title><path d="M575 201 V284" class="learning-boundary"/><text x="578" y="194" class="learning-tiny" text-anchor="middle">全部 AIC 完成 dO 读取</text></g><path d="M550 242 H625" class="learning-arrow learning-stroke-violet" marker-end="url(#learning-arrow-18)"/><g class="learning-hotspot" data-learning-node="b_dx" tabindex="0" role="button" aria-label="覆盖为 dXroute"><title>覆盖为 dXroute</title><rect x="630" y="207" width="430" height="70" rx="12" class="learning-fill-teal"/><text x="648" y="236" class="learning-strong" text-anchor="start">覆盖为 dXroute</text><text x="648" y="261" class="learning-small" text-anchor="start">AIC 写 GM → DXReady → AIV0 回传</text></g><text x="25" y="358" class="learning-code" text-anchor="start">SHMEM 返回区</text><g class="learning-hotspot" data-learning-node="b_dx_send" tabindex="0" role="button" aria-label="接收 routed dX 矩阵"><title>接收 routed dX 矩阵</title><rect x="220" y="324" width="330" height="70" rx="12" class="learning-fill-blue"/><text x="239" y="353" class="learning-strong" text-anchor="start">接收 routed dX 矩阵</text><text x="239" y="378" class="learning-small" text-anchor="start">源 rank 读完 TopK 行并得到 dX</text></g><g class="learning-hotspot" data-learning-node="b_reuse_ptrd" tabindex="0" role="button" aria-label="所有 rank 的 dX 读者退出"><title>所有 rank 的 dX 读者退出</title><path d="M575 318 V401" class="learning-boundary"/><text x="578" y="311" class="learning-tiny" text-anchor="middle">所有 rank 的 dX 读者退出</text></g><path d="M550 359 H625" class="learning-arrow learning-stroke-violet" marker-end="url(#learning-arrow-18)"/><g class="learning-hotspot" data-learning-node="b_reduce_dp" tabindex="0" role="button" aria-label="复用为连续 dP 标量表"><title>复用为连续 dP 标量表</title><rect x="630" y="324" width="430" height="70" rx="12" class="learning-fill-teal"/><text x="648" y="353" class="learning-strong" text-anchor="start">复用为连续 dP 标量表</text><text x="648" y="378" class="learning-small" text-anchor="start">dP 回传后按逆置换恢复 [M,TopK]</text></g></svg>
