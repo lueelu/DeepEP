@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_sort_base.h
- * \brief
+ * \brief Shared buffers and synchronization for MoE expert-index sorting.
  */
 #ifndef MOE_V3_SORT_BASE_H_REGBASE
 #define MOE_V3_SORT_BASE_H_REGBASE

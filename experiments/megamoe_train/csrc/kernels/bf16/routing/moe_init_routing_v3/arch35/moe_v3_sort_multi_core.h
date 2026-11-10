@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_sort_multi_core.h
- * \brief
+ * \brief Multi-core expert-index sorting with merge stages for MoE routing.
  */
 #ifndef MOE_V3_VBS_ONE_CORE_H_REGBASE
 #define MOE_V3_VBS_ONE_CORE_H_REGBASE

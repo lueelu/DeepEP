@@ -4,7 +4,7 @@
 
 /*!
  * \file mc2_kernel_utils.h
- * \brief
+ * \brief AscendC pipeline synchronization using paired event set and wait.
  */
 
 #ifndef MC2_KERNEL_UTILS_H

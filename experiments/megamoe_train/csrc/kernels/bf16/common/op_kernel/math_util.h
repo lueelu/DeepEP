@@ -4,7 +4,7 @@
 
 /*!
  * \file math_util.h
- * \brief
+ * \brief Integer division and alignment helpers shared by host and device code.
  */
 #ifndef OP_COMMON_OP_KERNEL_MATH_UTIL_H
 #define OP_COMMON_OP_KERNEL_MATH_UTIL_H

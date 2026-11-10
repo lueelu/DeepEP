@@ -4,7 +4,7 @@
 
 /*!
  * \file load_store_utils.h
- * \brief
+ * \brief Vector-register loads with FP32 conversion for routing quantization.
  */
 
 #ifndef OPS_BUILT_IN_OP_ASCENDC_LOAD_STORE_UTILS_H_

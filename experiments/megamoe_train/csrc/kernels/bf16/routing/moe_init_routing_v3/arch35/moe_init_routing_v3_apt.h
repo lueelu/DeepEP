@@ -2,8 +2,8 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_init_routing_v3_apt.cpp
- * \brief
+ * \file moe_init_routing_v3_apt.h
+ * \brief MoE routing initialization: sorting, token counting, row indices and gathering.
  */
 #include "moe_v3_mrgsort_out.h"
 #include "moe_v3_mrgsort.h"

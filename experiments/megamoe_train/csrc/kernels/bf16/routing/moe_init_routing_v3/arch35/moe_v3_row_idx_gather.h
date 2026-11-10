@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_row_idx_gather.h
- * \brief
+ * \brief Invert sorted route indices to construct the gather row mapping.
  */
 #ifndef MOE_V3_ROW_IDX_GATHER_H_REGBASE
 #define MOE_V3_ROW_IDX_GATHER_H_REGBASE

@@ -3,8 +3,8 @@
 // Modified by xixing 2026
 
 /*!
- * \file mega_moe_tiling.cpp
- * \brief
+ * \file tiling_impl.hpp
+ * \brief Host-side tiling and buffer size calculation for MegaMoE BF16 training.
  */
 
 #include "csrc/kernels/bf16/layout/mega_moe_layout.hpp"

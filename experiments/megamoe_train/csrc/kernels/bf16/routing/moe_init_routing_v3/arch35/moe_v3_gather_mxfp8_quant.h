@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_gather_mxfp8_quant.h
- * \brief
+ * \brief Token gathering with block-scaled MXFP8 quantization for MoE routing.
  */
 #ifndef MOE_V3_GATHER_MXFP8_QUANT_H_REGBASE
 #define MOE_V3_GATHER_MXFP8_QUANT_H_REGBASE

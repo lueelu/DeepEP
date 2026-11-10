@@ -3,7 +3,7 @@
 
 /*!
  * \file mega_moe_context.hpp
- * \brief
+ * \brief Kernel parameters, tensor addresses and AIC/AIV synchronization helpers.
  */
 
 #ifndef MEGA_MOE_CONTEXT_HPP

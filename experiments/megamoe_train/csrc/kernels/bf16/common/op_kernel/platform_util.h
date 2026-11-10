@@ -4,7 +4,7 @@
 
 /*!
  * \file platform_util.h
- * \brief
+ * \brief UB block and vector-register size helpers for device code.
  */
 
 #ifndef OP_COMMON_OP_KERNEL_PLATFORM_UTIL_H

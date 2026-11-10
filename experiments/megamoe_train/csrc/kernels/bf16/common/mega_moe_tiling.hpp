@@ -3,7 +3,7 @@
 
 /*!
  * \file mega_moe_tiling.hpp
- * \brief
+ * \brief Shared tiling parameters and constants for MegaMoE BF16 training.
  */
 
 #ifndef ASCENDC_MEGA_MOE_TILING

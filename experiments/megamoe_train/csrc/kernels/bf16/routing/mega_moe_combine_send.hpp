@@ -3,7 +3,7 @@
 
 /*!
  * \file mega_moe_combine_send.hpp
- * \brief
+ * \brief Return expert output tiles to their source ranks during combine.
  */
 
 #ifndef MEGA_MOE_COMBINE_SEND_HPP
@@ -79,4 +79,4 @@ __aicore__ inline void CombineTokens(uint32_t mLoc, uint32_t nLoc, uint32_t n, u
 }
 }  // namespace MegaMoeCombineImpl
 
-#endif  // MEGA_MOE_BF16_COMBINE_SEND_H
+#endif  // MEGA_MOE_COMBINE_SEND_HPP

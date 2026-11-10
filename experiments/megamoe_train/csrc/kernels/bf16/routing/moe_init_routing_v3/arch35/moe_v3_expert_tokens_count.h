@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_expert_tokens_count.h
- * \brief
+ * \brief Per-expert token counts derived from sorted expert indices.
  */
 #ifndef MOE_V3_EXPERT_TOKENS_COUNT_H_REGBASE
 #define MOE_V3_EXPERT_TOKENS_COUNT_H_REGBASE

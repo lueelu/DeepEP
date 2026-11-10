@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_mrgsort_out.h
- * \brief
+ * \brief Final merge and row-index extraction for MoE routing sort output.
  */
 #ifndef MOE_V3_MRGSORT_OUT_H_REGBASE
 #define MOE_V3_MRGSORT_OUT_H_REGBASE

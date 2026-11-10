@@ -3,7 +3,7 @@
 
 /*!
  * \file mega_moe_workspace_view.hpp
- * \brief
+ * \brief Device views of forward, backward and SHMEM workspace layouts.
  */
 
 #ifndef MEGA_MOE_WORKSPACE_VIEW_HPP

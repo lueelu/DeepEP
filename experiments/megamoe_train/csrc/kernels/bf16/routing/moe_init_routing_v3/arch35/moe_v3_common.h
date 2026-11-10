@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_common.h
- * \brief
+ * \brief Shared constants, types and helpers for MoE routing initialization.
  */
 #ifndef MOE_V3_COMMON_H_REGBASE
 #define MOE_V3_COMMON_H_REGBASE

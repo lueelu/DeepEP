@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_sort_one_core.h
- * \brief
+ * \brief Single-core expert-index sorting and route row-index output.
  */
 #ifndef MOE_V3_SORT_ONE_CORE_H_REGBASE
 #define MOE_V3_SORT_ONE_CORE_H_REGBASE

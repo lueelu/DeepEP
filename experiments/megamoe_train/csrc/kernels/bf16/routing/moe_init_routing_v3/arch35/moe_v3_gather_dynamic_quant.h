@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_gather_dynamic_quant.h
- * \brief
+ * \brief Token gathering with per-token dynamic quantization for MoE routing.
  */
 #ifndef MOE_V3_GATHER_DYNAMIC_QUANT_H_REGBASE
 #define MOE_V3_GATHER_DYNAMIC_QUANT_H_REGBASE

@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_mrgsort.h
- * \brief
+ * \brief Merge sorted expert-index lists during MoE routing initialization.
  */
 #ifndef MOE_V3_MRGSORT_H_REGBASE
 #define MOE_V3_MRGSORT_H_REGBASE

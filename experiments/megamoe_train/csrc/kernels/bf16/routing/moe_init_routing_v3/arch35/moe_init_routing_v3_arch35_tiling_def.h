@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_init_routing_v3_arch35_tiling_def.h
- * \brief
+ * \brief Tiling structures for MoE routing sort, token counting and gather stages.
  */
 
 #ifndef __MOE_INIT_ROUTING_V3_ARCH35_TILING_DEF_H__

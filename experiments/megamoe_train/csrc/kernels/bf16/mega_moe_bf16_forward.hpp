@@ -3,7 +3,7 @@
 
 /*!
  * \file mega_moe_bf16_forward.hpp
- * \brief
+ * \brief Fused BF16 MoE training forward dispatch, expert computation and combine.
  */
 
 #ifndef MEGA_MOE_BF16_FORWARD_HPP

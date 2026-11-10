@@ -3,7 +3,7 @@
 
 /*!
  * \file moe_v3_gather_out.h
- * \brief
+ * \brief Token and scale gathering in expert routing order.
  */
 #ifndef MOE_V3_GATHER_OUT_H_REGBASE
 #define MOE_V3_GATHER_OUT_H_REGBASE
