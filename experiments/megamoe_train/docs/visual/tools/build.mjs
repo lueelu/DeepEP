@@ -8,13 +8,17 @@ import crypto from 'node:crypto';
 import cp from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { routeGraph, roundedPath } from './router.mjs';
-import { buildLearningScenes } from './learning-scenes.mjs';
+import { buildLearningScenes, buildForwardReuseFigures, buildBackwardReuseFigure } from './learning-scenes.mjs';
 import { sourceConfig } from './source-config.mjs';
 
 export const visual = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const root = path.resolve(visual, '../../../..');
 const git = (...args) => cp.execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 12 * 1024 * 1024 }).trimEnd();
 const sourceCommit = git('rev-parse', process.env.SOURCE_REF || 'HEAD');
+const sourceMode = process.env.SOURCE_WORKTREE === '1' ? 'worktree' : 'commit';
+if (sourceMode === 'worktree' && sourceCommit !== git('rev-parse', 'HEAD')) {
+  throw new Error('SOURCE_WORKTREE requires SOURCE_REF to resolve to HEAD');
+}
 const { repository: repoUrl, sourceBranch, siteUrl } = sourceConfig(process.env, {
   remote: process.env.SOURCE_REPOSITORY_URL || process.env.GITHUB_REPOSITORY ? '' : git('remote', 'get-url', 'origin'),
   branch: git('branch', '--show-current'), commit: sourceCommit,
@@ -26,6 +30,7 @@ const colors = {
   vector: ['#e5edff', '#4266ac'], comm: ['#e2f3f2', '#257b80'], memory: ['#f4eafa', '#82539b'], neutral: ['#edf0f4', '#596578'],
 };
 const readSource = new Map();
+const committedSource = new Map();
 const graphFiles = fs.readdirSync(path.join(visual, 'data')).filter(x => /^\d\d-.*\.json$/.test(x)).sort();
 if (graphFiles.length !== 8) throw new Error(`Expected eight graph files, found ${graphFiles.length}`);
 const graphs = graphFiles.map(file => JSON.parse(fs.readFileSync(path.join(visual, 'data', file), 'utf8')));
@@ -48,7 +53,11 @@ for (const graph of graphs) {
       const relative = source.path.replaceAll('\\', '/');
       if (relative.startsWith('/') || relative.split('/').includes('..')) throw new Error(`Unsafe source path: ${relative}`);
       if (!readSource.has(relative)) {
-        const text = cp.execFileSync('git', ['-C', root, 'show', `${sourceCommit}:${relative}`], { encoding: 'utf8' });
+        const committed = cp.execFileSync('git', ['-C', root, 'show', `${sourceCommit}:${relative}`], { encoding: 'utf8' });
+        committedSource.set(relative, committed.split('\n'));
+        const text = sourceMode === 'worktree'
+          ? fs.readFileSync(path.join(root, relative), 'utf8').replaceAll('\r\n', '\n')
+          : committed;
         readSource.set(relative, { text, lines: text.split('\n'), sha256: crypto.createHash('sha256').update(text).digest('hex') });
       }
       const file = readSource.get(relative);
@@ -58,8 +67,10 @@ for (const graph of graphs) {
       if (!line) throw new Error(`Missing occurrence: ${node.id}`);
       const start = Math.max(1, line - (source.before ?? 2));
       const end = Math.min(file.lines.length, line + (source.after ?? 16));
+      const onlineHits = committedSource.get(relative).flatMap((text, i) => text.includes(source.anchor) ? [i + 1] : []);
+      const onlineLine = onlineHits[(source.occurrence || 1) - 1];
       return { path: relative, anchor: source.anchor, occurrence: source.occurrence || 1, line, start, end,
-        sha256: file.sha256, url: `${repoUrl}/blob/${sourceCommit}/${urlPath(relative)}#L${line}`,
+        sha256: file.sha256, url: `${repoUrl}/blob/${sourceCommit}/${urlPath(relative)}${onlineLine ? `#L${onlineLine}` : ''}`,
         excerpt: file.lines.slice(start - 1, end).map((text, i) => ({ line: start + i, text })) };
     });
     manifestNodes.push({ id: node.id, graph: graph.id, symbol: node.symbol, sources: node.sources });
@@ -81,11 +92,17 @@ for (const graph of graphs) for (const node of graph.nodes) if (node.drilldown) 
   if (!destination || (node.drilldown.node && !destination.nodes.some(n => n.id === node.drilldown.node))) throw new Error(`Invalid drilldown: ${node.id}`);
 }
 const learning = buildLearningScenes();
+const memoryFigures = [...buildForwardReuseFigures(), buildBackwardReuseFigure()];
 if (learning.scenes.length !== 3) throw new Error('Expected three learning scenes');
 for (const scene of learning.scenes) {
   if (!allIds.has(scene.sourceNode)) throw new Error(`Missing scene source: ${scene.id}`);
   for (const match of scene.html.matchAll(/data-learning-node=["']([^"']+)["']/g)) {
     if (!allIds.has(match[1])) throw new Error(`Unknown learning source ${scene.id}: ${match[1]}`);
+  }
+}
+for (const figure of memoryFigures) {
+  for (const match of figure.html.matchAll(/data-learning-node=["']([^"']+)["']/g)) {
+    if (!allIds.has(match[1])) throw new Error(`Unknown memory figure source ${figure.id}: ${match[1]}`);
   }
 }
 
@@ -133,20 +150,37 @@ for (const graph of graphs) {
   fs.writeFileSync(path.join(visual, 'diagrams', `${graph.id}.svg`), graph.svg + '\n');
   fs.writeFileSync(path.join(visual, 'diagrams', `${graph.id}.mmd`), graph.mermaid);
 }
-const manifest = { sourceCommit, sourceRepository: repoUrl, sourceBranch, siteUrl,
+// The standalone figures and reader scenes share the same diagram functions.
+const memoryFigureStyle = fs.readFileSync(path.join(visual, 'assets', 'learning.css'), 'utf8')
+  .replaceAll('.learning-canvas ', '');
+for (const figure of memoryFigures) {
+  const raw = figure.html.match(/<svg\b[\s\S]*?<\/svg>/)?.[0];
+  if (!raw) throw new Error(`Missing memory figure SVG: ${figure.id}`);
+  const viewBox = raw.match(/viewBox="0 0 (\d+) (\d+)"/);
+  if (!viewBox) throw new Error(`Missing memory figure bounds: ${figure.id}`);
+  const [, width, height] = viewBox;
+  const styled = raw.replace('<svg ', `<svg width="${width}" height="${height}" style="width:${width}px;height:${height}px;min-width:0;max-width:none" `)
+    .replace(/(<svg\b[^>]*>)/, `$1<style>${memoryFigureStyle}</style><rect width="100%" height="100%" fill="white"/>`);
+  fs.writeFileSync(path.join(visual, 'diagrams', `${figure.id}.svg`), styled + '\n');
+}
+const manifest = { sourceCommit, sourceMode, sourceRepository: repoUrl, sourceBranch, siteUrl,
   scenario: { platform: 'Ascend950', save: 'bf16', hidden: 7168, ffn: 3072, clipping: false, forceExpertReady: false },
   learningScenes: learning.scenes.map(({ id, title, sourceNode }) => ({ id, title, sourceNode })),
+  memoryFigures: memoryFigures.map(({ id, title, summary }) => ({ id, title, summary })),
   files: Object.fromEntries([...readSource].map(([file, data]) => [file, { sha256: data.sha256, lines: data.lines.length - 1 }])), nodes: manifestNodes };
 fs.writeFileSync(path.join(visual, 'source-map.json'), JSON.stringify(manifest, null, 2) + '\n');
-const bundle = { sourceCommit, sourceRepository: repoUrl, scenario: manifest.scenario, graphs, learning };
+const bundle = { sourceCommit, sourceMode, sourceRepository: repoUrl, scenario: manifest.scenario, graphs, learning };
 const payload = JSON.stringify(bundle).replaceAll('<', '\\u003c').replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029');
 const html = fs.readFileSync(path.join(visual, 'assets', 'page.html'), 'utf8')
   .replace('/*__STYLE__*/', ['reader.css', 'layout.css', 'learning.css', 'gmm2-pipeline.css'].map(file => fs.readFileSync(path.join(visual, 'assets', file), 'utf8')).join('\n'))
   .replace('/*__DATA__*/', payload)
   .replace('/*__APP__*/', () => ['gmm2-pipeline.js', 'full-pipeline.js', 'reader.js'].map(file => fs.readFileSync(path.join(visual, 'assets', file), 'utf8')).join('\n'));
 fs.writeFileSync(path.join(visual, 'index.html'), html);
-let markdown = `# MegaMoE BF16 训练源码图解\n\n按项目结构、调用链、三核流水和内存复用逐层阅读。默认场景为 Ascend950、save=bf16、H7168/F3072、BF16 路由权重 p、关闭 clipping。\n\n`;
-markdown += `源码快照：[${sourceCommit.slice(0, 7)}](${repoUrl}/tree/${sourceCommit})。\n\n[离线交互页面](index.html) · [完整调用点与源码](CALLPOINTS.md) · [维护方法](MAINTAINING.md)\n\n`;
+let markdown = `# MegaMoE BF16 训练源码图解\n\n按项目结构、调用链、三核流水和内存复用逐层阅读。默认场景为 Ascend950、save=bf16、K7168/F3072、BF16 路由权重 p、关闭 clipping。K 表示 hidden 维，H 表示 SwiGLU 激活。\n\n`;
+markdown += sourceMode === 'worktree'
+  ? `源码：当前工作区，基于 [${sourceCommit.slice(0, 7)}](${repoUrl}/tree/${sourceCommit})。\n\n`
+  : `源码快照：[${sourceCommit.slice(0, 7)}](${repoUrl}/tree/${sourceCommit})。\n\n`;
+markdown += '[离线交互页面](index.html) · [完整调用点与源码](CALLPOINTS.md) · [维护方法](MAINTAINING.md)\n\n';
 if (siteUrl) markdown += `[在线交互导览](${siteUrl})\n\n`;
 markdown += '**VS Code 一键定位**：按[扩展安装说明](vscode/README.md)安装一次，运行 **MegaMoE: 打开训练源码导览**。点击节点、阶段或等待查看讲解，点击 **打开源码** 或 **查看对应源码**，再在旁边的编辑器中定位到文件和行号。\n\n';
 if (siteUrl) markdown += `[下载 VS Code 导览扩展](${siteUrl}downloads/megamoe-train-source-guide.vsix)\n\n`;
@@ -158,11 +192,16 @@ markdown += '## 三个阅读场景\n\n固定侧栏可以随时回到章节。三
 for (const scene of learning.scenes) {
   markdown += `### ${scene.title}\n\n${scene.summary}\n\n![${scene.title}](diagrams/${scene.id}.png)\n\n`;
 }
+markdown += '## 前向与反向的内存用途切换\n\n在“前向保存的数据，反向怎样使用”和“前后向流水与缓冲复用”中，点击对应内存或等待条件可查看源码。GM交接与UB交接分别展示；保存模式auto先解析为bf16或mxfp8，再选择交接路径。\n\n';
+for (const figure of memoryFigures) {
+  markdown += `### ${figure.title}\n\n${figure.summary}\n\n![${figure.title}](diagrams/${figure.id}.png)\n\n[查看矢量图](diagrams/${figure.id}.svg)\n\n`;
+}
 for (const graph of graphs) {
   markdown += `## ${graph.layer} · ${graph.title}\n\n${graph.summary}\n\n![${graph.title}](diagrams/${graph.id}.png)\n\n[查看矢量图](diagrams/${graph.id}.svg) · [查看图源](diagrams/${graph.id}.mmd) · [本节调用点](CALLPOINTS.md#${graph.id})\n\n`;
 }
 fs.writeFileSync(path.join(visual, 'README.md'), markdown.trimEnd() + '\n');
 let calls = '# 函数、数据与源码调用点\n\n图中节点与下面的编号一一对应；在线链接固定到本次采集的源码提交。\n\n';
+if (sourceMode === 'worktree') calls += '本地行号与摘录来自当前工作区；“已提交源码”指向基准提交中的位置。\n\n';
 for (const graph of graphs) {
   calls += `<a id="${graph.id}"></a>\n\n## ${graph.title}\n\n`;
   for (const node of graph.nodes) {
@@ -170,7 +209,12 @@ for (const graph of graphs) {
     for (const [title, values] of [['执行位置', [graph.lanes.find(l => l.id === node.lane).label]], ['读取', node.reads], ['写入', node.writes], ['等待', node.waits]]) if (values?.length) calls += `- **${title}**：${values.join('；')}\n`;
     if (node.formula) calls += `\n\`\`\`text\n${node.formula}\n\`\`\`\n`;
     calls += '\n';
-    for (const source of node.sources) calls += `源码：[${path.basename(source.path)}:${source.line}](${source.url}) · [仓内文件](${path.relative(visual, path.join(root, source.path)).replaceAll('\\', '/')})\n\n`;
+    for (const source of node.sources) {
+      const local = path.relative(visual, path.join(root, source.path)).replaceAll('\\', '/');
+      calls += sourceMode === 'worktree'
+        ? `源码：[${path.basename(source.path)}:${source.line}](${local}) · [已提交源码](${source.url})\n\n`
+        : `源码：[${path.basename(source.path)}:${source.line}](${source.url}) · [仓内文件](${local})\n\n`;
+    }
   }
 }
 fs.writeFileSync(path.join(visual, 'CALLPOINTS.md'), calls.trimEnd() + '\n');
@@ -180,4 +224,4 @@ fs.copyFileSync(path.join(visual, 'index.html'), path.join(site, 'index.html'));
 fs.copyFileSync(path.join(visual, 'source-map.json'), path.join(site, 'source-map.json'));
 for (const file of fs.readdirSync(path.join(visual, 'diagrams'))) if (/\.(svg|mmd|png)$/.test(file)) fs.copyFileSync(path.join(visual, 'diagrams', file), path.join(site, 'diagrams', file));
 fs.writeFileSync(path.join(site, '.nojekyll'), '');
-console.log(`Built ${graphs.length} views, ${allIds.size} source-backed nodes from ${sourceCommit.slice(0, 7)} (${repoUrl}).`);
+console.log(`Built ${graphs.length} views, ${allIds.size} source-backed nodes from ${sourceMode} ${sourceCommit.slice(0, 7)} (${repoUrl}).`);

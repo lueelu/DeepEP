@@ -19,7 +19,7 @@ const mapping = JSON.parse(await readFile(mappingPath, 'utf8'));
 const packageManifest = JSON.parse(await readFile(path.join(visual, 'vscode/package.json'), 'utf8'));
 assert.equal(packageManifest.version, '0.2.0');
 assert.equal(packageManifest.contributes.customEditors[0].viewType, 'megamoeTrain.sourceGuide');
-const [node] = mapping.nodes.filter(entry => entry.sources?.length);
+const node = mapping.nodes.find(entry => entry.id === 'f_dispatch_p') || mapping.nodes.find(entry => entry.sources?.length);
 assert(node, 'The current map must contain a source-backed node');
 const source = node.sources[0];
 const sourcePath = path.resolve(root, source.path);

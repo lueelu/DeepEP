@@ -87,7 +87,6 @@ __aicore__ inline void ExpertTokensCountV2::Process()
                                  0, 0, 0};
     SetAtomicAdd<int32_t>();
     DataCopyPad(expertTokensCountGm_, tmpSum, copyParams);
-    // DataCopy(expertTokensCountGm_, tmpSum, actualExpertNum_);
     SetAtomicNone();
 }
 

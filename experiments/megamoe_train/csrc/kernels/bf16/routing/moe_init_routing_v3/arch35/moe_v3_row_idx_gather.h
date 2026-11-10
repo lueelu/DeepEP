@@ -114,9 +114,6 @@ __aicore__ inline void RowIdxGather::Process()
                                    sortedExpertIndicesGmAddr, expandedRowIdxGmAddr);
     }
     SyncAll<true>();
-    // printf("blockIdx: %d, sortedExpertIndicesGm_: %d, expandedRowIdxGm_: %d, needCoreNum_: %d, curCoreElements_:
-    // %d\n", blockIdx_, sortedExpertIndicesGm_(blockIdx_), expandedRowIdxGm_(blockIdx_), needCoreNum_,
-    // curCoreElements_);
 }
 
 }  // namespace MoeInitRoutingV3

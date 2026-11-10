@@ -6,11 +6,16 @@
 `sourceCommit`。构建工具从 `SOURCE_REF` 指定的真实 Git 提交读取源码，未指定时解析当前
 Git 提交；写入产物的是完整 SHA，不是字面量 `HEAD`，也不代表未提交工作区的内容。
 
+预览尚未提交的源码修改时，设置 `SOURCE_WORKTREE=1` 后构建。此时摘录、行号与
+本地跳转读取当前工作区，页面标记为“本地源码”；在线链接仍定位到基准提交中的
+对应锚点。源码检查会核对本地文件，行号或内容变化后需要重新构建。
+
 默认构建离线导览，不根据仓库 owner 推导在线站点。生成来源可用以下环境变量明确设置：
 
 | 变量 | 含义 | 默认值 |
 | --- | --- | --- |
 | `SOURCE_REF` | 读取源码的真实 Git 提交或引用 | 当前提交 |
+| `SOURCE_WORKTREE` | 设为 `1` 时读取当前工作区，基准提交须为 HEAD | 空，读取已提交源码 |
 | `SOURCE_REPOSITORY_URL` | 源码链接使用的 HTTPS 仓库地址 | CI 的 `GITHUB_REPOSITORY`，本地为 origin |
 | `SOURCE_BRANCH` | 映射文件中记录的来源分支 | CI 分支、当前分支；分离 HEAD 时记录提交 |
 | `SITE_URL` | 显式启用在线导览及站点 VSIX 下载入口 | 空，保持离线 |
@@ -28,6 +33,17 @@ npm run test:editor
 npx playwright install chromium
 npm run test:browser
 ```
+
+PowerShell 中预览未提交的修改：
+
+```powershell
+$env:SOURCE_WORKTREE = '1'
+npm run build
+Remove-Item Env:SOURCE_WORKTREE
+npm run check
+```
+
+正式生成时使用默认提交模式；本地预览不会提交代码。
 
 阅读时直接打开 [index.html](index.html)，无需启动服务。仓库网页入口是 [README.md](README.md)，保留图文说明和源码链接。
 

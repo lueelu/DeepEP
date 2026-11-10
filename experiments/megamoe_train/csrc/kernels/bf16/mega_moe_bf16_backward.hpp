@@ -379,7 +379,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GatherRoutes()
     ptrA0.SetGlobalBuffer((__gm__ QuantOutType*)params_.peermemInfo.ptrA0);
 
     // Both gather paths copy raw dY in route order. The forward scales h
-    // before W2, so P1 applies p to dHp as dh=R(p*dHp), not to dO here.
+    // before W2, so P1 forms dH=FP32(dHp)*FP32(p), not weighted dO here.
     // Preserve the fixed P0 window above all three P1/P2 work tiles.
     // Do not borrow their space: P1 may already fixpipe while P0-B runs.
     const uint32_t capacity = MegaMoeBF16BackwardCatlassImpl::ArchTag::UB_SIZE - BW_STAGE_BASE_BYTES;
@@ -826,7 +826,8 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM2GradPhase()
     preOffset_ = 0;
     // P1 GEMM produces dHp, not dh: canonical dHp = dO @ W2 is
     // [Me,K] x [K,F], with GEMM N=F=n_/2 and K=k_. Transposed storage
-    // uses W2.T. The epilogue subsequently forms dh=R(p*dHp) and dZ.
+    // uses W2.T. The epilogue forms dH=FP32(dHp)*FP32(p), then
+    // rounds dGate and dUp to BF16 dZ.
     Get<N_VALUE>(problemShape_) = n_ / MegaMoeBF16BackwardCatlassImpl::SWIGLU_N_HALF;
     Get<K_VALUE>(problemShape_) = k_;
     uint32_t nonemptyOrdinal = 0;

@@ -39,12 +39,12 @@
       "subtitle": "saved-bf16 不重算 GMM1",
       "symbol": "BackwardSavedStateInfo / UseGmForBackwardDataGrad",
       "description": [
-        "反向读取前向保存的 packed X、packed p、原始 Gate/Up 和路由/计数信息。bf16 模式使用 GM dHp 路径；只有 none 模式在此反向中重新执行 GMM1。这里的 GM 表示激活梯度交接位置，与前向 H7168 选择 UB SwiGLU 是不同策略。"
+        "反向读取前向保存的 packed X、packed p、原始 Gate/Up 和路由/计数信息。bf16 模式使用 GM dHp 路径；只有 none 模式在此反向中重新执行 GMM1。这里的 GM 表示激活梯度交接位置，与前向 K7168 选择 UB SwiGLU 是不同策略。"
       ],
       "reads": [
         "training_saved_state",
         "dispatch_output",
-        "grad_y [M,H]",
+        "grad_y [M,K]",
         "W1/W2"
       ],
       "writes": [
@@ -79,7 +79,7 @@
         "所有 AIV 按 expandedRowIdx[sortedRoute]/TopK 找到原 token 的 dY，直接复制 BF16 到源 rank SHMEM ptrA0。同一 token 选多个专家时，每条 route 都取得同一份上游 dY。这里不乘 p：前向是先乘 p 再做 GMM2，所以 p 应放在后面的 dH=p×dHp。"
       ],
       "reads": [
-        "grad_y [M,H] BF16",
+        "grad_y [M,K] BF16",
         "expandedRowIdx"
       ],
       "writes": [
@@ -149,7 +149,7 @@
         "source/expert 前缀"
       ],
       "writes": [
-        "本专家 ptrDO [M_e,H] BF16"
+        "本专家 ptrDO [M_e,K] BF16"
       ],
       "waits": [
         "本 source 的排序 dY 可见",
@@ -213,11 +213,11 @@
       "subtitle": "P1 GEMM 可与后续 source 搬运重叠",
       "symbol": "GMM2GradSwiGLUGradGM",
       "description": [
-        "AIC 按实际 row-ready 或整专家 ready 等输入，再用 BF16 dO 与 W2 计算 dHp，逻辑形状为 [M_e,H]×[H,F]。累加发生在 FP32，Fixpipe 输出 BF16 GM。这个阶段 ptrHp 里的内容暂时是 dHp，而不是重建的前向 Hp。"
+        "AIC 按实际 row-ready 或整专家 ready 等输入，再用 BF16 dO 与 W2 计算 dHp，逻辑形状为 [M_e,K]×[K,F]。累加发生在 FP32，Fixpipe 输出 BF16 GM。这个阶段 ptrHp 里的内容暂时是 dHp，而不是重建的前向 Hp。"
       ],
       "reads": [
-        "ptrDO [M_e,H] BF16",
-        "canonical W2 [H,F]"
+        "ptrDO [M_e,K] BF16",
+        "canonical W2 [K,F]"
       ],
       "writes": [
         "ptrHp 暂存 dHp [M_e,F] BF16"
@@ -226,7 +226,7 @@
         "本任务需要的 dO 行已到达",
         "必要的 producer phase 元数据 ready"
       ],
-      "formula": "dHp = R(dO · W2)\nGEMM 用 FP32 累加，R(x) 表示将结果舍入到 BF16",
+      "formula": "dHp = Rbf16(dO · W2)\nGEMM 用 FP32 累加，Rbf16(x) 表示将结果舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_backward_catlass_impl.hpp",
@@ -382,7 +382,7 @@
       "waits": [
         "dHp tile 读入完成后才覆盖同地址 Hp"
       ],
-      "formula": "R = BF16舍入；G、U、p、dHp 均按 FP32 参与计算\ns = sigmoid(G)，S = SiLU(G)\nH = S × U                         # FP32\nHp = R(H × p)\ndH = dHp × p                      # FP32\ndGate = R((dH × U) × (s × (1 + G × (1 - s))))\ndUp = R(dH × S)\ndZ = (dGate, dUp)\ndp_tile = Σ_FP32(dHp × H)\ndp = cast_to_p_dtype(Σ_FP32 dp_tile)",
+      "formula": "Rbf16 = BF16舍入；G、U、p、dHp 均按 FP32 参与计算\ns = sigmoid(G)，S = SiLU(G)\nH = S × U                         # FP32\nHp = Rbf16(H × p)\ndH = dHp × p                      # FP32\ndGate = Rbf16((dH × U) × (s × (1 + G × (1 - s))))\ndUp = Rbf16(dH × S)\ndZ = (dGate, dUp)\ndp_tile = Σ_FP32(dHp × H)\ndp = cast_to_p_dtype(Σ_FP32 dp_tile)",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/epilogue/block_epilogue_swiglu_backward_bf16.hpp",
@@ -473,20 +473,20 @@
       "subtitle": "这是原始 dO 的最后一批读者",
       "symbol": "GMM2DW",
       "description": [
-        "canonical W2 的梯度形状是 [H,F]。dO 和 Hp 都是 BF16，AIC 沿该专家实际接收行数 M_e 做 FP32 累加，Fixpipe 写回 GM 时舍入成 BF16。梯度留在专家 rank，框架外层的 DP/FSDP 梯度同步另行执行。",
+        "canonical W2 的梯度形状是 [K,F]。dO 和 Hp 都是 BF16，AIC 沿该专家实际接收行数 M_e 做 FP32 累加，Fixpipe 写回 GM 时舍入成 BF16。梯度留在专家 rank，框架外层的 DP/FSDP 梯度同步另行执行。",
         "所有 AIC 完成本专家 dW2 读写后，这段 dO 才能复用为 dX。"
       ],
       "reads": [
-        "原始 ptrDO [M_e,H]",
+        "原始 ptrDO [M_e,K]",
         "重建 ptrHp [M_e,F]"
       ],
       "writes": [
-        "本地 grad_weight2 [E_local,H,F] BF16"
+        "本地 grad_weight2 [E_local,K,F] BF16"
       ],
       "waits": [
         "当前专家 DZReady >= 2 × blockNum"
       ],
-      "formula": "dW2 = R(dOᵀ · Hp)\nGEMM 用 FP32 累加，R(x) 表示将结果舍入到 BF16",
+      "formula": "dW2 = Rbf16(dOᵀ · Hp)\nGEMM 用 FP32 累加，Rbf16(x) 表示将结果舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
@@ -538,20 +538,20 @@
       "subtitle": "dX 使用 GM 输出，非前向双槽协议",
       "symbol": "GMM1GradCombineGM",
       "description": [
-        "AIC计算 [M_e,2F]×[2F,H]，FP32累加后输出BF16到ptrDX；saved-bf16中ptrDX直接别名ptrDO。完成本专家全部Fixpipe GM写后，各AIC给DXReady加1。AIV0不是拿到一个tile就立即发送，而是等本专家所有AIC输出退休。"
+        "AIC计算 [M_e,2F]×[2F,K]，FP32累加后输出BF16到ptrDX；saved-bf16中ptrDX直接别名ptrDO。完成本专家全部Fixpipe GM写后，各AIC给DXReady加1。AIV0不是拿到一个tile就立即发送，而是等本专家所有AIC输出退休。"
       ],
       "reads": [
         "ptrGradZ=[dGate,dUp] BF16",
-        "canonical W1 [2F,H]"
+        "canonical W1 [2F,K]"
       ],
       "writes": [
-        "ptrDX=ptrDO [M_e,H] BF16",
+        "ptrDX=ptrDO [M_e,K] BF16",
         "DXReady arrival"
       ],
       "waits": [
         "DOReleased 达到 blockNum"
       ],
-      "formula": "dXpacked = R(dZ · W1)\nGEMM 用 FP32 累加，R(x) 表示将结果舍入到 BF16",
+      "formula": "dXpacked = Rbf16(dZ · W1)\nGEMM 用 FP32 累加，Rbf16(x) 表示将结果舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_backward_catlass_impl.hpp",
@@ -611,19 +611,19 @@
       "subtitle": "用前向保留的 packed X",
       "symbol": "GMM1DWPhase / GMM1DW",
       "description": [
-        "saved-BF16 各专家的 dW2 和 dX 路径走完后，AIC 用 BF16 dZ 和 Xpacked 计算 canonical [2F,H] 的 dW1。沿专家接收行做 FP32 累加，Fixpipe 写回 GM 时舍入到 BF16。dZ 和 Xpacked 保留到此处读完，空专家的权重梯度由 AIV 补零。"
+        "saved-BF16 各专家的 dW2 和 dX 路径走完后，AIC 用 BF16 dZ 和 Xpacked 计算 canonical [2F,K] 的 dW1。沿专家接收行做 FP32 累加，Fixpipe 写回 GM 时舍入到 BF16。dZ 和 Xpacked 保留到此处读完，空专家的权重梯度由 AIV 补零。"
       ],
       "reads": [
         "ptrGradZ [M_e,2F]",
-        "前向 dispatch_output 的 Xpacked [M_e,H]"
+        "前向 dispatch_output 的 Xpacked [M_e,K]"
       ],
       "writes": [
-        "本地 grad_weight1 [E_local,2F,H] BF16"
+        "本地 grad_weight1 [E_local,2F,K] BF16"
       ],
       "waits": [
         "该专家 P1 dZ 写退休"
       ],
-      "formula": "dW1 = R(dZᵀ · Xpacked)\nGEMM 用 FP32 累加，R(x) 表示将结果舍入到 BF16",
+      "formula": "dW1 = Rbf16(dZᵀ · Xpacked)\nGEMM 用 FP32 累加，Rbf16(x) 表示将结果舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",
@@ -683,13 +683,13 @@
         "原 route→排序行逆置换"
       ],
       "writes": [
-        "grad_x [M,H] BF16"
+        "grad_x [M,K] BF16"
       ],
       "waits": [
         "P5 dX 全部到达",
         "结果 UB 的旧 MTE3 读者退出"
       ],
-      "formula": "grad_x = R(Σ_FP32 dXroute)\n沿 TopK 槽顺序累加，R(x) 表示将最终结果舍入到 BF16",
+      "formula": "grad_x = Rbf16(Σ_FP32 dXroute)\n沿 TopK 槽顺序累加，Rbf16(x) 表示将最终结果舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_backward.hpp",

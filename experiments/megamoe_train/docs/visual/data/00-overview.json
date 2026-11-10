@@ -29,13 +29,13 @@
       "subtitle": "X、expert IDs、p、W1、W2",
       "symbol": "MegaMoeBF16Train.forward",
       "description": [
-        "调用方已完成路由，提供每个 token 的专家 ID 和路由权重 p。p 支持 BF16 或 FP32，算子边界不重新执行 router。默认数值示例使用 Ascend950、H7168、F3072、BF16 p、BF16 保存和 canonical 专家权重。"
+        "调用方已完成路由，提供每个 token 的专家 ID 和路由权重 p。p 支持 BF16 或 FP32，算子边界不重新执行 router。默认数值示例使用 Ascend950、K7168、F3072、BF16 p、BF16 保存和 canonical 专家权重。"
       ],
       "reads": [
-        "X [M,H] BF16",
+        "X [M,K] BF16",
         "IDs [M,T] int32",
         "p [M,T] BF16 或 FP32",
-        "W1 [E,2F,H]、W2 [E,H,F]"
+        "W1 [E,2F,K]、W2 [E,K,F]"
       ],
       "writes": [],
       "waits": [],
@@ -126,7 +126,7 @@
         "通信 context"
       ],
       "writes": [
-        "Y [M,H]",
+        "Y [M,K]",
         "counts [E]",
         "前向持久状态"
       ],
@@ -134,7 +134,7 @@
         "当前输入 ready",
         "UB 复用与通信读写边界"
       ],
-      "formula": "R(x) 表示将 x 舍入到 BF16。GEMM 使用 FP32 累加。\nG = R(Xpacked · Wgᵀ)\nU = R(Xpacked · Wuᵀ)\nH = SiLU_FP32(G) × FP32(U)\nHp = R(H × FP32(p))\nYroute = R(Hp · W2ᵀ)\nY = R(Σ_FP32 Yroute)  # 按 TopK 槽求和后写回 BF16",
+      "formula": "Rbf16(x) 表示将 x 舍入到 BF16。GEMM 使用 FP32 累加。\nG = Rbf16(Xpacked · Wgᵀ)\nU = Rbf16(Xpacked · Wuᵀ)\nH = SiLU_FP32(G) × FP32(U)\nHp = Rbf16(H × FP32(p))\nOroute = Rbf16(Hp · W2ᵀ)\nY = Rbf16(Σ_FP32 Oroute)  # 按 TopK 槽求和后写回 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.hpp",
@@ -184,12 +184,12 @@
         "反向复用前向路由和保存状态，将原始 dY 分发到专家卡。专家卡完成激活梯度和权重梯度计算；dX 与每个路由权重的梯度回源，dW1、dW2 保留在专家所在 rank。"
       ],
       "reads": [
-        "dY [M,H]",
+        "dY [M,K]",
         "保存的 Gate/Up、Xpacked、p、路由元数据",
         "W1、W2"
       ],
       "writes": [
-        "dX [M,H]、dp [M,T]",
+        "dX [M,K]、dp [M,T]",
         "dW1、dW2"
       ],
       "waits": [

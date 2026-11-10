@@ -17,7 +17,12 @@ const data = JSON.parse(html.match(/<script id="reader-data" type="application\/
 assert.equal(data.graphs.length, 8);
 assert.equal(data.learning.scenes.length, 3);
 assert.equal(manifest.learningScenes.length, 3);
+assert.deepEqual(manifest.memoryFigures.map(figure => figure.id), [
+  'forward-gm-reuse', 'forward-ub-reuse', 'backward-memory-reuse',
+]);
 assert.equal(manifest.sourceCommit, data.sourceCommit);
+assert.equal(manifest.sourceMode, data.sourceMode);
+assert(['commit', 'worktree'].includes(manifest.sourceMode));
 assert.equal(typeof manifest.sourceBranch, 'string');
 assert(manifest.sourceBranch.length > 0, 'Source identity must name its branch or detached commit');
 const readme = fs.readFileSync(path.join(visual, 'README.md'), 'utf8');
@@ -32,19 +37,37 @@ assert(!/<script[^>]+src=/.test(html), 'Reader must open offline without externa
 assert(!html.includes('/*__'), 'Unreplaced page placeholder');
 const nodeIds = new Set();
 const sourceCache = new Map();
-for (const [file, info] of Object.entries(manifest.files)) {
-  const bytes = cp.execFileSync('git', ['-C', root, 'show', `${manifest.sourceCommit}:${file}`]);
-  assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'), info.sha256, file);
-  sourceCache.set(file, bytes.toString('utf8').split('\n'));
-  const current = cp.execFileSync('git', ['-C', root, 'show', `HEAD:${file}`]);
-  assert.equal(crypto.createHash('sha256').update(current).digest('hex'), info.sha256, `Refresh source content: ${file}`);
+const committedCache = new Map();
+const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+if (manifest.sourceMode === 'worktree') {
+  assert.equal(manifest.sourceCommit, cp.execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
 }
+for (const [file, info] of Object.entries(manifest.files)) {
+  const committed = cp.execFileSync('git', ['-C', root, 'show', `${manifest.sourceCommit}:${file}`]);
+  committedCache.set(file, committed.toString('utf8').split('\n'));
+  const local = fs.readFileSync(path.join(root, file), 'utf8').replaceAll('\r\n', '\n');
+  const bytes = manifest.sourceMode === 'worktree' ? local : committed;
+  assert.equal(digest(bytes), info.sha256, file);
+  sourceCache.set(file, bytes.toString('utf8').split('\n'));
+  assert.equal(digest(local), info.sha256, `Refresh local source content: ${file}; use SOURCE_WORKTREE=1 for uncommitted edits`);
+  if (manifest.sourceMode === 'commit') {
+    const current = cp.execFileSync('git', ['-C', root, 'show', `HEAD:${file}`]);
+    assert.equal(digest(current), info.sha256, `Refresh source content: ${file}`);
+  }
+}
+const bundledNodes = new Map(data.graphs.flatMap(graph => graph.nodes.map(node => [node.id, node])));
 for (const node of manifest.nodes) {
   assert(!nodeIds.has(node.id), node.id); nodeIds.add(node.id);
+  assert.deepEqual(node.sources, bundledNodes.get(node.id).sources, `${node.id}: embedded source map`);
   for (const source of node.sources) {
     const lines = sourceCache.get(source.path);
     assert(lines[source.line - 1].includes(source.anchor), `${node.id}: anchor`);
-    assert(new URL(source.url).pathname.includes(`/blob/${manifest.sourceCommit}/`), `${node.id}: source URL`);
+    const online = new URL(source.url);
+    assert(online.pathname.includes(`/blob/${manifest.sourceCommit}/`), `${node.id}: source URL`);
+    if (online.hash) {
+      const line = Number(online.hash.slice(2));
+      assert(committedCache.get(source.path)[line - 1].includes(source.anchor), `${node.id}: online anchor`);
+    }
     for (const row of source.excerpt) assert.equal(row.text, lines[row.line - 1], `${node.id}: excerpt ${row.line}`);
   }
 }
@@ -52,6 +75,13 @@ for (const scene of data.learning.scenes) {
   assert(nodeIds.has(scene.sourceNode), `${scene.id}: initial source`);
   for (const match of scene.html.matchAll(/data-learning-node=["']([^"']+)["']/g)) assert(nodeIds.has(match[1]), `${scene.id}: ${match[1]}`);
   assert(!/<script\b/.test(scene.html), `${scene.id}: scripts belong to the shared reader`);
+}
+for (const figure of manifest.memoryFigures) {
+  const svg = fs.readFileSync(path.join(visual, 'diagrams', `${figure.id}.svg`), 'utf8');
+  assert(svg.includes('<style>'), `${figure.id}: standalone figure contains its styling`);
+  for (const match of svg.matchAll(/data-learning-node=["']([^"']+)["']/g)) {
+    assert(nodeIds.has(match[1]), `${figure.id}: ${match[1]}`);
+  }
 }
 const overlaps = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 for (const graph of data.graphs) {
@@ -84,12 +114,12 @@ for (const file of ['README.md', 'CALLPOINTS.md', 'MAINTAINING.md']) {
     if (!relative) continue;
     // PNGs are rendered by the browser check immediately following this step.
     if (/^diagrams\/[^/]+\.png$/.test(relative)) {
-      assert([...data.graphs, ...data.learning.scenes].some(g => relative === `diagrams/${g.id}.png`), relative);
+      assert([...data.graphs, ...data.learning.scenes, ...manifest.memoryFigures].some(g => relative === `diagrams/${g.id}.png`), relative);
     } else assert(fs.existsSync(path.resolve(visual, decodeURIComponent(relative))), `${file}: ${target}`);
     ++links;
   }
 }
 fs.mkdirSync(path.join(visual, '.artifacts'), { recursive: true });
-const report = { ok: true, sourceCommit: manifest.sourceCommit, graphs: data.graphs.length, learningScenes: data.learning.scenes.length, nodes: nodeIds.size, sourceFiles: sourceCache.size, localLinks: links };
+const report = { ok: true, sourceCommit: manifest.sourceCommit, sourceMode: manifest.sourceMode, graphs: data.graphs.length, learningScenes: data.learning.scenes.length, nodes: nodeIds.size, sourceFiles: sourceCache.size, localLinks: links };
 fs.writeFileSync(path.join(visual, '.artifacts', 'source-check.json'), JSON.stringify(report, null, 2) + '\n');
 console.log(report);

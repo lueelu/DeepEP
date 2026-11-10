@@ -120,7 +120,7 @@ function deriveCase(caseData) {
 
 function context(caseData, arithmetic = true) {
   const s = caseData.shape;
-  return `<div class="learning-context"><strong>${arithmetic ? 'CPU 数值教学' : '流水仿真'}</strong><span>EP${s.ep} · 全局${s.totalExperts}专家 · 每源M${s.tokensPerRank} · TopK${s.topk}</span><span>H${s.hidden} / F${s.ffn} · saved-bf16</span></div>${arithmetic ? '<p class="learning-caption">只展示 H[0:2] 与 F[0:2]，其余坐标全零。R 表示 BF16 最近偶数舍入。</p>' : ''}`;
+  return `<div class="learning-context"><strong>${arithmetic ? 'CPU 数值教学' : '流水仿真'}</strong><span>EP${s.ep} · 全局${s.totalExperts}专家 · 每源M${s.tokensPerRank} · TopK${s.topk}</span><span>K${s.hidden} / F${s.ffn} · saved-bf16</span></div>${arithmetic ? '<p class="learning-caption">只展示 K[0:2] 与 F[0:2]，其余坐标全零。Rbf16 表示 BF16 最近偶数舍入。</p>' : ''}`;
 }
 function tokenPanel(token, phase, content, first) {
   return `<div class="learning-token-panel" data-learning-token="${token.id}" data-learning-phase="${phase}"${first && phase === 'forward' ? '' : ' hidden'}>${content}</div>`;
@@ -151,21 +151,21 @@ function rankFlow(caseData, token, backward = false) {
   return svg(1090, height, backward ? 'dY复制、专家梯度与dX回源' : 'token路由与专家输出回源', content);
 }
 function weightsTiles(token) {
-  return `<div class="learning-weights-grid">${token.routes.map(route => `<div class="learning-weight-set"><h4>e${route.expert} 的非零权重子块</h4><div class="learning-weight-triple"><div>${chip('f_gate_up', 'Wg[0:2,0:2]')}${matrix(route.weights.wg)}</div><div>${chip('f_gate_up', 'Wu[0:2,0:2]')}${matrix(route.weights.wu)}</div><div>${chip('f_gmm2', 'W2[0:2,0:2]')}${matrix(route.weights.w2)}</div></div><p class="learning-caption">W1完整形状[2F,H]；Gate位于前F行，Up位于后F行。W2完整形状[H,F]。</p></div>`).join('')}</div>`;
+  return `<div class="learning-weights-grid">${token.routes.map(route => `<div class="learning-weight-set"><h4>e${route.expert} 的非零权重子块</h4><div class="learning-weight-triple"><div>${chip('f_gate_up', 'Wg[0:2,0:2]')}${matrix(route.weights.wg)}</div><div>${chip('f_gate_up', 'Wu[0:2,0:2]')}${matrix(route.weights.wu)}</div><div>${chip('f_gmm2', 'W2[0:2,0:2]')}${matrix(route.weights.w2)}</div></div><p class="learning-caption">W1完整形状[2F,K]；Gate位于前F行，Up位于后F行。W2完整形状[K,F]。</p></div>`).join('')}</div>`;
 }
 function numericForward(token) {
-  return table(['route', 'G = R(X · Wgᵀ)', 'U = R(X · Wuᵀ)', 'H = SiLU_FP32(G) × U', 'Hp = R(H × p)', 'Yroute = R(Hp · W2ᵀ)'], token.routes.map(route => [`e${route.expert} / slot${route.slot}`, vector(route.gate), vector(route.up), vector(route.h), `<strong>${vector(route.hp)}</strong>`, vector(route.output)]), 'learning-numeric');
+  return table(['route', 'G = Rbf16(X · Wgᵀ)', 'U = Rbf16(X · Wuᵀ)', 'H = SiLU_FP32(G) × U', 'Hp = Rbf16(H × p)', 'Oroute = Rbf16(Hp · W2ᵀ)'], token.routes.map(route => [`e${route.expert} / slot${route.slot}`, vector(route.gate), vector(route.up), vector(route.h), `<strong>${vector(route.hp)}</strong>`, vector(route.output)]), 'learning-numeric');
 }
 function numericBackward(token) {
   const headers = [
     'route',
-    'dHp = R(dO · W2)',
+    'dHp = Rbf16(dO · W2)',
     'dH = FP32(dHp) × p',
-    'dGate =\nR((dH × U) × SiLU′(G))',
-    'dUp =\nR(dH × SiLU(G))',
+    'dGate =\nRbf16((dH × U) × SiLU′(G))',
+    'dUp =\nRbf16(dH × SiLU(G))',
     'dZ = (dGate, dUp)',
-    'dXroute = R(dZ · W1)',
-    'dp_route',
+    'dXroute = Rbf16(dZ · W1)',
+    'dP_route',
   ];
   const rows = token.routes.map(route => [
     `e${route.expert} / slot${route.slot}`,
@@ -185,7 +185,7 @@ function gradientDestinations(caseData, token) {
     const total = caseData.derived.weightTotals[route.expert];
     return [`e${route.expert} → 留在rank${route.ownerRank}`, `${number(route.dy[0])} × ${number(route.hp[0])} = ${number(route.dw2[0][0])}`, `${number(route.dgate[0])} × ${number(route.x[0])} = ${number(route.dw1[0][0])}`, `dW2[0,0]=${number(total.dw2[0][0])}<br>dW1[0,0]=${number(total.dw1[0][0])}`];
   });
-  return `<div class="learning-gradient-result"><div>${chip('b_unpermute_dx', 'dX [M,H] 回到源rank')}<strong>${vector(token.dx)}</strong><span>按 TopK 槽 FP32 累加，再舍入 BF16</span></div><div>${chip('b_dp_output', 'dp [M,TopK] 回到源rank')}<strong>${vector(token.dp)}</strong><span>按 ${token.routes.length} 个 TopK 槽分别保留</span></div></div>${table(['专家梯度归属', '本route对dW2[0,0]的贡献', '本route对dW1[0,0]的贡献', `该专家全部 ${expertRows} 条 route 的最终梯度`], rows)}<p class="learning-caption">dW2 = R(dOᵀ · Hp)，dW1 = R(dZᵀ · Xpacked)。单 route 的外积是 FP32 贡献，沿 ${expertRows} 行累加后才舍入到 BF16。</p><details class="learning-expand"><summary>展开各 route 的完整非零权重梯度子块</summary><div class="learning-weights-grid">${token.routes.map(route => `<div class="learning-weight-set"><h4>e${route.expert} · 单route贡献（FP32乘积）</h4><div class="learning-weight-pair"><div>${chip('b_dw2', 'dW2贡献 [H0:H1,F0:F1]')}${matrix(route.dw2)}</div><div>${chip('b_dw1', 'dW1贡献：Gate0/1、Up0/1')}${matrix(route.dw1, ['G0', 'G1', 'U0', 'U1'])}</div></div></div>`).join('')}</div></details>`;
+  return `<div class="learning-gradient-result"><div>${chip('b_unpermute_dx', 'dX [M,K] 回到源rank')}<strong>${vector(token.dx)}</strong><span>按 TopK 槽 FP32 累加，再舍入 BF16</span></div><div>${chip('b_dp_output', 'dP [M,TopK] 回到源rank')}<strong>${vector(token.dp)}</strong><span>按 ${token.routes.length} 个 TopK 槽分别保留</span></div></div>${table(['专家梯度归属', '本route对dW2[0,0]的贡献', '本route对dW1[0,0]的贡献', `该专家全部 ${expertRows} 条 route 的最终梯度`], rows)}<p class="learning-caption">dW2 = Rbf16(dOᵀ · Hp)，dW1 = Rbf16(dZᵀ · Xpacked)。单 route 的外积是 FP32 贡献，沿 ${expertRows} 行累加后才舍入到 BF16。</p><details class="learning-expand"><summary>展开各 route 的完整非零权重梯度子块</summary><div class="learning-weights-grid">${token.routes.map(route => `<div class="learning-weight-set"><h4>e${route.expert} · 单route贡献（FP32乘积）</h4><div class="learning-weight-pair"><div>${chip('b_dw2', 'dW2贡献 [K0:K1,F0:F1]')}${matrix(route.dw2)}</div><div>${chip('b_dw1', 'dW1贡献：Gate0/1、Up0/1')}${matrix(route.dw1, ['G0', 'G1', 'U0', 'U1'])}</div></div></div>`).join('')}</div></details>`;
 }
 function renderToken(caseData) {
   const panels = caseData.focusTokens.map((token, index) => {
@@ -199,11 +199,11 @@ function renderToken(caseData) {
       <p class="learning-caption">H 保持 FP32，乘 p 后才舍入形成 Hp。Gate/Up 保存的是上表原始值，Hp 临时供 GMM2 消费。切到「反向」继续使用同一个 token 和这份前向状态。</p>`;
     const backward = `
       ${heading('1', '最后是求和，所以每条 route 得到同一 dY', 'b_gather', 'GatherRoutes')}${rankFlow(caseData, token, true)}
-      ${heading('2', '从 dHp 走到激活梯度、dX 和 dp', 'b_numeric', 'SwiGLU 反向')}
+      ${heading('2', '从 dHp 走到激活梯度、dX 和 dP', 'b_numeric', 'SwiGLU 反向')}
       ${numericBackward(token)}
-      <p class="learning-caption">G、U 是 Gate、Up；SiLU′(G) = s × (1 + G × (1 − s))，s = sigmoid(G)。H、dH 与 dp 乘积保持 FP32。关闭 clipping 时按表中公式计算，R 表示舍入到 BF16。dZ 沿特征维拼接，前 F 列为 dGate，后 F 列为 dUp。</p>
-      <p class="learning-caption">dp 先对 F 分块归约，再得到每条 route 的标量。本例只有同一块内的 F0、F1 非零。</p>
-      <div class="learning-equation">dp(slot0) = R(Σ_FP32 (FP32(dHp) × H)) = <strong>${number(token.routes[0].dp)}</strong>，点积使用保持 FP32 的未乘 p 激活 H。</div>
+      <p class="learning-caption">G、U 是 Gate、Up；SiLU′(G) = s × (1 + G × (1 − s))，s = sigmoid(G)。H、dH 与 dP 乘积保持 FP32。关闭 clipping 时按表中公式计算，Rbf16 表示舍入到 BF16。dZ 沿特征维拼接，前 F 列为 dGate，后 F 列为 dUp。</p>
+      <p class="learning-caption">dP 先对 F 分块归约，再得到每条 route 的标量。本例只有同一块内的 F0、F1 非零。</p>
+      <div class="learning-equation">dP(slot0) = Rbf16(Σ_FP32 (FP32(dHp) × H)) = <strong>${number(token.routes[0].dp)}</strong>，点积使用保持 FP32 的未乘 p 激活 H。</div>
       ${heading('3', '区分回到 token 和留在专家的梯度', 'b_dw2', 'dW2 / dW1')}${gradientDestinations(caseData, token)}`;
     return tokenPanel(token, 'forward', forward, index === 0) + tokenPanel(token, 'backward', backward, false);
   });
@@ -212,10 +212,10 @@ function renderToken(caseData) {
 
 function savedBridge() {
   const resources = [
-    { title: '原始 Gate / Up', size: 'saved_state · 两个 [R,F] BF16 平面', producer: 'f_save_raw', from: 'GMM1 → AIV0 保存', consumers: [['b_numeric', '重建 H / Hp，计算 dGate / dUp']] },
-    { title: 'Xpacked', size: 'dispatch_output · [R,H] BF16', producer: 'f_dispatch_x', from: '专家卡 Dispatch 收到 X', consumers: [['b_dw1', 'dW1 = R(dZᵀ · Xpacked)']] },
-    { title: 'packed p', size: 'dispatch_output · 每 route 一个 BF16', producer: 'f_dispatch_p', from: '与 X 对齐的 route 权重', consumers: [['b_numeric', 'Hp = R(H×p)；dH = dHp×p（FP32）']] },
-    { title: 'route 正 / 逆置换', size: 'sortedRoute ↔ token×TopK+slot', producer: 'f_routes', from: '前向路由初始化', consumers: [['b_gather', '反向复制对应 token 的原始 dY'], ['b_unpermute_dx', '按原 token 归并 dX'], ['b_dp_output', '按原 TopK 槽恢复 dp']] },
+    { title: '原始 Gate / Up', size: 'saved_state · 两个 [C,F] BF16 平面', producer: 'f_save_raw', from: 'GMM1 → AIV0 保存', consumers: [['b_numeric', '重建 H / Hp，计算 dGate / dUp']] },
+    { title: 'Xpacked', size: 'dispatch_output · [C,K] BF16', producer: 'f_dispatch_x', from: '专家卡 Dispatch 收到 X', consumers: [['b_dw1', 'dW1 = Rbf16(dZᵀ · Xpacked)']] },
+    { title: 'packed p', size: 'dispatch_output · 每 route 一个 BF16', producer: 'f_dispatch_p', from: '与 X 对齐的 route 权重', consumers: [['b_numeric', 'Hp = Rbf16(H×p)；dH = dHp×p（FP32）']] },
+    { title: 'route 正 / 逆置换', size: 'sortedRoute ↔ token×TopK+slot', producer: 'f_routes', from: '前向路由初始化', consumers: [['b_gather', '反向复制对应 token 的原始 dY'], ['b_unpermute_dx', '按原 token 归并 dX'], ['b_dp_output', '按原 TopK 槽恢复 dP']] },
     { title: '专家计数 / source 前缀', size: 'saved_state · 实际行数和源分段', producer: 'f_counts', from: '计数交换与前缀', consumers: [['b_restore_counts', '恢复 Dispatch / 回传行段']] },
   ];
   let content = text(45, 30, '前向生产', 'learning-svg-title') + text(425, 30, '跨越 forward → backward 的持久数据', 'learning-svg-title') + text(810, 30, '反向消费', 'learning-svg-title');
@@ -236,7 +236,7 @@ function savedBridge() {
   return svg(1170, 595, '前向保存数据到反向消费者的跨阶段桥', content);
 }
 function lifetimeBands() {
-  let content = text(25, 27, '同一地址，按依赖切换用途', 'learning-svg-title') + text(25, 51, '每行只表达该内存的局部生命期；横向长度不代表时间或字节比例。', 'learning-small');
+  let content = text(25, 27, '反向：三个复用位置与各自的旧读者', 'learning-svg-title') + text(25, 51, '每行表达同一内存的用途切换；等待条件决定何时可以覆写。', 'learning-small');
   const band = (row, title, left, boundary, right, sources) => {
     const y = 90 + row * 117;
     content += text(25, y + 34, title, 'learning-code');
@@ -245,17 +245,104 @@ function lifetimeBands() {
     content += arrow(`M550 ${y + 35} H625`, 'violet');
     content += group(sources[2], right[0], box(630, y, 430, 70, 'teal') + text(648, y + 29, right[0], 'learning-strong') + text(648, y + 54, right[1], 'learning-small'));
   };
-  band(0, 'ptrHp [R,F]', ['暂存 dHp = R(dO×W2)', '整专家 dHpReady 后，owner 先读入 tile UB'], '本 tile dHp 已读入 UB', ['改存重建 Hp = R(H×p)', '各 tile 独占；P2 用于 dW2'], ['b_dhp', 'm_hp_overwrite', 'b_numeric']);
-  band(1, 'ptrDO = ptrDX', ['保留原始 dO', 'dHp GEMM 与 dW2 都需要读取'], 'DOReleased = blockNum', ['覆盖为 dXroute', 'AIC 写 GM → DXReady → AIV0 回传'], ['b_dw2', 'b_do_release', 'b_dx']);
-  band(2, 'SHMEM ptrD', ['接收 routed dX 矩阵', '源 rank 读完 TopK 行并得到 grad_x'], '所有 rank 的 dX 读者退出', ['复用为连续 dp 标量表', 'P6 回传后按逆置换恢复 [M,TopK]'], ['b_dx_send', 'b_reuse_ptrd', 'b_reduce_dp']);
+  band(0, 'dHp / Hp 共用区', ['暂存 dHp = Rbf16(dO×W2)', '整专家 dHpReady 后，先读入 tile UB'], '本 tile dHp 已读入 UB', ['改存重建 Hp = Rbf16(H×p)', '各 tile 独占；重建 Hp 用于 dW2'], ['b_dhp', 'm_hp_overwrite', 'b_numeric']);
+  band(1, 'dO / dXroute 共用区', ['保留原始 dO', 'dHp GEMM 与 dW2 都需要读取'], '全部 AIC 完成 dO 读取', ['覆盖为 dXroute', 'AIC 写 GM → DXReady → AIV0 回传'], ['b_dw2', 'b_do_release', 'b_dx']);
+  band(2, 'SHMEM 返回区', ['接收 routed dX 矩阵', '源 rank 读完 TopK 行并得到 dX'], '所有 rank 的 dX 读者退出', ['复用为连续 dP 标量表', 'dP 回传后按逆置换恢复 [M,TopK]'], ['b_dx_send', 'b_reuse_ptrd', 'b_reduce_dp']);
   return svg(1100, 460, 'dHp到Hp、dO到dX和ptrD的三次复用', content);
+}
+function reuseStage(node, x, y, width, title, lines, color = 'blue') {
+  return group(node, title, box(x, y, width, 86, color)
+    + text(x + 14, y + 28, title, 'learning-strong')
+    + lines.map((line, index) => text(x + 14, y + 53 + index * 20, line, 'learning-small')).join(''));
+}
+function forwardGmReuse() {
+  let content = text(25, 31, '前向 GM：保存模式决定原始激活放在哪里', 'learning-svg-title')
+    + text(25, 58, 'K 是 hidden 维，H 是 SwiGLU 激活；C 是分配容量，Me 是当前专家的有效行数。', 'learning-small');
+  content += text(25, 102, 'GM 交接 + save=bf16', 'learning-strong');
+  content += reuseStage('m_fwd_gm_alias', 35, 122, 310, '持久 GM：Gate / Up', ['AIC 直接写入保存区', '两个 [C,F] BF16 平面'], 'blue');
+  content += arrow('M345 165 H410', 'violet');
+  content += reuseStage('m_fwd_gm_alias', 415, 122, 290, 'AIV0 读取并计算', ['等待本专家全部 AIC 写完', '读原始 Gate / Up'], 'violet');
+  content += arrow('M705 165 H765', 'violet');
+  content += reuseStage('m_forward_transient', 770, 122, 300, '独立临时 GM：Hp', ['Gate / Up 保留给反向', 'Hp 写到另一块 [C,F] 平面'], 'teal');
+  content += text(36, 239, '此路径中，保存的 Gate 不与 GM Hp 同址；Hp 完成后供 GMM2 消费。', 'learning-small');
+
+  content += text(25, 287, 'GM 交接 + save=none / mxfp8', 'learning-strong');
+  content += reuseStage('m_fwd_gm_alias', 35, 310, 310, '临时 GM：原始 Gate', ['AIC 暂借未来的 Hp 平面', '原始 Gate 与 Hp 同址'], 'blue');
+  content += arrow('M345 353 H410', 'violet');
+  content += reuseStage('m_fwd_gm_alias', 415, 310, 290, 'AIV0 完整读入 tile', ['先等全部 AIC 写完本专家', '再把本 tile 载入私有 UB'], 'violet');
+  content += arrow('M705 353 H765', 'violet');
+  content += reuseStage('m_fwd_gm_alias', 770, 310, 300, '同址改存 BF16 Hp', ['本 tile 的 Gate 已读完', '才可覆写该 tile 的 GM'], 'teal');
+  content += group('m_fwd_gm_alias', '原始 Up 使用独立平面', box(35, 425, 1035, 64, 'orange')
+    + text(52, 451, '原始 Up：另分配一个 [C,F] BF16 平面，读取期间保持可用。', 'learning-medium')
+    + text(52, 475, 'none 不持久保存 Gate/Up；mxfp8 在激活前生成压缩保存值与 scale。', 'learning-small'));
+  content += text(36, 522, '用途切换有两道门：全部 AIC 写完原始激活 → 当前 AIV 完整读入本 tile → 才写 Hp。', 'learning-medium');
+  content += text(36, 551, '示例 K7168 / save=bf16 默认走 UB 交接；上面的 GM 图展示另一种前向交接路径。', 'learning-small');
+  return `<section data-forward-gm-reuse>${svg(1100, 578, '前向GM复用：bf16独立Hp与none mxfp8原始Gate转Hp', content)}</section>`;
+}
+function forwardUbReuse() {
+  let content = text(25, 31, '前向 UB：阶段分时使用与单 tile 原位计算', 'learning-svg-title')
+    + text(25, 58, '每行表示一块资源的用途切换；图中的条件对应它的旧读者何时结束。', 'learning-small');
+  const row = (y, label, stages, notes) => {
+    content += text(26, y - 18, label, 'learning-strong');
+    const x = [35, 415, 770], widths = [310, 290, 300];
+    stages.forEach((stage, index) => {
+      content += reuseStage(stage[0], x[index], y, widths[index], stage[1], stage[2], ['blue', 'violet', 'teal'][index]);
+      if (index) content += arrow(`M${x[index - 1] + widths[index - 1]} ${y + 43} H${x[index] - 5}`, 'violet');
+    });
+    notes.forEach((note, i) => { content += text(36, y + 112 + i * 22, note, 'learning-small'); });
+  };
+  row(111, '① 前置 Gather 的临时 UB → Dispatch', [
+    ['f_route_p', '按 route 排序 p', ['临时源窗、索引和结果 batch', 'BF16 / FP32 按原类型搬运']],
+    ['f_route_p', '完成写回，释放临时区', ['Gather 内部搬运全部结束', '随后退出该阶段的分配']],
+    ['f_dispatch_x', '为 Dispatch 分配 UB', ['继续使用可用片上空间', '接收和转发 X / p']],
+  ], ['适用：命中前置 Gather 优化的所有保存模式；回退路径直接使用后续搬运缓冲。']);
+  row(304, '② AIV0 内部：Gate UB → Hp UB（UB / GM 两条交接路径共用）', [
+    ['m_fwd_ub', '原始 Gate / Up 已到 UB', ['UB 路径由配对 AIC 写入', 'GM 路径从原始 GM 载入']],
+    ['m_fwd_ub', 'Gate 区原位改成 Hp', ['先结束原始激活的保存读取', 'Gate / Up 载入 FP32 寄存器']],
+    ['m_fwd_ub', '写 Hp 到 GM 后回收', ['等搬运读者结束', '再允许下一任务使用本地 UB']],
+  ], ['UB 交接：归还配对 AIC，下一任务重写 Gate / Up；GM 交接：下一次载入复用本地缓冲。',
+    '保存：none 跳过；UB+bf16 等原始值复制读完，GM+bf16 已由 AIC 直写保存区。',
+    'mxfp8 等量化读取原始值完成，私有压缩输出写 GM 可与激活计算重叠。',
+    '本例 M192×F256：Gate、Up 两片各 96KiB；Hp 在 Gate 那片内生成。']);
+  row(543, '③ AIV1：Dispatch staging → GMM2 双输出槽', [
+    ['m_ub_handoff', 'Dispatch 搬运 X / p', ['该 AIV1 使用临时搬运区', '阶段内按依赖重复填充']],
+    ['m_ub_handoff', '搬运完成，释放 UB', ['排空本核流水并释放分配', '向配对 AIC 发布 UB 就绪']],
+    ['f_gmm2_wait', 'GMM2 接管该 UB', ['数值输入另等本专家 Hp 完成', '两个条件齐备才写输出']],
+  ], ['适用：UB / GM 交接及所有保存模式；UB 释放保护空间，Hp 完成保护计算输入。']);
+  row(736, '④ GMM2 槽位：tile0 → Combine 发送 → tile2', [
+    ['f_gmm2', '槽0保存输出 tile0', ['128×256 BF16，即 64KiB', '槽1可同时计算 tile1']],
+    ['f_combine', 'AIV1 发送槽0内容', ['按 source 行段回传', '发送结束后归还槽0']],
+    ['f_gmm2', '同一槽0写入 tile2', ['AIC 先等槽0归还', '再覆盖上一份输出']],
+  ], ['适用：所有保存模式。槽0与槽1独立回收；这两个槽不同于 AIV0 的 Gate / Up 输入片。']);
+  return `<section data-forward-ub-reuse>${svg(1100, 884, '前向UB复用：Gather Dispatch Gate到Hp与GMM2双槽', content)}</section>`;
+}
+function forwardReuseGuide(gmIndex, ubIndex) {
+  const paths = table(['前向交接', '保存模式', 'Gate / Up 的位置', '用途切换'], [
+    ['UB 配对', 'bf16 / none / mxfp8', '配对 AIV0 的两片 UB', 'Gate 片生成 Hp；写完后归还 AIC'],
+    ['GM 解耦', 'bf16', '持久保存区中的两个 BF16 平面', 'Gate/Up保持原值，Hp写独立平面'],
+    ['GM 解耦', 'none / mxfp8', 'Gate暂借Hp区，Up另有临时区', '本tile读入后，原Gate位置改存Hp'],
+  ], 'learning-reuse-paths');
+  return `${heading(gmIndex, '前向 GM：两类保存路径与原位切换', 'm_fwd_gm_alias', '前向 GM 读写')}
+    <p class="learning-caption">交接路径与保存模式分别选择。默认自动策略：K&lt;3584用GM；K=3584仅mxfp8用GM；更大K用UB。保存模式auto先解析：关闭clipping选mxfp8，否则选bf16。</p>
+    ${paths}${forwardGmReuse()}
+    ${heading(ubIndex, '前向 UB：旧读者结束后，再交给下一用途', 'm_fwd_ub', '前向 UB 交接')}${forwardUbReuse()}`;
+}
+export function buildForwardReuseFigures() {
+  return [
+    { id: 'forward-gm-reuse', title: '前向 GM 复用', summary: '区分bf16直接保存和none/mxfp8的原始Gate→Hp原位切换。', html: forwardGmReuse() },
+    { id: 'forward-ub-reuse', title: '前向 UB 复用', summary: 'Gather、AIV0 Gate→Hp、AIV1 Dispatch→GMM2与双槽回收的等待条件。', html: forwardUbReuse() },
+  ];
+}
+export function buildBackwardReuseFigure() {
+  return { id: 'backward-memory-reuse', title: '反向的三个复用位置',
+    summary: 'dHp→Hp、dO→dXroute、SHMEM返回矩阵→dP标量表分别等待不同旧读者结束。', html: lifetimeBands() };
 }
 function renderSaved(caseData) {
   const snapshots = caseData.focusTokens.map((token, index) => {
     const route = token.routes[0];
     return `<div class="learning-snapshot" data-learning-token="${token.id}"${index ? ' hidden' : ''}><strong>${escape(token.label)} → e${route.expert}</strong><span>保存 G=${vector(route.gate)}、U=${vector(route.up)}、p=${number(route.p)}</span><span>反向重建 H=${vector(route.h)}，再得到 Hp=${vector(route.hp)}</span></div>`;
   }).join('');
-  return `<div class="learning-scene learning-saved-scene">${context(caseData)}${heading('1', '前向保存的张量与反向用途', 'lc_saved', 'ctx 保存 Tensor')}${snapshots}${savedBridge()}<p class="learning-caption">W1/W2 由 ctx 保持参数引用；上图是算子生成的持久状态。前向临时 Hp 不跨越反向，反向用 Gate/Up 和 p 重建。none 模式不保存 Gate/Up，而用 Xpacked、W1 重算 GMM1；本图固定 bf16。</p>${heading('2', '写入新含义之前，旧读者必须全部结束', 'm_do_last_reader', '内存复用协议')}${lifetimeBands()}<div class="learning-memory-footer"><span><strong>packed X/p</strong>、原始 Gate/Up、路由元数据：活到匹配反向。</span><span><strong>前向 Hp / ready</strong>：当前前向临时区。</span><span><strong>反向 dO/dX、Hp、dZ、dp partial</strong>：当前反向 scratch。</span></div></div>`;
+  return `<div class="learning-scene learning-saved-scene">${context(caseData)}${heading('1', '前向保存的张量与反向用途', 'lc_saved', 'ctx 保存 Tensor')}${snapshots}${savedBridge()}<p class="learning-caption">W1/W2 由 ctx 保持参数引用；上图是算子生成的持久状态。前向临时 Hp 不跨越反向，反向用 Gate/Up 和 p 重建。none 模式不保存 Gate/Up，而用 Xpacked、W1 重算 GMM1；保存桥固定 bf16，下面分别展开前向各条路径。</p>${forwardReuseGuide('2', '3')}${heading('4', '反向的三个复用位置', 'm_do_last_reader', '反向内存复用')}${lifetimeBands()}<div class="learning-memory-footer"><span><strong>packed X/p</strong>、原始 Gate/Up、路由元数据：活到匹配反向。</span><span><strong>前向 Hp / ready</strong>：当前前向临时区。</span><span><strong>反向 dO/dX、Hp、dZ、dP partial</strong>：当前反向 scratch。</span></div></div>`;
 }
 function pipelineSwimlanes() {
   let content = text(25, 28, '同一核组的 GMM2 连续任务：tile0 / tile1 / tile2', 'learning-svg-title') + text(25, 53, 'AIC 与两个配对 AIV；专家计数覆盖所有相关核。横向只是依赖顺序，不是实测时间轴。', 'learning-small');
@@ -280,7 +367,7 @@ function pipelineSwimlanes() {
   content += arrow('M615 121 H630 V305 H750 V381 H765', 'orange', 'tile ready', 651, 324);
   content += arrow('M735 350 V180 H707 V152', 'teal', '槽0发送已完成', 757, 188);
   content += arrow('M935 121 H951 V381 H970', 'orange');
-  content += text(146, 450, '槽0：tile0 → 发送完 → tile2；槽1：tile1 → 发送完 → 下一次使用。GMM1 的 Gate/Up 两片 UB 是另一种用途。', 'learning-small');
+  content += text(146, 450, '槽0：tile0 → 发送完 → tile2；槽1：tile1 → 发送完 → 下一次使用。AIV0 的 Gate/Up 两片 UB 是另一种用途。', 'learning-small');
   return svg(1160, 483, 'GMM2双槽与AIC AIV0 AIV1依赖泳道', content);
 }
 function backwardRetirement() {
@@ -350,8 +437,9 @@ function renderPipeline(caseData) {
       ${pipelineSwimlanes()}
       <p class="learning-caption">先等本核 Dispatch 释放 UB、当前专家写完 Hp。tile0 发送期间可以计算 tile1，tile2 要等槽0归还。</p>
     </details>
-    ${heading('2', '反向 dW2、dX 与回传的退休顺序', 'b_dw2', 'P2 的实际顺序')}${backwardRetirement()}
-    ${heading('3', '三个复用位置，各自等待不同读者', 'm_dx_alias', '同地址不同生命期')}${lifetimeBands()}
+    ${forwardReuseGuide('2', '3')}
+    ${heading('4', '反向 dW2、dX 与回传的退休顺序', 'b_dw2', 'P2 的实际顺序')}${backwardRetirement()}
+    ${heading('5', '反向的三个复用位置', 'm_dx_alias', '同地址不同生命期')}${lifetimeBands()}
   </div>`;
 }
 
@@ -360,7 +448,7 @@ export function buildLearningScenes() {
   const caseData = deriveCase(JSON.parse(fs.readFileSync(path.join(visual, 'data/learning-case.json'), 'utf8')));
   return { case: caseData, scenes: [
     { id: 'learn-token', title: '追踪一个 token 的前反向', summary: '同一份固定输入：看 route 行号、关键数值、矩阵 tile 和四项梯度最终归属。', sourceNode: 'f_routes', phaseSources: { forward: 'f_routes', backward: 'b_gather' }, html: renderToken(caseData) },
-    { id: 'learn-saved', title: '前向保存的数据，反向怎样使用', summary: '连接生产者与消费者，再沿同一地址看三次生命周期切换。', sourceNode: 'b_saved', html: renderSaved(caseData) },
-    { id: 'learn-pipeline', title: '前后向流水与缓冲复用', summary: '在 rank0 的前后向专家时间轴上调节耗时、点等待查看源码，再用独立练习展开 GMM2 双槽。', sourceNode: 'f_routes', html: renderPipeline(caseData) },
+    { id: 'learn-saved', title: '前向保存的数据，反向怎样使用', summary: '连接前向保存与反向读取，分别查看前向GM、UB与反向同址复用的等待条件。', sourceNode: 'b_saved', html: renderSaved(caseData) },
+    { id: 'learn-pipeline', title: '前后向流水与缓冲复用', summary: '沿专家时间轴查看计算重叠，再按路径与保存模式展开前向GM/UB切换和反向复用。', sourceNode: 'f_routes', html: renderPipeline(caseData) },
   ] };
 }

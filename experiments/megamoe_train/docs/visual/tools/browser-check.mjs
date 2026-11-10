@@ -104,6 +104,21 @@ try {
     await svgPage.close();
   }
   const scenes = await page.evaluate(() => window.__reader.data.learning.scenes.map(scene => scene.id));
+  const memoryFigures = JSON.parse(fs.readFileSync(path.join(visual, 'source-map.json'), 'utf8')).memoryFigures;
+  for (const figure of memoryFigures) {
+    const svgPage = await context.newPage();
+    await svgPage.goto(pathToFileURL(path.join(visual, 'diagrams', `${figure.id}.svg`)).href);
+    await svgPage.evaluate(() => document.fonts.ready);
+    const clipped = await svgPage.locator('svg').evaluate(svg => [...svg.querySelectorAll('text')].filter(text => {
+      const box = text.getBBox(), view = svg.viewBox.baseVal;
+      return box.x < -2 || box.y < -2 || box.x + box.width > view.width + 2 || box.y + box.height > view.height + 2;
+    }).map(text => text.textContent));
+    assert.deepEqual(clipped, [], `${figure.id}: clipped text`);
+    const image = path.join(visual, 'diagrams', `${figure.id}.png`);
+    await svgPage.locator('svg').screenshot({ path: image, scale: 'css' });
+    fs.copyFileSync(image, path.join(visual, 'site', 'diagrams', `${figure.id}.png`));
+    await svgPage.close();
+  }
   const focus = await page.evaluate(() => window.__reader.data.learning.case.focusTokens.map(token => token.id));
   const sceneReports = [];
   for (const id of scenes) {
@@ -114,6 +129,22 @@ try {
     if (!isPipeline) await page.locator('#case-token').selectOption(focus[0]);
     if (id === 'learn-token') await page.locator('#case-phase').selectOption('forward');
     assert(await page.locator('#canvas [data-learning-node]:visible').count() > 0, `${id}: clickable sources`);
+    if (id === 'learn-saved' || isPipeline) {
+      const gm = page.locator('[data-forward-gm-reuse]');
+      const ub = page.locator('[data-forward-ub-reuse]');
+      assert(await gm.isVisible() && await ub.isVisible(), `${id}: forward GM and UB diagrams`);
+      assert.match(await gm.textContent(), /bf16[\s\S]*none\s*\/\s*mxfp8/);
+      assert.match(await ub.textContent(), /Gate UB[\s\S]*Hp UB/);
+      assert.match(await ub.textContent(), /96KiB/);
+      assert.match(await ub.textContent(), /64KiB/);
+      await gm.locator('[data-learning-node="m_fwd_gm_alias"]').first().click();
+      assert.equal(await page.evaluate(() => window.__reader.selected().id), 'm_fwd_gm_alias');
+      assert.match(await page.locator('#inspector').innerText(), /none[\s\S]*mxfp8/);
+      assert(await page.locator('#inspector .code-line.anchor-line').count() > 0, `${id}: GM reuse source`);
+      await ub.locator('[data-learning-node="m_fwd_ub"]').first().click();
+      assert.equal(await page.evaluate(() => window.__reader.selected().id), 'm_fwd_ub');
+      assert.match(await page.locator('#inspector').innerText(), /Gate[\s\S]*Hp/);
+    }
     const source = page.locator('#canvas [data-learning-node]:visible').first();
     const nodeId = await source.getAttribute('data-learning-node');
     await source.click();
@@ -334,6 +365,9 @@ try {
     .map(file => new URL(`../../../../${file}`, location.href).href));
   for (const source of localSources) assert(fs.existsSync(fileURLToPath(source)), `Local source file: ${source}`);
   await chooseView(local, 'learn-pipeline');
+  await local.locator('[data-forward-gm-reuse] [data-learning-node="m_fwd_gm_alias"]').first().click();
+  assert.equal(await local.evaluate(() => window.__reader.selected().id), 'm_fwd_gm_alias');
+  assert(await local.locator('#inspector .code-line.anchor-line').count() > 0, 'Offline forward GM source');
   await local.locator('[data-overview-direction="backward"]').click();
   await local.locator('[data-overview-chart] [data-wait-for="ptrd-reuse"]').first().click();
   assert.equal(await local.evaluate(() => window.__reader.selected().id), 'b_reuse_ptrd');
@@ -429,7 +463,7 @@ try {
   await native.screenshot({ path: path.join(artifacts, 'editor-bridge.png') });
   await hosted.close();
   assert.deepEqual(errors, []);
-  fs.writeFileSync(path.join(artifacts, 'browser-check.json'), JSON.stringify({ ok: true, errors, views: reports, scenes: sceneReports, fullForward: true, fullBackward: true, gmm2Simulation: true, offline: true, site: true, mobile: true, editorBridge: true, drilldown: targets.length, downloads: true }, null, 2) + '\n');
+  fs.writeFileSync(path.join(artifacts, 'browser-check.json'), JSON.stringify({ ok: true, errors, views: reports, scenes: sceneReports, memoryFigures: memoryFigures.map(({ id }) => id), forwardMemoryReuse: true, fullForward: true, fullBackward: true, gmm2Simulation: true, offline: true, site: true, mobile: true, editorBridge: true, drilldown: targets.length, downloads: true }, null, 2) + '\n');
   console.log(`Browser PASS: ${reports.length} source views + ${sceneReports.length} learning scenes; full forward/backward, GMM2 zoom, offline, site, mobile and native bridge.`);
 } catch (error) {
   fs.writeFileSync(path.join(artifacts, 'browser-error.txt'), String(error.stack));

@@ -444,11 +444,6 @@ __aicore__ inline void MoeGatherOutMxfp8Quant<T, U>::CopyInGatherIdx(int64_t glo
 template <typename T, typename U>
 __aicore__ inline void MoeGatherOutMxfp8Quant<T, U>::ProcessOneToken(int64_t globalTokenIdx)
 {
-    // 批量搬入 k 个 gather idx
-    // CopyInGatherIdx(globalTokenIdx);
-    // LocalTensor<int32_t> gatherIdxLocal = gatherIdxInQueue_.DeQue<int32_t>();
-    // SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-
     // CopyIn -> Compute（一次量化）
     CopyIn(globalTokenIdx);
     Compute(perLoopCols_, perLoopScaleCols_, perLoopScaleCols_);
@@ -456,13 +451,9 @@ __aicore__ inline void MoeGatherOutMxfp8Quant<T, U>::ProcessOneToken(int64_t glo
     // DeQue 一次量化结果，写出 k 份（不插 MTE3 等待）
     outLocal_ = xQuantOutQueue_.DeQue<uint8_t>();
     for (int64_t jj = 0; jj < k_; jj++) {
-        // int64_t dstIdx = gatherIdxLocal.GetValue(jj);
-        // CopyOut(dstIdx);
         CopyOut(expandedRowIdxGatherGm_(globalTokenIdx * k_ + jj));
     }
     xQuantOutQueue_.FreeTensor(outLocal_);
-
-    // gatherIdxInQueue_.FreeTensor(gatherIdxLocal);
 }
 
 template <typename T, typename U>

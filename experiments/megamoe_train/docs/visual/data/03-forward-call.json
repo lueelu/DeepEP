@@ -36,7 +36,7 @@
       "description": [
         "调用 op(...) 时，nn.Module 的调用机制进入 MegaMoeBF16Train.forward。它校验 max_recv_tokens、clipping limit 与保存模式，再调用 _MegaMoeBF16TrainFunction.apply(self, x, IDs, p, W1, W2, ...)。",
         "启用梯度且有浮点输入需要求导时，apply 建立自定义 autograd 节点并执行 Function.forward。PyTorch 因此知道后续反传应调用哪个 Function.backward。",
-        "这里的 save_gmm1_output 默认 bf16；本图选择 canonical 权重、H7168、F3072 和关闭 clipping。"
+        "这里的 save_gmm1_output 默认 bf16；本图选择 canonical 权重、K7168、F3072 和关闭 clipping。"
       ],
       "reads": [
         "X、IDs、p、W1、W2、max_recv_tokens"
@@ -149,7 +149,7 @@
       "subtitle": "MakeMegaMoeHostTiling",
       "symbol": "detail::MakeMegaMoeHostTiling",
       "description": [
-        "查询平台AIC/AIV/UB资源，解析保存模式、路由容量与前向调度参数。前向GM/UB策略由构建设备SO查询参与Host临时区规划，本图H7168且保存BF16使用UB交接。"
+        "查询平台AIC/AIV/UB资源，解析保存模式、路由容量与前向调度参数。前向GM/UB策略由构建设备SO查询参与Host临时区规划，本图K7168且保存BF16使用UB交接。"
       ],
       "reads": [
         "shape、保存模式、平台资源"
@@ -185,7 +185,7 @@
         "saved-state、dispatch、transient布局"
       ],
       "writes": [
-        "Y [M,H]、counts [E]",
+        "Y [M,K]、counts [E]",
         "saved_state、dispatch_output、forward scratch"
       ],
       "waits": [],

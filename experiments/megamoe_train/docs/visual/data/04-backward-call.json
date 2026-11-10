@@ -39,7 +39,7 @@
         "统一测试直接执行 y.backward(dy)，为每个 y 元素指定上游梯度。这等价于构造 loss=(y*dy).sum() 再反向。counts 已标记不可微；本算子为 x、p、W1、W2 返回梯度。"
       ],
       "reads": [
-        "grad_y [M,H]",
+        "grad_y [M,K]",
         "ctx"
       ],
       "writes": [
@@ -194,7 +194,7 @@
         "backwardLayout、输入Tensor options"
       ],
       "writes": [
-        "dx [M,H]、dp [M,T]",
+        "dx [M,K]、dp [M,T]",
         "dw1、dw2、backward scratch"
       ],
       "waits": [],

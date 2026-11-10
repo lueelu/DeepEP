@@ -2,7 +2,7 @@
   "id": "05-forward-kernel",
   "title": "前向：Dispatch、GMM1、SwiGLU、GMM2 与回传",
   "layer": "L5",
-  "summary": "沿普通 BF16、H7168、F3072、saved-bf16、clipping 关闭的路径阅读。纵向表示源码阶段和依赖，不是耗时比例；不同核可以处于不同阶段。X/p 就绪、专家 SwiGLU 完成、UB 槽可复用是三种不同条件。",
+  "summary": "沿普通 BF16、K7168、F3072、saved-bf16、clipping 关闭的路径阅读。纵向表示源码阶段和依赖，不是耗时比例；不同核可以处于不同阶段。X/p 就绪、专家 SwiGLU 完成、UB 槽可复用是三种不同条件。",
   "lanes": [
     {
       "id": "f_all",
@@ -30,11 +30,11 @@
       "id": "f_select",
       "lane": "f_all",
       "step": 0,
-      "title": "选择 H7168 的 UB 前向路径",
+      "title": "选择 K7168 的 UB 前向路径",
       "subtitle": "bf16 保存模式决定数值状态",
       "symbol": "MegaMoeBF16Forward::ProcessSelected",
       "description": [
-        "当前构建将前向 SwiGLU handoff 设为 auto。H7168、保存模式为 bf16 时选择 UB 路径：GMM1 的 Gate/Up 先送入 AIV0 UB，再由 AIV0 保存并计算 SwiGLU。这里固定该路径学习。"
+        "当前构建将前向 SwiGLU handoff 设为 auto。K7168、保存模式为 bf16 时选择 UB 路径：GMM1 的 Gate/Up 先送入 AIV0 UB，再由 AIV0 保存并计算 SwiGLU。这里固定该路径学习。"
       ],
       "reads": [
         "hidden=7168",
@@ -69,7 +69,7 @@
         "所有 AIV 完成路由初始化：按专家整理源 rank 的 token，结果放在本 rank 的 SHMEM ptrA0。expandedRowIdx 将排序行映射回原 route，expandedRowIdxGather 是逆置换。它们随后把回传的 route 行恢复为原 token/TopK 槽位。整数专家 ID 已经由调用方给出，这里不重新计算 router。"
       ],
       "reads": [
-        "X [M,H] BF16",
+        "X [M,K] BF16",
         "topk_ids [M,TopK]"
       ],
       "writes": [
@@ -103,7 +103,8 @@
       "subtitle": "这里整理路由权重，不是专家 W1/W2",
       "symbol": "TryGatherTopkWeights / GatherRoutedTopkWeights",
       "description": [
-        "按 expandedRowIdx 将原 [M,TopK] 概率整理到 SHMEM ptrRoutedTopkWeights。每条排序 route 对应一个原类型 p，BF16/FP32 均保留原始位模式，X 与 p 使用相同排序行号。批量 gather 不适用时走 GatherRoutedTopkWeights 回退，数据顺序与结果契约相同。"
+        "按 expandedRowIdx 将原 [M,TopK] 概率整理到 SHMEM ptrRoutedTopkWeights。每条排序 route 对应一个原类型 p，BF16/FP32 均保留原始位模式，X 与 p 使用相同排序行号。批量 gather 不适用时走 GatherRoutedTopkWeights 回退，数据顺序与结果契约相同。",
+        "批量/多窗Gather的临时UB在写回完成后释放，后面再分配Dispatch缓冲；回退路径直接使用Dispatch staging。源p表与保存Gate/Up模式分别处理，p保持BF16/FP32原类型。"
       ],
       "reads": [
         "原 topk_weights",
@@ -128,6 +129,12 @@
           "anchor": "            const int32_t originalRoute = expandedRowIdx.GetValue(sortedRow);",
           "before": 2,
           "after": 5
+        },
+        {
+          "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.hpp",
+          "anchor": "    // Finish and release the optional gather-only UB phase before Dispatch",
+          "before": 0,
+          "after": 23
         }
       ]
     },
@@ -352,7 +359,7 @@
         "X+p ready",
         "上一对 Gate/Up UB 已被 AIV0 消费"
       ],
-      "formula": "G = R(Xpacked · Wgᵀ)\nU = R(Xpacked · Wuᵀ)\nGEMM 用 FP32 累加，R(x) 表示将结果舍入到 BF16",
+      "formula": "G = Rbf16(Xpacked · Wgᵀ)\nU = Rbf16(Xpacked · Wuᵀ)\nGEMM 用 FP32 累加，Rbf16(x) 表示将结果舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_forward_catlass_impl.hpp",
@@ -406,7 +413,8 @@
       "subtitle": "H 保持 FP32，Hp 写出时舍入",
       "symbol": "ComputeSwigluDirect",
       "description": [
-        "AIV0 从本地 packed p 表按输入类型批量加载当前 tile 各行的 p，一行一个值，广播到该行全部特征。BF16 p 提升到 FP32，FP32 p 直接参与计算。SiLU(G)、H=SiLU(G)×U 和乘 p 连续使用 FP32 寄存器中间量，最后一次舍入形成 BF16 Hp，交给 GMM2。p 在 GMM2 之前使用，后面的 Combine 不再乘一次。"
+        "AIV0 从本地 packed p 表按输入类型批量加载当前 tile 各行的 p，一行一个值，广播到该行全部特征。BF16 p 提升到 FP32，FP32 p 直接参与计算。SiLU(G)、H=SiLU(G)×U 和乘 p 连续使用 FP32 寄存器中间量，最后一次舍入形成 BF16 Hp，交给 GMM2。p 在 GMM2 之前使用，后面的 Combine 不再乘一次。",
+        "AIV0先读原始Gate/Up到FP32寄存器，再把BF16 Hp原位写回Gate那块UB。保存原始值的读者必须先结束；写Hp到GM的读者结束后，工作片才能交给下一任务。此内部原位计算也用于GM解耦路径，差别是输入来源与配对槽的回收方式。"
       ],
       "reads": [
         "Gate / Up tile",
@@ -529,11 +537,11 @@
       "subtitle": "最大128行×256列，轮转复用",
       "symbol": "GroupMatmul2：blockMmad / NotifyVector",
       "description": [
-        "读取当前专家 Hp 与 W2，将逻辑 [M_e,F]×[F,H] 分解为输出 tile；FP32 累加后 Fixpipe 输出 BF16 UB。前两个任务可分别用槽0/1；之后复用某槽前，必须等 AIV1 发送完该槽。pingpongIdx 是本核输出槽，不是路由 rank 或专家编号。"
+        "读取当前专家 Hp 与 W2，将逻辑 [M_e,F]×[F,K] 分解为输出 tile；FP32 累加后 Fixpipe 输出 BF16 UB。前两个任务可分别用槽0/1；之后复用某槽前，必须等 AIV1 发送完该槽。pingpongIdx 是本核输出槽，不是路由 rank 或专家编号。"
       ],
       "reads": [
         "ptrA2 当前专家 Hp",
-        "W2 [H,F]"
+        "W2 [K,F]"
       ],
       "writes": [
         "AIV1 UB 槽0/1：专家输出 tile"
@@ -542,7 +550,7 @@
         "当前专家 Hp ready",
         "目标 UB 槽已被 Combine 归还"
       ],
-      "formula": "Yroute = R(Hp · W2ᵀ)\nGEMM 用 FP32 累加，R(x) 表示将结果舍入到 BF16",
+      "formula": "Oroute = Rbf16(Hp · W2ᵀ)\nGEMM 用 FP32 累加，Rbf16(x) 表示将结果舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/catlass/mega_moe_bf16_forward_catlass_impl.hpp",
@@ -600,17 +608,17 @@
         "排空 GMM2/Combine 尾部并建立跨 rank 完成边界后，所有 AIV 负责本 rank 的不同 token。使用 expandedRowIdxGather[token×TopK+slot] 找到 ptrD 返回矩阵的 route 行，将回传的 BF16 route 值提升到 FP32，按 TopK 槽顺序累加，最后一次舍入成 BF16 Y。该索引属于源 rank 的排序 route 布局，不是专家卡跨源拼接后的接收行号。"
       ],
       "reads": [
-        "本 rank ptrD [M×TopK,H]",
+        "本 rank ptrD [M×TopK,K]",
         "expandedRowIdxGather"
       ],
       "writes": [
-        "Y [M,H] BF16"
+        "Y [M,K] BF16"
       ],
       "waits": [
         "所有本地 Combine 管线退休",
         "跨 rank 确认各 route 输出已送达"
       ],
-      "formula": "acc[0] = FP32(Yroute[slot 0])\nacc[j] = acc[j−1] + FP32(Yroute[slot j])，j = 1…TopK−1\nY = R(acc[TopK−1])\nR(x) 表示将总和舍入到 BF16",
+      "formula": "acc[0] = FP32(Oroute[slot 0])\nacc[j] = acc[j−1] + FP32(Oroute[slot j])，j = 1…TopK−1\nY = Rbf16(acc[TopK−1])\nRbf16(x) 表示将总和舍入到 BF16",
       "sources": [
         {
           "path": "experiments/megamoe_train/csrc/kernels/bf16/mega_moe_bf16_forward.hpp",

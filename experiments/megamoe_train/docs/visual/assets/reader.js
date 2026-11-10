@@ -17,7 +17,8 @@
   const canvas = $('canvas'), viewport = $('viewport');
   $('repository').href = data.sourceRepository;
   $('revision').href = `${data.sourceRepository}/tree/${data.sourceCommit}`;
-  $('revision').textContent = `源码 ${data.sourceCommit.slice(0, 7)}`;
+  $('revision').textContent = data.sourceMode === 'worktree' ? '本地源码' : `源码 ${data.sourceCommit.slice(0, 7)}`;
+  $('revision').title = `基准提交 ${data.sourceCommit}`;
   if (editorBridge) {
     const badge = document.createElement('span'); badge.textContent = 'VS Code 源码直达';
     document.querySelector('.scenario').append(badge);
@@ -113,7 +114,7 @@
       const open = editorBridge ? `<button type="button" data-open-source="${index}">打开源码</button>` : '<button type="button" data-copy-location>复制定位路径</button>';
       const locator = editorBridge ? '' : `<div class="source-locator"><input class="source-location" aria-label="源码定位路径" readonly value="${esc(sourceLocation(source))}"><span class="copy-status" role="status">复制后，在 VS Code 按 Ctrl+P 粘贴并回车。</span></div>`;
       const protocolLink = !editorBridge && localFile(source) ? `<a href="${esc(editorFile(source))}" title="在 Edge、Chrome 等外部浏览器中使用；VS Code 内置浏览器请复制定位路径">用 VS Code 打开</a>` : '';
-      return `<details class="source-block" ${index === sourceIndex ? 'open' : ''}><summary>${esc(source.path.split('/').at(-1))}:${source.line}</summary><div class="source-links">${open}<a target="_blank" rel="noopener" href="${esc(source.url)}">在线源码 ↗</a>${protocolLink}</div>${locator}<div class="source-path">${esc(source.path)}</div><div class="code-lines">${source.excerpt.map(row => `<div class="code-line ${row.line === source.line ? 'anchor-line' : ''}"><span class="ln">${row.line}</span><code>${esc(row.text)}</code></div>`).join('')}</div></details>`;
+      return `<details class="source-block" ${index === sourceIndex ? 'open' : ''}><summary>${esc(source.path.split('/').at(-1))}:${source.line}</summary><div class="source-links">${open}<a target="_blank" rel="noopener" href="${esc(source.url)}">${data.sourceMode === 'worktree' ? '已提交源码' : '在线源码'} ↗</a>${protocolLink}</div>${locator}<div class="source-path">${esc(source.path)}</div><div class="code-lines">${source.excerpt.map(row => `<div class="code-line ${row.line === source.line ? 'anchor-line' : ''}"><span class="ln">${row.line}</span><code>${esc(row.text)}</code></div>`).join('')}</div></details>`;
     }).join('');
     return `<div class="detail-kicker"><span class="pill">${esc(lane.label)}</span><span>${node.ordinal} / ${graph.nodes.length}</span></div><h3>${esc(node.title)}</h3>${node.symbol ? `<code class="function-name">${esc(node.symbol)}</code>` : ''}${(node.description || []).map(p => `<p>${esc(p)}</p>`).join('')}<dl class="detail-list">${list.filter(([, values]) => values?.length).map(([title, values]) => `<div><dt>${title}</dt><dd>${values.map(esc).join('<br>')}</dd></div>`).join('')}</dl>${node.formula ? `<pre class="formula">${esc(node.formula)}</pre>` : ''}${node.drilldown ? `<button type="button" class="drilldown" data-drill-view="${esc(node.drilldown.view)}" data-drill-node="${esc(node.drilldown.node || '')}">继续深入 → ${esc(data.graphs.find(g => g.id === node.drilldown.view).title)}</button>` : ''}<div class="detail-nav"><button type="button" id="previous" ${node.ordinal === 1 ? 'disabled' : ''}>← 上一步</button><button type="button" id="next" ${node.ordinal === graph.nodes.length ? 'disabled' : ''}>下一步 →</button></div><div class="sources-title">对应源码</div>${sourceBlocks}`;
   }

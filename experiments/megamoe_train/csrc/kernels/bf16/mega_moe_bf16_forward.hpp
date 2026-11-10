@@ -295,7 +295,6 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ResetWorkSpaceFlagList()
     if constexpr (g_coreType == AIV) {
         if (aivCoreIdx_ == 0) {
             int32_t flagNum = expertPerRank_ * INT_CACHELINE * 2;
-            // LocalTensor<int32_t> initTensor = ResetFlagBuf_.Get<int32_t>();
             LocalTensor<int32_t> initTensor{TPosition::VECIN, 0, 0};
             Duplicate(initTensor, 0, flagNum);
             SyncFunc<AscendC::HardEvent::V_MTE3>();

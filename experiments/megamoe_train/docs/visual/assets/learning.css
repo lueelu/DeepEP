@@ -50,6 +50,7 @@
 .learning-canvas .learning-table tbody tr:last-child td{border-bottom:0}
 .learning-canvas .learning-table tbody tr:nth-child(even){background:#fbfcfe}
 .learning-canvas .learning-table strong{color:#2f5b8c;font-weight:650}
+.learning-canvas .learning-reuse-paths .learning-table{table-layout:fixed;white-space:normal;line-height:1.65}
 .learning-canvas .learning-numeric .learning-table{font-family:"Cascadia Code",Consolas,"Microsoft YaHei",monospace;font-size:11px}
 .learning-canvas .learning-numeric .learning-table th{font-family:Inter,"Microsoft YaHei",sans-serif;font-size:11px}
 .learning-canvas .learning-backward-numeric .learning-table th{white-space:pre-line}

@@ -252,9 +252,6 @@ void PrintMoeInitRoutingV3Arch35TilingData(const MoeInitRoutingV3Arch35TilingDat
 
 void PrintMegaMoeTilingData(const MegaMoeTilingData* tilingData, const char* nodeName)
 {
-    // OP_TILING_CHECK(tilingData == nullptr,
-    //     VECTOR_INNER_ERR_REPORT_TILING(nodeName, "tilingData is nullptr."), return);
-
     OP_LOGD(nodeName, "========== MegaMoeTilingData ==========");
 
     PrintMoeInitRoutingV3Arch35TilingData(tilingData->moeInitRoutingTilingData, nodeName);
@@ -275,44 +272,6 @@ void PrintMegaMoeTilingData(const MegaMoeTilingData* tilingData, const char* nod
     OP_LOGD(nodeName, "transW2 is %s", (tilingData->transW2 ? "True" : "False"));
 }
 
-// void printWorkspaceInfo(const struct WorkspaceInfo *info, const char *nodeName)
-// {
-//     OP_LOGD(nodeName, "ptrA:                        %ld\n", info->ptrA);
-//     OP_LOGD(nodeName, "ptrAScale:                   %ld\n", info->ptrAScale);
-//     OP_LOGD(nodeName, "ptrA2:                       %ld\n", info->ptrA2);
-//     OP_LOGD(nodeName, "ptrA2Scale:                  %ld\n", info->ptrA2Scale);
-//     OP_LOGD(nodeName, "ptrcumsumMM:                 %ld\n", info->ptrcumsumMM);
-//     OP_LOGD(nodeName, "expandedRowIdx:              %ld\n", info->expandedRowIdx);
-//     OP_LOGD(nodeName, "ptrSumBeforeRank:            %ld\n", info->ptrSumBeforeRank);
-//     OP_LOGD(nodeName, "ptrFlagSwiGluToGmm2:         %ld\n", info->ptrFlagSwiGluToGmm2);
-//     OP_LOGD(nodeName, "ptrFlagDispatchToGmm1:       %ld\n", info->ptrFlagDispatchToGmm1);
-//     OP_LOGD(nodeName, "workspaceSize:               %ld\n", info->workspaceSize);
-// }
-
-// void printPeermemInfo(const MegaMoeTilingData* tilingData, const char *nodeName)
-// {
-//     OP_LOGD(nodeName, "========== PeermemInfo ==========");
-
-//     int64_t peermemSize = static_cast<int64_t>(tilingData->m) * tilingData->topK *
-//             (tilingData->k + tilingData->k / MXFP_SCALE_GROUP_NUM) * sizeof(int8_t) + 60 * 1024 +
-//             static_cast<int64_t>(tilingData->epWorldSize) * 128 * sizeof(int32_t) +
-//             static_cast<int64_t>(tilingData->m) * tilingData->topK * tilingData->k * sizeof(int16_t);
-//     OP_LOGD(nodeName, "peermemSize: {%ld}\n", peermemSize);
-
-//     int64_t offset = PEERMEM_DATA_OFFSET;
-//     OP_LOGD(nodeName, "ptrA0: {%ld}\n", PEERMEM_DATA_OFFSET);
-//     offset += static_cast<int64_t>(tilingData->m) *
-//         tilingData->topK *
-//         (tilingData->k + tilingData->k / MXFP_SCALE_GROUP_NUM) *
-//         sizeof(int8_t);
-//     OP_LOGD(nodeName, "ptrTokenPerExpert: {%ld}\n", offset);
-//     offset += static_cast<int64_t>(tilingData->epWorldSize) *
-//         HostCeilAlign(static_cast<int64_t>(tilingData->epWorldSize) *
-//         tilingData->expertPerRank, ALIGN_128) *
-//         sizeof(int32_t);
-//     OP_LOGD(nodeName, "ptrD: {%ld}\n", offset);
-// }
-
 void printAuxiliaryTilingCtx(const MegaMoeAuxTilingContext* ctx, const uint32_t expertPerRank,
                              const uint32_t epWorldSize, const std::vector<int64_t>& expertIdxShape,
                              const char* nodeName)
@@ -331,7 +290,6 @@ void printAuxiliaryTilingCtx(const MegaMoeAuxTilingContext* ctx, const uint32_t 
     OP_LOGD(nodeName, "expertCapacity is %ld", ctx->expertCapacity);
     OP_LOGD(nodeName, "expertNum is %ld", ctx->expertNum);
 
-    // OP_LOGD(nodeName, "x is %s, inputXDtypeSize = %ld", Ops::Base::ToString(xDtype).c_str(), ctx->inputXDtypeSize);
     OP_LOGD(nodeName, "isInputScale is %s, isInputOffset is %s", ctx->isInputScale ? "True" : "False",
             ctx->isInputOffset ? "True" : "False");
     OP_LOGD(nodeName, "dropPadMode is %ld, expertTokensNumType is %ld", ctx->dropPadMode, ctx->expertTokensNumType);
