@@ -11,3 +11,23 @@ extern "C" void mega_moe_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* 
                                    uint8_t* shared_weight1, uint8_t* shared_weight2, uint8_t* shared_weight_scales1,
                                    uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums,
                                    uint8_t* workspace, uint8_t* timer, const uint8_t* tiling_host, uint64_t ffts_addr);
+
+namespace MegaMoeUrma {
+struct Arguments;
+}
+namespace deepep::megamoe {
+enum class Backend : uint8_t { Pod, Ubx };
+// Host-only launch description; the separate device ABIs remain unchanged.
+struct PodLaunchArgs {
+    bool is_a8w4 = false;
+    uint8_t *context = nullptr, *x = nullptr, *x_scales = nullptr, *topk_ids = nullptr, *topk_weights = nullptr;
+    uint8_t *weight1 = nullptr, *weight2 = nullptr, *weight_scales1 = nullptr, *weight_scales2 = nullptr;
+    uint8_t *shared_weight1 = nullptr, *shared_weight2 = nullptr, *shared_weight_scales1 = nullptr,
+            *shared_weight_scales2 = nullptr;
+    uint8_t *y = nullptr, *expert_token_nums = nullptr, *workspace = nullptr, *timer = nullptr;
+    const uint8_t* tiling = nullptr;
+    uint64_t ffts = 0;
+};
+void launch_kernel(Backend backend, uint32_t block_dim, uint32_t ub_bytes, void* stream, const PodLaunchArgs& pod,
+                   const MegaMoeUrma::Arguments* ubx);
+}  // namespace deepep::megamoe

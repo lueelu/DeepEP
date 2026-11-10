@@ -8,7 +8,6 @@ def run(args, config, group):
     import numpy as np
     import torch
     from .api import SymmBuffer, mega_moe, transform_weights_for_mega_moe
-    from .backend import cv_rows
     from .benchmark import inputs
     from .reference import make_weights, quantize_input, expand_fp4_to_fp8
     from .golden import contract, load, compare
@@ -152,7 +151,7 @@ def run(args, config, group):
                 )
                 rows = group.all_gather(samples["durations_us"], f"UBX samples BS={bs}")
                 report = summarize_profile_rounds(rows, int(os.environ.get("LOCAL_WORLD_SIZE", world)))
-                report.update(cv_rows=cv_rows(world, bs), includes_device_routing=True)
+                report.update(cv_rows=owner._plan.cv_rows, includes_device_routing=True)
                 (case / "performance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if args.timer:
                 torch.npu.synchronize()
@@ -179,7 +178,7 @@ def run(args, config, group):
                         from .urma_timer import communication_bandwidth
 
                         timing = communication_bandwidth(
-                            owner._ubx._diagnostic_timer.cpu().numpy(), rank, world=world, clock_mhz=1000.0
+                            owner._plan.diagnostic_timer.cpu().numpy(), rank, world=world, clock_mhz=1000.0
                         )
                         timing["diagnostic_only"] = True
                         timing["selected_timer_ranks"] = timer_ranks

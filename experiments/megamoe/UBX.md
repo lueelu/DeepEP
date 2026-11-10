@@ -34,6 +34,40 @@ does not reject a supported group or bypass these checks. Rebuild the complete
 wheel when changing this runtime ABI; do not mix the new Python code with an old
 native extension.
 
+## Unified Host call path
+
+Both backends now follow the same execution chain:
+
+```text
+mega_moe / fp8_fp4_mega_moe
+  -> api._run
+  -> Plan.forward
+  -> launch_kernel (Host-only bridge)
+  -> original POD or UBX device launcher
+```
+
+There is one `SymmBuffer` owner, one native `Plan`, and one `buffer_size`
+binding. The separate `UbxBuffer`, `UrmaBuffer`, `prepare_routes`,
+`forward_prepared`, `UrmaPlan` and `urma_buffer_size` execution interfaces
+have been removed. Backend remains a property used for shape support,
+resource layout, weight selection and launch arguments. Shared dimensions are
+inferred and validated within the common native forward, not through another
+Host API.
+
+`csrc/forward.cpp` owns common validation, output/count allocation, resource
+preparation and tensor lifetimes. Its private UBX workspace stores resources
+without defining another forward pipeline. `csrc/kernel_launch.cpp` is the
+thin common Host bridge; the existing Bisheng translation units and both device
+ABIs remain separate and unchanged. Python/native API protocol is now 5; rebuild
+the full wheel rather than mixing the new Python with old Plan bindings.
+
+The Python owner maintains a monotonic generation across shape/Plan changes;
+native Plan checks it for UBX. Changing BS retires UBX work and collectively
+checks shape metadata before rebuilding resources. Shared-I changes only
+reprepare local scratch. Neither step reads route tensor contents. Diagnostic
+aggregate data is exposed through the common `Plan.diagnostic_timer`, and
+reports obtain the selected CV from `Plan.cv_rows`.
+
 UBX supports EP4/8/16, equal positive BS on all ranks, capacity up to 16384,
 H256..8192 and I256..16384 aligned to 256, TopK1..min(8,E), and equal contiguous
 expert partitions with 1..128 routed experts per rank. Expanded receive
@@ -53,8 +87,8 @@ I. POD's existing dtype and shared-expert support is unchanged. UBX requires
 
 There are no H/I/TopK gates on this CV rule and no public CV/algorithm knob.
 Control-region offsets are reserved for CV128 at construction and stay fixed
-when logical CV changes. A CV/shared-shape change retires previous work and
-coordinates the resource transition; steady calls reuse resources. Every
+when logical CV changes. A BS/CV change coordinates resource retirement;
+shared-shape changes retire and reprepare local scratch. Steady calls reuse resources. Every
 kernel rebuilds routes from the current top-k input without D2H.
 
 `mega_moe` returns `(output, expert_counts)` on both products. Consumer exports
@@ -146,6 +180,16 @@ available. These checks did not create a Session or launch a kernel.
 
 The isolated build directory is
 `/home/codex-deepep/megamoe-runtime-unified-20261110-b89e367-check1`.
+The subsequent common-Host refactor passed 187 local API/runtime/timer tests
+(20 real-Torch cases skipped locally), including unified POD/UBX Plan calls,
+shared shape forwarding, monotonic generation across BS changes and failure
+poisoning. The complete refactored wheel also compiled successfully in `tpr`
+on 2026-11-10, with the original device translation units and ABIs retained.
+Its isolated build is `/home/codex-deepep/megamoe-host-unified-20261110-check1`.
+In `tpr`, the public API and runtime CPU mock suites passed all 93 tests.
+Wheel loading confirmed API protocol 5, a single Plan/buffer-size interface,
+the backend/generation defaults and the common diagnostic properties, with no
+old UrmaPlan binding. No Plan or Session was constructed during the load check.
 The build did not replace any existing installed package or run NPU operators.
 NPU accuracy/performance for this revision remains unverified: run POD
 regression plus UBX S0/S1, CV-boundary/transition, empty/hot expert and E-limit

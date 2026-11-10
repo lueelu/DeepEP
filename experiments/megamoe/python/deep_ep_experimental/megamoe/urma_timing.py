@@ -99,7 +99,7 @@ class UrmaLaunchGuard:
         self.dist.all_reduce(self.alignment, group=self.process_group)
 
     def end(self):
-        # forward_prepared orders caller after owner. The barrier therefore sees
+        # The public forward orders caller after owner. The barrier therefore sees
         # the completed block; neither this barrier nor synchronization is timed.
         if self.process_group is not None:
             self.dist.barrier(group=self.process_group)

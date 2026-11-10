@@ -74,7 +74,7 @@ add_custom_command(OUTPUT "${urma_kernel_library}"
     DEPENDS csrc/kernels/ubx/urma/launcher.cpp ${kernel_headers}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 add_custom_target(megamoe_device DEPENDS "${kernel_library}" "${urma_kernel_library}")
-pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/urma_forward.cpp)
+pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/kernel_launch.cpp)
 set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
     INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include")
