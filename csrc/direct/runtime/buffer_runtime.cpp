@@ -184,6 +184,13 @@ bool BufferRuntime::IsInitialized() const
     return initialized_ && shmem_ != nullptr && shmem_->Initialized();
 }
 
+std::vector<int64_t> BufferRuntime::ConfigureTuning(
+    int64_t dispatch_order, int64_t combine_order, int64_t group_peers, int64_t workers, int64_t qps)
+{
+    TORCH_CHECK(IsInitialized(), "Buffer is not initialized");
+    return shmem_->ConfigureTuning(dispatch_order, combine_order, group_peers, workers, qps);
+}
+
 void BufferRuntime::Barrier()
 {
     if (!IsInitialized()) {

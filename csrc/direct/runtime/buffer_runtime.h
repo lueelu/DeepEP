@@ -40,6 +40,8 @@ public:
     BufferRuntime& operator=(const BufferRuntime&) = delete;
 
     bool IsInitialized() const;
+    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order,
+                                       int64_t group_peers, int64_t workers, int64_t qps);
     void Barrier();
     void Destroy();
     void AbortInitialization();

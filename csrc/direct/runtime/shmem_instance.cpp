@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <exception>
 #include <limits>
@@ -182,6 +183,31 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     if (data_op_engine_type_ <= 0 || (data_op_engine_type_ & ~kValidEngineMask) != 0) {
         throw std::invalid_argument("invalid CANN SHMEM data operation engine type");
     }
+    const char* tuning = std::getenv("DEEPEP_CLOS_TUNING_SESSION");
+    tuning_session_ = tuning && std::strcmp(tuning, "1") == 0;
+    if (tuning_session_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
+        throw std::invalid_argument("tuning session requires shared-Jetty peer scheduling and a fixed group size");
+}
+
+std::vector<int64_t> ShmemInstance::ConfigureTuning(
+    int64_t dispatch_order, int64_t combine_order, int64_t group_peers, int64_t workers, int64_t qps)
+{
+    if (!initialized_ || !tuning_session_ || g_runtime_refcount != 1)
+        throw std::runtime_error("configure_tuning requires one active tuning-session Buffer per process");
+    // Validate before any collective or mutation. The benchmark agrees the
+    // complete plan across ranks before entering this private interface.
+    ShmemInstance candidate(rank_, world_size_, ip_port_, data_op_engine_type_, use_1g_huge_pages_,
+                            unique_id_, bootstrap_key_, true, false, dispatch_order, combine_order,
+                            ranks_per_group_, group_peers, workers, qps);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
+    Barrier();
+    dispatch_peer_order_ = candidate.dispatch_peer_order_;
+    combine_peer_order_ = candidate.combine_peer_order_;
+    peers_per_group_per_worker_ = candidate.peers_per_group_per_worker_;
+    workers_per_peer_ = candidate.workers_per_peer_;
+    qps_per_worker_ = candidate.qps_per_worker_;
+    return {dispatch_peer_order_, combine_peer_order_, peers_per_group_per_worker_,
+            workers_per_peer_, qps_per_worker_};
 }
 
 ShmemInstance::~ShmemInstance()
@@ -363,7 +389,9 @@ void ShmemInstance::InitRuntime()
             if (shared_jetty_) {
                 std::vector<uint64_t> masks(world_size_);
                 for (int peer = 0; peer < world_size_; ++peer)
-                    masks[peer] = token_schedule_
+                    masks[peer] = tuning_session_
+                                      ? ascend_deepep::udma::TuningPeerMask(rank_, peer, world_size_, ranks_per_group_)
+                                      : token_schedule_
                                       ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
                                       : ascend_deepep::udma::PeerMask(rank_, peer, world_size_, dispatch_peer_order_,
                                                                       combine_peer_order_, ranks_per_group_,

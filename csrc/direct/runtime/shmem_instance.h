@@ -34,6 +34,8 @@ public:
     void WaitHandle(aclrtStream stream) const;
     void Synchronize(aclrtStream stream) const;
     void Destroy();
+    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order,
+                                       int64_t group_peers, int64_t workers, int64_t qps);
 
     uint64_t FftsAddr() const;
     bool Initialized() const;
@@ -93,6 +95,7 @@ private:
     int64_t data_op_engine_type_;
     bool use_1g_huge_pages_;
     bool shared_jetty_;
+    bool tuning_session_ = false;
     bool token_schedule_;
     uint32_t dispatch_peer_order_ = 0;
     uint32_t combine_peer_order_ = 0;

@@ -36,6 +36,7 @@ static auto buffer_runtime_registry =
               torch::arg("udma_peers_per_group_per_worker") = 0, torch::arg("udma_workers_per_peer") = 1,
               torch::arg("udma_qps_per_worker") = 1})
         .def("is_initialized", &BufferRuntime::IsInitialized)
+        .def("_configure_tuning", &BufferRuntime::ConfigureTuning)
         .def("barrier", &BufferRuntime::Barrier)
         .def("destroy", &BufferRuntime::Destroy)
         .def("abort_initialization", &BufferRuntime::AbortInitialization)

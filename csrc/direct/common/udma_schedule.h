@@ -142,6 +142,19 @@ ASCEND_DEEPEP_SCHEDULE_FN uint64_t PeerMask(
     }
     return mask;
 }
+// Benchmark-only union for the existing peer schedules. Reserve both endpoint
+// mappings before SHMEM initialization; launches retain exclusive SQ ownership.
+ASCEND_DEEPEP_SCHEDULE_FN uint64_t TuningPeerMask(
+    uint32_t rank, uint32_t peer, uint32_t world, uint32_t ranks_per_group)
+{
+    uint64_t mask = 0;
+    for (uint32_t order = kRankOrder; order <= kGroupRoundRobinOrder; ++order)
+        for (uint32_t lanes = 1; lanes <= 2; ++lanes)
+            for (uint32_t count = 1; count <= 4; count *= 2)
+                mask |= PeerMask(rank, peer, world, order, order, ranks_per_group,
+                                 order == kGroupRoundRobinOrder ? count : 0, lanes);
+    return mask;
+}
 } // namespace ascend_deepep::udma
 
 #undef ASCEND_DEEPEP_SCHEDULE_FN
