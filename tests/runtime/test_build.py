@@ -12,9 +12,62 @@ import zipfile
 
 import pytest
 
+
+@pytest.mark.parametrize(
+    "old", ["backends/clos/buffer.py", "backends/pod/elastic.py", "_clos_adapter.py", "_card_adapter.py"]
+)
+@pytest.mark.parametrize("side", ["build_dir", "install_dir"])
+def test_install_rejects_renamed_backend_staging(build, tmp_path, monkeypatch, old, side):
+    from setuptools import Distribution
+
+    command = build.CheckedInstallLib(Distribution())
+    command.build_dir = str(tmp_path / "build")
+    command.install_dir = str(tmp_path / "install")
+    obsolete = Path(getattr(command, side)) / "deep_ep" / old
+    obsolete.parent.mkdir(parents=True)
+    obsolete.write_text("stale implementation")
+    monkeypatch.setattr(build.install_lib, "install", lambda _: pytest.fail("must reject before copying files"))
+    with pytest.raises(RuntimeError, match="Obsolete backend implementation"):
+        command.install()
+
+
+def test_native_topology_manifest_and_direct_source_paths():
+    import re
+
+    text = (ROOT / "CMakeLists.txt").read_text()
+    manifest = json.loads(text.split("CONTENT [=[", 1)[1].split("]=])", 1)[0])
+    entries = manifest["machine_backends"]
+    assert set(entries) == {"mesh_clos", "mesh_pcie", "global_clos"}
+    assert entries["mesh_pcie"]["transport"] == "mte"
+    assert entries["global_clos"]["transport"] == "udma"
+    assert entries["mesh_pcie"]["module"] == entries["global_clos"]["module"] == "deep_ep._clos_C"
+    for name in ("cmake/Direct.cmake", "cmake/device/CMakeLists.txt"):
+        cmake = (ROOT / name).read_text()
+        assert "csrc/direct" in cmake and "csrc/clos" not in cmake
+        for path in re.findall(r'"\$\{_direct(?:_root)?\}/([^"$]+)"', cmake):
+            assert (ROOT / "csrc/direct" / path).exists(), path
+
+
 ROOT = Path(__file__).resolve().parents[2]
 if not (ROOT / "build_support.py").is_file():
     pytest.skip("Build-source tests run before packaging", allow_module_level=True)
+
+CANN_VERSIONS = [
+    ("9.2", True),
+    ("9.2.0", True),
+    ("9.2.0.b080", True),
+    ("9.2.1", True),
+    ("9.2.1+build1", True),
+    ("9.2.1-custom", True),
+    ("9.10.0", True),
+    ("10.0.0", True),
+    ("9.1.99", False),
+    ("8.10.0", False),
+    ("", False),
+    ("9", False),
+    ("invalid", False),
+    ("9.2RC1", False),
+]
 
 
 def load(path):
@@ -28,6 +81,12 @@ def load(path):
 def build(monkeypatch):
     module = load(ROOT / "build_support.py")
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(__version__="build-test", _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True))
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(__version__="build-test"))
     return module
 
 
@@ -58,22 +117,25 @@ def test_beta_requires_sdk_and_timer_requires_beta(build):
 
 
 @pytest.mark.parametrize(
-    "fault",
-    [
-        None,
-        "missing",
-        "json",
-        "list",
-        "revision",
-        "header",
-        "checksum",
-        "coverage",
-        "path",
-        "missing_library",
-        "missing_device_header",
+    "fault,version,accepted",
+    [(None, version, accepted) for version, accepted in CANN_VERSIONS]
+    + [
+        (fault, "9.2.0", True)
+        for fault in (
+            "missing",
+            "json",
+            "list",
+            "revision",
+            "header",
+            "checksum",
+            "coverage",
+            "path",
+            "missing_library",
+            "missing_device_header",
+        )
     ],
 )
-def test_ndr_sdk_identity_is_required(build, monkeypatch, tmp_path, fault):
+def test_sdk_identity_and_cann_version(build, monkeypatch, tmp_path, fault, version, accepted):
     import hashlib
     import warnings
     from types import SimpleNamespace
@@ -81,7 +143,7 @@ def test_ndr_sdk_identity_is_required(build, monkeypatch, tmp_path, fault):
     cann, sdk = tmp_path / "cann", tmp_path / "shmem"
     files = {
         cann / "include/acl/acl.h": "",
-        cann / "compiler/version.info": "Version=9.2.0",
+        cann / "compiler/version.info": f"Version={version}",
         cann / "tools/bisheng_compiler/bin/bisheng": "compiler",
         sdk / "include/host/shmem_host_def.h": "host",
         sdk / "include/shmem.h": "public",
@@ -105,7 +167,6 @@ def test_ndr_sdk_identity_is_required(build, monkeypatch, tmp_path, fault):
     monkeypatch.setitem(sys.modules, "pybind11", SimpleNamespace(__version__=lock["python_build"]["pybind11"]))
     identity = {
         "revision": lock["shmem"]["revision"],
-        "build": {"rdma_backend": "HNS_1825", "hns_1825_pi_on_chip": 0, "cann_version": "test", "cann_timestamp": "test", "target": "Ascend950", "source_patches": []},
         "sha256": {
             str(path.relative_to(sdk).as_posix()): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in files
@@ -136,48 +197,48 @@ def test_ndr_sdk_identity_is_required(build, monkeypatch, tmp_path, fault):
     }
     with warnings.catch_warnings(record=True) as messages:
         warnings.simplefilter("always")
-        if fault is not None:
-            errors = {
-                "missing": (RuntimeError, "no deepep-sdk.json"),
-                "json": (ValueError, "Expecting value"),
-                "list": (ValueError, "Invalid SHMEM SDK manifest"),
-                "revision": (RuntimeError, "source revision differs"),
-                "header": (RuntimeError, "public API differs"),
-                "checksum": (RuntimeError, "checksum mismatch"),
-                "coverage": (RuntimeError, "must cover headers"),
-                "path": (RuntimeError, "Invalid SHMEM SDK manifest path"),
-                "missing_library": (RuntimeError, "Invalid SHMEM SDK manifest path"),
-                "missing_device_header": (RuntimeError, "missing"),
-            }
-            error, match = errors[fault]
-            with pytest.raises(error, match=match):
+        if fault in ("missing_library", "missing_device_header"):
+            with pytest.raises(RuntimeError, match="missing"):
                 build.build_configuration(env)
-            assert not messages
+            return
+        if not accepted:
+            with pytest.raises(RuntimeError, match=r"requires CANN >= 9\.2\.0"):
+                build.build_configuration(env)
             return
         result = build.build_configuration(env)
-    assert not messages
-    assert result["ll_rdma"] is True
+    assert result["cann"]["version"] == version
+    assert bool(messages) == (fault is not None)
+    assert all("continuing with SHMEM_ROOT=" in str(message.message) for message in messages)
     assert (
         result["shmem"]["sha256"]["lib/libshmem.so"]
         == hashlib.sha256((sdk / "lib/libshmem.so").read_bytes()).hexdigest()
     )
-    assert result["shmem"]["revision"] == identity["revision"]
-    assert result["shmem"]["build"]["hns_1825_pi_on_chip"] == 0
-    initial_key = build.build_cache_key(result)
-    result["shmem"]["build"]["hns_1825_pi_on_chip"] = 1
-    assert build.build_cache_key(result) != initial_key
+    assert result["shmem"]["revision"] == ("unknown" if fault in ("missing", "json", "list") else identity["revision"])
     assert manifest.exists() == (fault != "missing")
     before = build.build_cache_key(result)
     result["shmem"]["sha256"]["lib/libshmem.so"] = "0" * 64
     assert build.build_cache_key(result) != before
 
 
+@pytest.mark.parametrize("version,accepted", CANN_VERSIONS)
+def test_shmem_cann_version(monkeypatch, tmp_path, version, accepted):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    builder = load(ROOT / "scripts/build_shmem.py")
+    (tmp_path / "compiler").mkdir()
+    (tmp_path / "compiler/version.info").write_text(f"Version={version}\ntimestamp=test\n")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path))
+    if accepted:
+        assert builder.cann_version("9.2.0") == {"Version": version, "timestamp": "test"}
+    else:
+        with pytest.raises(RuntimeError, match=r"requires CANN >= 9\.2\.0"):
+            builder.cann_version("9.2.0")
+
+
 def test_metadata_no_sdk_or_framework(tmp_path):
     # Query in a copy so egg metadata does not alter the checkout.
     import shutil
 
-    for name in ("setup.py", "build_support.py", "VERSION", "scripts/shmem_sdk_identity.py"):
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+    for name in ("setup.py", "build_support.py", "VERSION"):
         shutil.copy2(ROOT / name, tmp_path / name)
     result = subprocess.run(
         [sys.executable, "setup.py", "--name"],
@@ -237,7 +298,7 @@ def test_lock_declares_operators_without_claiming_device_qualification():
         "elastic-combine-expanded-v3",
     ],
 )
-def test_elastic_wheel_requires_device_library(tmp_path, capability):
+def test_elastic_wheel_requires_device_library(tmp_path, capability, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
     operations = ["ElasticBuffer.dispatch", "ElasticBuffer.combine"]
     for device_library in (False, True):
@@ -251,6 +312,7 @@ def test_elastic_wheel_requires_device_library(tmp_path, capability):
                     {
                         "communication_operations": operations,
                         "capabilities": [capability],
+                        "shmem_runtime": shmem_wheel_payload(archive),
                     }
                 ),
             )
@@ -266,7 +328,7 @@ def test_elastic_wheel_requires_device_library(tmp_path, capability):
 @pytest.mark.parametrize(
     "missing", [None, "deep_ep/libdeepep_kernels.so", "deep_ep_experimental/megamoe/libmegamoe_kernel.so"]
 )
-def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing):
+def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
     info = {
         "megamoe": {"enabled": True, "timer": True},
@@ -286,6 +348,7 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
     }
     wheel = tmp_path / "combined.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
+        info["shmem_runtime"] = shmem_wheel_payload(archive)
         archive.writestr("deep_ep/_build_info.json", json.dumps(info))
         for name in sorted(members - {missing}):
             archive.writestr(name, b"fixture")
@@ -325,8 +388,155 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         assert build.build_cache_key({**configuration, name: value}) != key
 
 
-@pytest.mark.parametrize("beta,timer", [(False, False), (True, False), (True, True)])
-def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer):
+@pytest.fixture
+def source_native(build, monkeypatch, tmp_path):
+    source = tmp_path / "checkout"
+    package = source / "deep_ep"
+    package.mkdir(parents=True)
+    probe = package / "probe"
+    try:
+        probe.symlink_to("target")
+    except OSError:
+        pytest.skip("Source builds require symlink support")
+    probe.unlink()
+    monkeypatch.setattr(build, "ROOT", source)
+    monkeypatch.setattr(build.sysconfig, "get_config_var", lambda key: ".test.so")
+    destination = tmp_path / "temporary-staging"
+    destination.mkdir()
+    names = ["_C.test.so", "_clos_C.test.so", "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    for name in names:
+        (destination / name).write_bytes(("first:" + name).encode())
+    (destination / ".libs").mkdir()
+    for name in build.SHMEM_RUNTIME_LIBRARIES:
+        (destination / ".libs" / name).write_bytes(b"SDK")
+    return package, destination, names
+
+
+def test_source_native_snapshot_survives_staging_removal_and_refresh(build, source_native):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    first = (package / ".native-build").resolve()
+    for name in names:
+        assert (package / name).is_symlink()
+        assert (package / name).read_bytes() == (destination / name).read_bytes()
+        (destination / name).write_bytes(b"second")
+    # The first complete build is not changed by staging a second one.
+    assert (package / names[0]).read_bytes().startswith(b"first:")
+    build.publish_source_native(destination)
+    assert (package / ".native-build").resolve() != first
+    build.shutil.rmtree(destination)
+    assert all((package / name).read_bytes() == b"second" for name in names)
+    assert (package / ".libs").is_symlink()
+    assert all((package / ".libs" / name).read_bytes() == b"SDK" for name in build.SHMEM_RUNTIME_LIBRARIES)
+
+
+@pytest.mark.parametrize("missing", [None, "libshmem_utils.so", "aclshmem_bootstrap_uid.so"])
+def test_bundle_shmem_runtime(build, tmp_path, missing):
+    sdk = tmp_path / "sdk"
+    (sdk / "lib").mkdir(parents=True)
+    destination = tmp_path / "package"
+    destination.mkdir()
+    for name in build.SHMEM_RUNTIME_LIBRARIES:
+        if name != missing:
+            (sdk / "lib" / name).write_bytes(name.encode())
+    if missing:
+        with pytest.raises(RuntimeError, match="Incomplete SHMEM runtime"):
+            build.bundle_shmem_runtime(sdk, destination)
+        assert not (destination / ".libs").exists()
+    else:
+        hashes = build.bundle_shmem_runtime(sdk, destination)
+        build.shutil.rmtree(sdk)
+        assert set(hashes) == set(build.SHMEM_RUNTIME_LIBRARIES)
+        for name, digest in hashes.items():
+            path = destination / ".libs" / name
+            assert not path.is_symlink()
+            assert build.hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "checksum", "manifest", "license", "extra"])
+def test_wheel_shmem_runtime_integrity(tmp_path, shmem_wheel_payload, fault):
+    validator = load(ROOT / "scripts/validate_package.py")
+    wheel = tmp_path / "bundle.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        hashes = shmem_wheel_payload(archive)
+        archive.writestr("deep_ep/_C.fake.so", "fixture")
+        archive.writestr("licenses/deepseek-deepep.LICENSE", "fixture")
+        if fault == "manifest":
+            hashes.pop("libshmem.so")
+        archive.writestr(
+            "deep_ep/_build_info.json", json.dumps({"communication_operations": [], "shmem_runtime": hashes})
+        )
+    with zipfile.ZipFile(wheel) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    target = "deep_ep/.libs/libshmem_utils.so"
+    if fault == "missing":
+        members.pop(target)
+    elif fault == "checksum":
+        members[target] = b"wrong SDK"
+    elif fault == "license":
+        members.pop("licenses/cann.LICENSE")
+    elif fault == "extra":
+        members["deep_ep/.libs/old.so"] = b"old SDK"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    if fault:
+        with pytest.raises(RuntimeError, match="SHMEM"):
+            validator.inspect_wheel(wheel)
+    else:
+        assert validator.inspect_wheel(wheel)["shmem_runtime"] == hashes
+
+
+def test_incomplete_source_native_build_keeps_previous_links(build, source_native):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    first = (package / ".native-build").readlink()
+    (destination / names[0]).write_bytes(b"new")
+    (destination / names[1]).unlink()
+    with pytest.raises(RuntimeError, match="Incomplete native build"):
+        build.publish_source_native(destination)
+    assert (package / ".native-build").readlink() == first
+    assert (package / names[0]).read_bytes().startswith(b"first:")
+
+
+@pytest.mark.parametrize("foreign_link", [False, True])
+def test_source_native_never_overwrites_unmanaged_files(build, source_native, foreign_link):
+    package, destination, names = source_native
+    path = package / names[0]
+    if foreign_link:
+        path.symlink_to(destination / names[0])
+    else:
+        path.write_bytes(b"user file")
+    with pytest.raises(RuntimeError, match="unmanaged source artifact"):
+        build.publish_source_native(destination)
+    assert path.is_symlink() == foreign_link
+    assert not (package / ".native-build").exists()
+
+
+def test_source_native_removes_only_managed_old_abi_links(build, source_native, monkeypatch):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    for name in names[:2]:
+        (destination / name).rename(destination / name.replace(".test.so", ".next.so"))
+    monkeypatch.setattr(build.sysconfig, "get_config_var", lambda key: ".next.so")
+    build.publish_source_native(destination)
+    assert all(not (package / name).is_symlink() for name in names[:2])
+    assert (package / "_C.next.so").is_file()
+
+
+def test_source_native_recovers_after_build_directory_removed(build, source_native):
+    package, destination, names = source_native
+    build.publish_source_native(destination)
+    build.shutil.rmtree(build.ROOT / "build")
+    assert (package / names[0]).is_symlink() and not (package / names[0]).exists()
+    build.publish_source_native(destination)
+    assert all((package / name).is_file() for name in names)
+
+
+@pytest.mark.parametrize(
+    "beta,timer,inplace", [(False, False, False), (True, False, False), (True, True, False), (False, False, True)]
+)
+def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer, inplace):
     from setuptools import Distribution, Extension
 
     # This CPU-only test mocks the build tools, including their discovery paths.
@@ -376,7 +586,19 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
             (destination / "libdeepep_kernels.so").write_bytes(b"new")
 
     monkeypatch.setattr(build, "checked_run", run)
-    command.build_extension(ext)
+    monkeypatch.setattr(build, "bundle_shmem_runtime", lambda sdk, target: {"test": "hash"})
+    published = []
+    monkeypatch.setattr(build, "publish_source_native", published.append)
+    command.inplace = inplace
+
+    def setuptools_run(self):
+        # setuptools hides inplace while building into its staging directory.
+        self.inplace = False
+        self.build_extension(ext)
+
+    monkeypatch.setattr(build.build_ext, "run", setuptools_run)
+    command.run()
+    assert published == ([] if inplace else [destination.resolve()])
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
@@ -423,9 +645,8 @@ def test_compiler_symlink_keeps_invocation_name(build, monkeypatch, tmp_path):
     monkeypatch.setattr(build, "ROOT", source)
     manifest = {
         "revision": lock["shmem"]["revision"],
-        "build": {"rdma_backend": "HNS_1825", "hns_1825_pi_on_chip": 0, "cann_version": "test", "cann_timestamp": "test", "target": "Ascend950", "source_patches": []},
         "sha256": {
-            path.relative_to(sdk).as_posix(): hashlib.sha256(data.encode()).hexdigest()
+            str(path.relative_to(sdk)): hashlib.sha256(data.encode()).hexdigest()
             for path, data in files.items()
             if path.is_relative_to(sdk)
         },

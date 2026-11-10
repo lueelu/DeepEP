@@ -16,6 +16,19 @@ from deep_ep import _runtime
 from deep_ep.utils import event as events
 
 
+@pytest.fixture(autouse=True)
+def select_existing_pod_backend(monkeypatch):
+    # These are the original Mesh+Clos runtime fault-injection tests. Real selection
+    # and mixed-rank rejection are tested independently in test_machine_selection.
+    from deep_ep import _machine
+    from deep_ep import buffer
+    from deep_ep.buffers import elastic
+
+    monkeypatch.setattr(_machine, "select", lambda *a, **kw: {"machine_type": "mesh_clos", "source": "test"})
+    monkeypatch.setattr(buffer, "require_native", lambda _: None)
+    monkeypatch.setattr(elastic, "require_native", lambda _: None)
+
+
 class FakeEvent:
     def __init__(self, log):
         self.log = log
@@ -35,7 +48,6 @@ def event_backend(monkeypatch):
         current_stream=lambda device: "consumer",
         Event=lambda: FakeEvent(log),
     )
-    monkeypatch.setattr(events, "require_native", lambda operation: None)
     monkeypatch.setattr(events, "npu_api", lambda: npu)
     return log, npu
 
@@ -48,7 +60,7 @@ def test_record_wait_hook_and_release(event_backend):
         log.append("body")
     assert log == [("record", "consumer"), "body", ("wait", "consumer"), "hook"]
     assert wrapper.event is None
-    with pytest.raises(RuntimeError, match="released"):
+    with pytest.raises(AssertionError):
         wrapper.current_stream_wait()
 
 
@@ -67,7 +79,7 @@ def test_event_failure_does_not_drop_resources_or_hook(event_backend):
     wrapper.event._event.wait = fail
     with pytest.raises(RuntimeError, match="wait fault"):
         wrapper.current_stream_wait(release_handle=True)
-    assert wrapper.event is not None and wrapper._hook is hook
+    assert wrapper.event is not None and wrapper.hook_after_wait is hook
 
 
 def test_context_wait_runs_on_body_exception(event_backend):
@@ -81,18 +93,133 @@ def test_context_wait_runs_on_body_exception(event_backend):
 
 def test_empty_event_wrong_device_and_hooks(event_backend):
     _, npu = event_backend
-    with pytest.raises(ValueError, match="recorded"):
-        events.EventOverlap(None)
+    assert events.EventOverlap(None).event is None
     handle = events.EventHandle()
     npu.current_device = lambda: 1
     with pytest.raises(RuntimeError, match="another"):
         handle.current_stream_wait()
     wrapper = events.EventOverlap(handle)
-    with pytest.raises(TypeError):
-        wrapper.register_hook_after_wait(42)
     wrapper.register_hook_after_wait(lambda: None)
-    with pytest.raises(RuntimeError, match="already"):
+    with pytest.raises(AssertionError, match="already"):
         wrapper.register_hook_after_wait(lambda: None)
+
+
+def test_explicit_stream_is_recorded_and_cross_device_is_rejected(event_backend):
+    log, npu = event_backend
+    stream = SimpleNamespace(device=SimpleNamespace(index=0))
+    event = events.EventHandle(stream)
+    assert event._stream is stream and event.event is event._event
+    npu.current_stream = lambda device: "next-consumer"
+    event.current_stream_wait()
+    assert log == [("record", stream), ("wait", "next-consumer")]
+    with pytest.raises(RuntimeError, match="another NPU device"):
+        events.EventHandle(SimpleNamespace(device=SimpleNamespace(index=1)))
+    assert len(log) == 2
+
+
+@pytest.mark.parametrize("factory", [lambda: events.EventOverlap(), lambda: events.EventOverlap(None)])
+def test_empty_wrapper_matches_upstream(factory):
+    result = factory()
+    calls = []
+    result.register_hook_after_wait(lambda: calls.append("hook"))
+    with result(True):
+        assert result.event is None
+    assert calls == []
+    with pytest.raises(AssertionError):
+        result.current_stream_wait()
+    with pytest.raises(AssertionError):
+        result.wait()
+
+
+def test_duck_typed_event_release_and_hook_result():
+    log = []
+    event = SimpleNamespace(current_stream_wait=lambda: log.append("wait"))
+    retained = (object(),)
+    overlap = events.EventOverlap(event, retained)
+    overlap.register_hook_after_wait(lambda: 42)
+    assert overlap.wait() == 42
+    assert overlap.wait() is None
+    assert log == ["wait", "wait"]
+    overlap.current_stream_wait(release_handle=True)
+    assert overlap.event is None and overlap.extra_tensors is retained
+    with overlap:
+        pass  # A released wrapper is also an empty wrapper upstream.
+    with pytest.raises(AssertionError):
+        overlap.current_stream_wait()
+    invalid = events.EventOverlap(object())
+    with pytest.raises(AttributeError):
+        invalid.wait()
+
+
+def test_failed_hook_is_retained_for_retry():
+    overlap = events.EventOverlap(SimpleNamespace(current_stream_wait=lambda: None))
+    calls = []
+
+    def hook():
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError("epilogue failed")
+        return 7
+
+    overlap.register_hook_after_wait(hook)
+    with pytest.raises(ValueError):
+        overlap.current_stream_wait(True)
+    assert overlap.event is not None and overlap.hook_after_wait is hook
+    assert overlap.current_stream_wait(True) == 7
+    assert overlap.event is None and overlap.hook_after_wait is None
+
+
+def test_resources_track_both_streams_before_release(event_backend, monkeypatch):
+    import gc
+    import weakref
+
+    log, npu = event_backend
+
+    class Tensor:
+        device = SimpleNamespace(type="npu", index=0)
+
+        def record_stream(self, stream):
+            log.append(("tensor", stream))
+
+    class Owner:
+        pass
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(Tensor=Tensor))
+    tensor, owner = Tensor(), Owner()
+    owner_ref, tensor_ref = weakref.ref(owner), weakref.ref(tensor)
+    event = events.EventHandle()
+    overlap = events.EventOverlap._from_resources(event, (tensor, owner))
+    del tensor, owner
+    gc.collect()
+    assert owner_ref() is not None and tensor_ref() is not None
+    npu.current_stream = lambda device: "next-consumer"
+    original_wait = event._event.wait
+
+    def fail(stream):
+        raise RuntimeError("wait failed")
+
+    event._event.wait = fail
+    with pytest.raises(RuntimeError, match="wait failed"):
+        overlap.current_stream_wait(True)
+    assert owner_ref() is not None and tensor_ref() is not None
+    event._event.wait = original_wait
+    overlap.current_stream_wait(True)
+    gc.collect()
+    assert log == [
+        ("record", "consumer"),
+        ("tensor", "consumer"),
+        ("wait", "next-consumer"),
+        ("tensor", "next-consumer"),
+    ]
+    assert owner_ref() is None and tensor_ref() is None
+    assert overlap._retained_objects is None
+
+
+def test_events_do_not_load_native_extension(event_backend, monkeypatch):
+    from deep_ep import _native
+
+    monkeypatch.setattr(_native, "require_native", lambda _: pytest.fail("event loaded a backend extension"))
+    events.EventOverlap(events.EventHandle()).current_stream_wait()
 
 
 @pytest.mark.parametrize("value", [None, -1, 0, True, 1.5, 2**63])
@@ -160,7 +287,7 @@ def test_unreadable_host_boot_id_returns_collective_failure_marker(monkeypatch):
     ],
 )
 def test_unsupported_constructor_before_runtime(monkeypatch, cls, options):
-    module = importlib.import_module(cls.__module__)
+    module = importlib.import_module(cls.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda operation: None)
 
     def forbidden(*args):
@@ -192,7 +319,7 @@ def test_close_failure_retains_owner(monkeypatch):
 
 
 def test_scaleup_capacity_reaches_runtime_without_translation(monkeypatch):
-    module = importlib.import_module(deep_ep.Buffer.__module__)
+    module = importlib.import_module(deep_ep.Buffer.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda operation: None)
     calls = []
     resource = SimpleNamespace(closed=True)
@@ -210,7 +337,7 @@ def test_scaleup_capacity_reaches_runtime_without_translation(monkeypatch):
 
 @pytest.mark.parametrize("option, expected", [({}, True), ({"use_1g_huge_pages": False}, False)])
 def test_elastic_huge_page_default_and_opt_out(monkeypatch, option, expected):
-    module = importlib.import_module(deep_ep.ElasticBuffer.__module__)
+    module = importlib.import_module(deep_ep.ElasticBuffer.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda _: None)
     calls = []
     monkeypatch.setattr(module, "Runtime", lambda *a, **kw: calls.append(kw) or SimpleNamespace(closed=True))
@@ -220,7 +347,7 @@ def test_elastic_huge_page_default_and_opt_out(monkeypatch, option, expected):
 
 
 def test_elastic_debug_collectives_reaches_runtime(monkeypatch):
-    module = importlib.import_module(deep_ep.ElasticBuffer.__module__)
+    module = importlib.import_module(deep_ep.ElasticBuffer.__init__.__module__)
     monkeypatch.setattr(module, "require_native", lambda _: None)
     calls = []
     monkeypatch.setattr(module, "Runtime", lambda *a, **kw: calls.append(kw) or SimpleNamespace(closed=True))

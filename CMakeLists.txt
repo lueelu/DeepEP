@@ -18,30 +18,12 @@ option(DEEPEP_BUILD_EP_GMM_FUSED "Build Ascend950 communication/GMM experiment" 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 include(cmake/Dependencies.cmake)
-option(DEEPEP_LL_STAGE_TIMER "Compile optional LL device stage tracing" OFF)
-option(DEEPEP_LL_REFERENCE_PROFILE "Compile LL dispatch reference cycle profiling" OFF)
-option(DEEPEP_LL_COUNT_HISTOGRAM "Experimental remote count hardware histogram" OFF)
-if(DEEPEP_LL_STAGE_TIMER)
-    message(FATAL_ERROR "Legacy LL stage/expert tracing was removed; use DEEPEP_LL_REFERENCE_PROFILE=ON")
-endif()
 option(DEEPEP_BUILD_MEGAMOE "Build the optional MegaMoE Beta" OFF)
 option(DEEPEP_MEGAMOE_TIMER "Compile MegaMoE device tracing" OFF)
 include(cmake/Device.cmake)
-pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/low_latency.cpp)
-find_path(DEEPEP_PLATFORM_INCLUDE tiling/platform/platform_ascendc.h
-    HINTS "${ASCEND_HOME_PATH}/asc/include" "${ASCEND_HOME_PATH}/include/op_common"
-          "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include" NO_DEFAULT_PATH REQUIRED)
-target_link_directories(_C PRIVATE "${ASCEND_HOME_PATH}/lib64")
-target_link_libraries(_C PRIVATE platform tiling_api unified_dlog)
-target_include_directories(_C PRIVATE "${DEEPEP_PLATFORM_INCLUDE}" csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
+pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp)
+target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
 target_link_libraries(_C PRIVATE ascendcl shmem deepep_device ${CMAKE_DL_LIBS})
-target_compile_definitions(_C PRIVATE DEEPEP_LL_RDMA=1)
-if(DEEPEP_LL_COUNT_HISTOGRAM)
-    target_compile_definitions(_C PRIVATE DEEPEP_LL_COUNT_HISTOGRAM=1)
-endif()
-if(DEEPEP_LL_REFERENCE_PROFILE)
-    target_compile_definitions(_C PRIVATE DEEPEP_LL_REFERENCE_PROFILE=1)
-endif()
 target_compile_options(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -Wall -Wextra -Werror -fstack-protector-strong)
 target_compile_options(_C PRIVATE "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
     "-ffile-prefix-map=${SHMEM_ROOT}=SHMEM_SDK" "-ffile-prefix-map=${ASCEND_HOME_PATH}=CANN_SDK")
@@ -50,6 +32,7 @@ target_link_options(_C PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 # SDKs are external dependencies. Never embed checkout/toolkit absolute RPATHs.
 set_target_properties(_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS _C LIBRARY DESTINATION .)
+include(cmake/Direct.cmake)
 if(DEEPEP_BUILD_MEGAMOE)
     target_compile_definitions(_C PRIVATE DEEPEP_BUILD_MEGAMOE=1)
     add_subdirectory(experiments/megamoe)
@@ -66,7 +49,19 @@ endif()
 # Packaging consumes this file instead of maintaining another operator list.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/capabilities.json" CONTENT [=[
 {
-  "capabilities": ["runtime-mte", "runtime-mpi-bootstrap", "event", "elastic-low-latency-ndr-hns1825-v8", "ll-only"],
-  "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"]
+  "capabilities": ["runtime-mte", "runtime-urma", "runtime-mpi-bootstrap", "runtime-shmem-huge1g-v1", "event", "elastic-notify-metadata-v7", "elastic-notify-profile-v1", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3", "elastic-combine-rank-return-v1", "elastic-combine-return-slots-v2", "elastic-combine-chunk-tuning-v1", "elastic-combine-profile-v4", "elastic-combine-peers-v1", "elastic-combine-chunks-v2", "runtime-combine-sparse-qp-v1"],
+  "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"],
+  "machine_backends": {
+    "mesh_clos": {"module": "deep_ep._C", "device_library": "libdeepep_kernels.so"},
+    "mesh_pcie": {
+      "module": "deep_ep._clos_C", "device_library": "libdeepep_clos_kernels.so",
+      "interfaces": ["Buffer", "ElasticBuffer"], "transport": "mte", "topk_index_bits": 64
+    },
+    "global_clos": {
+      "module": "deep_ep._clos_C", "device_library": "libdeepep_clos_kernels.so",
+      "interfaces": ["Buffer", "ElasticBuffer"],
+      "transport": "udma", "topk_index_bits": 64
+    }
+  }
 }
 ]=])

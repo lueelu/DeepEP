@@ -5,7 +5,7 @@
 
 from types import SimpleNamespace
 
-from deep_ep.buffers import elastic
+from deep_ep.backends.mesh_clos import elastic
 
 
 def test_handle_schema(monkeypatch):

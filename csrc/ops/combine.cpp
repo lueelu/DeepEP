@@ -171,6 +171,8 @@ void bind_combine(py::module_& module)
     });
     module.def("combine_input_staging_version", [] { return 1; });
     module.def("combine_reuse_version", [] { return 1; });
+    module.def("combine_ep8_version", [] { return 2; });
+    // Compatibility with older Python clients; both names select the EP8 pipeline.
     module.def("combine_ep8_mte_version", [] { return 2; });
     module.def("combine_profile_version", [] { return ascend_deepep::combine_diagnostics::kVersion; });
     module.def("combine_chunk_profile_version", [] { return ascend_deepep::combine_chunks::kVersion; });
@@ -249,11 +251,13 @@ void bind_combine(py::module_& module)
             sample = tensors["profile_sample"].cast<uint64_t>();
             if (!sample || sample >= (1ULL << 63)) throw std::invalid_argument("Invalid Combine profile sample");
         }
-        const bool ep8_mte = tensors.contains("ep8_rank_mte") && tensors["ep8_rank_mte"].cast<bool>();
+        const bool ep8_pipeline = tensors.contains("ep8_rank_pipeline")
+                                      ? tensors["ep8_rank_pipeline"].cast<bool>()
+                                      : tensors.contains("ep8_rank_mte") && tensors["ep8_rank_mte"].cast<bool>();
         const bool stage_input = tensors.contains("stage_input") && tensors["stage_input"].cast<bool>();
         uint8_t *reuse_backward = nullptr, *reuse_offsets = nullptr;
         if (reuse) {
-            if (stage_input || ep8_mte || profile) {
+            if (stage_input || ep8_pipeline || profile) {
                 throw std::invalid_argument("Combine reuse cannot use staging, rank-return, or legacy diagnostics");
             }
             const int64_t plan_rows = tensors["reuse_backward"].attr("size")(0).cast<int64_t>();
@@ -268,8 +272,8 @@ void bind_combine(py::module_& module)
         if (stage_input && (staging_offset > half || staging_bytes > half - staging_offset)) {
             throw std::invalid_argument("Combine input staging exceeds its reserved SHMEM half");
         }
-        if (ep8_mte && t.rank_num != 8U) {
-            throw std::invalid_argument("EP8 rank MTE requires EP8");
+        if (ep8_pipeline && t.rank_num != 8U) {
+            throw std::invalid_argument("EP8 return pipeline requires EP8");
         }
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         py::gil_scoped_release release;
@@ -297,13 +301,13 @@ void bind_combine(py::module_& module)
             input = staged;
         }
         combine_prepare_kernel_do(stream, workspace, reinterpret_cast<uint8_t*>(&t));
-        if (ep8_mte && profile) {
-            combine_ep8_mte_profile_kernel_do(stream, workspace, input, forward, counts, backward, backward_counts,
-                                              mask, ranges, masks, weights, weight_meta, profile, sample, chunk_profile,
-                                              peer_profile, reinterpret_cast<uint8_t*>(&t));
-        } else if (ep8_mte) {
-            combine_ep8_mte_kernel_do(stream, workspace, input, forward, counts, backward, backward_counts, mask,
-                                      ranges, masks, weights, weight_meta, reinterpret_cast<uint8_t*>(&t));
+        if (ep8_pipeline && profile) {
+            combine_ep8_profile_kernel_do(stream, workspace, input, forward, counts, backward, backward_counts, mask,
+                                          ranges, masks, weights, weight_meta, profile, sample, chunk_profile,
+                                          peer_profile, reinterpret_cast<uint8_t*>(&t));
+        } else if (ep8_pipeline) {
+            combine_ep8_kernel_do(stream, workspace, input, forward, counts, backward, backward_counts, mask, ranges,
+                                  masks, weights, weight_meta, reinterpret_cast<uint8_t*>(&t));
         } else if (profile) {
             combine_profile_kernel_do(stream, workspace, input, forward, counts, backward, backward_counts, mask,
                                       ranges, masks, weights, weight_meta, profile, sample, chunk_profile, peer_profile,

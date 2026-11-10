@@ -36,5 +36,17 @@
     "experiments/comm_gmm/python/deep_ep_experimental/comm_gmm/__init__.py": "f8c4bdeeb2553f34c9824d4e0d208d6d23f02b0f41e1ec4b5d54e0300eac9224",
     "experiments/comm_gmm/tests/native/tiling_validation_test.cpp": "47bd59a46c691d7ff93f0bcbf208b862ef83caa4ebb7395d127ca030de71b456"
   },
-  "sha256_normalization": "Original source text encoded as UTF-8 with LF line endings; independent of checkout autocrlf."
+  "sha256_normalization": "Original source text encoded as UTF-8 with LF line endings; independent of checkout autocrlf.",
+  "performance_sync": {
+    "commit": "3ab6b8bba2cbdaf3751596c3e4b0488e1991df5f",
+    "scope": "Inverse physical staging, workspace depth, parallel self copy and EP4/28-expert defaults for both operators; existing local correctness and runtime changes retained.",
+    "source_sha256": {
+      "experimental/mc2/catccos_udma_ops/csrc/all_to_allv_grouped_mat_mul_udma/ascend950/all_to_allv_grouped_mat_mul_udma.cpp": "786b51b7f19d46a1a7d2305ca551248b98a0497bded6f39efbf8ba08279dfaaf",
+      "experimental/mc2/catccos_udma_ops/csrc/grouped_mat_mul_all_to_allv_udma/ascend950/grouped_mat_mul_all_to_allv_udma.cpp": "5b3992a7e0ef032dd8980ee3037001dddacc325eb400a6bd2b80ff0b3073082b",
+      "experimental/mc2/catccos_udma_ops/csrc/grouped_mat_mul_all_to_allv_udma/ascend950/grouped_mat_mul_all_to_allv_udma_device.h": "a54160bca9fe84fb796baa243a5bba04555e9e051af6bc735a20a59cecee4286",
+      "experimental/mc2/catccos_udma_ops/csrc/catccos_overlay/include/catccos/dgemm/kernel/grouped_matmul_alltoallv_tla.hpp": "234e59602e410e30e75db2d7e3c9a2427a5742860098c4e9855c7b966fef6ed7",
+      "experimental/mc2/catccos_udma_ops/csrc/tiling_validation.h": "a95cea065eeb4aee93d797884c0906a89a6715b424433df7fe9ffbd861eb009b",
+      "experimental/mc2/catccos_udma_ops/validation/tiling_space.py": "69141ee19a28852fba3601dfb8683c0ee36c0beceab2aef91ba0d08b90c13aee"
+    }
+  }
 }

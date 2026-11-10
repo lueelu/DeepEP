@@ -7,16 +7,36 @@ Modified by Joyce_An 2026
 
 `deep_ep.ElasticBuffer` 提供 V2 dispatch/combine。高吞吐（HT）和低时延（LL）使用相同方法，输入、权重、布局及路径选择见 [Elastic 接口](elastic.md)。本页说明核心 `deep_ep` 的公共对象、初始化、资源生命周期和兼容范围。MegaMoE 的 `SymmBuffer/StoreGroup` 和 EpGmmFused 的 UDMA 域使用独立接口，分别见 [MegaMoE](../experiments/megamoe/README.md)与 [EpGmmFused](../experiments/ep_gmm_fused/README.md)。
 
+下文初始化方式与算子参数限制描述 Mesh+Clos 路径；公共对象表注明后端差异。新增 Clos V1/V2、自动选择和使用方式见
+[机型后端说明](machine_backends.md)，不能把 Mesh+Clos 的限制套到 Clos 路径。
+
 ## 公共对象
 
 | 对象 | 导入路径 | 用途 |
 | --- | --- | --- |
 | `ElasticBuffer`、`EPHandle` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.elastic` | V2 通信资源、dispatch/combine 及配对路由信息 |
-| `Buffer` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.legacy` | V1 资源构造、通信流、事件与销毁；V1 通信方法不在本版本支持范围内 |
-| `Config` | `deep_ep` | 保留配置签名；构造和容量查询报 `NotImplementedError` |
+| `Buffer` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.legacy` | 按机型选择 V1 后端；Clos/CARD 支持高吞吐 dispatch/combine，Mesh+Clos 仅支持资源构造、通信流、事件与销毁 |
+| `Config` | `deep_ep` | Clos V1 的核数、分块配置与容量查询，默认 32 AIV；不表示 Mesh+Clos 已支持 V1 通信 |
 | `EventHandle`、`EventOverlap` | `deep_ep`、`deep_ep.utils`、`deep_ep.utils.event` | 记录 NPU 事件、建立流依赖和保留相关 Tensor |
 
-同一对象的不同导入路径指向同一个类。普通 `import deep_ep` 不加载 Torch、torch_npu 或原生扩展；运行时调用按需加载当前安装目录的扩展并校验 SHMEM 库身份。普通导入成功不表示运行环境、算法或设备验证通过。
+同一对象的不同导入路径指向同一个类。普通 `import deep_ep` 不加载 Torch、torch_npu 或原生扩展；通信运行时调用按需加载当前安装目录的扩展并校验 SHMEM 库身份。普通导入成功不表示运行环境、算法或设备验证通过。
+
+### 公共事件与后端兼容
+
+Mesh+Clos 和 CLOS 共用 `deep_ep.EventHandle`、`deep_ep.EventOverlap`。旧的
+`deep_ep.backends.direct.event` 路径仅转发相同的类，返回事件也可使用公共类型进行检查。
+`EventHandle()` 记录当前流；`EventHandle(stream)` 记录指定的同设备 NPU 流。
+事件操作只加载 Torch/torch_npu，不要求加载某个通信后端的原生扩展。
+
+V1 的 `previous_event` 使用 `EventOverlap`，V2 使用 `EventHandle`；统一类型不改变两者的
+参数约定。`EventOverlap()` / `EventOverlap(None)` 与官方一样允许构造，空包装退出
+`with` 时不等待，显式 `current_stream_wait()` / `wait()` 则触发断言。构造器不对非空
+事件做额外类型限制，等待时调用其 `current_stream_wait()` 方法。
+
+Mesh+Clos 与 Direct 的同步调用均先建立计算流依赖，再返回 `event=None` 的包装；异步调用返回
+有效事件。hook 成功执行一次后清除，等待返回 hook 的结果。`release_handle=True`
+清除事件与内部资源，但保留用户传入的 `extra_tensors`，与官方保持一致。NPU Tensor
+的生产/消费流登记和后端资源保活作为内部适配保留，不改变这些公共语义。
 
 ## 初始化与资源
 
@@ -49,7 +69,7 @@ Modified by Joyce_An 2026
 
 `Buffer/ElasticBuffer` 的普通 Runtime 接受 EP2/4/8/16/32/64/128/256/512。对称工作区至少 2 MiB，按 2 MiB 对齐，字节数不能超过 int64 上限；实际分配受设备内存和 SHMEM 地址空间限制。各 rank 的容量相同。**这是资源准入范围；算子的 EP、shape 和容量限制另见 Elastic 文档。**
 
-`ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。`Buffer` 使用 MTE 配置，要求显式进程组、`num_scaleup_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_scaleout_bytes`；资源构造不启用 V1 通信算法。
+`ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。Mesh+Clos 的 `Buffer` 使用 MTE 配置，要求显式进程组、`num_nvl_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_rdma_bytes`；资源构造不启用 V1 通信算法。Global Clos / Mesh+PCIe 的 V1 通信能力见机型后端说明。
 
 `ElasticBuffer(use_1g_huge_pages=True)` 默认为 SHMEM 工作区申请 1 GiB 大页；所有 rank 须使用相同设置。设置为 `False` 使用 SHMEM 常规分配。`num_bytes` 仍表示逻辑容量，实际分配包含页对齐和必要的保护区。
 
@@ -69,27 +89,15 @@ Modified by Joyce_An 2026
 
 `event.current_stream_wait()` 向当前流添加依赖，不等同于 CPU 等待设备完成。读取输出、复用输入或交给另一条流之前，调用方须建立对应依赖。输入的 dtype/contiguous 转换应在 capture 之前完成。
 
-`EventOverlap` 保留事件及相关 Tensor；不能用 `EventOverlap(None)` 表示已经完成。`register_hook_after_wait()` 注册的 hook 在添加等待后执行一次，不是设备执行完成回调。上下文管理器退出也会添加等待。指定 `release_handle=True` 后释放包装所持引用，该包装不能再次等待。
+`EventOverlap` 保留事件及相关 Tensor；空包装只表示没有可等待的事件，不代表设备已完成执行。`register_hook_after_wait()` 注册的 hook 在添加等待后执行一次，不是设备执行完成回调。上下文管理器退出时仅对非空事件添加等待。指定 `release_handle=True` 后清除事件及内部资源，保留 `extra_tensors`；该空包装不能再次显式等待。
 
 HT 的 `async_with_compute_stream=True` 不在返回前为计算流添加输出依赖，调用方通过返回事件连接后续计算。fresh Notify 仍回读计数；cached Dispatch 支持 `do_cpu_sync=False`，复用 handle 的计数。Dispatch 控制区首次使用或布局变化时仍有原生 Host 同步，开启 `debug_collectives` 也会增加 Host 等待。cached Combine 复用 handle 的计数和布局，通过通信流上的 barrier 保护工作区，不保证所有调用均无 Host 阻塞。LL 只接受默认流选项。`ElasticBuffer.barrier()` 只支持显式 `with_cpu_sync=True, sequential=True` 的同步用法。
 
-## 上游兼容与平台命名
+## 接口兼容范围
 
 接口参考固定到 [DeepSeek DeepEP a56d6156](https://github.com/deepseek-ai/DeepEP/tree/a56d6156febcd9976e55adc85b5155bfac9f28f8)。[机器可读契约](../tests/api/api_contract.json)保存所选对象的参数、默认值、参考源码及哈希；它描述经过平台适配的接口，不代表上游全部 API 或行为均受支持。
 
-`scaleup/scaleout` 表示通信域，`memory_transport` 表示内存传输语义，`compute_units` 表示计算单元，QP 表示后端队列对资源。通信域不等于物理节点或某种传输引擎。迁移关键字时不保留旧平台名称别名，完整签名以机器可读契约为准。
-
-| 上游或旧名称 | 本项目名称 |
-| --- | --- |
-| `num_sms` | `num_compute_units` |
-| `num_max_nvl_chunked_send_tokens/recv_tokens` | `num_max_scaleup_chunked_send_tokens/recv_tokens` |
-| `num_max_rdma_chunked_send_tokens/recv_tokens` | `num_max_scaleout_chunked_send_tokens/recv_tokens` |
-| `num_nvl_bytes/num_rdma_bytes` | `num_scaleup_bytes/num_scaleout_bytes` |
-| `get_nvl_buffer_size_hint/get_rdma_buffer_size_hint` | `get_scaleup_buffer_size_hint/get_scaleout_buffer_size_hint` |
-| `get_low_latency_rdma_size_hint` | `get_low_latency_scaleout_size_hint` |
-| `num_tokens_per_rdma_rank` | `num_tokens_per_scaleout_rank` |
-| `get_theoretical_num_compute_units(rdma_gbs=...)` | `scaleout_gbs=...` |
-| `allow_scaleup_for_low_latency_mode/allow_multinode_scaleup` | `allow_memory_transport_for_low_latency_mode/allow_multinode_memory_transport` |
+这里保留 V1 Buffer 与旧版 V2 ElasticBuffer，不是升级为官方最新的 EPBuffer/V2.5。
 
 容量和开关名称不承诺同名对象属性，也不代表对应通信路径已启用。V1 的 `num_qps_per_rank` 仅接受默认值 24；Elastic 构造接受 `num_allocated_qps=0/6`，HT 调用接受 `num_qps=0/2`，LL 调用只接受 0。QP 不作为所有 DMA 引擎的统一资源计数。
 

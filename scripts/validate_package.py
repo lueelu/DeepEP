@@ -4,7 +4,7 @@
 
 No packages are installed into the caller's environment. --system-site-packages
 explicitly reuses a provisioned framework/SDK Python environment, not a claim
-of complete dependency isolation. CANN/SHMEM remain external system SDKs.
+of complete dependency isolation. CANN remains external; the wheel carries SHMEM.
 """
 
 import argparse
@@ -103,7 +103,7 @@ def inspect_wheel(path):
             if missing:
                 raise RuntimeError(f"Incomplete EP_GMM_FUSED wheel: {missing}")
             if any(n.startswith(component + ".libs/") for n in names):
-                raise RuntimeError("EP_GMM_FUSED must use the external SHMEM SDK; bundled libraries are unsupported")
+                raise RuntimeError("EP_GMM_FUSED must share the core SHMEM runtime, not carry a second copy")
             component_info = json.loads(archive.read(component + "_build_info.json"))
             if (
                 not info.get("shmem", {}).get("revision")
@@ -139,6 +139,23 @@ def inspect_wheel(path):
             or len(operations) != len(set(operations))
         ):
             raise RuntimeError("Invalid or unknown communication_operations build metadata")
+        runtime = info.get("shmem_runtime", {})
+        required_runtime = {
+            "libshmem.so",
+            "libshmem_utils.so",
+            "aclshmem_bootstrap_config_store.so",
+            "aclshmem_bootstrap_uid.so",
+        }
+        if set(runtime) != required_runtime:
+            raise RuntimeError("Wheel must contain the complete SHMEM runtime manifest")
+        if not any(n.endswith("cann.LICENSE") for n in names):
+            raise RuntimeError("Missing CANN license for bundled SHMEM")
+        for name, digest in runtime.items():
+            member = "deep_ep/.libs/" + name
+            if member not in names or hashlib.sha256(archive.read(member)).hexdigest() != digest:
+                raise RuntimeError(f"Missing or corrupt bundled SHMEM library: {name}")
+        if {n.removeprefix("deep_ep/.libs/") for n in names if n.startswith("deep_ep/.libs/")} != required_runtime:
+            raise RuntimeError("Unexpected files in the bundled SHMEM runtime")
         return info
 
 

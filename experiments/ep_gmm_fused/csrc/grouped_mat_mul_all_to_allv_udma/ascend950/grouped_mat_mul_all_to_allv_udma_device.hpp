@@ -34,13 +34,16 @@
 namespace deepep::ep_gmm_fused {
 
 template <class ElementA, class LayoutA, class ElementB, class LayoutB, class ElementC, class LayoutC, uint32_t M0,
-          uint32_t N0, uint32_t K0>
+          uint32_t N0, uint32_t K0, uint32_t WorkspaceStages = 2>
 struct GroupedMatMulAllToAllVUdmaConfig {
+    static_assert(WorkspaceStages == 2 || WorkspaceStages == 3,
+                  "Ascend950 BF16 UDMA MoE supports two or three workspace stages");
     using ArchTag = Catlass::Arch::Ascend950;
     static_assert(ArchTag::UB_SIZE == TilingValidation::kCompiledUbBytes, "Update the Host and Python UB budgets");
     static constexpr uint32_t kM0 = M0;
     static constexpr uint32_t kN0 = N0;
     static constexpr uint32_t kK0 = K0;
+    static constexpr uint32_t kWorkspaceStages = WorkspaceStages;
     using MmadDispatchPolicy = Catlass::Gemm::MmadPingpong<ArchTag, true, false, 1, false, 2, 2, 2, 2>;
     using L1TileShape = tla::Shape<tla::Int<M0>, tla::Int<N0>, tla::Int<K0>>;
     using L0TileShape = tla::Shape<tla::Int<M0>, tla::Int<N0>, tla::Int<64>>;
@@ -52,7 +55,6 @@ struct GroupedMatMulAllToAllVUdmaConfig {
     using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, 32>;
     static constexpr bool kIsDynamic = true;
     static constexpr uint32_t kUbStages = 2;
-    static constexpr uint32_t kWorkspaceStages = 2;
     static constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);
     using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>;
     using BlockCommScheduler =
@@ -85,6 +87,22 @@ using GroupedMatMulAllToAllVUdmaDefaultConfig =
 using GroupedMatMulAllToAllVUdmaM0_256Config =
     GroupedMatMulAllToAllVUdmaConfig<bfloat16_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor,
                                      bfloat16_t, Catlass::layout::RowMajor, 256, 128, 256>;
+
+using GroupedMatMulAllToAllVUdmaM0_256N0_256Config =
+    GroupedMatMulAllToAllVUdmaConfig<bfloat16_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor,
+                                     bfloat16_t, Catlass::layout::RowMajor, 256, 256, 256>;
+
+using GroupedMatMulAllToAllVUdmaDefaultWS3Config =
+    GroupedMatMulAllToAllVUdmaConfig<bfloat16_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor,
+                                     bfloat16_t, Catlass::layout::RowMajor, 128, 256, 256, 3>;
+
+using GroupedMatMulAllToAllVUdmaM0_256WS3Config =
+    GroupedMatMulAllToAllVUdmaConfig<bfloat16_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor,
+                                     bfloat16_t, Catlass::layout::RowMajor, 256, 128, 256, 3>;
+
+using GroupedMatMulAllToAllVUdmaM0_256N0_256WS3Config =
+    GroupedMatMulAllToAllVUdmaConfig<bfloat16_t, Catlass::layout::RowMajor, bfloat16_t, Catlass::layout::RowMajor,
+                                     bfloat16_t, Catlass::layout::RowMajor, 256, 256, 256, 3>;
 
 }  // namespace deepep::ep_gmm_fused
 

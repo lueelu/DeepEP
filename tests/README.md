@@ -13,6 +13,7 @@ Modified by Joyce_An 2026
 | --- | --- |
 | `api/` | 公开导出、签名、参数默认值和未支持操作的错误 |
 | `runtime/` | 构建预检、SDK/安装身份、资源和事件生命周期、故障传播 |
+| `clos/` | CLOS V1/V2 基础精度与事件验证、共享 CPU Golden；机型识别使用 `scripts/check_machine.py` |
 | `elastic/test_dispatch.py` | HT Notify 元数据、BF16/FP8 payload、权重、fresh/cached 和路由 |
 | `elastic/test_combine.py` | HT dispatch → 专家输出 → BF16 combine、独立权重回传、重复调用及输出生命周期 |
 | `elastic/test_ep_low_latency.py` | LL 返回、精度、重复 combine，以及 profiler kernel 耗时 |
@@ -22,6 +23,37 @@ Modified by Joyce_An 2026
 | `../experiments/ep_gmm_fused/tests/` | 通信计算融合算子的路由参考、精度、性能与 profiler；命令见[组件测试说明](../experiments/ep_gmm_fused/tests/README.md) |
 | `test_reference.py`、`test_precision.py`、`utils/` | 独立路由参考、Golden、dtype 模拟和精度比较器 |
 | `legacy/` 及通用 V2 设备用例 | 兼容性测试入口；其参数矩阵不等于当前 Elastic 算子支持范围 |
+
+## CLOS 基础验证
+
+机型识别只检查分类，不启动通信算子；`--expect` 不会强制选择后端：
+
+```bash
+python -I scripts/check_machine.py --physical-devices 0 1 2 3 4 5 6 7 --expect global_clos
+```
+
+Mesh+Clos 或 Mesh+PCIe 机器分别使用 `--expect mesh_clos` 或 `--expect mesh_pcie`。
+安装待验证的 wheel 并加载 CANN/SHMEM 环境后，在空闲设备上运行：
+
+```bash
+for api in v1 v2; do
+    timeout -k 30s 900s python tests/clos/source/test_v1_v2_shared_backend.py \
+        --api "$api" --public-auto --auto-policy \
+        --ep-size 8 --num-tokens 129 --hidden 6144 --num-topk 8 \
+        --experts-per-rank 32 --num-aiv 32 --check-events
+done
+```
+
+该入口对照独立 CPU Golden，检查 BF16 fresh/cached dispatch、payload 和路由权重、
+带/不带权重及 bias 的 combine、事件依赖和销毁后的输出。所有 rank 均须输出
+`PUBLIC_PRECISION_PASSED`，且启动器退出码为 0。`--auto-policy` 使用默认调度，保留指定的 AIV 数。
+在开发机器上强制验证 CLOS 可将 `--public-auto` 改为 `--public-clos`；这不验证自动机型选择。
+
+基础入口仅支持单机，`--ep-size` 是本机进程数。多机、FP8、展开布局及性能测量使用
+`benchmarks/clos/bench_v1_bandwidth.py` 和 `benchmarks/clos/bench_v2_bandwidth.py`，
+见[后端使用说明](../docs/machine_backends.md)。它们先验证精度再测量性能，
+共用 `tests/clos/common.py` 的参考计算和 `benchmarks/clos/profiling.py` 的采样逻辑。
+保留这些辅助文件，并避免通过 `PYTHONPATH` 用未构建的源码覆盖已安装 wheel。
 
 ## CPU 回归
 
@@ -63,6 +95,40 @@ combine 的专家输出固定 BF16、H=7168；其前置 dispatch 可用 `--dispa
 combine 默认同时检查独立权重回传；`--without-weights` 关闭该通道，不改变 hidden 的归约语义。
 
 HT 脚本也支持 kernel 测量：dispatch 入口增加 `--profile-op notify` 或 `--profile-op dispatch`，combine 入口增加 `--profile-op combine`。`--profile-warmup` 默认 5 次，`--profile-iters` 默认 10 次。先通过正确性检查，再采集各 rank 的 profiler 记录；计时范围和输出文件见[性能说明](../docs/performance.md#ht-kernel-耗时)。
+
+### Dispatch 性能测试的启动对齐
+
+`test_dispatch.py --profile-op dispatch` 和 `run_peer_table_check.py` 的 cached Dispatch 性能采样默认开启 `--dispatch-barrier`，在每次预热和正式采样的 Dispatch kernel 前插入设备侧 SHMEM barrier。barrier 位于参数检查、输出分配等准备工作之后，与 Dispatch 使用同一通信流，减少各 rank 准备速度不同带来的启动偏斜。测试默认只插入前置 barrier，结束时仍依靠 Dispatch 自身的入向完成协议。
+
+```bash
+# 默认开启前置 barrier，测量 cached Dispatch kernel。
+python tests/elastic/test_dispatch.py --ep-size 8 --nproc-per-node 8 \
+  --tokens 4096 --hidden 7168 --topk 6 --experts 512 --dtype fp8 \
+  --route random --profile-op dispatch --profile-warmup 10 --profile-iters 20 \
+  --output /tmp/dispatch-perf-aligned-001
+
+# 对照正常调用的启动行为：在同一命令中增加 --no-dispatch-barrier。
+```
+
+所有 rank 使用一致选项。`capture.json`、profiler 的 `summary.json`、peer-table 的 rank JSON 和 `kernel-summary.json` 都记录 `dispatch_entry_barrier`，汇总时检查各 rank 的开关是否一致。profiler 只统计 Dispatch kernel；peer-table Event 将 `entry_barrier` 和 `kernel` 分开统计，`device_total` 包含前置 barrier。peer-table 的 API 墙钟时间也包含该 barrier 的等待，比较结果时须保持选项和计时口径一致。
+
+这是性能用例的配置，直接使用 `buffer.dispatch()` 默认仍不插入测试 barrier。正确性阶段、Notify 和 Combine 的测量不受该选项影响。自定义 HT 测试可使用内部诊断开关：
+
+```python
+# 在所有 rank 的性能采样阶段设置；实际模型调用无需设置。
+buffer._dispatch_diagnostics = {
+    "benchmark_entry_barrier": True,
+    "kernel_timing": True,  # 收集分阶段 Event 时间；profiler 采样可设为 False。
+}
+try:
+    output = buffer.dispatch(x, handle=handle, do_expand=True)
+    output[-1].current_stream_wait()
+    # kernel_timing=True 时，在诊断字典中读取 device_ms / device_phase_names。
+finally:
+    del buffer._dispatch_diagnostics
+```
+
+`_dispatch_diagnostics` 是内部测试钩子，直接设置在 buffer 上。`benchmark_barriers=True` 表示同时开启前后置 barrier；`benchmark_entry_barrier` 单独控制前置 barrier。开启 Event 计时时 native 返回前会等待计时流，profiler 用例设置 `kernel_timing=False`，保留批量异步提交方式。该设置用于比较启动对齐后的 kernel 性能，模型调用的时延应另外测量。
 
 ## HT 多机测试
 
@@ -128,10 +194,10 @@ MTE 完成后再发布 generation 的顺序，以及出口完成协议保持不�
 64 位 generation 不复用，耗尽后要求重建 Session。
 
 冷启动、布局变化、Notify/LL 工作区复用后的控制区初始化在 Host 侧执行；
-缓存调用复用已初始化的控制区。每次调用均保留 stream drain + host 全 rank join，
-保证上次输出拷贝和标志消费完成后才能启动下一轮，不支持跨轮重叠。
-Host join 和冷初始化均在 dispatch Event 区间之外，因此 kernel Event 不能代表
-包含这些同步成本的完整 API 时延。原 profile 的 entry_barrier 槽保留但不再执行设备全局同步。
+缓存调用复用已初始化的控制区，普通 API 不逐次插入测试 barrier。
+调用方通过返回 Event 连接后续消费，保持各 rank 的调用顺序和输入输出生命周期。
+冷初始化的 Host 同步位于 dispatch Event 区间之外，因此 kernel Event 不能代表完整 API 时延。
+性能采样使用的前置 barrier 及其关闭方式见[启动对齐说明](#dispatch-性能测试的启动对齐)。
 
 ## LL 正确性与性能
 

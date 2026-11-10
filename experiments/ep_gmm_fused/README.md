@@ -6,12 +6,10 @@ Modified by Joyce_An 2026
 # EpGmmFused Beta
 
 Ascend950 上的两个 BF16 通算融合算子：`alltoallv_gmm`（AllToAllV → GMM）和
-`gmm_alltoallv`（GMM → AllToAllV）。源码迁自
-[ops-transformer MR 11602](https://gitcode.com/cann/ops-transformer/merge_requests/11602)，
-固定提交、原始文件哈希见 [upstream.json](upstream.json)；迁入代码保留原有文件头和 [CatCCOS 许可文本](csrc/catccos_overlay/LICENSE)。
+`gmm_alltoallv`（GMM → AllToAllV）。
 
 本目录包含内核、Host、Python API 和设备验证工具。根构建按 `DEEPEP_BUILD_EP_GMM_FUSED`
-选择完整实验单元。设备算术和 UDMA 完成协议沿用原 PR；Linux/CANN 原生构建、
+选择完整实验单元。Linux/CANN 原生构建、
 Ascend950 精度、性能和流水采集仍需实机验收。核心 `deep_ep` 的 V2 expanded dispatch/combine
 支持范围见 [Elastic 文档](../../docs/elastic.md)。
 
@@ -69,7 +67,7 @@ SHMEM 沿用主线 [dependencies.lock.json](../../dependencies.lock.json) 固定
 `SHMEM_SOURCE_PATH` 为同一提交的干净源码，提供 device 私有头；`SHMEM_ROOT` 为已记录身份的外部 SDK。
 `CATCCOS_SOURCE_PATH` 可显式指定；提交不匹配、源码脏或子模块不匹配时停止。
 准备脚本校验并复用已有 SDK；默认本地 SDK 尚无身份记录时，按锁定提交构建 Ascend950 SDK 并生成 manifest。
-构建使用上游 `scripts/build.sh -soc_type Ascend950`，启用 Bash 的 `errexit/pipefail`，
+构建使用 SHMEM 的 `scripts/build.sh -soc_type Ascend950`，启用 Bash 的 `errexit/pipefail`，
 成功后调用 `scripts/record_shmem_sdk.py` 记录身份；已有 manifest 不匹配时停止，不自动改写身份。
 可用 `python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" --check` 单独校验。
 默认安装目录为 `${SHMEM_SOURCE_PATH}/install/shmem`；显式指定其他 SDK 路径时只校验，不覆盖。
@@ -123,7 +121,7 @@ Gloo 使用 CPU tensor。所有成员调用 `aclshmemx_set_attr_uniqueid_args`�
 `ACLSHMEM_DATA_OP_UDMA` 后通过 UNIQUEID 模式初始化。无需传 `ep_endpoints`，也不依赖
 官方 SHMEM Python 包。默认使用已绑定的 NPU；`local_rank=` 可显式覆盖。
 
-不传 `group` 时保留原 PR DEFAULT 路径：
+不传 `group` 时使用 DEFAULT 初始化路径：
 
 ```python
 from deep_ep_experimental.ep_gmm_fused import init_udma_group, destroy_udma_group
@@ -169,6 +167,30 @@ destroy_udma_group()
 - 两算子均支持 `out=`；正向导出还支持 `all_to_allv_out=`。异步结果需按 NPU stream 规则消费。
 - 所有 rank 必须使用一致的形状配置、路由对应关系及 tiling；本库不是 autograd 封装。
 
+## Tiling 兼容与 EP4 配置
+
+两方向均支持 `128×256×256`、`256×128×256`、`256×256×256` MMAD 分块。
+`gmm_alltoallv` 的 `tiling=` 新增 `stage_rows`、`workspace_stages`、`self_copy_cores`：
+分别指定每 rank 每缓冲的 staging 行容量、2/3 级缓冲及本地拷贝 worker 数。
+`stage_rows=0` 时继续由核数、`comm_interval`、EP 和 N 推导容量。
+旧五字段配置仍有效，新增字段默认 `0/2/1`，不会继承新 shape 的三缓冲或并行拷贝设置。
+使用扩展字段须重新编译安装 wheel；原有 248 KiB UB、对齐工作区、内存重叠和动态输出检查继续生效。
+
+EP8、总专家数 256 的已有固定配置保持不变，包括逆向 `K=1024/512、N=2048` 的
+`128×256×256` 分块、通信间隔 `10/16`、本地拷贝行数 `4/16`、双缓冲及单 self-copy worker。
+
+EP4、总专家数 28（每卡 7 专家）新增以下自动选择的配置；显式 `tiling=` 可覆盖：
+
+| 算子 | 形状条件 | MMAD | staging 行数 | 缓冲级数 | 本地拷贝行数 | self-copy worker | export worker |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `alltoallv_gmm`，export 开启 | M=131072、K=3584、N=6144 | 256×256×256 | 2048 | 2 | 16 | 4 | 8 |
+| `alltoallv_gmm`，export 开启 | M=131072、K=3584、N=3072 | 256×256×256 | 2048 | 2 | 16 | 8 | 8 |
+| `gmm_alltoallv` | K=3072、N=3584 | 256×256×256 | 2048 | 3 | 8 | 8 | — |
+| `gmm_alltoallv` | K=6144、N=3584 | 256×256×256 | 2048 | 2 | 8 | 8 | — |
+
+正向非 export 调用及不匹配上述条件的形状继续使用原选择逻辑。逆向不以 rank 本地 M 为匹配条件，
+因此不均衡路由下各 rank 仍选择同一配置。新增调度的实机验证入口见[测试说明](tests/README.md)。
+
 ## API 名称与别名
 
 | 功能 | 主 API | 长名称别名 |
@@ -196,11 +218,12 @@ from deep_ep_experimental.ep_gmm_fused import (
 ## 开发与构建接入
 
 本模块沿用仓库根目录的格式和检查配置。C++ 命名空间为 `deepep::ep_gmm_fused`，
-头文件保护宏使用 `DEEPEP_EP_GMM_FUSED_*_HPP`；迁入代码保留原始版权与来源记录。
+头文件保护宏使用 `DEEPEP_EP_GMM_FUSED_*_HPP`；依赖代码保留版权与许可声明。
 
 - [组件 CMake](CMakeLists.txt) 定义可选扩展目标，由根构建在开启本模块时接入。
 - [依赖校验](../../cmake/EpGmmFusedDependencies.cmake) 解析框架依赖，检查 CatCCOS、CATLASS 和 SHMEM 源码版本及洁净状态。
 - [编译辅助](../../cmake/ascend/) 提供本模块的 AscendC 工具链和算子编译规则。
 - [依赖准备脚本](../../scripts/prepare_ep_gmm_fused_dependencies.sh) 准备源码和固定版本 SDK，下载目录不纳入本仓提交。
 
-本组件中由 Lu Lu 持有权利的代码采用根目录 [BSD 2-Clause 许可证](../../LICENSE)。迁入代码保留原有版权声明和许可证文本。
+本组件中由 Lu Lu 持有权利的代码采用根目录 [BSD 2-Clause 许可证](../../LICENSE)。
+依赖代码保留各自的版权声明和许可证文本，包括 [CatCCOS overlay 许可证](csrc/catccos_overlay/LICENSE)。

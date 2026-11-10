@@ -8,13 +8,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import sysconfig
-import time
+import tempfile
 import warnings
-from scripts.shmem_sdk_identity import validate_build_identity
 
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build import build
@@ -22,6 +22,35 @@ from setuptools.command.egg_info import egg_info
 from setuptools.command.install_lib import install_lib
 
 ROOT = Path(__file__).resolve().parent
+
+# Runtime closure of the pinned SDK; CANN and driver libraries remain external.
+SHMEM_RUNTIME_LIBRARIES = (
+    "libshmem_utils.so",
+    "aclshmem_bootstrap_config_store.so",
+    "aclshmem_bootstrap_uid.so",
+    "libshmem.so",
+)
+
+
+def bundle_shmem_runtime(sdk, destination):
+    """Copy SDK runtime files, following SDK links into a self-contained wheel."""
+    sources = [Path(sdk) / "lib" / name for name in SHMEM_RUNTIME_LIBRARIES]
+    for path in sources:
+        if not path.is_file():
+            raise RuntimeError(f"Incomplete SHMEM runtime: missing {path}")
+    directory = destination / ".libs"
+    if directory.is_symlink():
+        raise RuntimeError(f"Refusing to replace linked SHMEM staging: {directory}")
+    # This directory belongs to build staging; discard stale SDK payloads.
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir()
+    hashes = {}
+    for source in sources:
+        target = directory / source.name
+        shutil.copy2(source, target)
+        hashes[source.name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    return hashes
 
 
 class BuildEggInfo(egg_info):
@@ -40,19 +69,6 @@ def enabled(name, environment=None):
     if value not in {"ON", "OFF", "1", "0", "TRUE", "FALSE"}:
         raise ValueError(f"{name} must be ON or OFF, got {value!r}")
     return value in {"ON", "1", "TRUE"}
-
-
-def ndr_rdma_enabled(environment=None):
-    """NDR has one binary capability; MTE is a runtime selection."""
-    env = os.environ if environment is None else environment
-    if "DEEPEP_LL_RDMA" in env and env["DEEPEP_LL_RDMA"].upper() not in {"ON", "1", "TRUE"}:
-        warnings.warn(
-            "DEEPEP_LL_RDMA is deprecated and ignored: NDR always compiles HNS_1825 support. "
-            "Select --backend mte at runtime, or use kernel/ll-configurable-groups "
-            "for a build without RDMA.",
-            FutureWarning, stacklevel=2,
-        )
-    return True
 
 
 class ConfiguredBuild(build):
@@ -83,6 +99,28 @@ class CheckedInstallLib(install_lib):
         component_enabled = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
         for directory in (self.build_dir, self.install_dir):
             root = Path(directory)
+            # Renamed internal implementations must not survive in a reused
+            # wheel staging directory alongside the canonical topology packages.
+            for old in ("backends/clos", "backends/pod", "_clos_adapter.py", "_card_adapter.py"):
+                obsolete = root / "deep_ep" / old
+                files = obsolete.rglob("*") if obsolete.is_dir() else (obsolete,)
+                if any(path.is_file() and "__pycache__" not in path.parts for path in files):
+                    raise RuntimeError(
+                        f"Obsolete backend implementation at {obsolete}. "
+                        "Use a clean build/install directory for the topology package layout."
+                    )
+            compatibility = root / "ascend_deepep"
+            # Only ship the forwarding files from this source tree, never an
+            # old implementation or its native libraries left in build staging.
+            for path in compatibility.rglob("*"):
+                if not path.is_file() or "__pycache__" in path.parts:
+                    continue
+                source = ROOT / "ascend_deepep" / path.relative_to(compatibility)
+                if not source.is_file() or path.read_bytes() != source.read_bytes():
+                    raise RuntimeError(
+                        f"Obsolete ascend_deepep package file at {path}. "
+                        "Use a clean build/install directory; only the current compatibility aliases are supported."
+                    )
             for component in root.glob("**/deep_ep_experimental/ep_gmm_fused"):
                 relative = component.relative_to(root).as_posix()
                 if not component_enabled or relative != "deep_ep_experimental/ep_gmm_fused":
@@ -95,19 +133,6 @@ class CheckedInstallLib(install_lib):
 
 
 def source_fingerprint():
-    # Switching branches can leave untracked historical experiments under
-    # tests/. They are not this checkout's test inputs. Keep all real build
-    # inputs below (including new local csrc headers), but select tests from
-    # the Git index when present. Source archives have no index and retain the
-    # existing filesystem fallback. Hash working-tree bytes, never Git blobs.
-    tracked_tests = None
-    if (ROOT / ".git").exists():
-        git_env = dict(os.environ)
-        git_env.pop("LD_LIBRARY_PATH", None)
-        git_env.pop("LD_PRELOAD", None)
-        paths = subprocess.check_output(
-            ["git", "-C", str(ROOT), "ls-files", "-z", "--", "tests"], env=git_env)
-        tracked_tests = {os.fsdecode(path) for path in paths.split(b"\0") if path}
     files = [
         ROOT / name
         for name in (
@@ -141,7 +166,6 @@ def source_fingerprint():
             for path in (ROOT / name).rglob("*")
             if (path.suffix in {".sh", ".py", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
             and path.name != "_build_info.json"
-            and (name != "tests" or tracked_tests is None or path.relative_to(ROOT).as_posix() in tracked_tests)
         )
     digest = hashlib.sha256()
     for path in sorted(files):
@@ -159,7 +183,6 @@ def validate_shmem_sdk(root, expected):
     if not manifest.is_file():
         raise RuntimeError("SHMEM SDK needs deepep-sdk.json; see scripts/record_shmem_sdk.py")
     sdk = json.loads(manifest.read_text(encoding="utf-8"))
-    validate_build_identity(sdk.get("build"))
     if sdk.get("revision") != expected["revision"]:
         raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
     for relative, digest in expected["header_sha256_lf"].items():
@@ -179,38 +202,9 @@ def validate_shmem_sdk(root, expected):
 
 def build_cache_key(configuration):
     """Keep object files across source edits; isolate incompatible toolchains."""
-    # CMake retains separate timer/plain LL objects in the same native tree.
-    # Selecting diagnostics must not discard unrelated native objects.
-    identity = {key: value for key, value in configuration.items()
-                if key not in {"source_sha256", "source_version", "ll_stage_timer"}}
+    identity = {key: value for key, value in configuration.items() if key not in {"source_sha256", "source_version"}}
     identity["source_root"] = str(ROOT.resolve())
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
-
-
-def configure_identity(directory, arguments):
-    """Match explicit settings and detect manual cache edits, not source edits.
-
-    CMake's generated build graph remains responsible for source, header and
-    CMake input dependencies. It is entered even when explicit configure skips.
-    """
-    hashes = {}
-    for relative in (".", "device"):
-        tree = directory / relative
-        cache = tree / "CMakeCache.txt"
-        if not cache.is_file() or not any((tree / name).is_file() for name in ("build.ninja", "Makefile")):
-            return None
-        hashes[relative] = hashlib.sha256(cache.read_bytes()).hexdigest()
-    return {"arguments": [str(arg) for arg in arguments], "cache_sha256": hashes}
-
-
-def configuration_matches(directory, arguments):
-    expected = configure_identity(directory, arguments)
-    if expected is None:
-        return False
-    try:
-        return json.loads((directory / ".deepep-configure.json").read_text(encoding="utf-8")) == expected
-    except (OSError, ValueError):
-        return False
 
 
 def find_host_compiler(env):
@@ -258,12 +252,6 @@ def build_configuration(environment=None):
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
     default_shmem = ROOT / "third-party/shmem/install/shmem"
 
-    result["ll_stage_timer"] = enabled("DEEPEP_LL_STAGE_TIMER", env)
-    result["ll_reference_profile"] = enabled("DEEPEP_LL_REFERENCE_PROFILE", env)
-    result["ll_count_histogram"] = enabled("DEEPEP_LL_COUNT_HISTOGRAM", env)
-    if result["ll_stage_timer"] and result["ll_reference_profile"]:
-        raise RuntimeError("DEEPEP_LL_REFERENCE_PROFILE and DEEPEP_LL_STAGE_TIMER are mutually exclusive")
-    result["ll_rdma"] = ndr_rdma_enabled(env)
     result["build_type"] = env.get("DEEPEP_BUILD_TYPE", "RelWithDebInfo" if lineinfo else "Release")
     if result["build_type"] not in {"Release", "RelWithDebInfo", "Debug"}:
         raise RuntimeError("DEEPEP_BUILD_TYPE must be Release, RelWithDebInfo or Debug")
@@ -285,7 +273,6 @@ def build_configuration(environment=None):
         sdk = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(sdk, dict):
             raise ValueError("Invalid SHMEM SDK manifest")
-        validate_build_identity(sdk.get("build"))
         if sdk.get("revision") != lock["shmem"]["revision"]:
             raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
         for relative, expected in lock["shmem"]["header_sha256_lf"].items():
@@ -304,11 +291,10 @@ def build_configuration(environment=None):
         if "lib/libshmem.so" not in hashes or not any(key.startswith("include/") for key in hashes):
             raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
-        if beta == "ON" or result["ll_rdma"]:
+        if beta == "ON":
             raise
         warnings.warn(f"{exc}; continuing with SHMEM_ROOT={manifest.parent}", RuntimeWarning, stacklevel=2)
     library = manifest.parent / "lib/libshmem.so"
-    validate_build_identity(sdk.get("build"), require_rdma=True)
     if not library.is_file():
         raise RuntimeError(f"SHMEM SDK is missing {library}")
     files = sorted(
@@ -318,7 +304,6 @@ def build_configuration(environment=None):
     # Record actual inputs so replacing an unpinned SDK invalidates the build cache.
     result["shmem"] = {
         "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
-        "build": sdk["build"],
         "sha256": {
             path.relative_to(manifest.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in files
@@ -329,27 +314,35 @@ def build_configuration(environment=None):
         raise RuntimeError("pybind11 version differs from dependencies.lock.json")
     version_file = Path(result["ASCEND_HOME_PATH"]) / "compiler/version.info"
     versions = dict(line.split("=", 1) for line in version_file.read_text().splitlines() if "=" in line)
-    if versions.get("Version") not in {lock["cann_version"], "9.3.0"}:
-        raise RuntimeError(f"This runtime build requires the CANN {lock['cann_version']} qualification baseline")
+    actual = versions.get("Version", "")
+    release = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?(?:[.+-].*)?", actual)
+    minimum = tuple(int(part) for part in lock["cann_version"].split("."))
+    if release is None or tuple(int(part or 0) for part in release.groups()) < minimum:
+        raise RuntimeError(f"This runtime build requires CANN >= {lock['cann_version']}; detected {actual!r}")
     result["cann"] = {
         "version": versions["Version"],
         "timestamp": versions.get("timestamp", "unknown"),
     }
     result["source_version"] = (ROOT / "VERSION").read_text().strip()
     result["source_sha256"] = source_fingerprint()
+    import torch
+    import torch_npu
+
+    result["direct"] = {
+        "torch": torch.__version__,
+        "torch_npu": torch_npu.__version__,
+        "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+        "topk_idx_bits": 64,
+    }
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
     if beta == "ON":
-        if not env.get("CATLASS_ROOT"):
-            raise RuntimeError("MegaMoE requires explicit CATLASS_ROOT; CATLASS is no longer a submodule")
-        catlass = Path(env["CATLASS_ROOT"])
-        if not catlass.is_absolute():
-            catlass = ROOT / catlass
+        catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
             raise RuntimeError(
-                "MegaMoE requires a separate pinned CATLASS checkout at CATLASS_ROOT; "
-                "see experiments/megamoe/README.md"
+                "MegaMoE requires CATLASS: run git submodule update --init --recursive, "
+                "or set CATLASS_ROOT; see experiments/megamoe/README.md"
             )
         revision = subprocess.check_output(["git", "-C", str(catlass), "rev-parse", "HEAD"], text=True).strip()
         if revision != lock["megamoe"]["catlass_revision"]:
@@ -427,14 +420,60 @@ class VariantBuild(ConfiguredBuild):
         beta = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
         timer = os.environ.get("DEEPEP_MEGAMOE_TIMER", "OFF") == "ON"
         variant = "megamoe-timer" if beta and timer else ("megamoe" if beta else "core")
-        if enabled("DEEPEP_LL_STAGE_TIMER"):
-            variant += "-ll-timer"
-        if enabled("DEEPEP_LL_REFERENCE_PROFILE"):
-            if enabled("DEEPEP_LL_STAGE_TIMER"):
-                raise RuntimeError("DEEPEP_LL_REFERENCE_PROFILE and DEEPEP_LL_STAGE_TIMER are mutually exclusive")
-            variant += "-ll-reference"
         self.build_base = str(Path(self.build_base) / variant)
         super().finalize_options()
+
+
+def publish_source_native(destination):
+    """Expose a complete build to imports from the checkout, without mixing wheels.
+
+    Keep a private, persistent copy: setuptools staging can be temporary or be
+    overwritten by a later build. Switch all existing links through one anchor.
+    This does not run when installing a prebuilt wheel.
+    """
+    package = ROOT / "deep_ep"
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    names = ["_C" + suffix, "_clos_C" + suffix, "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    for name in names:
+        if not (destination / name).is_file():
+            raise RuntimeError(f"Incomplete native build: {destination / name}")
+    for name in SHMEM_RUNTIME_LIBRARIES:
+        if not (destination / ".libs" / name).is_file():
+            raise RuntimeError(f"Incomplete native build: {destination / '.libs' / name}")
+    names.append(".libs")
+    anchor = package / ".native-build"
+    storage = ROOT / "build" / "source-native"
+    if anchor.exists() and not anchor.is_symlink():
+        raise RuntimeError(f"Refusing to replace non-link source artifact: {anchor}")
+    if anchor.is_symlink() and anchor.resolve().parent != storage.resolve():
+        raise RuntimeError(f"Refusing to replace unmanaged source anchor: {anchor}")
+    managed = {}
+    for path in package.iterdir():
+        if path.is_symlink() and path.readlink() == Path(".native-build") / path.name:
+            managed[path.name] = path
+    for name in names:
+        path = package / name
+        if (path.exists() or path.is_symlink()) and name not in managed:
+            raise RuntimeError(f"Refusing to replace unmanaged source artifact: {path}")
+    storage.mkdir(parents=True, exist_ok=True)
+    snapshot = Path(tempfile.mkdtemp(prefix="build-", dir=storage)).resolve()
+    for name in names:
+        if name == ".libs":
+            shutil.copytree(destination / name, snapshot / name)
+        else:
+            shutil.copy2(destination / name, snapshot / name)
+    # Install new names before publishing the completed snapshot. Old names use
+    # the previous snapshot until the anchor is atomically replaced.
+    for name in names:
+        if name not in managed:
+            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name == ".libs")
+    pending = snapshot / "anchor"
+    pending.symlink_to(os.path.relpath(snapshot, package), target_is_directory=True)
+    os.replace(pending, anchor)
+    for name, path in managed.items():
+        if name not in names:
+            path.unlink()
+    print(f"Prepared source native links in {package}")
 
 
 class CMakeBuild(build_ext):
@@ -442,14 +481,13 @@ class CMakeBuild(build_ext):
         # Check before setuptools temporarily clears inplace during run().
         if enabled("DEEPEP_BUILD_EP_GMM_FUSED") and (self.inplace or self.editable_mode):
             raise RuntimeError("EP_GMM_FUSED requires a wheel; editable/inplace builds are not supported")
+        self._publish_source_links = not (self.inplace or self.editable_mode)
         super().run()
 
     def build_extension(self, ext):
         import pybind11
 
-        started = time.perf_counter()
         configuration = build_configuration()
-        seconds = {"preflight": time.perf_counter() - started}
         megamoe = configuration.get("megamoe", {})
         ep_gmm_fused = configuration.get("ep_gmm_fused", {}).get("enabled", False)
         fingerprint = build_cache_key(configuration)
@@ -469,9 +507,6 @@ class CMakeBuild(build_ext):
             directory,
             f"-DCMAKE_BUILD_TYPE={configuration['build_type']}",
             f"-DDEEPEP_DEVICE_JOBS={jobs}",
-            f"-DDEEPEP_LL_STAGE_TIMER={'ON' if configuration.get('ll_stage_timer', False) else 'OFF'}",
-            f"-DDEEPEP_LL_REFERENCE_PROFILE={'ON' if configuration.get('ll_reference_profile', False) else 'OFF'}",
-            f"-DDEEPEP_LL_COUNT_HISTOGRAM={'ON' if configuration.get('ll_count_histogram', False) else 'OFF'}",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
@@ -491,23 +526,9 @@ class CMakeBuild(build_ext):
                     *(f"-D{name}={value}" for name, value in configuration["ep_gmm_fused_paths"].items()),
                 ]
             )
-        configure_skipped = configuration_matches(directory, arguments)
-        stamp = directory / ".deepep-configure.json"
-        # A failed configure/build must not leave an apparently valid new stamp.
-        stamp.unlink(missing_ok=True)
-        phase = time.perf_counter()
-        if not configure_skipped:
-            checked_run(arguments)
-        seconds["configure"] = time.perf_counter() - phase
-        phase = time.perf_counter()
+        checked_run(arguments)
         checked_run([cmake, "--build", directory, "--parallel", jobs])
-        seconds["build"] = time.perf_counter() - phase
-        phase = time.perf_counter()
         checked_run([cmake, "--install", directory])
-        seconds["install"] = time.perf_counter() - phase
-        identity = configure_identity(directory, arguments)
-        if identity is not None:
-            stamp.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
         # A reused setuptools build_lib may still contain the former library.
         (destination / "libdeepep_notify.so").unlink(missing_ok=True)
         # Elastic implementation/layout modules now live under buffers/.
@@ -532,6 +553,7 @@ class CMakeBuild(build_ext):
         }
         info["compiler"] = json.loads((directory / "compiler-info.json").read_text())
         info.update(json.loads((directory / "capabilities.json").read_text(encoding="utf-8")))
+        info["shmem_runtime"] = bundle_shmem_runtime(configuration["SHMEM_ROOT"], destination)
         (destination / "_build_info.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
@@ -551,15 +573,6 @@ class CMakeBuild(build_ext):
             (component / "_build_info.json").write_text(
                 json.dumps(component_info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
-        seconds["total"] = time.perf_counter() - started
-        report = directory / "build-timing.json"
-        timing = {"cache_key": fingerprint, "configure_skipped": configure_skipped,
-                  "ll_stage_timer": configuration.get("ll_stage_timer", False),
-                  "ll_reference_profile": configuration.get("ll_reference_profile", False),
-                  "source_sha256": configuration["source_sha256"], "jobs": int(jobs),
-                  "completed_unix_ns": time.time_ns(), "seconds": seconds}
-        report.write_text(json.dumps(timing, indent=2) + "\n", encoding="utf-8")
-        with (directory / "build-timings.jsonl").open("a", encoding="utf-8") as history:
-            history.write(json.dumps(timing, sort_keys=True) + "\n")
-        print(f"Native build: configure {'reused' if configure_skipped else 'run'}, "
-              f"build {seconds['build']:.3f}s, install {seconds['install']:.3f}s; report: {report}", flush=True)
+        # Run only after every native artifact and its build identity is ready.
+        if getattr(self, "_publish_source_links", not (self.inplace or self.editable_mode)):
+            publish_source_native(destination)

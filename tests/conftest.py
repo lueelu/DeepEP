@@ -7,6 +7,24 @@ import os
 import pytest
 
 
+@pytest.fixture
+def shmem_wheel_payload():
+    """Write the synthetic runtime closure for package-content tests."""
+    import hashlib
+
+    def write(archive):
+        names = ("libshmem.so", "libshmem_utils.so", "aclshmem_bootstrap_config_store.so", "aclshmem_bootstrap_uid.so")
+        hashes = {}
+        for name in names:
+            data = name.encode()
+            archive.writestr("deep_ep/.libs/" + name, data)
+            hashes[name] = hashlib.sha256(data).hexdigest()
+        archive.writestr("licenses/cann.LICENSE", "fixture")
+        return hashes
+
+    return write
+
+
 DEVICE_CAPABILITIES = frozenset(
     {
         "legacy",

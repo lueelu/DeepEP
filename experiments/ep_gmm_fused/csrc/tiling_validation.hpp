@@ -29,6 +29,9 @@ struct AllToAllV {
 
 struct GroupedMatMul {
     uint32_t m0, n0, k0, commInterval, localCopyTileRows;
+    uint32_t stageRows{0};
+    uint32_t workspaceStages{2};
+    uint32_t selfCopyCores{1};
 };
 
 inline uint64_t CeilDiv(uint64_t value, uint64_t divisor)
@@ -94,16 +97,30 @@ inline const char* ParseAllToAllV(const int64_t* values, size_t count, bool expo
 
 inline const char* ParseGroupedMatMul(const int64_t* values, size_t count, GroupedMatMul& result)
 {
-    if (const char* error = CheckValues(values, count, 5, 5)) {
+    if (count != 5 && count != 8) {
+        return "GroupedMatMul tiling requires 5 legacy or 8 physical fields";
+    }
+    if (const char* error = CheckValues(values, count, count, 5)) {
         return error;
     }
     result = {static_cast<uint32_t>(values[0]), static_cast<uint32_t>(values[1]), static_cast<uint32_t>(values[2]),
               static_cast<uint32_t>(values[3]), static_cast<uint32_t>(values[4])};
-    if (!IsCompiledShape(result.m0, result.n0, result.k0, false)) {
+    if (count == 8) {
+        result.stageRows = static_cast<uint32_t>(values[5]);
+        result.workspaceStages = static_cast<uint32_t>(values[6]);
+        result.selfCopyCores = static_cast<uint32_t>(values[7]);
+    }
+    if (!IsCompiledShape(result.m0, result.n0, result.k0, true)) {
         return "tiling MMAD shape has no compiled GroupedMatMul kernel instance";
     }
     if (result.localCopyTileRows > kIntMax / 2) {
         return "local_copy_tile_rows * 2 exceeds int32 range";
+    }
+    if (result.stageRows % result.m0 != 0) {
+        return "stage_rows must be zero (derived) or divisible by M0";
+    }
+    if (result.workspaceStages != 2 && result.workspaceStages != 3) {
+        return "workspace_stages must be 2 or 3";
     }
     return nullptr;
 }
@@ -155,17 +172,33 @@ inline const char* ValidateGroupedMatMul(const GroupedMatMul& tiling, uint32_t n
     if (const char* error = CheckHardware(worldSize, coreCount, ubBytes)) {
         return error;
     }
-    const uint64_t blocks = static_cast<uint64_t>(coreCount) * tiling.commInterval;
-    if (blocks > kUintMax || blocks % worldSize != 0) {
-        return "AI-core count * comm_interval must fit uint32 and be divisible by world_size";
-    }
     const uint64_t nLoops = CeilDiv(n, tiling.n0);
-    if (nLoops == 0 || n > kUintMax - tiling.n0 + 1 || blocks / worldSize < nLoops) {
-        return "tiling requires AI-core count * comm_interval / world_size >= ceil(N / N0)";
+    if (nLoops == 0 || n > kUintMax - tiling.n0 + 1) {
+        return "N must be positive and its tile ceiling must fit uint32";
     }
-    const uint64_t stageRows = (blocks / worldSize / nLoops) * tiling.m0;
-    if (stageRows > kUintMax / worldSize || stageRows > kSymmetricDataBytes / 4 / worldSize / n) {
+    if (tiling.selfCopyCores == 0 || static_cast<uint64_t>(worldSize) + tiling.selfCopyCores - 1 > coreCount) {
+        return "self_copy_cores exceeds the available AIV worker pool";
+    }
+    if (tiling.stageRows % tiling.m0 != 0 || (tiling.workspaceStages != 2 && tiling.workspaceStages != 3)) {
+        return "invalid GroupedMatMul physical staging profile";
+    }
+    uint64_t stageRows = tiling.stageRows;
+    if (stageRows == 0) {
+        const uint64_t blocks = static_cast<uint64_t>(coreCount) * tiling.commInterval;
+        if (blocks > kUintMax || blocks % worldSize != 0) {
+            return "AI-core count * comm_interval must fit uint32 and be divisible by world_size";
+        }
+        if (blocks / worldSize < nLoops) {
+            return "tiling requires AI-core count * comm_interval / world_size >= ceil(N / N0)";
+        }
+        stageRows = (blocks / worldSize / nLoops) * tiling.m0;
+    }
+    if (stageRows > kUintMax / worldSize ||
+        stageRows > kSymmetricDataBytes / 2 / tiling.workspaceStages / worldSize / n) {
         return "tiling exceeds the target-order symmetric workspace capacity";
+    }
+    if ((stageRows / tiling.m0) * worldSize * nLoops > kUintMax - coreCount) {
+        return "tiling MMAD task grid exceeds the uint32 scheduler range";
     }
     const uint64_t alignedColumns = CeilDiv(n, 16) * 16;
     if (4ULL * tiling.localCopyTileRows * alignedColumns + kWqeScratchBytes > std::min(ubBytes, kCompiledUbBytes)) {

@@ -38,7 +38,7 @@ __aicore__
     inline constexpr uint32_t
     DefaultClosPeerTableOptions(uint32_t world)
 {
-    // EP32/64: balanced+window. EP128/256: balanced+pod-staged.
+    // EP32/64: balanced+window. EP128/256: balanced+mesh_clos-staged.
     return kClosPeerTableSplitQp | kClosPeerTableAddressReady | kClosPeerTableQp1EightWorkers |
            kClosPeerTableBalancedLayout | (world >= 128U ? kClosPeerTablePodStaged : 0U);
 }

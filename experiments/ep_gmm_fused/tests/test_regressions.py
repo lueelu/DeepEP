@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by zhu-mingzhe71 2026
 
-"""CPU regressions for UB budgets, Tensor overlap and route-dependent Meta shapes."""
+"""CPU regressions for tiling compatibility, resource budgets and Tensor contracts."""
 
 import importlib.util
 from pathlib import Path
@@ -50,7 +50,106 @@ def test_forward_copy_budget(tiling):
             tiling.validate_tiling(tiling.ALL_TO_ALLV, profile)
 
 
-def test_native_ub_budget(tmp_path):
+@pytest.mark.parametrize(
+    "world,experts,k,n,export,values",
+    [
+        (8, 256, 2048, 1024, False, (128, 256, 256, 128, 1536, 2, 64, 1, 0, 1)),
+        (8, 256, 2048, 1024, True, (256, 256, 256, 32, 1280, 3, 16, 1, 24, 8)),
+        (8, 256, 2048, 512, False, (256, 128, 256, 128, 1536, 2, 64, 1, 0, 1)),
+        (8, 256, 2048, 512, True, (256, 128, 256, 64, 1280, 2, 8, 1, 0, 8)),
+        (4, 28, 3584, 6144, True, (256, 256, 256, 32, 2048, 2, 16, 1, 8, 4)),
+        (4, 28, 3584, 3072, True, (256, 256, 256, 32, 2048, 2, 16, 1, 8, 8)),
+    ],
+)
+def test_forward_fixed_profiles(tiling, world, experts, k, n, export, values):
+    case = dict(
+        operator=tiling.ALL_TO_ALLV,
+        shape=dict(m=131072, k=k, n=n),
+        world_size=world,
+        expert_num=experts,
+        output_all_to_allv=export,
+    )
+    assert tiling.default_tiling(case) == dict(zip(tiling.TILING_FIELDS[tiling.ALL_TO_ALLV], values))
+    if world == 4:
+        for changes in (
+            dict(output_all_to_allv=False),
+            dict(expert_num=32),
+            dict(world_size=8),
+            dict(shape=dict(m=131071, k=k, n=n)),
+            dict(shape=dict(m=131072, k=k + 1, n=n)),
+            dict(shape=dict(m=131072, k=k, n=n + 1)),
+        ):
+            assert tiling.default_tiling(dict(case, **changes))["m0"] == 128
+
+
+@pytest.mark.parametrize(
+    "world,experts,k,n,values",
+    [
+        (8, 256, 1024, 2048, (128, 256, 256, 10, 4, 0, 2, 1)),
+        (8, 256, 512, 2048, (128, 256, 256, 16, 16, 0, 2, 1)),
+        (4, 28, 3072, 3584, (256, 256, 256, 8, 8, 2048, 3, 8)),
+        (4, 28, 6144, 3584, (256, 256, 256, 8, 8, 2048, 2, 8)),
+    ],
+)
+def test_inverse_fixed_profiles_and_legacy_overrides(tiling, world, experts, k, n, values):
+    expected = dict(zip(tiling.TILING_FIELDS[tiling.GROUPED_MATMUL], values))
+    # Rank-local M must not select different schedules under imbalanced routing.
+    for m in (1, 131084, 262144):
+        case = dict(operator=tiling.GROUPED_MATMUL, shape=dict(m=m, k=k, n=n), world_size=world, expert_num=experts)
+        assert tiling.default_tiling(case) == expected
+    legacy = {name: expected[name] for name in tiling.TILING_FIELDS[tiling.GROUPED_MATMUL][:5]}
+    for profile in (expected, legacy):
+        normalized = tiling.validate_tiling(tiling.GROUPED_MATMUL, profile, n=n, world_size=world, aic_cores=32)
+        assert normalized == (
+            expected if profile is expected else dict(legacy, stage_rows=0, workspace_stages=2, self_copy_cores=1)
+        )
+    assert len(legacy) == 5
+    if world == 4:
+        for changes in (dict(expert_num=32), dict(world_size=8), dict(shape=dict(m=1, k=k + 1, n=n))):
+            default = tiling.default_tiling(dict(case, **changes))
+            assert (default["stage_rows"], default["workspace_stages"], default["self_copy_cores"]) == (0, 2, 1)
+
+
+@pytest.mark.parametrize("shape", [(128, 256, 256), (256, 128, 256), (256, 256, 256)])
+@pytest.mark.parametrize("stages", [2, 3])
+def test_inverse_physical_staging_bounds(tiling, shape, stages):
+    profile = dict(zip(tiling.TILING_FIELDS[tiling.GROUPED_MATMUL], (*shape, 1, 8, 2048, stages, 8)))
+    arguments = dict(n=3584, world_size=4, aic_cores=30, ub_bytes=256 * 1024)
+    # Explicit staging works even when core count / EP is not divisible.
+    assert tiling.validate_tiling(tiling.GROUPED_MATMUL, profile, **arguments) == profile
+    for changes, match in (
+        (dict(stage_rows=0), "divisible"),
+        (dict(stage_rows=2049), "divisible"),
+        (dict(workspace_stages=4), "workspace_stages"),
+        (dict(self_copy_cores=0), "self_copy_cores"),
+        (dict(self_copy_cores=30), "worker pool"),
+        (dict(stage_rows=8192), "workspace"),
+        (dict(local_copy_tile_rows=18), "UB capacity"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            tiling.validate_tiling(tiling.GROUPED_MATMUL, dict(profile, **changes), **arguments)
+
+
+def test_search_deduplicates_derived_and_explicit_staging(tiling):
+    case = dict(operator=tiling.GROUPED_MATMUL, shape=dict(m=131072, k=1024, n=2048), world_size=8, expert_num=256)
+    candidates = tiling.candidates_for_case(
+        case,
+        space=dict(
+            stage_rows=[0, 640],
+            comm_interval=[10, 11],
+            workspace_stages=[2],
+            self_copy_cores=[1],
+            local_copy_tile_rows=[4],
+            **{"mmad": [[128, 256, 256]]},
+        ),
+        strategy="exhaustive",
+        max_candidates=None,
+        aic_cores=32,
+    )
+    assert candidates == [tiling.default_tiling(case)]
+
+
+def test_native_tiling_validation(tmp_path):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("C++17 compiler required for production Host validation")
@@ -73,6 +172,17 @@ int main() {
     assert(ValidateAllToAllV(forward, 128, 256, 2, 32, 256 * 1024) == nullptr);
     forward.localCopyTileRows = 248;
     assert(ValidateAllToAllV(forward, 128, 256, 2, 32, 256 * 1024) != nullptr);
+    int64_t physical[]{256, 256, 256, 1, 8, 2048, 3, 8};
+    int64_t legacy[]{128, 256, 256, 10, 4};
+    assert(ParseGroupedMatMul(physical, 8, inverse) == nullptr);
+    assert(ValidateGroupedMatMul(inverse, 3584, 4, 30, 248 * 1024) == nullptr);
+    inverse.selfCopyCores = 30;
+    assert(ValidateGroupedMatMul(inverse, 3584, 4, 30, 248 * 1024) != nullptr);
+    assert(ParseGroupedMatMul(legacy, 5, inverse) == nullptr);
+    assert(inverse.stageRows == 0 && inverse.workspaceStages == 2 && inverse.selfCopyCores == 1);
+    assert(ParseGroupedMatMul(physical, 7, inverse) != nullptr);
+    physical[6] = 4;
+    assert(ParseGroupedMatMul(physical, 8, inverse) != nullptr);
 }
 """,
         encoding="utf-8",

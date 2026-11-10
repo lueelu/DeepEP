@@ -38,9 +38,14 @@ endif()
 # depending only on the .cpp files; that would silently reuse stale kernels.
 add_custom_target(device_build
     COMMAND "${CMAKE_COMMAND}" --build "${DEEPEP_DEVICE_BINARY_DIR}" --parallel "${DEEPEP_DEVICE_JOBS}"
-    BYPRODUCTS "${DEEPEP_DEVICE_LIBRARY}"
+    BYPRODUCTS "${DEEPEP_DEVICE_LIBRARY}" "${DEEPEP_DEVICE_BINARY_DIR}/libdeepep_clos_kernels.so"
     VERBATIM)
 add_library(deepep_device SHARED IMPORTED)
 set_target_properties(deepep_device PROPERTIES IMPORTED_LOCATION "${DEEPEP_DEVICE_LIBRARY}")
 add_dependencies(deepep_device device_build)
 install(FILES "${DEEPEP_DEVICE_LIBRARY}" DESTINATION .)
+add_library(deepep_clos_device SHARED IMPORTED)
+set_target_properties(deepep_clos_device PROPERTIES
+    IMPORTED_LOCATION "${DEEPEP_DEVICE_BINARY_DIR}/libdeepep_clos_kernels.so")
+add_dependencies(deepep_clos_device device_build)
+install(FILES "${DEEPEP_DEVICE_BINARY_DIR}/libdeepep_clos_kernels.so" DESTINATION .)

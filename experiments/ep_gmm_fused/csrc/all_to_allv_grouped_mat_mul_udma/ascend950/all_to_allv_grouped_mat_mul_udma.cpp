@@ -85,6 +85,12 @@ constexpr TilingProfile kM131072K2048N512ExportTiling{
 // commNpuSplit/commDataSplit remain recorded for traceability but are not
 // consumed by this operator's current host/kernel ABI.
 
+// CatCCOS export search winners for four ranks and 28 experts.
+constexpr TilingProfile kM131072K3584N6144ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 32, 32, 1, 16, 2048, 2, 16, 1, 8, 4};
+constexpr TilingProfile kM131072K3584N3072ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 32, 32, 1, 16, 2048, 2, 16, 1, 8, 8};
+
 const TilingProfile& SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
                                   bool outputAllToAllV)
 {
@@ -93,6 +99,15 @@ const TilingProfile& SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t w
     // to a rank and may differ, so it must not participate in tiling selection.
     // This operator requires the input M/K/N and the export mode to be
     // rank-invariant; those values are therefore safe selection keys.
+    const bool isFourRank28ExpertCase = worldSize == 4 && expertNum == 28;
+    if (isFourRank28ExpertCase && outputAllToAllV && m == 131072 && k == 3584) {
+        if (n == 6144) {
+            return kM131072K3584N6144ExportTiling;
+        }
+        if (n == 3072) {
+            return kM131072K3584N3072ExportTiling;
+        }
+    }
     const bool isEightRank256ExpertCase = worldSize == 8 && expertNum == 256;
     if (isEightRank256ExpertCase && m == 131072 && k == 2048 && n == 1024) {
         return outputAllToAllV ? kM131072K2048N1024ExportTiling : kM131072K2048N1024NonExportTiling;

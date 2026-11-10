@@ -141,12 +141,17 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
                 component.mkdir(parents=True)
 
     monkeypatch.setattr(build, "checked_run", run)
+    monkeypatch.setattr(build, "bundle_shmem_runtime", lambda sdk, target: {"test": "hash"})
+    published = []
+    monkeypatch.setattr(build, "publish_source_native", published.append)
     if expected_jobs is None:
         with pytest.raises(RuntimeError, match="must be in"):
             command.build_extension(ext)
         assert not calls
+        assert not published
         return
     command.build_extension(ext)
+    assert published == [destination.resolve()]
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert f"-DDEEPEP_DEVICE_JOBS={expected_jobs}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
@@ -223,7 +228,7 @@ def packaging_source(tmp_path):
     for name in ("setup.py", "build_support.py", "VERSION", "pyproject.toml", "scripts/shmem_sdk_identity.py"):
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / name, tmp_path / name)
-    for directory in ("deep_ep", "experiments/ep_gmm_fused/python"):
+    for directory in ("deep_ep", "ascend_deepep", "experiments/ep_gmm_fused/python"):
         shutil.copytree(ROOT / directory, tmp_path / directory, ignore=shutil.ignore_patterns("__pycache__"))
     return tmp_path
 
@@ -248,6 +253,7 @@ def test_switching_component_and_lineinfo_produces_clean_wheels(packaging_source
         assert any(n.startswith(component) for n in names) is (enabled == "ON")
         assert not any(component in n and not n.startswith(component) for n in names)
         assert not any("ep-gmm-fused-shared" in n for n in names)
+        assert [n for n in names if n.startswith("ascend_deepep/")] == ["ascend_deepep/__init__.py"]
 
 
 @pytest.mark.parametrize("prefix", ["ep-gmm-fused-shared", "ep-gmm-fused-shared-lineinfo", ""])
@@ -263,6 +269,72 @@ def test_old_or_explicitly_reused_staging_cannot_leak_into_core_wheel(packaging_
     assert "Stale EP_GMM_FUSED staging" in result.stderr
     assert stale.is_file()  # No implicit recursive deletion of user caches.
     assert not list((packaging_source / "dist").glob("*.whl"))
+
+
+@pytest.mark.parametrize(
+    "filename", ["__init__.py", "buffer.py", "utils/__init__.py", "lib/libascend_deepep_kernels.so"]
+)
+def test_old_implementation_cannot_leak_from_reused_build_staging(packaging_source, filename):
+    result = run_packaging(packaging_source, "OFF", "OFF", "build_py")
+    assert result.returncode == 0, result.stderr
+    staging = next((packaging_source / "build").glob("lib*"))
+    stale = staging / "ascend_deepep" / filename
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("# Obsolete compatibility package from a previous build.\n")
+    result = run_packaging(packaging_source, "OFF", "OFF", "bdist_wheel", "--skip-build")
+    assert result.returncode != 0
+    assert "Obsolete ascend_deepep package" in result.stderr
+    assert stale.is_file()
+    assert not list((packaging_source / "dist").glob("*.whl"))
+
+
+def test_compatibility_imports_from_packaged_files_outside_checkout(packaging_source):
+    result = run_packaging(packaging_source, "OFF", "OFF", "build_py")
+    assert result.returncode == 0, result.stderr
+    result = run_packaging(packaging_source, "OFF", "OFF", "bdist_wheel", "--skip-build")
+    assert result.returncode == 0, result.stderr
+    installed = packaging_source / "isolated-package"
+    with zipfile.ZipFile(next((packaging_source / "dist").glob("*.whl"))) as archive:
+        archive.extractall(installed)
+    code = """
+import importlib
+import sys
+sys.path.insert(0, sys.argv[1])
+import ascend_deepep, deep_ep
+from ascend_deepep.buffer import Buffer
+from ascend_deepep.elastic import ElasticBuffer
+from ascend_deepep.config import Config
+from ascend_deepep.event import EventHandle
+assert Buffer is ascend_deepep.Buffer is deep_ep.Buffer
+assert ElasticBuffer is ascend_deepep.ElasticBuffer is deep_ep.ElasticBuffer
+assert Config is ascend_deepep.Config is deep_ep.Config
+assert EventHandle is deep_ep.EventHandle
+for name in ('expand', 'resources', 'dtypes', 'utils'):
+    module = importlib.import_module('ascend_deepep.' + name)
+    assert module is getattr(ascend_deepep, name)
+assert 'torch' not in sys.modules and 'deep_ep._C' not in sys.modules
+assert ascend_deepep.__file__.startswith(sys.argv[1])
+assert deep_ep.__file__.startswith(sys.argv[1])
+from types import ModuleType
+torch = ModuleType('torch')
+torch.int32, torch.int64 = 'int32', 'int64'
+sys.modules['torch'] = torch
+from ascend_deepep.utils import align_up
+from ascend_deepep.dtypes import topk_idx_t
+from ascend_deepep.expand import ExpandHandle
+from ascend_deepep.resources import Handle, Slot, SlotState
+assert align_up(33, 32) == 64
+for name in ('topk_idx_t', 'ExpandHandle', 'Handle', 'Slot', 'SlotState'):
+    assert globals()[name] is getattr(deep_ep, name)
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code, str(installed)],
+        cwd=packaging_source,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.fixture
@@ -349,13 +421,16 @@ def test_lineinfo_only_affects_component_builds(build, sdk_environment, ep_gmm_f
 
 
 @pytest.mark.parametrize("component", ["ep_gmm_fused", "other", "nested"])
-def test_disabled_component_check_leaves_other_experiments_alone(tmp_path, component):
+def test_disabled_component_check_leaves_other_experiments_alone(tmp_path, component, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
     wheel = tmp_path / "test.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("deep_ep/_C.fake.so", b"test")
         archive.writestr("deep_ep/deepseek-deepep.LICENSE", b"test")
-        archive.writestr("deep_ep/_build_info.json", json.dumps({"communication_operations": []}))
+        archive.writestr(
+            "deep_ep/_build_info.json",
+            json.dumps({"communication_operations": [], "shmem_runtime": shmem_wheel_payload(archive)}),
+        )
         archive.writestr("deep_ep_experimental/__init__.py", "")
         name = (
             "ep-gmm-fused-shared/deep_ep_experimental/ep_gmm_fused/__init__.py"

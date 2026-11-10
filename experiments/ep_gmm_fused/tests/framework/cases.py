@@ -119,6 +119,10 @@ def generate(suite="smoke", seed=20260920, random_count=24):
             )
             for k in (512, 1024)
         ]
+        ep4 = replace(base, ep_size=4, local_experts=7, m=131072, route="balanced", preallocate=True)
+        cases += [replace(ep4, k=3584, n=n, export=True) for n in (3072, 6144)] + [
+            replace(ep4, operator="gmm_alltoallv", k=k, n=3584) for k in (3072, 6144)
+        ]
     if suite != "smoke":
         for op in ("alltoallv_gmm", "gmm_alltoallv"):
             for ep in (1, 2, 4, 8):

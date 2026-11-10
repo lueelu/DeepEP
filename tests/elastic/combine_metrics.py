@@ -40,21 +40,30 @@ NOTE = (
 
 
 def decode_profile(
-    records, *, rank, world, tokens, topk, weights, sample, chunk_tokens=256, hidden=7168, ep8_rank_mte=False
+    records, *, rank, world, tokens, topk, weights, sample, chunk_tokens=256, hidden=7168, ep8_rank_pipeline=False
 ):
-    if ep8_rank_mte and world != 8:
-        raise ValueError("EP8 rank MTE diagnostics require EP8")
+    if ep8_rank_pipeline and world != 8:
+        raise ValueError("EP8 return pipeline diagnostics require EP8")
     if len(records) != 64:
         raise ValueError("Expected 64 Combine AIV records")
     cores = []
     version = records[0][1] if len(records[0]) > 1 else 0
     words_per_record = {3: 64, VERSION: WORDS}.get(version)
     cross = 16 if world > 8 else 0
-    local = 32 if ep8_rank_mte else min(world, 8)
+    compact = ep8_rank_pipeline and len(records[11]) == WORDS and records[11][6] == 3
+    local = (11 if compact else 32) if ep8_rank_pipeline else min(world, 8)
     for core, words in enumerate(records):
         if len(words) != words_per_record or any(type(v) is not int or not 0 <= v < 2**63 for v in words):
             raise ValueError("Invalid Combine summary record width/version")
-        role = 0 if core < local else 1 if 8 <= core < 8 + cross else 2 if core >= 8 + cross else 3
+        role = (
+            0
+            if core < local
+            else 1
+            if 8 <= core < 8 + cross
+            else 2
+            if core >= (32 if ep8_rank_pipeline else 8 + cross)
+            else 3
+        )
         if words[:9] != [MAGIC, version, rank, core, world, tokens, role, int(weights), sample]:
             raise ValueError(f"Missing/stale Combine profile rank={rank} core={core}")
         v = dict(zip(FIELDS if version == VERSION else FIELDS[:63], words))
@@ -231,7 +240,8 @@ def summarize(reports):
         if (
             d["schema_version"] not in (3, VERSION)
             or (d["ticks_per_us"], d["precision_checked"]) != (TICKS_PER_US, True)
-            or d["kernel"] not in ("combine_profile_kernel", "combine_ep8_mte_profile_kernel")
+            or d["kernel"]
+            not in ("combine_profile_kernel", "combine_ep8_profile_kernel", "combine_ep8_mte_profile_kernel")
         ):
             raise ValueError("Invalid Combine diagnostic schema/precision/kernel")
         cores = decode_profile(
@@ -244,7 +254,7 @@ def summarize(reports):
             sample=d["sample"],
             chunk_tokens=d.get("chunk_tokens", 256),
             hidden=d["hidden"],
-            ep8_rank_mte=d["kernel"] == "combine_ep8_mte_profile_kernel",
+            ep8_rank_pipeline=d["kernel"] != "combine_profile_kernel",
         )
         for c in cores:
             for name, value in c["phases_us"].items():

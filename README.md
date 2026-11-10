@@ -11,6 +11,10 @@ Modified by Joyce_An 2026
 
 **DeepEP 昇腾版本**（`Ascend/DeepEP`）是面向 Ascend NPU 混合专家模型（Mixture-of-Experts，MoE）推理的专家并行（Expert Parallelism，EP）通信库，提供高吞吐 **Prefill**、低时延 **Decode** 通信，以及实验性 **MegaMoE** 融合推理。
 
+支持 Mesh+PCIe、Mesh+Clos 和 Global Clos 三种拓扑入口，共用 CANN SHMEM。
+自动识别、手动选择及使用方式见 [机型后端说明](docs/machine_backends.md)。
+以下 HT/LL/MegaMoE 描述对应 Mesh+Clos 路径。
+
 ## 最新进展
 
 ---
@@ -77,14 +81,15 @@ DeepEP/
 
 ### 安装 SHMEM 依赖
 
-按照[构建指南](docs/build.md)准备 SHMEM SDK，加载 CANN 与 SHMEM 环境：
+源码构建时按照[构建指南](docs/build.md)准备 SHMEM SDK，并加载 CANN 环境：
 
 ```bash
 source /path/to/ascend-toolkit/set_env.sh
 export SHMEM_ROOT=/path/to/shmem-sdk
-source "$SHMEM_ROOT/set_env.sh"
-export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 ```
+
+wheel 包含构建所用的 SHMEM 运行库。安装后只需加载匹配的 CANN 环境，
+无需设置 `SHMEM_ROOT` 或手动添加 SHMEM 的 `LD_LIBRARY_PATH`；`SHMEM_ROOT` 仅用于选择构建 SDK。
 
 ### 开发
 

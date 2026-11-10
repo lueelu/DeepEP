@@ -31,11 +31,20 @@ TILING_FIELDS = {
         "export_core_count",
         "self_copy_cores",
     ),
-    GROUPED_MATMUL: ("m0", "n0", "k0", "comm_interval", "local_copy_tile_rows"),
+    GROUPED_MATMUL: (
+        "m0",
+        "n0",
+        "k0",
+        "comm_interval",
+        "local_copy_tile_rows",
+        "stage_rows",
+        "workspace_stages",
+        "self_copy_cores",
+    ),
 }
 MMAD_SHAPES = {
     ALL_TO_ALLV: ((128, 256, 256), (256, 128, 256), (256, 256, 256)),
-    GROUPED_MATMUL: ((128, 256, 256), (256, 128, 256)),
+    GROUPED_MATMUL: ((128, 256, 256), (256, 128, 256), (256, 256, 256)),
 }
 # CATLASS Ascend950 LocalTensorBuffer allocation, smaller than physical UB.
 UB_BYTES = 248 * 1024
@@ -79,12 +88,26 @@ def validate_tiling(
         raise ValueError("unsupported operator: {}".format(operator))
     if not isinstance(tiling, Mapping):
         raise ValueError("tiling must be a mapping")
+    if operator == GROUPED_MATMUL:
+        # Saved five-field overrides keep the legacy staging and worker pool,
+        # independently of the shape-specific defaults selected by the host.
+        tiling = dict(tiling)
+        for name, value in (("stage_rows", 0), ("workspace_stages", 2), ("self_copy_cores", 1)):
+            tiling.setdefault(name, value)
     fields = TILING_FIELDS[operator]
     missing = set(fields) - set(tiling)
     unknown = set(tiling) - set(fields)
     if missing or unknown:
         raise ValueError("tiling fields: missing={}, unknown={}".format(sorted(missing), sorted(unknown, key=str)))
-    result = {name: _integer(name, tiling[name], 0 if name == "export_core_count" else 1, INT32_MAX) for name in fields}
+    result = {
+        name: _integer(
+            name,
+            tiling[name],
+            0 if name == "export_core_count" or (operator == GROUPED_MATMUL and name == "stage_rows") else 1,
+            INT32_MAX,
+        )
+        for name in fields
+    }
     shape = tuple(result[name] for name in ("m0", "n0", "k0"))
     if shape not in MMAD_SHAPES[operator]:
         raise ValueError("MMAD shape {} has no compiled {} kernel".format(shape, operator))
@@ -142,22 +165,39 @@ def validate_tiling(
             raise ValueError("GroupedMatMul->AllToAllV has no export mode")
         if local_rows > INT32_MAX // 2:
             raise ValueError("local_copy_tile_rows exceeds the native commTileM range")
+        stage_rows = result["stage_rows"]
+        stages = result["workspace_stages"]
+        if stage_rows % result["m0"]:
+            raise ValueError("stage_rows must be zero (derived) or divisible by m0")
+        if stages not in (2, 3):
+            raise ValueError("workspace_stages must be 2 or 3")
         if m is not None and m > UINT32_MAX - result["m0"] + 1:
             raise ValueError("input rows overflow the target-order tiling scheduler")
         if aic_cores is not None and world_size is not None:
-            blocks = aic_cores * result["comm_interval"]
-            if blocks > UINT32_MAX:
-                raise ValueError("AI-core count * comm_interval exceeds uint32")
-            if blocks % world_size:
-                raise ValueError("AI-core count * comm_interval must be divisible by world_size")
+            if world_size + result["self_copy_cores"] - 1 > aic_cores:
+                raise ValueError("self_copy_cores exceeds the available AIV worker pool")
+            if stage_rows == 0:
+                blocks = aic_cores * result["comm_interval"]
+                if blocks > UINT32_MAX:
+                    raise ValueError("AI-core count * comm_interval exceeds uint32")
+                if blocks % world_size:
+                    raise ValueError("AI-core count * comm_interval must be divisible by world_size")
+                if n is not None:
+                    n_loops = (n + result["n0"] - 1) // result["n0"]
+                    rank_tiles = blocks // world_size
+                    if rank_tiles < n_loops:
+                        raise ValueError("comm_interval is too small to cover one full N row of tiles")
+                    stage_rows = (rank_tiles // n_loops) * result["m0"]
+        if world_size is not None and stage_rows:
+            if stage_rows * world_size > UINT32_MAX:
+                raise ValueError("stage_rows * world_size exceeds uint32")
             if n is not None:
-                n_loops = (n + result["n0"] - 1) // result["n0"]
-                rank_tiles = blocks // world_size
-                if rank_tiles < n_loops:
-                    raise ValueError("comm_interval is too small to cover one full N row of tiles")
-                stage_rows = (rank_tiles // n_loops) * result["m0"]
-                if 2 * stage_rows * world_size * n * 2 > WORKSPACE_BYTES:
+                if stages * stage_rows * world_size * n * 2 > WORKSPACE_BYTES:
                     raise ValueError("tiling exceeds the 400 MiB symmetric workspace")
+                n_loops = (n + result["n0"] - 1) // result["n0"]
+                tasks = (stage_rows // result["m0"]) * world_size * n_loops
+                if aic_cores is not None and tasks > UINT32_MAX - aic_cores:
+                    raise ValueError("MMAD task grid exceeds the uint32 scheduler range")
         copy_columns = _aligned(n, 16) if n is not None else None
     if n is not None and n > UINT32_MAX - result["n0"] + 1:
         raise ValueError("N exceeds the uint32 MMAD scheduler range")
@@ -183,16 +223,27 @@ def default_tiling(case):
                 values = (
                     [256, 128, 256, 64, 1280, 2, 8, 1, 0, 8] if export else [256, 128, 256, 128, 1536, 2, 64, 1, 0, 1]
                 )
+        elif (
+            export
+            and case["world_size"] == 4
+            and case["expert_num"] == 28
+            and m == 131072
+            and k == 3584
+            and n in (6144, 3072)
+        ):
+            values = [256, 256, 256, 32, 2048, 2, 16, 1, 8, 4 if n == 6144 else 8]
     elif operator == GROUPED_MATMUL:
-        values = [128, 256, 256, 10, 32]
+        values = [128, 256, 256, 10, 32, 0, 2, 1]
         if business and n == 2048:
             if k == 1024:
-                values = [128, 256, 256, 10, 4]
+                values = [128, 256, 256, 10, 4, 0, 2, 1]
             elif k == 512:
-                values = [128, 256, 256, 16, 16]
+                values = [128, 256, 256, 16, 16, 0, 2, 1]
+        elif case["world_size"] == 4 and case["expert_num"] == 28 and n == 3584 and k in (3072, 6144):
+            values = [256, 256, 256, 8, 8, 2048, 3 if k == 3072 else 2, 8]
         # Native fallback caps the requested copy rows to the compiled UB size.
         capacity = (UB_BYTES - UDMA_SCRATCH_BYTES) // (4 * _aligned(n, 16))
-        values[-1] = min(values[-1], capacity)
+        values[4] = min(values[4], capacity)
     else:
         raise ValueError("unsupported operator: {}".format(operator))
     return dict(zip(TILING_FIELDS[operator], values))
@@ -220,7 +271,13 @@ def default_search_space(case):
             self_copy_cores=[1, 2, 4, 8],
         )
     else:
-        result.update(comm_interval=[1, 2, 4, 6, 8, 10, 12, 14, 16], local_copy_tile_rows=[1, 2, 4, 8, 16, 32, 64])
+        # Only explicit search spaces expand the added physical dimensions.
+        baseline = default_tiling(case)
+        result.update(
+            comm_interval=[1, 2, 4, 6, 8, 10, 12, 14, 16],
+            local_copy_tile_rows=[1, 2, 4, 8, 16, 32, 64],
+            **{name: [baseline[name]] for name in ("stage_rows", "workspace_stages", "self_copy_cores")},
+        )
     return result
 
 
@@ -254,7 +311,13 @@ def _space_for_case(case, space):
                     raise ValueError("mmad shape has no compiled kernel: {}".format(shape))
         else:
             for value in values:
-                _integer(name, value, 0 if name == "export_core_count" else 1)
+                _integer(
+                    name,
+                    value,
+                    0
+                    if name == "export_core_count" or (case["operator"] == GROUPED_MATMUL and name == "stage_rows")
+                    else 1,
+                )
         size *= len(values)
     if size > MAX_SPACE_SIZE:
         raise ValueError("search space exceeds {} combinations; narrow the dimensions".format(MAX_SPACE_SIZE))
@@ -304,14 +367,18 @@ def candidates_for_case(
         except ValueError:
             return
         effective = dict(normalized)
-        if aic_cores is not None:
-            if case["operator"] == ALL_TO_ALLV:
+        if case["operator"] == ALL_TO_ALLV:
+            if aic_cores is not None:
                 effective["export_core_count"] = effective["export_core_count"] or aic_cores
-            else:
-                # Only the complete M groups per round reach the target-order
-                # schedulers; intervals that produce the same groups are equal.
+        else:
+            if effective["stage_rows"] == 0 and aic_cores is not None:
+                # Only complete M groups reach the target-order schedulers.
                 n_loops = (case["shape"]["n"] + effective["n0"] - 1) // effective["n0"]
-                effective["comm_interval"] = aic_cores * effective["comm_interval"] // case["world_size"] // n_loops
+                effective["stage_rows"] = effective["m0"] * (
+                    aic_cores * effective["comm_interval"] // case["world_size"] // n_loops
+                )
+            if effective["stage_rows"]:
+                effective.pop("comm_interval")  # Inactive when physical staging is known.
         identity = candidate_id(effective)
         if identity not in seen:
             seen.add(identity)

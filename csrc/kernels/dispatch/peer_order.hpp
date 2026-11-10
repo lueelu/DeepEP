@@ -43,18 +43,18 @@ SCALE_CLOS_INLINE void SplitLocalForwardRange(uint32_t world, uint32_t core, uin
     last = first + whole + (rotated < remainder ? 1U : 0U);
 }
 // One fixed order per EP size: balanced four-server windows through EP64,
-// and eight-server pod stages above it. Start at the next server; callers
+// and eight-server mesh_clos stages above it. Start at the next server; callers
 // skip the local server without changing ownership or the QP0/QP1 split.
 SCALE_CLOS_INLINE uint32_t Peer(uint32_t rank, uint32_t world, uint32_t owner, uint32_t index)
 {
-    // Source local ranks 0..3 submit intra-pod first, 4..7 cross-pod first.
-    // Every eight-visit window stays in one pod; owner/SQ identity is unchanged.
+    // Source local ranks 0..3 submit intra-mesh_clos first, 4..7 cross-mesh_clos first.
+    // Every eight-visit window stays in one mesh_clos; owner/SQ identity is unchanged.
     // EP128 visits two pods; EP256 visits four (XOR stage 0,1,2,3).
     if (world >= 128U) {
-        const uint32_t pod = rank / 64U ^ (rank % 8U) / 4U ^ index / 8U;
-        return pod * 64U + ((rank / 8U + 1U + index % 8U) % 8U) * 8U + owner;
+        const uint32_t mesh_clos = rank / 64U ^ (rank % 8U) / 4U ^ index / 8U;
+        return mesh_clos * 64U + ((rank / 8U + 1U + index % 8U) % 8U) * 8U + owner;
     }
-    // One/two-server groups have no 32-rank pod to XOR. Enumerate each
+    // One/two-server groups have no 32-rank mesh_clos to XOR. Enumerate each
     // real server once; the hidden scheduler omits its own server.
     if (world < 32U) {
         const uint32_t servers = (world + 7U) / 8U;

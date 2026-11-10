@@ -65,6 +65,7 @@ public:
     struct Params {
         ProblemShape problemShape;
         uint32_t commInterval;
+        uint32_t stageRows;
         __gm__ ElementA* ptrA;
         LayoutA layoutA;
         __gm__ ElementB* ptrB;
@@ -75,6 +76,7 @@ public:
         GM_ADDR ptrSymmetric;
         GM_ADDR syncMmadFinish;
         GM_ADDR syncCommFinish;
+        uint32_t selfCopyCores;
         BlockCommParams blockCommParams;
         BlockCommSchedulerParams blockCommSchedulerParams;
 
@@ -85,9 +87,11 @@ public:
         Params(ProblemShape const& problemShape_, uint32_t commInterval_, LayoutTagComm layoutTagComm_, GM_ADDR ptrA_,
                LayoutA const& layoutA_, GM_ADDR ptrB_, LayoutB const& layoutB_, GM_ADDR ptrC_, LayoutC const& layoutC_,
                GM_ADDR ptrSymmetric_, GM_ADDR syncMmadFinish_, GM_ADDR syncCommFinish_,
-               BlockCommParams const& blockCommParams_, BlockCommSchedulerParams const& blockCommSchedulerParams_)
+               BlockCommParams const& blockCommParams_, BlockCommSchedulerParams const& blockCommSchedulerParams_,
+               uint32_t stageRows_ = 0, uint32_t selfCopyCores_ = 0)
             : problemShape(problemShape_),
               commInterval(commInterval_),
+              stageRows(stageRows_),
               layoutTagComm(layoutTagComm_),
               ptrA(reinterpret_cast<__gm__ ElementA*>(ptrA_)),
               layoutA(layoutA_),
@@ -98,6 +102,7 @@ public:
               ptrSymmetric(ptrSymmetric_),
               syncMmadFinish(syncMmadFinish_),
               syncCommFinish(syncCommFinish_),
+              selfCopyCores(selfCopyCores_),
               blockCommParams(blockCommParams_),
               blockCommSchedulerParams(blockCommSchedulerParams_)
         {
@@ -126,6 +131,10 @@ public:
         // Zero preserves the legacy balanced-route layout. It is also safe for
         // a zero-token rank because the scheduler emits no C writes.
         uint32_t outputRows{0};
+        // Direct physical row capacity of one [stage][destination rank] slot.
+        // Zero preserves the legacy commInterval-derived value.
+        uint32_t stageRows{0};
+        uint32_t selfCopyCores{0};
     };
 
     static Params ToUnderlyingArguments(Arguments const& args, uint8_t* workspace = nullptr)
@@ -159,7 +168,8 @@ public:
         BlockCommSchedulerParams blockCommSchedulerParams{args.commCoreSplit};
 
         return Params(problemShape, args.commInterval, layoutTagC, args.ptrA, layoutA, args.ptrB, layoutB, args.ptrC,
-                      layoutC, gmSymmetric, syncMmadFinish, syncCommFinish, blockCommParams, blockCommSchedulerParams);
+                      layoutC, gmSymmetric, syncMmadFinish, syncCommFinish, blockCommParams, blockCommSchedulerParams,
+                      args.stageRows, args.selfCopyCores);
     }
 
     CATLASS_DEVICE
@@ -380,10 +390,13 @@ private:
     void RunTargetOrderAic(Params const& params)
     {
         uint32_t rankSize = params.problemShape.rankSize();
-        uint32_t blockPerComm = AscendC::GetBlockNum() * params.commInterval;
-        uint32_t tilePerCommInRank = blockPerComm / rankSize;
-        uint32_t nLoops = CeilDiv(params.problemShape.n(), L1_TILE_N);
-        uint32_t groupsPerCommInRank = Max<uint32_t>(1U, tilePerCommInRank / nLoops);
+        uint32_t groupsPerCommInRank = params.stageRows / L1_TILE_M;
+        if (params.stageRows == 0) {
+            uint32_t blockPerComm = AscendC::GetBlockNum() * params.commInterval;
+            uint32_t tilePerCommInRank = blockPerComm / rankSize;
+            uint32_t nLoops = CeilDiv(params.problemShape.n(), L1_TILE_N);
+            groupsPerCommInRank = Max<uint32_t>(1U, tilePerCommInRank / nLoops);
+        }
         GemmCoord mmadBlockShape{L1_TILE_M, L1_TILE_N, L1_TILE_K};
         BlockMmadScheduler scheduler{params.problemShape, groupsPerCommInRank, mmadBlockShape.GetCoordMN()};
 
@@ -456,13 +469,22 @@ private:
         uint32_t subcoreIdx = AscendC::GetSubBlockIdx();
         uint32_t rankSize = params.problemShape.rankSize();
         uint32_t rankIdx = params.problemShape.rankIdx();
-        uint32_t srcRankIdx = aicoreIdx;
+        uint32_t coreCount = AscendC::GetBlockNum();
+        uint32_t availableSelfCores = coreCount >= rankSize ? coreCount - rankSize + 1 : 1;
+        uint32_t selfCopyCores = params.selfCopyCores == 0 ? 1U : Min(params.selfCopyCores, availableSelfCores);
+        bool isPrimaryPeerCore = aicoreIdx < rankSize;
+        bool isExtraSelfCopyCore = aicoreIdx >= rankSize && aicoreIdx < rankSize + selfCopyCores - 1;
+        uint32_t srcRankIdx = isExtraSelfCopyCore ? rankIdx : aicoreIdx;
+        uint32_t selfWorkerIdx = isExtraSelfCopyCore ? aicoreIdx - rankSize + 1 : 0;
         uint32_t srcEpIdx = srcRankIdx % params.problemShape.epSize();
 
-        uint32_t blockPerComm = AscendC::GetBlockNum() * params.commInterval;
-        uint32_t tilePerCommInRank = blockPerComm / rankSize;
-        uint32_t nLoops = CeilDiv(params.problemShape.n(), L1_TILE_N);
-        uint32_t groupsPerCommInRank = Max<uint32_t>(1U, tilePerCommInRank / nLoops);
+        uint32_t groupsPerCommInRank = params.stageRows / L1_TILE_M;
+        if (params.stageRows == 0) {
+            uint32_t blockPerComm = AscendC::GetBlockNum() * params.commInterval;
+            uint32_t tilePerCommInRank = blockPerComm / rankSize;
+            uint32_t nLoops = CeilDiv(params.problemShape.n(), L1_TILE_N);
+            groupsPerCommInRank = Max<uint32_t>(1U, tilePerCommInRank / nLoops);
+        }
         uint32_t stageRows = groupsPerCommInRank * L1_TILE_M;
         GemmCoord mmadBlockShape{L1_TILE_M, L1_TILE_N, L1_TILE_K};
         MatrixCoord commBlockShape = params.blockCommParams.BlockShape();
@@ -484,7 +506,10 @@ private:
         auto const& layoutC = params.layoutTagComm;
 
         bool isSyncCore = (subcoreIdx == 0) && (srcRankIdx == rankIdx);
-        bool isCommCore = (subcoreIdx == 0) && (srcRankIdx < rankSize);
+        // Only the primary self core owns synchronization. Extra self-copy
+        // workers map to the same source rank but must not duplicate it.
+        isSyncCore = isSyncCore && isPrimaryPeerCore;
+        bool isCommCore = (subcoreIdx == 0) && (isPrimaryPeerCore || isExtraSelfCopyCore);
         auto syncMmadFinish = reinterpret_cast<__gm__ int32_t*>(params.syncMmadFinish);
         if (isCommCore) {
             syncMmadFinish = static_cast<__gm__ int32_t*>(aclshmem_ptr(params.syncMmadFinish, srcRankIdx));
@@ -514,19 +539,34 @@ private:
                 aclshmem_signal_wait_until(syncMmadFinish, ACLSHMEM_CMP_EQ, commIdx + 1);
 
                 uint32_t actualRows = scheduler.GetActualRows();
-                MatrixCoord actualShape{actualRows, params.problemShape.n()};
-                auto const& gmBlockSrc = gmSymmetricList[stageIdx];
-                auto layoutBlockSrc = layoutSymmetric.GetTileLayout(actualShape);
-                MatrixCoord outputOffset{scheduler.GetOutputRowOffset(), 0};
-                auto gmBlockDst = gmC[layoutC.GetOffset(outputOffset)];
-                auto layoutBlockDst = layoutC.GetTileLayout(actualShape);
+                uint32_t workerRowOffset = 0;
+                if (srcRankIdx == rankIdx) {
+                    uint32_t rowsPerWorker = CeilDiv(actualRows, selfCopyCores);
+                    workerRowOffset = selfWorkerIdx * rowsPerWorker;
+                    actualRows = Min(rowsPerWorker, ClipSub(actualRows, workerRowOffset));
+                }
+                if (actualRows != 0) {
+                    MatrixCoord actualShape{actualRows, params.problemShape.n()};
+                    MatrixCoord stageOffset{workerRowOffset, 0};
+                    auto gmBlockSrc = gmSymmetricList[stageIdx][layoutSymmetric.GetOffset(stageOffset)];
+                    auto layoutBlockSrc = layoutSymmetric.GetTileLayout(actualShape);
+                    MatrixCoord outputOffset{scheduler.GetOutputRowOffset() + workerRowOffset, 0};
+                    auto gmBlockDst = gmC[layoutC.GetOffset(outputOffset)];
+                    auto layoutBlockDst = layoutC.GetTileLayout(actualShape);
 
-                blockRemoteCopy.InitBlockLoop();
-                blockRemoteCopy(gmBlockSrc, layoutBlockSrc, gmBlockDst, layoutBlockDst, actualShape, srcRankIdx);
-                blockRemoteCopy.FinalizeBlockLoop();
+                    blockRemoteCopy.InitBlockLoop();
+                    blockRemoteCopy(gmBlockSrc, layoutBlockSrc, gmBlockDst, layoutBlockDst, actualShape, srcRankIdx);
+                    blockRemoteCopy.FinalizeBlockLoop();
 
-                aclshmemx_mte_quiet();
-                aclshmemx_signal_op(syncCommFinish, 1, ACLSHMEM_SIGNAL_ADD, srcRankIdx);
+                    // Remote peers already have one queue owner. For the
+                    // multi-core self copy, only worker 0 publishes the
+                    // receive completion; the loop-end hardware barrier
+                    // joins the remaining row slices before AIC is released.
+                    if (srcRankIdx != rankIdx || selfWorkerIdx == 0) {
+                        aclshmemx_mte_quiet();
+                        aclshmemx_signal_op(syncCommFinish, 1, ACLSHMEM_SIGNAL_ADD, srcRankIdx);
+                    }
+                }
             }
 
             if (isSyncCore) {

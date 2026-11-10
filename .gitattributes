@@ -8,3 +8,5 @@
 *.jpeg binary
 *.pdf binary
 *.whl binary
+# Preserve upstream whitespace in the hashed CATLASS/TLA header snapshot.
+csrc/direct/vendor/** whitespace=-blank-at-eol

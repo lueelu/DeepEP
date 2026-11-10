@@ -3,12 +3,23 @@
 
 """DeepEP resource/event interfaces; imports do not require Torch or an NPU SDK.
 
-Installed native wheels provide resources, events, and ElasticBuffer EP operations.
-Without the extension, runtime calls fail explicitly. See docs/api.md.
+Installed native wheels provide communication resources and EP operations.
+Framework events require Torch/torch_npu only. Communication runtime calls without
+the extension fail explicitly. See docs/api.md.
 """
 
 from ._config import Config
-from .buffers import Buffer, ElasticBuffer, EPHandle
+from .buffer import Buffer
+from .buffers.elastic import ElasticBuffer, EPHandle
 from .utils import EventHandle, EventOverlap
 
 __all__ = ["Buffer", "ElasticBuffer", "EPHandle", "Config", "EventHandle", "EventOverlap"]
+
+
+def __getattr__(name):
+    # Keep package import metadata-only; Direct helpers load Torch on demand.
+    if name in {"topk_idx_t", "ExpandHandle", "Handle", "Slot", "SlotState"}:
+        from .backends import direct
+
+        return getattr(direct, name)
+    raise AttributeError(name)
