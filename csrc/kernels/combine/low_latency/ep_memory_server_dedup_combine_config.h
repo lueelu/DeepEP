@@ -5,16 +5,18 @@
 #define COMBINE_DEDUP_EP_MEMORY_SERVER_DEDUP_COMBINE_CONFIG_H
 
 #include <cstdint>
-#include "../../dispatch/low_latency/common/ep_memory_server_dedup_protocol.h"
-#include "../../dispatch/low_latency/common/ll_core_config.h"
+
+// Independent of Dispatch. Rebuild Host and kernel together on all ranks.
+#ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM
+#define COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM 32U
+#endif
 
 namespace CombineDedup {
-// Resident capacity is shared across ranks, independently of active core count.
-constexpr uint32_t kCombineNotifyRows = DispatchDedup::kLlMaxRecvCoreNum;
-constexpr uint32_t kCombineReadyInputBytes = DispatchDedup::kLlRanksPerGroup * 32U + 256U;
-constexpr uint32_t kCombinePrepareRowBytes = DispatchDedup::kLlMaxCoreNum * 32U;
-static_assert(kCombinePrepareRowBytes * DispatchDedup::kLlNotifyCoreNum == 18432U, "prepare/ready boundary");
-static_assert(DispatchDedup::kLlRanksPerGroup * 32U <= 512U, "ready row capacity");
+constexpr uint32_t kEpServerDedupCombineSendCoreNum = COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM;
+static_assert(kEpServerDedupCombineSendCoreNum >= 16U && kEpServerDedupCombineSendCoreNum <= 56U &&
+                  kEpServerDedupCombineSendCoreNum % 4U == 0U,
+              "COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM must be 16..56 in steps of 4");
+constexpr uint32_t kEpServerDedupCombineRecvCoreNum = 64U - kEpServerDedupCombineSendCoreNum;
 constexpr uint32_t kEpServerDedupCombineMaxTokenNum = 10000U;
 // M1/M2 keep all resources distinct: three row arrays, compare mask, one
 // 512-row table-2 cache, per-level detector/work/result/zero buffers and flags.
@@ -29,9 +31,9 @@ constexpr uint32_t kEpServerDedupCombineTableRows = 512U;
 // Even before metadata is reserved, one admitted input/output pair has fewer
 // than 256 blocks, so packing never narrows an oversized vector repeat count.
 static_assert(kEpServerDedupCombineUbBytes / (480U + 512U) <= 255U, "M3 vector repeat budget");
-constexpr uint32_t kEpServerDedupCombineFixedUbBytes = kEpServerDedupCombineTableRows * 12U + 256U + (kCombinePrepareRowBytes + 256U) + 512U +
-                                                       32U + kCombinePrepareRowBytes + kCombineReadyInputBytes + 256U + 32U + 512U +
-                                                       kCombineNotifyRows * 32U;
+constexpr uint32_t kEpServerDedupCombineFixedUbBytes = kEpServerDedupCombineTableRows * 12U + 256U + 2304U + 512U +
+                                                       32U + 2048U + 512U + 256U + 32U + 512U +
+                                                       kEpServerDedupCombineRecvCoreNum * 32U;
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 #define COMBINE_DEDUP_EP_COMBINE_CONSTEXPR __aicore__ inline constexpr
 #else
@@ -77,15 +79,15 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM4ScanRows(uint32_t h, uint
     while (rows < 512U && EpCombineM4ScanBytes(rows * 2U) <= available) rows *= 2U;
     return rows;
 }
-COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM4TaskBytes(uint32_t tokens, uint32_t recvCores = DispatchDedup::kLlDefaultPlanCoreNum / 2U)
+COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM4TaskBytes(uint32_t tokens)
 {
-    return EpCombineAlign(((tokens + recvCores - 1U) / recvCores) * 4U,
+    return EpCombineAlign(((tokens + kEpServerDedupCombineRecvCoreNum - 1U) / kEpServerDedupCombineRecvCoreNum) * 4U,
                           32U);
 }
 // M5 input events use IDs 0..6; MTE2_V(7) is reserved for probe.
-COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5TokenCount(uint32_t bs, uint32_t recvCores = DispatchDedup::kLlDefaultPlanCoreNum / 2U)
+COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5TokenCount(uint32_t bs)
 {
-    return bs / recvCores + (bs % recvCores != 0U);
+    return bs / kEpServerDedupCombineRecvCoreNum + (bs % kEpServerDedupCombineRecvCoreNum != 0U);
 }
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5FlagBytes(uint32_t h, uint32_t k)
 {
@@ -108,14 +110,14 @@ struct EpCombineM45WorkspaceLayout {
     uint32_t totalBytes = 0U;
 };
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR EpCombineM45WorkspaceLayout EpCombineM45Layout(uint32_t tokens, uint32_t bs,
-                                                                                  uint32_t h, uint32_t k, uint32_t recvCores = DispatchDedup::kLlDefaultPlanCoreNum / 2U)
+                                                                                  uint32_t h, uint32_t k)
 {
     EpCombineM45WorkspaceLayout result{};
-    if (recvCores == 0U || recvCores > DispatchDedup::kLlMaxRecvCoreNum || tokens > kEpServerDedupCombineMaxTokenNum || bs == 0U || h == 0U ||
+    if (tokens > kEpServerDedupCombineMaxTokenNum || bs == 0U || h == 0U ||
         h > kEpServerDedupCombineRecvUbBytes / 12U || k == 0U || k > 32U)
         return result;
-    const uint64_t owned = EpCombineM5TokenCount(bs, recvCores);
-    const uint64_t partial = EpCombineM4TaskBytes(tokens, recvCores) + 384U +
+    const uint64_t owned = EpCombineM5TokenCount(bs);
+    const uint64_t partial = EpCombineM4TaskBytes(tokens) + 384U +
                              EpCombineAlign(kEpServerDedupCombineM4TableRows * k * 8U, 32U) +
                              ((h * 2U + 479U) / 480U) * 480U;
     const uint64_t final = 2U * ((owned * 4U + 31U) / 32U * 32U) + (owned * k * 4U + 31U) / 32U * 32U +

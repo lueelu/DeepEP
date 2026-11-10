@@ -5,8 +5,6 @@
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 
 #include "kernel_operator.h"
-#include "../../dispatch/low_latency/device/ll_transport.h"
-#include "combine_rdma_return.h"
 #include "../../dispatch/low_latency/common/comm_args.h"
 #include "../../dispatch/low_latency/common/dispatch_dedup_types.h"
 #include "ep_memory_server_dedup_buffer_layout.h"
@@ -16,22 +14,16 @@
 namespace CombineDedup {
 using namespace AscendC;
 
-// 中文审计：M4按目标server筛选元数据、聚合贡献并回传partial结果。
-// 输出地址与MTE3完成事件交给M5继续使用；退出本类不表示所有远端消费已经完成。
 // Recv-core M4 scans type/routing metadata per destination server. Its output
 // addresses and completion events remain live through the M5 handoff.
-template<uint32_t Group>
 class ServerDedupPartial {
 public:
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch,
                                 GM_ADDR expert, GM_ADDR table2, GM_ADDR table3, GM_ADDR types, uint32_t tokens,
                                 uint32_t bs, uint32_t h, uint32_t k, uint32_t experts, uint8_t dtype, uint64_t window,
-                                const EpCombineM45WorkspaceLayout& layout, LlTransport::DispatchRdmaBatch* batch)
+                                const EpCombineM45WorkspaceLayout& layout)
     {
         args_ = args;
-        rdmaBatch_ = batch;
-
-        recvCores_ = GetBlockNum() / 2U;
         pipe_ = pipe;
         scratch_ = scratch[layout.phaseOffset];
         tokens_ = tokens;
@@ -52,7 +44,7 @@ public:
             Trap();
             return;
         }
-        rows_ = Allocate<int32_t>(EpCombineM4TaskBytes(tokens, recvCores_));
+        rows_ = Allocate<int32_t>(EpCombineM4TaskBytes(tokens));
         scan_ = scratch_[used_];
         scanRows_ = EpCombineM4ScanRows(h, k);
         table2Ub_ = Allocate<int32_t>(EpCombineAlign(kEpServerDedupCombineM4TableRows * 12U, 32U));
@@ -71,7 +63,6 @@ public:
 
     __aicore__ inline uint32_t Process()
     {
-        if (LlTransport::Rdma(args_)) rdmaBatch_->Init(args_, packetBytes_);
         for (uint32_t lane = 0; lane < inputLanes_; ++lane) SetFlag<HardEvent::V_MTE2>(lane);
         uint64_t flagMask[2] = {0xffU, 0U};
         for (uint32_t lane = 0; lane < outputLanes_; ++lane) {
@@ -79,8 +70,8 @@ public:
                              uint8_t(blocks_), 1U, 16U);
         }
         PipeBarrier<PIPE_V>();
-        const uint32_t servers = uint32_t(args_->rankSize) / Group;
-        const uint32_t ownServer = uint32_t(args_->rank) / Group;
+        const uint32_t servers = uint32_t(args_->rankSize) / 8U;
+        const uint32_t ownServer = uint32_t(args_->rank) / 8U;
         uint32_t owner = 0U, completed = 0U;
         for (uint32_t step = 1U; step <= servers; ++step) {
             const uint32_t count = SelectServer(ServerDedupHalfOrder(servers, ownServer, step - 1U), owner, step == 1U);
@@ -105,10 +96,6 @@ public:
             // Reuse phase scratch with its Vector dependency, not an MTE3 drain.
         }
         for (uint32_t lane = 0; lane < inputLanes_; ++lane) WaitFlag<HardEvent::V_MTE2>(lane);
-        // Post the final staged packet before M5 can wait on peer returns.
-        // Isolated GM slots survive M5's UB reuse; tail CQ retirement is owned
-        // by the enclosing kernel, after M5, not by this temporary object.
-        rdmaBatch_->SubmitPending();
         // Output events and their UB sources remain owned by the shared ring.
         // The caller hands off only MTE2/Vector before M5 reuses phase metadata.
         return completed;
@@ -132,7 +119,7 @@ private:
     __aicore__ inline uint32_t SelectServer(uint32_t server, uint32_t& owner, bool validateRanks)
     {
         uint32_t count = 0U;
-        const uint32_t localCore = GetBlockIdx() - recvCores_;
+        const uint32_t localCore = GetBlockIdx() - kEpServerDedupCombineSendCoreNum;
         const uint32_t vectorBytes = EpCombineAlign(scanRows_ * 4U, 256U);
         const uint32_t maskBytes = EpCombineAlign((scanRows_ + 7U) / 8U, 32U);
         auto table = scan_.ReinterpretCast<int32_t>();
@@ -175,16 +162,16 @@ private:
                     return 0U;
                 }
             }
-            ServerDedupRankMask(mask, upper, ranks, int32_t(server * Group), int32_t((server + 1U) * Group), span);
+            ServerDedupRankMask(mask, upper, ranks, int32_t(server * 8U), int32_t((server + 1U) * 8U), span);
             And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(),
                 typeMask.ReinterpretCast<uint16_t>(), int32_t((span + 15U) / 16U));
             PipeBarrier<PIPE_V>();
             uint64_t selected = 0U;
             GatherMask(table, indices, mask.ReinterpretCast<uint32_t>(), true, span, {1U, 1U, 0U, 0U}, selected);
             Sync<HardEvent::V_S>();
-            const uint32_t first = ServerDedupFirstOwned(localCore, owner, recvCores_);
-            owner = (owner + uint32_t(selected)) % recvCores_;
-            for (uint32_t task = first; task < uint32_t(selected); task += recvCores_)
+            const uint32_t first = ServerDedupFirstOwned(localCore, owner, kEpServerDedupCombineRecvCoreNum);
+            owner = (owner + uint32_t(selected)) % kEpServerDedupCombineRecvCoreNum;
+            for (uint32_t task = first; task < uint32_t(selected); task += kEpServerDedupCombineRecvCoreNum)
                 rows_.SetValue(count++, table.GetValue(task));
         }
         return count;
@@ -204,7 +191,6 @@ private:
         GlobalTensor<uint16_t> data;
         if (member == 0U) {
             data = expert_[uint64_t(row) * h_];
-
             DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U},
                         {false, 0U, 0U, uint16_t(0)});
         } else {
@@ -213,10 +199,10 @@ private:
             const uint32_t memberRank = expert / localExperts_, localExpert = expert % localExperts_;
             const uint64_t slot =
                 (((uint64_t(source) + memberRank) % uint32_t(args_->rankSize)) * localExperts_ + localExpert) * bs_ + q;
-            if (memberRank / Group != uint32_t(args_->rank) / Group) { Trap(); return; }
-
-            LlTransport::LoadLocalPeer(args_, memberRank, stageBase_ + slot * stageStride_,
-                inputs_[lane * inputBytes_ / 2U], h_ * 2U);
+            data.SetGlobalBuffer(
+                reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[memberRank] + stageBase_ + slot * stageStride_));
+            DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U},
+                        {false, 0U, 0U, uint16_t(0)});
         }
         SetFlag<HardEvent::MTE2_V>(lane);
     }
@@ -260,17 +246,13 @@ private:
         Copy(dst[64U], src[64U], uint64_t(56U), uint8_t(blocks_), {1U, 1U, 16U, 15U});
         SetFlag<HardEvent::V_MTE3>(lane);
         WaitFlag<HardEvent::V_MTE3>(lane);
-
-        // This reduced output has one destination; the next use rewrites its
-        // body and never reads the SDK's borrowed first 128 bytes.
-        const uint64_t offset = window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET +
-            (uint64_t(token) * k_ + topk) * packetBytes_;
-        SendReturnPacket(*rdmaBatch_, args_, source, offset, output, packetBytes_, false);
+        GlobalTensor<uint8_t> target;
+        target.SetGlobalBuffer(args_->peerMems[source] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET +
+                               (uint64_t(token) * k_ + topk) * packetBytes_);
+        DataCopy(target, output, packetBytes_);
         SetFlag<HardEvent::MTE3_V>(lane);
     }
 
-    uint32_t recvCores_ = 0;
-    LlTransport::DispatchRdmaBatch* rdmaBatch_ = nullptr;
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
     TPipe* pipe_ = nullptr;
     LocalTensor<uint8_t> scratch_, outputs_, scan_;
