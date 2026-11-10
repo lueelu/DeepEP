@@ -2,13 +2,13 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_gather_out.h
+ * \file moe_v3_gather_out.hpp
  * \brief Token and scale gathering in expert routing order.
  */
-#ifndef MOE_V3_GATHER_OUT_H_REGBASE
-#define MOE_V3_GATHER_OUT_H_REGBASE
+#ifndef MOE_V3_GATHER_OUT_HPP
+#define MOE_V3_GATHER_OUT_HPP
 
-#include "moe_v3_common.h"
+#include "moe_v3_common.hpp"
 #include "kernel_operator.h"
 
 namespace MoeInitRoutingV3 {
@@ -290,4 +290,4 @@ __aicore__ inline void MoeGatherOut<T>::Process()
     }
 }
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_GATHER_OUT_H_REGBASE
+#endif  // MOE_V3_GATHER_OUT_HPP

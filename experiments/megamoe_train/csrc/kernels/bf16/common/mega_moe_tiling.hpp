@@ -6,12 +6,12 @@
  * \brief Shared tiling parameters and constants for MegaMoE BF16 training.
  */
 
-#ifndef ASCENDC_MEGA_MOE_TILING
-#define ASCENDC_MEGA_MOE_TILING
+#ifndef ASCENDC_MEGA_MOE_TILING_HPP
+#define ASCENDC_MEGA_MOE_TILING_HPP
 
 #include <cstdint>
 #include "kernel_tiling/kernel_tiling.h"
-#include "routing/moe_init_routing_v3/arch35/moe_init_routing_v3_arch35_tiling_def.h"
+#include "routing/moe_init_routing_v3/arch35/moe_init_routing_v3_arch35_tiling_def.hpp"
 
 using namespace AscendC;
 

@@ -46,7 +46,7 @@ set(train_device_flags -O2 -std=c++17 -fPIC -xasc --npu-arch=dav-3510
 foreach(path IN LISTS train_include)
     list(APPEND train_device_flags "-I${path}")
 endforeach()
-file(GLOB_RECURSE train_headers CONFIGURE_DEPENDS "csrc/*.h" "csrc/*.hpp")
+file(GLOB_RECURSE train_headers CONFIGURE_DEPENDS "csrc/*.hpp")
 set(train_objects)
 foreach(source mega_moe_bf16_forward mega_moe_bf16_backward)
     set(object "${CMAKE_CURRENT_BINARY_DIR}/${source}.o")

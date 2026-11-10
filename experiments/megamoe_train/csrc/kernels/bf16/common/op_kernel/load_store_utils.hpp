@@ -3,12 +3,12 @@
 // Modified by guofanfeng 2026
 
 /*!
- * \file load_store_utils.h
+ * \file load_store_utils.hpp
  * \brief Vector-register loads with FP32 conversion for routing quantization.
  */
 
-#ifndef OPS_BUILT_IN_OP_ASCENDC_LOAD_STORE_UTILS_H_
-#define OPS_BUILT_IN_OP_ASCENDC_LOAD_STORE_UTILS_H_
+#ifndef OPS_BUILT_IN_OP_ASCENDC_LOAD_STORE_UTILS_HPP
+#define OPS_BUILT_IN_OP_ASCENDC_LOAD_STORE_UTILS_HPP
 
 #if ASC_DEVKIT_MAJOR >= 9
 #include "basic_api/kernel_vec_intf.h"
@@ -45,4 +45,4 @@ __aicore__ inline void LoadOneTensorForDtypeT(__local_mem__ T* input, Reg::RegTe
 
 }  // namespace ops
 
-#endif  // OPS_BUILT_IN_OP_ASCENDC_LOAD_STORE_UTILS_H_
+#endif  // OPS_BUILT_IN_OP_ASCENDC_LOAD_STORE_UTILS_HPP

@@ -2,19 +2,19 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_init_routing_v3_apt.h
+ * \file moe_init_routing_v3_apt.hpp
  * \brief MoE routing initialization: sorting, token counting, row indices and gathering.
  */
-#include "moe_v3_mrgsort_out.h"
-#include "moe_v3_mrgsort.h"
-#include "moe_v3_sort_one_core.h"
-#include "moe_v3_sort_multi_core.h"
-#include "moe_v3_expert_tokens_count.h"
-#include "moe_v3_expert_tokens_count_v2.h"
-#include "moe_v3_row_idx_gather.h"
-#include "moe_v3_gather_out.h"
-#include "moe_v3_gather_dynamic_quant.h"
-#include "moe_v3_gather_mxfp8_quant.h"
+#include "moe_v3_mrgsort_out.hpp"
+#include "moe_v3_mrgsort.hpp"
+#include "moe_v3_sort_one_core.hpp"
+#include "moe_v3_sort_multi_core.hpp"
+#include "moe_v3_expert_tokens_count.hpp"
+#include "moe_v3_expert_tokens_count_v2.hpp"
+#include "moe_v3_row_idx_gather.hpp"
+#include "moe_v3_gather_out.hpp"
+#include "moe_v3_gather_dynamic_quant.hpp"
+#include "moe_v3_gather_mxfp8_quant.hpp"
 
 /*
  * 非量化

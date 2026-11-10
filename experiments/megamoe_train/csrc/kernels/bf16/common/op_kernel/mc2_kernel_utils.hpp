@@ -3,12 +3,12 @@
 // Modified by guofanfeng 2026
 
 /*!
- * \file mc2_kernel_utils.h
+ * \file mc2_kernel_utils.hpp
  * \brief AscendC pipeline synchronization using paired event set and wait.
  */
 
-#ifndef MC2_KERNEL_UTILS_H
-#define MC2_KERNEL_UTILS_H
+#ifndef MC2_KERNEL_UTILS_HPP
+#define MC2_KERNEL_UTILS_HPP
 
 namespace AscendC {
 
@@ -21,4 +21,4 @@ __aicore__ inline void SyncFunc()
 }
 
 }  // namespace AscendC
-#endif  // MC2_KERNEL_UTILS_H
+#endif  // MC2_KERNEL_UTILS_HPP

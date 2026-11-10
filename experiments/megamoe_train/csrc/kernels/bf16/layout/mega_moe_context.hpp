@@ -11,7 +11,7 @@
 
 #include "lib/std/tuple.h"
 #include "mega_moe_tiling.hpp"
-#include "routing/moe_init_routing_v3/arch35/moe_init_routing_v3_apt.h"
+#include "routing/moe_init_routing_v3/arch35/moe_init_routing_v3_apt.hpp"
 #include "layout/mega_moe_workspace_view.hpp"
 
 using namespace AscendC;

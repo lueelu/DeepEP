@@ -45,7 +45,7 @@
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
-#include "op_kernel/mc2_kernel_utils.h"
+#include "op_kernel/mc2_kernel_utils.hpp"
 #include "layout/mega_moe_context.hpp"
 #include "routing/mega_moe_combine_send.hpp"
 #include "epilogue/block_epilogue_swiglu_backward_bf16.hpp"

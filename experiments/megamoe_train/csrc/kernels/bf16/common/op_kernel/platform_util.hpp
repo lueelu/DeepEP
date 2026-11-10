@@ -3,12 +3,12 @@
 // Modified by guofanfeng 2026
 
 /*!
- * \file platform_util.h
+ * \file platform_util.hpp
  * \brief UB block and vector-register size helpers for device code.
  */
 
-#ifndef OP_COMMON_OP_KERNEL_PLATFORM_UTIL_H
-#define OP_COMMON_OP_KERNEL_PLATFORM_UTIL_H
+#ifndef OP_COMMON_OP_KERNEL_PLATFORM_UTIL_HPP
+#define OP_COMMON_OP_KERNEL_PLATFORM_UTIL_HPP
 #if ASC_DEVKIT_MAJOR >= 9
 #include "basic_api/kernel_vec_intf.h"
 #else
@@ -39,4 +39,4 @@ __aicore__ inline constexpr uint32_t GetVRegSize()
 }
 }  // namespace Base
 }  // namespace Ops
-#endif  // OP_COMMON_OP_KERNEL_PLATFORM_UTIL_H
+#endif  // OP_COMMON_OP_KERNEL_PLATFORM_UTIL_HPP

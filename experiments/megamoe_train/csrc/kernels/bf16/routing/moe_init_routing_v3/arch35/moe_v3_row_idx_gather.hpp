@@ -2,13 +2,13 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_row_idx_gather.h
+ * \file moe_v3_row_idx_gather.hpp
  * \brief Invert sorted route indices to construct the gather row mapping.
  */
-#ifndef MOE_V3_ROW_IDX_GATHER_H_REGBASE
-#define MOE_V3_ROW_IDX_GATHER_H_REGBASE
+#ifndef MOE_V3_ROW_IDX_GATHER_HPP
+#define MOE_V3_ROW_IDX_GATHER_HPP
 
-#include "moe_v3_common.h"
+#include "moe_v3_common.hpp"
 #include "kernel_operator.h"
 
 namespace MoeInitRoutingV3 {
@@ -117,4 +117,4 @@ __aicore__ inline void RowIdxGather::Process()
 }
 
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_ROW_IDX_GATHER_H_REGBASE
+#endif  // MOE_V3_ROW_IDX_GATHER_HPP

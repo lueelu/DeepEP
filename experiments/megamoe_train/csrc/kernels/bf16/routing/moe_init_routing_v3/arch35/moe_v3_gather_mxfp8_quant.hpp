@@ -2,15 +2,15 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_gather_mxfp8_quant.h
+ * \file moe_v3_gather_mxfp8_quant.hpp
  * \brief Token gathering with block-scaled MXFP8 quantization for MoE routing.
  */
-#ifndef MOE_V3_GATHER_MXFP8_QUANT_H_REGBASE
-#define MOE_V3_GATHER_MXFP8_QUANT_H_REGBASE
+#ifndef MOE_V3_GATHER_MXFP8_QUANT_HPP
+#define MOE_V3_GATHER_MXFP8_QUANT_HPP
 
-#include "moe_v3_common.h"
-#include "op_kernel/platform_util.h"
-#include "op_kernel/math_util.h"
+#include "moe_v3_common.hpp"
+#include "op_kernel/platform_util.hpp"
+#include "op_kernel/math_util.hpp"
 
 namespace MoeInitRoutingV3 {
 using namespace AscendC;
@@ -518,4 +518,4 @@ __aicore__ inline void MoeGatherOutMxfp8Quant<T, U>::CopyOut(int64_t dstIdx)
 }
 
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_GATHER_MXFP8_QUANT_H_REGBASE
+#endif  // MOE_V3_GATHER_MXFP8_QUANT_HPP

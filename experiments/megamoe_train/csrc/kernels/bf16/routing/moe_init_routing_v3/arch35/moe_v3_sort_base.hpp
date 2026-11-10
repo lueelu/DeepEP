@@ -2,14 +2,14 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_sort_base.h
+ * \file moe_v3_sort_base.hpp
  * \brief Shared buffers and synchronization for MoE expert-index sorting.
  */
-#ifndef MOE_V3_SORT_BASE_H_REGBASE
-#define MOE_V3_SORT_BASE_H_REGBASE
+#ifndef MOE_V3_SORT_BASE_HPP
+#define MOE_V3_SORT_BASE_HPP
 
 #include "kernel_operator.h"
-#include "moe_init_routing_v3_arch35_tiling_def.h"
+#include "moe_init_routing_v3_arch35_tiling_def.hpp"
 
 namespace MoeInitRoutingV3 {
 using namespace AscendC;
@@ -57,4 +57,4 @@ __aicore__ inline void MoeSortBase::SyncAll()
 }
 
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_SORT_BASE_H_REGBASE
+#endif  // MOE_V3_SORT_BASE_HPP

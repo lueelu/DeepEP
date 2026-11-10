@@ -12,7 +12,7 @@
 #include "kernel_operator.h"
 #include <type_traits>
 #include "kernel_tiling/kernel_tiling.h"
-#include "op_kernel/mc2_kernel_utils.h"
+#include "op_kernel/mc2_kernel_utils.hpp"
 #include "kernel_operator_list_tensor_intf.h"
 #include "layout/mega_moe_context.hpp"
 #include "routing/mega_moe_combine_send.hpp"

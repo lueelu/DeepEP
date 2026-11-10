@@ -2,13 +2,13 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_expert_tokens_count.h
+ * \file moe_v3_expert_tokens_count.hpp
  * \brief Per-expert token counts derived from sorted expert indices.
  */
-#ifndef MOE_V3_EXPERT_TOKENS_COUNT_H_REGBASE
-#define MOE_V3_EXPERT_TOKENS_COUNT_H_REGBASE
+#ifndef MOE_V3_EXPERT_TOKENS_COUNT_HPP
+#define MOE_V3_EXPERT_TOKENS_COUNT_HPP
 
-#include "moe_v3_common.h"
+#include "moe_v3_common.hpp"
 #include "kernel_operator.h"
 
 namespace MoeInitRoutingV3 {
@@ -255,4 +255,4 @@ __aicore__ inline void ExpertTokensCount::expertCountCopyOut()
 }
 
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_EXPERT_TOKENS_COUNT_H_REGBASE
+#endif  // MOE_V3_EXPERT_TOKENS_COUNT_HPP

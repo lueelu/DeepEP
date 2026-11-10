@@ -3,11 +3,11 @@
 // Modified by guofanfeng 2026
 
 /*!
- * \file math_util.h
+ * \file math_util.hpp
  * \brief Integer division and alignment helpers shared by host and device code.
  */
-#ifndef OP_COMMON_OP_KERNEL_MATH_UTIL_H
-#define OP_COMMON_OP_KERNEL_MATH_UTIL_H
+#ifndef OP_COMMON_OP_KERNEL_MATH_UTIL_HPP
+#define OP_COMMON_OP_KERNEL_MATH_UTIL_HPP
 
 namespace Ops {
 namespace Base {
@@ -49,4 +49,4 @@ MEGA_MOE_HOST_AICORE inline T FloorAlign(T a, T b)
 #undef MEGA_MOE_HOST_AICORE
 }  // namespace Base
 }  // namespace Ops
-#endif  // OP_COMMON_OP_KERNEL_MATH_UTIL_H
+#endif  // OP_COMMON_OP_KERNEL_MATH_UTIL_HPP

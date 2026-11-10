@@ -2,14 +2,14 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_expert_tokens_count_v2.h
+ * \file moe_v3_expert_tokens_count_v2.hpp
  * \brief ExpertTokensCount V2: 直接对 expertIdx 执行原子加，无需排序
  */
 
-#ifndef MOE_V3_EXPERT_TOKENS_COUNT_V2_H_REGBASE
-#define MOE_V3_EXPERT_TOKENS_COUNT_V2_H_REGBASE
+#ifndef MOE_V3_EXPERT_TOKENS_COUNT_V2_HPP
+#define MOE_V3_EXPERT_TOKENS_COUNT_V2_HPP
 
-#include "moe_v3_common.h"
+#include "moe_v3_common.hpp"
 #include "kernel_operator.h"
 
 namespace MoeInitRoutingV3 {
@@ -92,4 +92,4 @@ __aicore__ inline void ExpertTokensCountV2::Process()
 
 }  // namespace MoeInitRoutingV3
 
-#endif  // MOE_V3_EXPERT_TOKENS_COUNT_V2_H_REGBASE
+#endif  // MOE_V3_EXPERT_TOKENS_COUNT_V2_HPP

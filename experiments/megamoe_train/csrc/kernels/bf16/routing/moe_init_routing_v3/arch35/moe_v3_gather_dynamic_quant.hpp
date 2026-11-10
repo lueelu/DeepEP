@@ -2,15 +2,15 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_gather_dynamic_quant.h
+ * \file moe_v3_gather_dynamic_quant.hpp
  * \brief Token gathering with per-token dynamic quantization for MoE routing.
  */
-#ifndef MOE_V3_GATHER_DYNAMIC_QUANT_H_REGBASE
-#define MOE_V3_GATHER_DYNAMIC_QUANT_H_REGBASE
+#ifndef MOE_V3_GATHER_DYNAMIC_QUANT_HPP
+#define MOE_V3_GATHER_DYNAMIC_QUANT_HPP
 
-#include "moe_v3_common.h"
+#include "moe_v3_common.hpp"
 #include "kernel_operator.h"
-#include "op_kernel/load_store_utils.h"
+#include "op_kernel/load_store_utils.hpp"
 
 namespace MoeInitRoutingV3 {
 using namespace AscendC;
@@ -523,4 +523,4 @@ __aicore__ inline void MoeGatherOutDynamicQuant<T>::Process()
     }
 }
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_GATHER_DYNAMIC_QUANT_H_REGBASE
+#endif  // MOE_V3_GATHER_DYNAMIC_QUANT_HPP

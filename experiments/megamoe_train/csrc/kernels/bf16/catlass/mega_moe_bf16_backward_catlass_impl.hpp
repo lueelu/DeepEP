@@ -30,7 +30,7 @@
 #include <type_traits>
 
 #include "kernel_operator.h"
-#include "op_kernel/mc2_kernel_utils.h"
+#include "op_kernel/mc2_kernel_utils.hpp"
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/catlass.hpp"

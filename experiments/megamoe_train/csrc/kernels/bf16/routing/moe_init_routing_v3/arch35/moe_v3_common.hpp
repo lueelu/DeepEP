@@ -2,14 +2,14 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_common.h
+ * \file moe_v3_common.hpp
  * \brief Shared constants, types and helpers for MoE routing initialization.
  */
-#ifndef MOE_V3_COMMON_H_REGBASE
-#define MOE_V3_COMMON_H_REGBASE
+#ifndef MOE_V3_COMMON_HPP
+#define MOE_V3_COMMON_HPP
 
 #include "kernel_operator.h"
-#include "moe_init_routing_v3_arch35_tiling_def.h"
+#include "moe_init_routing_v3_arch35_tiling_def.hpp"
 
 namespace MoeInitRoutingV3 {
 using namespace AscendC;
@@ -84,4 +84,4 @@ __aicore__ inline void SetWaitFlag()
 }
 
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_COMMON_H_REGBASE
+#endif  // MOE_V3_COMMON_HPP

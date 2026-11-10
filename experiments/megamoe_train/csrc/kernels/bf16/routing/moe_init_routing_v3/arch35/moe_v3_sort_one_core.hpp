@@ -2,13 +2,13 @@
 // Modified by xixing 2026
 
 /*!
- * \file moe_v3_sort_one_core.h
+ * \file moe_v3_sort_one_core.hpp
  * \brief Single-core expert-index sorting and route row-index output.
  */
-#ifndef MOE_V3_SORT_ONE_CORE_H_REGBASE
-#define MOE_V3_SORT_ONE_CORE_H_REGBASE
+#ifndef MOE_V3_SORT_ONE_CORE_HPP
+#define MOE_V3_SORT_ONE_CORE_HPP
 
-#include "moe_v3_sort_base.h"
+#include "moe_v3_sort_base.hpp"
 
 namespace MoeInitRoutingV3 {
 using namespace AscendC;
@@ -148,4 +148,4 @@ __aicore__ inline void MoeSortOneCore::Process()
     this->SyncAll();
 }
 }  // namespace MoeInitRoutingV3
-#endif  // MOE_V3_SORT_ONE_CORE_H_REGBASE
+#endif  // MOE_V3_SORT_ONE_CORE_HPP
