@@ -82,6 +82,23 @@ events are recorded, and real synchronization/credit waits remain. Trace tick
 conversion follows the existing 1000 MHz protocol assumption, not a claimed
 hardware frequency probe. Overflow is an explicit error.
 
+Dispatch diagnostics include a nonblocking observation of each peer's last
+incoming Dispatch CV SO epoch in local memory. This is a zero-duration completion
+point, not a wait interval; it adds no CQ access, quiet, remote operation or
+correctness dependency. Timer/trace-off calls do not read these diagnostic flags.
+The matching `diagnostic-peer-dispatch-receive-v2` capability requires rebuilding
+Python/native/device components together.
+
+For each selected rank and peer class, `communication_bandwidth.json` reports
+the last nonempty incoming receive observation minus the first outgoing PUT,
+using outgoing X+scale bytes as numerator. Receive-only peers affect the end;
+empty incoming edges do not. Missing endpoints or nonpositive spans produce no
+bandwidth value. This is an effective exchange-span rate including observation
+delay, not pure outbound link throughput. Both endpoints use the same rank's
+clock. Combine retains its existing semantics. This update imports the final
+Dispatch diagnostic from consumer `07cd68f`, not its superseded CQ experiment or
+the standalone hardware-capture scripts.
+
 Only input/routing, precision, performance and trace utilities are imported;
 the source branch's standalone CPU simulators and tuning CLI are not imported.
 

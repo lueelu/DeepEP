@@ -22,6 +22,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("urma_compute_schedule") = "unitflag-shared-fixub-both-v5";
     module.attr("urma_routing_protocol") = MegaMoeUrma::kDeviceRoutingProtocol;
     module.attr("urma_shared_contract") = "unitflag-shared-a8w8-early-reduce-v1";
+    module.attr("urma_dispatch_completion_probe") = "diagnostic-peer-dispatch-receive-v2";
     module.attr("urma_local_pipeline") = "pack6-reduce6-output2";
     module.attr("urma_tail_schedule") = "combine-ready-scan-reduce-world-v1";
     module.attr("urma_timer_numel") = MegaMoeUrma::kTimerElements;

@@ -47,6 +47,8 @@ def _extension():
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
     if getattr(extension, "urma_routed_weight_layout", None) != "gate128-up128-v1":
         raise RuntimeError("Rebuild the fused gate128/up128 routed GMM1 extension")
+    if getattr(extension, "urma_dispatch_completion_probe", None) != "diagnostic-peer-dispatch-receive-v2":
+        raise RuntimeError("Rebuild the matching Dispatch receive-observation wheel")
     if getattr(extension, "urma_routing_protocol", None) != 8:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension

@@ -70,10 +70,11 @@ __aicore__ inline TraceMeta CooperativeChunkMeta(const Chunk& c, uint32_t offset
 // per turn. No blocking PeerStart/PackReady wait and no per-CV quiet.
 class CooperativePeer {
 public:
-    __aicore__ CooperativePeer(Arguments& a, uint32_t core, Timer& timer)
+    __aicore__ CooperativePeer(Arguments& a, uint32_t core, Timer& timer, DispatchReceiveObserver& observer)
         : a_(a),
           core_(core),
           timer_(timer),
+          dispatchObserver_(observer),
           active_(core < CommunicationWorkers(a.config.world)),
           peer_(active_ ? PeerForOwner(a.config.rank, core) : 0U),
           submitted_(TPosition::VECCALC, CooperativeUb::submitted, kMaxPeerChunks),
@@ -186,6 +187,7 @@ public:
         if (!active_) return;
         const uint64_t start = timer_.TraceBegin();
         Quiet(peer_);
+        incoming.dispatch.Poll();  // Final nonblocking receive observation; quiet is not receive evidence.
         TraceMeta m;
         m.peer = peer_;
         timer_.TraceEnd(TraceEvent::CombineSendComplete, start, m);
@@ -207,6 +209,7 @@ private:
         const auto* r = RouteInfo(a_);
         begin_ = r->recvCvBase[peer_];
         receives_ = r->recvCvBase[peer_ + 1U] - begin_;
+        dispatchObserver_.Arm(a_, peer_, r->incoming[peer_][a_.config.localExperts]);
         selfBegin_ = r->recvCvBase[a_.config.rank];
         selfCount_ = r->recvCvBase[a_.config.rank + 1U] - selfBegin_;
         remaining_ = receives_;
@@ -283,6 +286,7 @@ private:
     Arguments& a_;
     uint32_t core_;
     Timer& timer_;
+    DispatchReceiveObserver& dispatchObserver_;
     bool active_;
     uint32_t peer_;
     bool started_ = false, initialized_ = false, finished_ = false, selfFinished_ = false, sharedHeadReady_ = false;
@@ -294,10 +298,11 @@ private:
 
 __aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& timer, SharedIncoming& incoming)
 {
+    incoming.dispatch.Init(timer);
     RoutedCompletionConsumer completion(a, core);
     completion.Init();  // even zero-task AICs need the single credit
     PackBatch pack(a, timer);
-    CooperativePeer peer(a, core, timer);
+    CooperativePeer peer(a, core, timer, incoming.dispatch);
     SharedActivationState shared(a, core, timer);
     if (!peer.Active()) timer.CoarseBegin(CoarsePhase::Activation);
     UbRoutedActivation activation;

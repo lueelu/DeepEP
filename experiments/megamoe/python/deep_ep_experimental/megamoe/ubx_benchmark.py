@@ -176,6 +176,16 @@ def run(args, config, group):
                         export_trace(
                             raw_trace, case / "urma_trace.json", rank=rank, clock_mhz=1000.0, include_waits=False
                         )
+                        from .urma_timer import communication_bandwidth
+
+                        timing = communication_bandwidth(
+                            owner._ubx._diagnostic_timer.cpu().numpy(), rank, world=world, clock_mhz=1000.0
+                        )
+                        timing["diagnostic_only"] = True
+                        timing["selected_timer_ranks"] = timer_ranks
+                        (case / "communication_bandwidth.json").write_text(
+                            json.dumps(timing, indent=2, allow_nan=False), encoding="utf-8"
+                        )
                     except Exception as exc:
                         failure = str(exc)
                 collective_check(group, "UBX trace export", failure)

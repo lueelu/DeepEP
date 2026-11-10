@@ -44,6 +44,23 @@ enum class CoarsePhase : uint32_t {
 
 class Timer {
 public:
+    __aicore__ inline bool DiagnosticEnabled() const
+    {
+        return address_ != 0U || traceAddress_ != 0U;
+    }
+
+    // Retain the successful observation in scalar state. Trace/aggregate GM
+    // writes happen only at FinishTrace, outside the cooperative/Reduce loop.
+    __aicore__ inline void RecordDispatchReceive(uint32_t peer, uint32_t cv, uint32_t rows, uint64_t bytes)
+    {
+        if (!DiagnosticEnabled()) return;
+        dispatchTick_ = AscendC::GetSystemCycle();
+        dispatchPeer_ = peer;
+        dispatchCv_ = cv;
+        dispatchRows_ = rows;
+        dispatchBytes_ = bytes;
+    }
+
     __aicore__ inline void SharedMode()
     {
         shared_ = true;
@@ -132,6 +149,19 @@ public:
     // An unfinished kernel leaves a zero header and is rejected by the reader.
     __aicore__ inline void FinishTrace()
     {
+        if (dispatchTick_ != 0U && address_ != 0U) {
+            auto* record = reinterpret_cast<__gm__ uint64_t*>(address_) +
+                           (static_cast<uint64_t>(core_) * kTimerPhases + Phase::Dispatch) * kTimerRecordElements;
+            // Timing kind2: outgoing first PUT -> incoming last Dispatch.
+            // Empty receive edges have no end tick but remain explicitly known.
+            record[5] = 2U;
+            record[6] = kProtocol;
+            record[7] = dispatchRows_ ? dispatchTick_ : 0U;
+            record[8] = dispatchBytes_;
+            record[9] = dispatchRows_;
+            FlushTraceLine(record);
+            FlushTraceLine(record + 8);
+        }
         if (traceAddress_ == 0U) return;
         // All engines have passed the final local join. Emit only now, sorted
         // by start so the ordinary raw trace decoder keeps its ordering checks.
@@ -157,6 +187,17 @@ public:
                 WriteTrace(event, coarseStart_[selected], coarseEnd_[selected], meta);
                 coarseStart_[selected] = 0U;
             }
+        }
+        // Observation may happen inside a Reduce/quiet envelope. Append this
+        // independent point after ordinary scopes, keeping its original tick.
+        // The decoder allows only this zero-duration ID65 point out of order.
+        if (dispatchTick_ != 0U) {
+            TraceMeta meta;
+            meta.peer = dispatchPeer_;
+            meta.cv = dispatchCv_;
+            meta.rows = dispatchRows_;
+            meta.bytes = dispatchBytes_;
+            WriteTrace(TraceEvent::DispatchReceiveComplete, dispatchTick_, dispatchTick_, meta);
         }
         auto* header = TraceHeader();
         header[0] = kTraceSchema;
@@ -206,6 +247,9 @@ public:
     }
 
 private:
+    uint64_t dispatchTick_ = 0U;
+    uint64_t dispatchBytes_ = 0U;
+    uint32_t dispatchPeer_ = 0U, dispatchCv_ = 0U, dispatchRows_ = 0U;
     bool shared_ = false;
     __aicore__ inline __gm__ uint64_t* TraceHeader() const
     {

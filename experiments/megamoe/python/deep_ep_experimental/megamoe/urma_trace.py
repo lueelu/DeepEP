@@ -82,6 +82,7 @@ EVENTS = (
     "RoutePrepare",
     "RouteSummary",
     "WaitRouteSummary",
+    "DispatchReceiveComplete",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {
@@ -186,12 +187,19 @@ def event_style(event):
             "thread_state_iowait",
             "final outbound-peer quiet; end confirms all prior Dispatch/Combine payload PUTs and SO flags to this peer completed",
         )
+    if event == "DispatchReceiveComplete":
+        return (
+            event + " [peer to local complete]",
+            "transport.receive_observation",
+            "good",
+            "first nonblocking observation of this peer's final Dispatch SO epoch in local memory; includes all preceding X/scale PUTs from peer to this rank; rows=0 marks an empty incoming edge and contributes no receive-end timestamp",
+        )
     if event == "DispatchSendComplete":
         return (
             event + " [outbound completion]",
             "transport.quiet",
             "thread_state_iowait",
-            "final owner QP quiet; end confirms all Dispatch payload PUTs and SO ready publications completed",
+            "outbound Dispatch completion observation; zero-duration records are nonblocking fixed CQ-target probes, not quiet waits; timestamp is first observation and may be later than actual completion",
         )
     if event.endswith("Drain"):
         return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"
@@ -263,9 +271,11 @@ def decode_trace(raw, *, rank, clock_mhz):
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
-            if previous_end is not None and start < previous_end:
-                raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
-            previous_end = end
+            observation_point = event_id in (43, 65) and start == end
+            if not observation_point:
+                if previous_end is not None and start < previous_end:
+                    raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
+                previous_end = end
             if any(row[13:]):
                 raise ValueError(f"engine={engine} record={ordinal}: nonzero reserved record fields")
             if row[3] != UNKNOWN and row[3] >= 16:
@@ -327,6 +337,11 @@ def decode_trace(raw, *, rank, clock_mhz):
     for start, end, engine, ordinal, row in sorted(records, key=lambda value: (value[0], value[2], value[3])):
         event = EVENTS[row[2]]
         name, category, color, meaning = event_style(event)
+        if event == "DispatchSendComplete" and start == end:
+            name = event + " [nonblocking observation]"
+            category, color = "transport.completion_observation", "good"
+        if event == "DispatchReceiveComplete" and row[8] == 0:
+            name = event + " [empty incoming edge]"
         if engine % 3 == 2 and event in ("Gmm1TileDrain", "Gmm2Drain"):
             name = event + " [paired FIX completion]"
             meaning = "paired AIV1 waits for actual FIX full before consuming the UB mailbox with GMM1 activation or GMM2 reorder; not AIC execution time"

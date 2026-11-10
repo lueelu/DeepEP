@@ -115,7 +115,8 @@ enum class TraceEvent : uint32_t {
     CoarseSharedCombineSubmit,
     RoutePrepare,
     RouteSummary,
-    WaitRouteSummary
+    WaitRouteSummary,
+    DispatchReceiveComplete
 };
 
 struct TraceMeta {

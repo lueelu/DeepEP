@@ -216,6 +216,10 @@ class UbxBuffer:
                 engine._plan = None
                 engine.cv_rows, engine.shared_intermediate_hidden = key
                 self._key = key
+            # Public timer remains the fine trace tensor. The matching aggregate
+            # diagnostic is internal and is never allocated for formal calls.
+            diagnostic_timer = engine.allocate_timer() if timer is not None else None
+            self._diagnostic_timer = diagnostic_timer
             output = engine.forward(
                 x,
                 topk_idx,
@@ -225,6 +229,7 @@ class UbxBuffer:
                 shared_l1_weights=shared_l1_weights,
                 shared_l2_weights=shared_l2_weights,
                 out=out,
+                timer=diagnostic_timer,
                 trace=timer,
             )
             counts = engine._plan.expert_counts

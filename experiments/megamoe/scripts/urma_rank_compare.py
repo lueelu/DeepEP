@@ -26,6 +26,7 @@ STAGES = [
     ("Activation", {23, 50}, None),
     ("SharedActivation", {57}, None),
     ("Dsubmit", {1, 2, 4, 48, 53}, None),
+    ("Dreceive", {65}, None),
     ("Csubmit", {10, 30, 49, 61}, None),
     ("Reorder", {40}, None),
     ("Quiet", {3, 11, 42, 43}, None),
@@ -176,6 +177,8 @@ def render(document, source="allrank.json", limit=60000):
         parts = []
         for rank in selected:
             es = choose(data[rank], ids, engine)
+            if name == "Dreceive":
+                es = [e for e in es if e.get("args", {}).get("rows", 0) > 0]
             parts.append(f"{window(es)} {f(longest(es)) if es else '-'} {len(es)}")
         add(name + " | " + " | ".join(parts))
     add("[WAITS] stage FAST(longest_core_sum max_record count) SLOW(...); missing=-, not0")
