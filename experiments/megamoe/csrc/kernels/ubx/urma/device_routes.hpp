@@ -43,6 +43,53 @@ __aicore__ inline void RouteSave(uint64_t gm, uint32_t ub, uint32_t bytes)
     DataCopyPad(dst, src, {1U, bytes, 0U, 0U, 0U});
     RouteFence<HardEvent::MTE3_S>();
 }
+// Startup-only scratch at UB offset 0 is retired before RouteOwnedExperts
+// reuses it. Assign whole 128B slots so AIV workers never share a cache line.
+__aicore__ inline void ResetFlagRegion(uint64_t address, uint64_t bytes, uint32_t worker)
+{
+    const uint64_t slots = bytes / kFlagBytes;
+    uint64_t offset = (slots * worker / kLocalWorkers) * kFlagBytes;
+    const uint64_t end = (slots * (worker + 1U) / kLocalWorkers) * kFlagBytes;
+    while (offset < end) {
+        const uint32_t size = static_cast<uint32_t>(end - offset < 4096U ? end - offset : 4096U);
+        RouteSave(address + offset, 0U, size);
+        offset += size;
+    }
+}
+
+__aicore__ inline void ResetInvocationFlags(const Arguments& a, uint32_t worker)
+{
+    LocalTensor<int32_t> zeros(TPosition::VECCALC, 0U, 1024U);
+    Duplicate<int32_t>(zeros, 0, 1024U);
+    RouteFence<HardEvent::V_MTE3>();
+    const auto& c = a.config;
+    const uint64_t chunks = uint64_t(c.world) * c.maxPeerChunks;
+    const uint64_t groups = RouteGroupCapacity(uint64_t(c.world) * c.sourceRowCapacity, c.localExperts);
+    // Match the Host allocation's minimum size, including its unused padding.
+    const uint64_t groupBytes = groups * kFlagBytes < 512U ? 512U : groups * kFlagBytes;
+    ResetFlagRegion(a.symmetric + c.dispatchReadyOffset, chunks * kFlagBytes, worker);
+    ResetFlagRegion(a.symmetric + c.combineReadyOffset, chunks * kFlagBytes, worker);
+    ResetFlagRegion(a.symmetric + c.barrierOffset + uint64_t(c.world) * kFlagBytes, uint64_t(c.world) * kFlagBytes,
+                    worker);
+    ResetFlagRegion(a.inputScaleDone, groupBytes, worker);
+    ResetFlagRegion(a.activationDone, groupBytes, worker);
+    ResetFlagRegion(a.gmm2Done, groupBytes, worker);
+    ResetFlagRegion(a.gmmIssued, kAic * kFlagBytes, worker);
+    ResetFlagRegion(a.localFlags, (a.sharedExperts ? kSharedLocalFlagCount : 16U) * kFlagBytes, worker);
+    ResetFlagRegion(a.packReady, chunks * kFlagBytes, worker);
+    if (a.sharedExperts) {
+        const uint64_t maxTokens = c.sourceRowCapacity / c.topk;
+        const uint64_t sharedGroups = (maxTokens + 255U) / 256U;
+        const uint64_t tileBytes = sharedGroups * (a.sharedIntermediate / 256U) * kFlagBytes;
+        const uint64_t activationBytes = sharedGroups * kFlagBytes;
+        ResetFlagRegion(a.sharedGmm1Done, tileBytes < 512U ? 512U : tileBytes, worker);
+        ResetFlagRegion(a.sharedActivationDone, activationBytes < 512U ? 512U : activationBytes, worker);
+    }
+    // RouteSave drains each MTE3 write. The existing first route SyncAll joins
+    // every reset worker before any Start, route-ready or compute publication.
+    // Persistent Start and route epoch slots deliberately remain untouched.
+}
+
 // Caller provides one S_MTE3 edge before the batch and one MTE3_S edge after
 // it. Every UB source remains immutable until that final completion edge.
 __aicore__ inline void RouteEnqueueSave(uint64_t gm, uint32_t ub, uint32_t bytes)
@@ -335,8 +382,12 @@ __aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer)
     // inboxes to its private RouteInfo. The next serialized invocation can
     // therefore reuse even a single remote mailbox; no benchmark collective
     // or double buffer is part of this argument. Keep the tail observers/join.
-    if constexpr (g_coreType == AIV) RouteOwnedExperts(a, LocalWorkerIndex(block, GetSubBlockIdx()));
-    // #1: all count DMA stores AND all consumers' cache invalidations precede
+    if constexpr (g_coreType == AIV) {
+        const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
+        ResetInvocationFlags(a, worker);
+        RouteOwnedExperts(a, worker);
+    }
+    // #1: all flag resets, count DMA stores and consumers' cache invalidations precede
     // the leader's first RouteInfo/Config update.
     SyncAll<false>();
     if constexpr (g_coreType == AIV)

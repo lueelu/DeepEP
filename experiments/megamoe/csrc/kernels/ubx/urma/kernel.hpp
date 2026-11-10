@@ -80,7 +80,7 @@ __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
 // Publish before packing so remote startup can overlap local DMA. Do not
 // wait here: all workers must reach the two-round startup join. Previous-call
 // receive/return consumers finished at the prior local join, and this call's
-// counter resets precede the kernel on the same stream. Self pack and remote
+// counter resets completed before the first local route join. Self pack and remote
 // PUTs address disjoint source intervals in receive storage.
 __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, Timer& timer)
 {

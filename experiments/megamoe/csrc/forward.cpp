@@ -732,25 +732,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                                                   shared_experts_, shared_i, world_ * experts_, platform_);
             shared_intermediate_ = shared_i;
         }
-        auto& state = *ubx_;
-        auto& args = state.args_;
-        auto& c = args.config;
-        c.bs = bs;
-        // Ready slots are receiver-owned and reset before this invocation's Start.
-        // Persistent Start/route epoch slots are never reset on plan reconstruction.
-        const uint64_t cv_flag_bytes = uint64_t(c.world) * c.maxPeerChunks * MegaMoeUrma::kFlagBytes;
-        for (uint64_t offset : {c.dispatchReadyOffset, c.combineReadyOffset})
-            ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(reinterpret_cast<void*>(args.symmetric + offset), cv_flag_bytes, 0,
-                                                     cv_flag_bytes, stream.stream()));
-        const uint64_t finished_bytes = uint64_t(c.world) * MegaMoeUrma::kFlagBytes;
-        ASCEND_DEEPEP_CHECK_ACL(
-            aclrtMemsetAsync(reinterpret_cast<void*>(args.symmetric + c.barrierOffset + finished_bytes), finished_bytes,
-                             0, finished_bytes, stream.stream()));
-        for (auto* tensor : {&state.input_scale_done_, &state.activation_done_, &state.gmm2_done_, &state.gmm_issued_,
-                             &state.local_flags_, &state.pack_ready_, &state.shared_done1_, &state.shared_done_act_})
-            if (tensor->defined())
-                ASCEND_DEEPEP_CHECK_ACL(
-                    aclrtMemsetAsync(tensor->data_ptr(), tensor->nbytes(), 0, tensor->nbytes(), stream.stream()));
+        ubx_->args_.config.bs = bs;
+        // Invocation flags are reset by AIV workers before the first route join.
         if (timer) {
             ASCEND_DEEPEP_CHECK_ACL(
                 aclrtMemsetAsync(timer->data_ptr(), timer->nbytes(), 0, timer->nbytes(), stream.stream()));
