@@ -1101,7 +1101,7 @@ def launch(args, *, entrypoint=None):
     ]
     api = getattr(args, "api", "v2")
     args.profile_sample_markers = True
-    args.combine_notify = api == "v2"
+    args.combine_notify = True
     plan = dict(
         format_version=2,
         api=api,

@@ -488,7 +488,7 @@ def parse_profile(
     if fused:
         main = "v1_combine_udma_kernel"
     required = [main]
-    # New V2 runs require a separate all-AIV entry rendezvous. Archived reports
+    # New V1/V2 profiles require a separate all-AIV entry rendezvous. Archived reports
     # without it remain readable; partial/mixed sequences always fail below.
     combine_notify = (
         ["cached_notify_combine_kernel"]

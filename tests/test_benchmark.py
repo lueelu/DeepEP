@@ -72,15 +72,15 @@ def test_clos_notify_switch_is_restored_after_capture(monkeypatch, previous, fai
 
 
 @pytest.mark.parametrize("expanded", [False, True])
-def test_clos_combine_notify_is_separate_and_complete(tmp_path, expanded):
+@pytest.mark.parametrize("api", ["v1", "v2"])
+def test_clos_combine_notify_is_separate_and_complete(tmp_path, expanded, api):
     from benchmarks.clos.stage_metrics import parse_profile
 
     columns = ["Name", "Start Time(us)", "Duration(us)", "Device_id", "Step Id", "Block Num"]
-    names = (["aggregate_kernel"] if expanded else []) + [
-        "cached_notify_combine_kernel",
-        "v1_combine_udma_comm_kernel",
-        "v1_combine_udma_reduce_kernel",
-    ]
+    names = (["aggregate_kernel"] if expanded else []) + ["cached_notify_combine_kernel"]
+    names += (
+        ["v1_combine_udma_kernel"] if api == "v1" else ["v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+    )
     rows = [
         dict(zip(columns, (name, 100 * sample + 10 * i, 3, 0, 1, 32)))
         for sample in range(2)
@@ -94,14 +94,21 @@ def test_clos_combine_notify_is_separate_and_complete(tmp_path, expanded):
             writer = csv.DictWriter(stream, fieldnames=columns)
             writer.writeheader()
             writer.writerows(values)
-        return parse_profile(tmp_path, "combine_unweighted", expanded, 2, 0, 32, require_combine_notify=required)
+        return parse_profile(
+            tmp_path, "combine_unweighted", expanded, 2, 0, 32, api=api, require_combine_notify=required
+        )
 
     result = parse(rows)
     for sample in result["samples"]:
         assert sample["notify_us"] == "3"
-        assert sample["comm_us"] == "3"
-        assert sample["reduce_us"] == "3"
-        assert sample["combine_stage_us"] == ("6" if expanded else "3")
+        if api == "v1":
+            assert sample["comm_us"] is None and sample["reduce_us"] is None
+            assert sample["fused_combine_us"] == "3"
+            assert sample["combine_with_reduce_us"] == ("6" if expanded else "3")
+        else:
+            assert sample["comm_us"] == "3"
+            assert sample["reduce_us"] == "3"
+            assert sample["combine_stage_us"] == ("6" if expanded else "3")
     missing = [r for r in rows if r["Name"] != "cached_notify_combine_kernel"]
     with pytest.raises(ValueError, match="kernel counts"):
         parse(missing)

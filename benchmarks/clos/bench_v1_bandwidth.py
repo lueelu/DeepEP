@@ -117,6 +117,8 @@ def worker(args):
     args.expert_alignment, args.zero_copy = 1, False
     args.profile_warmup, args.profile_iters = args.warmup, args.iterations
     args.profile_sample_markers = True
+    args.combine_notify = True
+    os.environ[shared.COMBINE_NOTIFY_ENV] = "0"
     device = args.first_device + local_rank
     destination = args.output / f"rank{rank}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -313,16 +315,17 @@ def worker(args):
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
-                profiling._profile_operator(
-                    rank,
-                    args,
-                    op,
-                    flush_cache.wrap(fn),
-                    sample_callback=shared.ProfileSamples(torch),
-                    guard_iters=shared.PROFILE_GUARD_ITERS,
-                    synchronize_each_iteration=True,
-                    before_iteration=before_iteration,
-                )
+                with shared.profile_combine_notify(op.startswith("combine")):
+                    profiling._profile_operator(
+                        rank,
+                        args,
+                        op,
+                        flush_cache.wrap(fn),
+                        sample_callback=shared.ProfileSamples(torch),
+                        guard_iters=shared.PROFILE_GUARD_ITERS,
+                        synchronize_each_iteration=True,
+                        before_iteration=before_iteration,
+                    )
             except profiling._ProfileComplete:
                 pass
             profile = shared.parse_profile_collective(
@@ -337,8 +340,10 @@ def worker(args):
                 api="v1",
                 flush_l2_cache=args.flush_l2_cache,
                 sample_markers=True,
+                require_combine_notify=True,
             )
             profile["sampling"]["host_sync_each_iteration"] = True
+            profile["sampling"]["combine_notify_profile_only"] = op.startswith("combine")
             dist.barrier()
             for _ in range(args.warmup):
                 if before_iteration is not None:
