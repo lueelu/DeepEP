@@ -5,6 +5,9 @@
  * \file moe_init_routing_v3_apt.hpp
  * \brief MoE routing initialization: sorting, token counting, row indices and gathering.
  */
+
+#pragma once
+
 #include "moe_v3_mrgsort_out.hpp"
 #include "moe_v3_mrgsort.hpp"
 #include "moe_v3_sort_one_core.hpp"

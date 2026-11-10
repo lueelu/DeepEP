@@ -7,6 +7,8 @@
  * \brief Host-side tiling and buffer size calculation for MegaMoE BF16 training.
  */
 
+#pragma once
+
 #include "csrc/kernels/bf16/layout/mega_moe_layout.hpp"
 #include <cstddef>
 #include <cmath>
