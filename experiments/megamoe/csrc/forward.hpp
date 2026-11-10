@@ -39,11 +39,6 @@ public:
         c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out, int64_t generation = 0);
 
     int64_t workspace_bytes() const;
-    torch::Tensor diagnostic_timer() const
-    {
-        return diagnostic_timer_;
-    }
-    uint32_t cv_rows() const;
 
 private:
     Backend backend_;
@@ -53,7 +48,7 @@ private:
     torch::Tensor workspace_;
     torch::Tensor context_;
     uint64_t ffts_;
-    torch::Tensor example_, diagnostic_timer_;
+    torch::Tensor example_;
     int64_t intermediate_, topk_, experts_, world_, max_tokens_, shared_experts_;
     bool is_a8w4_;
     uint64_t symmetric_address_;
@@ -61,6 +56,8 @@ private:
     int64_t last_generation_ = 0;
     int64_t shared_intermediate_ = 0;
 };
+
+torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend = "pod");
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
                     const std::string& backend = "pod");

@@ -3,10 +3,6 @@
 from .validation import collective_check
 
 
-def cv_rows(world, bs):
-    return 128 if world == 16 and bs in (1024, 2048) else 256
-
-
 def select_backend(group):
     # Product identity is distinct from fabric topology. Unknown products keep
     # the POD entry; its existing shape/platform/peer checks still apply.

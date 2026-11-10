@@ -178,7 +178,6 @@ def backend(monkeypatch):
             self.bs, self.workspace_bytes = example.shape[0], 4096
             self.backend = backend
             self.local_experts = experts
-            self.diagnostic_timer = None
             events.append(("prepare", self.bs))
             events.append(("plan_backend", backend))
 
@@ -221,7 +220,7 @@ def backend(monkeypatch):
             output = out if out is not None else Tensor(np.zeros(x.shape), "bfloat16")
             output.data.fill(3)
             if self.backend == "ubx" and timer is not None:
-                self.diagnostic_timer = Tensor([generation], "int64")
+                timer.data[-1] = generation
             return output, Tensor(np.arange(self.local_experts) + 2, "int32")
 
     def buffer_size(*args, backend="pod"):
@@ -234,10 +233,7 @@ def backend(monkeypatch):
         ffts_config=lambda: 123,
         timer_enabled=True,
         timer_numel=64,
-        urma_trace_num_engines=1,
-        urma_trace_header_elements=1,
-        urma_trace_record_elements=1,
-        urma_trace_max_capacity=65536,
+        allocate_timer=lambda example, backend="pod": Tensor(np.zeros(65536 if backend == "ubx" else 64), "int64"),
         small_batch_max_tokens=256,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
@@ -515,27 +511,6 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan_bs == 17
 
 
-@pytest.mark.parametrize(
-    "world,bs,expected",
-    [
-        (16, 1024, 128),
-        (16, 2048, 128),
-        (16, 1023, 256),
-        (16, 1025, 256),
-        (16, 2047, 256),
-        (16, 2049, 256),
-        (16, 1536, 256),
-        (8, 1024, 256),
-        (8, 2048, 256),
-        (4, 1024, 256),
-    ],
-)
-def test_ubx_cv_policy_exact_points(world, bs, expected):
-    from deep_ep_experimental.megamoe.backend import cv_rows
-
-    assert cv_rows(world, bs) == expected
-
-
 @pytest.mark.parametrize("board,expected", [(0x44, "ubx"), (7, "pod"), (3, "pod"), (None, "pod"), (0x6C, "pod")])
 def test_megamoe_product_selection(monkeypatch, board, expected):
     from deep_ep_experimental.megamoe import backend as selector
@@ -630,7 +605,9 @@ def test_ubx_timer_uses_unified_forward_and_plan_diagnostics(backend, monkeypatc
         api.fp8_fp4_mega_moe(y, *weights, b, timer=timer)
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
         assert launch[8] is timer
-        assert b._plan.diagnostic_timer is not None
+        assert timer.data[-1] == launch[-1]
+        assert not hasattr(b._plan, "diagnostic_timer")
+        assert not hasattr(b._plan, "cv_rows")
         assert not hasattr(b, "_ubx")
     finally:
         b.destroy()

@@ -32,7 +32,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 5:
+    if getattr(extension, "api_protocol", None) != 6:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -242,18 +242,10 @@ class SymmBuffer:
 
     def allocate_timer(self) -> Tensor:
         """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""
-        import torch
-
         self._runtime.ensure_alive()
         if not self.timer_enabled:
             raise RuntimeError("W4A8 timer requires DEEPEP_MEGAMOE_TIMER=ON")
-        ext = _extension()
-        numel = ext.timer_numel
-        if self._backend_name == "ubx":
-            numel = ext.urma_trace_num_engines * (
-                ext.urma_trace_header_elements + ext.urma_trace_max_capacity * ext.urma_trace_record_elements
-            )
-        return torch.zeros(numel, dtype=torch.int64, device=self._device)
+        return _extension().allocate_timer(self.x, backend=self._backend_name)
 
     def validate_inputs(self, bs: int, *, x: Tensor | None = None) -> None:
         """Collective, synchronizing routing scan. Run after filling inputs, outside timing."""

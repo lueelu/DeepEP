@@ -35,6 +35,10 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
     source = inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
+    if routing == "random-balanced":
+        from .benchmark import ROUTING_SEED, _global_routes, random_balanced_indices
+
+        source += str(ROUTING_SEED) + inspect.getsource(_global_routes) + inspect.getsource(random_balanced_indices)
     return dict(
         version=1,
         reference_sha256=hashlib.sha256(source.encode()).hexdigest(),

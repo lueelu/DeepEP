@@ -307,8 +307,6 @@ Config UbxLayout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden
                     max_tokens <= MegaMoeUrma::kMaxTokensPerRank && topk >= 1 && topk <= 8 && hidden >= 256 &&
                     hidden <= 8192 && hidden % 256 == 0,
                 "MegaMoE URMA v1 requires EP4/EP8/EP16, H256..8192 aligned256, K1..8 and max_tokens in [1,16384]");
-    TORCH_CHECK(cv_rows >= 128 && cv_rows <= 4096 && cv_rows % 128 == 0,
-                "URMA CV rows must be a multiple of 128 in [128,4096]");
     TORCH_CHECK(max_recv_rows == world * max_tokens * topk,
                 "Device routing requires worst-case receive capacity world*max_tokens*topk");
     Config config{};
@@ -341,7 +339,7 @@ uint64_t Address(const torch::Tensor& tensor)
 }
 uint32_t SelectCv(int64_t world, int64_t bs)
 {
-    return world == 16 && (bs == 1024 || bs == 2048) ? 128U : 256U;
+    return world == 16 && bs <= 2560 ? 128U : 256U;
 }
 
 }  // namespace
@@ -544,13 +542,22 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens, "BS outside allocated capacity");
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && world % ranks_per_node == 0),
                 "ranks_per_node must divide EP");
-    if (backend_ == Backend::Ubx) {
+    const bool ubx = backend_ == Backend::Ubx;
+    if (ubx) {
         TORCH_CHECK(is_a8w4 && intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0,
                     "UBX supports FP8xFP4 with I256..16384 aligned256");
         TORCH_CHECK(shared_experts == 0 || shared_experts == 1, "UBX supports S0/S1");
-        const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1), backend);
-        TORCH_CHECK(symmetric_address && symmetric_bytes >= required, "MegaMoE symmetric workspace is too small");
-        platform_ = GetPlatformInfo();
+    } else {
+        TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
+                    "Plan intermediate_hidden must be divisible by 128, in [256,4096]");
+        TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (is_a8w4 || shared_experts == 0),
+                    "Plan shared experts require W4A8, with count in [0,8]");
+    }
+    const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1), backend);
+    TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
+                " bytes, got ", symmetric_bytes);
+    platform_ = GetPlatformInfo();
+    if (ubx) {
         TORCH_CHECK(platform_.aic >= MegaMoeUrma::kAic && platform_.aiv >= 2U * MegaMoeUrma::kAic &&
                         platform_.ub >= MegaMoeUrma::kRequiredUbBytes,
                     "UBX requires 28 AIC/56 AIV and 248 KiB usable UB");
@@ -558,37 +565,11 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
         platform_.aic = MegaMoeUrma::kAic;
         platform_.aiv = 2U * MegaMoeUrma::kAic;
         platform_.block_dim = device_platform->CalcTschBlockDim(platform_.aiv, platform_.aic, platform_.aiv);
-        TORCH_CHECK(aclshmem_n_pes() == world && aclshmem_my_pe() >= 0 && aclshmem_my_pe() < world,
-                    "MegaMoE plan does not match its SHMEM runtime");
-        for (int64_t peer = 0; peer < world; ++peer)
-            TORCH_CHECK(aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), peer) != nullptr,
-                        "UBX completion signals require mapped peer workspace");
-        return;
+        TORCH_CHECK(aclshmem_n_pes() == world, "MegaMoE plan does not match its SHMEM runtime");
     }
-    TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens && max_tokens <= 65536,
-                "Plan BS must be in [1, max_tokens], max_tokens <= 65536");
-    TORCH_CHECK(intermediate >= 256 && intermediate <= 4096 && intermediate % 128 == 0,
-                "Plan intermediate_hidden must be divisible by 128, in [256,4096]");
-    TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (is_a8w4 || shared_experts == 0),
-                "Plan shared experts require W4A8, with count in [0,8]");
-    TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world && world % ranks_per_node == 0),
-                "Plan ranks_per_node must divide EP");
-    const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1));
-    TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
-                " bytes, got ", symmetric_bytes);
-    platform_ = GetPlatformInfo();
-    tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                         is_a8w4, shared_experts, platform_);
-    tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
-    static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
-    const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
-    const int64_t bytes =
-        info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
-    TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
-    workspace_ = torch::empty({bytes}, example.options().dtype(torch::kUInt8));
-    context_ = torch::empty({static_cast<int64_t>(sizeof(Mc2Aclnn::Mc2MoeContext))}, workspace_.options());
 
-    // peer 地址和 context 只在准备阶段解析，不在每次 forward 中重新分配、同步拷贝。
+    // Both backends resolve peer mappings once during plan preparation.
+    // Only POD uploads this context; UBX passes the symmetric base in its ABI.
     Mc2Aclnn::Mc2MoeContext context{};
     const int rank = aclshmem_my_pe();
     TORCH_CHECK(rank >= 0 && rank < world && world <= Mc2Aclnn::HCCL_MAX_RANK_SIZE, "Invalid SHMEM rank/world: ", rank,
@@ -600,16 +581,25 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
         TORCH_CHECK(address != nullptr, "rank=", rank, " prepare: cannot resolve peer=", peer);
         context.epHcclBuffer_[peer] = reinterpret_cast<uint64_t>(address);
     }
-    ASCEND_DEEPEP_CHECK_ACL(
-        aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
+    if (!ubx) {
+        tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
+                             is_a8w4, shared_experts, platform_);
+        tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
+        static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
+        const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
+        const int64_t bytes =
+            info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
+        TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
+        workspace_ = torch::empty({bytes}, example.options().dtype(torch::kUInt8));
+        context_ = torch::empty({static_cast<int64_t>(sizeof(context))}, workspace_.options());
+        ASCEND_DEEPEP_CHECK_ACL(
+            aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
+    }
+    // UBX workspace is prepared in forward once the shared tensor dimensions
+    // are available. POD keeps its existing eager allocation in prepare.
 }
 
 Plan::~Plan() = default;
-
-uint32_t Plan::cv_rows() const
-{
-    return backend_ == Backend::Ubx ? SelectCv(world_, example_.size(0)) : 0U;
-}
 
 int64_t Plan::workspace_bytes() const
 {
@@ -706,6 +696,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                     "Invalid shared weight scales");
     }
     uint64_t trace_capacity = 0;
+    int64_t trace_elements = 0;
     if (timer) {
 #ifndef DEEPEP_MEGAMOE_TIMER
         TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before passing timer");
@@ -715,11 +706,12 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         TORCH_CHECK(timer->scalar_type() == torch::kInt64, "timer must be int64");
         if (ubx) {
             constexpr int64_t row_elements = MegaMoeUrma::kTimerCores * MegaMoeUrma::kTraceRecordElements;
-            TORCH_CHECK(Address(*timer) % 128U == 0 && timer->numel() % row_elements == 0 &&
-                            timer->numel() >= 2 * row_elements &&
-                            timer->numel() <= (int64_t{MegaMoeUrma::kTraceMaxCapacity} + 1) * row_elements,
+            trace_elements = timer->numel() - MegaMoeUrma::kTimerElements;
+            TORCH_CHECK(Address(*timer) % 128U == 0 && trace_elements % row_elements == 0 &&
+                            trace_elements >= 2 * row_elements &&
+                            trace_elements <= (int64_t{MegaMoeUrma::kTraceMaxCapacity} + 1) * row_elements,
                         "Invalid UBX fine trace allocation");
-            trace_capacity = timer->numel() / row_elements - 1;
+            trace_capacity = trace_elements / row_elements - 1;
         } else
             TORCH_CHECK(timer->numel() == AscendTimer::TOTAL_BUFFER_SIZE, "Invalid POD timer allocation");
     }
@@ -728,20 +720,16 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     TORCH_CHECK(y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     torch::Tensor expert_tokens = torch::empty({experts_}, x.options().dtype(torch::kInt32));
     const auto stream = c10_npu::getCurrentNPUStream();
-    auto ptr = [](const torch::Tensor& t) { return static_cast<uint8_t*>(t.data_ptr()); };
-    auto opt = [&](const c10::optional<torch::Tensor>& t) { return t ? ptr(*t) : nullptr; };
-    PodLaunchArgs pod{};
-    MegaMoeUrma::Arguments* ubx_args = nullptr;
-    diagnostic_timer_ = torch::Tensor();
+    // Prepare backend state before assembling either device argument block.
     if (ubx) {
         TORCH_CHECK(generation > last_generation_ && generation < (1LL << 31),
                     "UBX generation must be positive and increase across the Buffer lifetime");
         if (!ubx_ || shared_intermediate_ != shared_i) {
             if (ubx_) ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeStream(stream.stream()));
             ubx_.reset();
-            ubx_ = std::make_unique<UbxWorkspace>(example_, world_, intermediate_, topk_, cv_rows(), max_tokens_,
-                                                  aclshmem_my_pe(), ffts_, symmetric_address_, shared_experts_,
-                                                  shared_i, world_ * experts_, platform_);
+            ubx_ = std::make_unique<UbxWorkspace>(example_, world_, intermediate_, topk_, SelectCv(world_, bs),
+                                                  max_tokens_, aclshmem_my_pe(), ffts_, symmetric_address_,
+                                                  shared_experts_, shared_i, world_ * experts_, platform_);
             shared_intermediate_ = shared_i;
         }
         auto& state = *ubx_;
@@ -764,10 +752,17 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                 ASCEND_DEEPEP_CHECK_ACL(
                     aclrtMemsetAsync(tensor->data_ptr(), tensor->nbytes(), 0, tensor->nbytes(), stream.stream()));
         if (timer) {
-            diagnostic_timer_ = torch::zeros({MegaMoeUrma::kTimerElements}, x.options().dtype(torch::kInt64));
             ASCEND_DEEPEP_CHECK_ACL(
                 aclrtMemsetAsync(timer->data_ptr(), timer->nbytes(), 0, timer->nbytes(), stream.stream()));
         }
+    }
+    // Common dispatch stage; only the device argument representation differs.
+    auto ptr = [](const torch::Tensor& t) { return static_cast<uint8_t*>(t.data_ptr()); };
+    auto opt = [&](const c10::optional<torch::Tensor>& t) { return t ? ptr(*t) : nullptr; };
+    PodLaunchArgs pod{};
+    MegaMoeUrma::Arguments* ubx_args = nullptr;
+    if (ubx) {
+        auto& args = ubx_->args_;
         args.config.epoch = generation;
         args.x = Address(x);
         args.xScale = Address(*x_scales);
@@ -780,7 +775,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         args.weightScale2 = Address(weight_scales2);
         args.output = Address(y);
         args.expertCountsOutput = Address(expert_tokens);
-        args.timer = diagnostic_timer_.defined() ? Address(diagnostic_timer_) : 0;
+        // Aggregate counters occupy the trailer of the same public timer buffer.
+        args.timer = timer ? Address(*timer) + trace_elements * sizeof(int64_t) : 0;
         args.trace = timer ? Address(*timer) : 0;
         args.traceCapacity = trace_capacity;
         args.coarseTrace = 0;
@@ -820,8 +816,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     auto record = [&](const torch::Tensor& t) {
         if (t.defined()) c10_npu::NPUCachingAllocator::recordStream(t.storage().data_ptr(), stream);
     };
-    for (const auto& t : {x, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2, y, expert_tokens,
-                          diagnostic_timer_})
+    for (const auto& t :
+         {x, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2, y, expert_tokens})
         record(t);
     for (const auto* t :
          {&x_scales, &timer, &shared_weight1, &shared_weight2, &shared_weight_scales1, &shared_weight_scales2})
@@ -833,6 +829,23 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         record(context_);
     }
     return {y, expert_tokens};
+}
+
+torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend)
+{
+#ifndef DEEPEP_MEGAMOE_TIMER
+    TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before allocating timer");
+#endif
+    CheckTensor(example, 2, "timer example");
+    TORCH_CHECK(backend == "pod" || backend == "ubx", "MegaMoE backend must be pod or ubx");
+    int64_t elements = AscendTimer::TOTAL_BUFFER_SIZE;
+    if (backend == "ubx") {
+        elements = int64_t{MegaMoeUrma::kTimerCores} *
+                       (MegaMoeUrma::kTraceHeaderElements +
+                        int64_t{MegaMoeUrma::kTraceMaxCapacity} * MegaMoeUrma::kTraceRecordElements) +
+                   MegaMoeUrma::kTimerElements;
+    }
+    return torch::zeros({elements}, example.options().dtype(torch::kInt64));
 }
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
