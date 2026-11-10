@@ -8,18 +8,11 @@
  */
 
 #include "csrc/kernels/bf16/layout/mega_moe_layout.hpp"
-#include <vector>
-#include <cstring>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
-#include <map>
-#include <cstdarg>
-#include <cstdio>
-#include <iomanip>
-#include <iostream>
 #include <string>
-#include <type_traits>
 
 #include "mega_moe_quant_constants.hpp"
 
@@ -47,23 +40,6 @@ constexpr int64_t SIZE_BF_16 = 2;
 constexpr int64_t SIZE_INT_32 = 4;
 
 using namespace AscendC;
-
-void OpLogDImpl(const char* nodeName, const char* fmt, ...)
-{
-    constexpr size_t BUF_SIZE = 4096;
-    char buf[BUF_SIZE];
-
-    va_list args;
-    va_start(args, fmt);
-
-    vsnprintf(buf, BUF_SIZE, fmt, args);
-
-    va_end(args);
-
-    printf("[DEBUG][%s] %s\n", nodeName, buf);
-}
-
-#define OP_LOGD(nodeName, fmt, ...) OpLogDImpl(nodeName, fmt, ##__VA_ARGS__)
 
 namespace optiling {
 
@@ -158,147 +134,6 @@ inline static int64_t CeilLog4(int64_t x)
 {
     if (x <= 1) return 0;
     return static_cast<int64_t>(std::ceil(std::log(x) / std::log(NUM_FOUR)));
-}
-
-void PrintMoeV3Arch35VBSComputeTilingData(const MoeV3Arch35VBSComputeTilingData& data, const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== MoeV3Arch35VBSComputeTilingData ==========");
-    OP_LOGD(nodeName, "needCoreNum is %ld", data.needCoreNum);
-    OP_LOGD(nodeName, "perCoreElements is %ld", data.perCoreElements);
-    OP_LOGD(nodeName, "perCoreLoops is %ld", data.perCoreLoops);
-    OP_LOGD(nodeName, "perCorePerLoopElements is %ld", data.perCorePerLoopElements);
-    OP_LOGD(nodeName, "perCoreLastLoopElements is %ld", data.perCoreLastLoopElements);
-    OP_LOGD(nodeName, "lastCoreElements is %ld", data.lastCoreElements);
-    OP_LOGD(nodeName, "lastCoreLoops is %ld", data.lastCoreLoops);
-    OP_LOGD(nodeName, "lastCorePerLoopElements is %ld", data.lastCorePerLoopElements);
-    OP_LOGD(nodeName, "lastCoreLastLoopElements is %ld", data.lastCoreLastLoopElements);
-    OP_LOGD(nodeName, "oneLoopMaxElements is %ld", data.oneLoopMaxElements);
-}
-
-void PrintMoeV3Arch35VMSMiddleComputeTilingData(const MoeV3Arch35VMSMiddleComputeTilingData& data, const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== MoeV3Arch35VMSMiddleComputeTilingData ==========");
-    OP_LOGD(nodeName, "needCoreNum is %ld", data.needCoreNum);
-}
-
-void PrintMoeV3Arch35SortOutComputeTilingData(const MoeV3Arch35SortOutComputeTilingData& data, const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== MoeV3Arch35SortOutComputeTilingData ==========");
-    OP_LOGD(nodeName, "oneLoopMaxElements is %ld", data.oneLoopMaxElements);
-}
-
-void PrintMoeV3Arch35ExpertTokensCountTilingData(const MoeV3Arch35ExpertTokensCountTilingData& data,
-                                                 const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== MoeV3Arch35ExpertTokensCountTilingData ==========");
-    OP_LOGD(nodeName, "needCoreNum is %ld", data.needCoreNum);
-    OP_LOGD(nodeName, "perCoreElements is %ld", data.perCoreElements);
-    OP_LOGD(nodeName, "lastCoreElements is %ld", data.lastCoreElements);
-    OP_LOGD(nodeName, "perCoreLoops is %ld", data.perCoreLoops);
-    OP_LOGD(nodeName, "perCorePerLoopElements is %ld", data.perCorePerLoopElements);
-    OP_LOGD(nodeName, "perCoreLastLoopElements is %ld", data.perCoreLastLoopElements);
-    OP_LOGD(nodeName, "lastCoreLoops is %ld", data.lastCoreLoops);
-    OP_LOGD(nodeName, "lastCorePerLoopElements is %ld", data.lastCorePerLoopElements);
-    OP_LOGD(nodeName, "lastCoreLastLoopElements is %ld", data.lastCoreLastLoopElements);
-}
-
-void PrintMoeV3Arch35GatherOutComputeTilingData(const MoeV3Arch35GatherOutComputeTilingData& data, const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== MoeV3Arch35GatherOutComputeTilingData ==========");
-    OP_LOGD(nodeName, "needCoreNum is %ld", data.needCoreNum);
-    OP_LOGD(nodeName, "perCoreIndicesElements is %ld", data.perCoreIndicesElements);
-    OP_LOGD(nodeName, "lastCoreIndicesElements is %ld", data.lastCoreIndicesElements);
-    OP_LOGD(nodeName, "perCoreIndicesLoops is %ld", data.perCoreIndicesLoops);
-    OP_LOGD(nodeName, "perCorePerLoopIndicesElements is %ld", data.perCorePerLoopIndicesElements);
-    OP_LOGD(nodeName, "perCoreLastLoopIndicesElements is %ld", data.perCoreLastLoopIndicesElements);
-    OP_LOGD(nodeName, "lastCoreIndicesLoops is %ld", data.lastCoreIndicesLoops);
-    OP_LOGD(nodeName, "lastCorePerLoopIndicesElements is %ld", data.lastCorePerLoopIndicesElements);
-    OP_LOGD(nodeName, "lastCoreLastLoopIndicesElements is %ld", data.lastCoreLastLoopIndicesElements);
-    OP_LOGD(nodeName, "colsLoops is %ld", data.colsLoops);
-    OP_LOGD(nodeName, "perLoopCols is %ld", data.perLoopCols);
-    OP_LOGD(nodeName, "lastLoopCols is %ld", data.lastLoopCols);
-}
-
-void PrintMoeInitRoutingV3Arch35TilingData(const MoeInitRoutingV3Arch35TilingData& data, const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== MoeInitRoutingV3Arch35TilingData ==========");
-    OP_LOGD(nodeName, "coreNum is %ld", data.coreNum);
-    OP_LOGD(nodeName, "BS is %ld", data.n);
-    OP_LOGD(nodeName, "H is %ld", data.cols);
-    OP_LOGD(nodeName, "topK is %ld", data.k);
-    OP_LOGD(nodeName, "expertStart is %ld", data.expertStart);
-    OP_LOGD(nodeName, "expertEnd is %ld", data.expertEnd);
-    OP_LOGD(nodeName, "actualExpertNum is %ld", data.actualExpertNum);
-    OP_LOGD(nodeName, "quantMode is %ld", data.quantMode);
-    OP_LOGD(nodeName, "rowIdxType is %ld", data.rowIdxType);
-    OP_LOGD(nodeName, "isInputScale is %s", data.isInputScale ? "True" : "False");
-    OP_LOGD(nodeName, "isInputOffset is %s", data.isInputOffset ? "True" : "False");
-    OP_LOGD(nodeName, "expertNum is %ld", data.expertNum);
-    OP_LOGD(nodeName, "expertTokensNumType is %ld", data.expertTokensNumType);
-    OP_LOGD(nodeName, "expertTokensNumFlag is %ld", data.expertTokensNumFlag);
-    OP_LOGD(nodeName, "gatherFirstFullload is %ld", data.gatherFirstFullload);
-    OP_LOGD(nodeName, "epFullload is %ld", data.epFullload);
-    OP_LOGD(nodeName, "activeNum is %ld", data.activeNum);
-    OP_LOGD(nodeName, "dropPadMode is %ld", data.dropPadMode);
-    OP_LOGD(nodeName, "smoothType is %ld", data.smoothType);
-    OP_LOGD(nodeName, "InitRouting TilingKey is %ld", data.tilingKey);
-
-    PrintMoeV3Arch35VBSComputeTilingData(data.vbsComputeParamsOp, nodeName);
-    PrintMoeV3Arch35VMSMiddleComputeTilingData(data.vmsMiddleComputeParamsOp, nodeName);
-    PrintMoeV3Arch35SortOutComputeTilingData(data.sortOutComputeParamsOp, nodeName);
-    PrintMoeV3Arch35ExpertTokensCountTilingData(data.expertTokensCountTilingDataOp, nodeName);
-    PrintMoeV3Arch35GatherOutComputeTilingData(data.gatherOutComputeParamsOp, nodeName);
-}
-
-void PrintMegaMoeTilingData(const MegaMoeTilingData* tilingData, const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== MegaMoeTilingData ==========");
-
-    PrintMoeInitRoutingV3Arch35TilingData(tilingData->moeInitRoutingTilingData, nodeName);
-
-    OP_LOGD(nodeName, "BS is %u", tilingData->m);
-    OP_LOGD(nodeName, "H is %u", tilingData->k);
-    OP_LOGD(nodeName, "N is %u", tilingData->n);
-
-    OP_LOGD(nodeName, "topK is %u", tilingData->topK);
-    OP_LOGD(nodeName, "expertPerRank is %u", tilingData->expertPerRank);
-    OP_LOGD(nodeName, "groupListType is %u", tilingData->groupListType);
-
-    OP_LOGD(nodeName, "epWorldSize is %u", tilingData->epWorldSize);
-    OP_LOGD(nodeName, "maxOutputSize is %u", tilingData->maxOutputSize);
-
-    OP_LOGD(nodeName, "transX is %s", (tilingData->transX ? "True" : "False"));
-    OP_LOGD(nodeName, "transW is %s", (tilingData->transW ? "True" : "False"));
-    OP_LOGD(nodeName, "transW2 is %s", (tilingData->transW2 ? "True" : "False"));
-}
-
-void printAuxiliaryTilingCtx(const MegaMoeAuxTilingContext* ctx, const uint32_t expertPerRank,
-                             const uint32_t epWorldSize, const std::vector<int64_t>& expertIdxShape,
-                             const char* nodeName)
-{
-    OP_LOGD(nodeName, "========== AuxiliaryTilingCtx ==========");
-    OP_LOGD(nodeName, "BS is %ld", ctx->n);
-    OP_LOGD(nodeName, "H is %ld", ctx->cols);
-    OP_LOGD(nodeName, "topK is %ld", ctx->k);
-    OP_LOGD(nodeName, "expertPerRank is %ld", expertPerRank);
-    OP_LOGD(nodeName, "epWorldSize is %ld", epWorldSize);
-
-    OP_LOGD(nodeName, "availUbSize is %ld", ctx->availUbSize);
-    OP_LOGD(nodeName, "sortLoopMaxElement is %ld", ctx->sortLoopMaxElement);
-    OP_LOGD(nodeName, "totalLength is %ld", ctx->totalLength);
-    OP_LOGD(nodeName, "activeNum is %ld", ctx->activeNum);
-    OP_LOGD(nodeName, "expertCapacity is %ld", ctx->expertCapacity);
-    OP_LOGD(nodeName, "expertNum is %ld", ctx->expertNum);
-
-    OP_LOGD(nodeName, "isInputScale is %s, isInputOffset is %s", ctx->isInputScale ? "True" : "False",
-            ctx->isInputOffset ? "True" : "False");
-    OP_LOGD(nodeName, "dropPadMode is %ld, expertTokensNumType is %ld", ctx->dropPadMode, ctx->expertTokensNumType);
-    OP_LOGD(nodeName, "expertTokensNumFlag is %s, quantMode is %ld", ctx->expertTokensNumFlag ? "True" : "False",
-            ctx->quantMode);
-
-    OP_LOGD(nodeName, "expertIdxShape is [%ld, %ld]", expertIdxShape[0], expertIdxShape[1]);
-    OP_LOGD(nodeName, "expertRange is [%ld, %ld]", ctx->expertStart, ctx->expertEnd);
-    OP_LOGD(nodeName, "rowIdxType is %ld", ctx->rowIdxType);
 }
 
 static int64_t OpQuantModeToInitRoutingQuantMode(const int64_t opQuantMode)
@@ -596,7 +431,6 @@ static bool SetInitTilingData(MegaMoeTilingData& td, uint32_t m, uint32_t k, uin
     return true;
 }
 
-// 调试
 enum WorkspaceIdx {
     PTR_A2 = 0,
     PTR_A2_SCALE,
@@ -682,140 +516,6 @@ inline size_t CalcBf16EarlyTopkWeightPeermemSize(const MegaMoeTilingData& td)
 {
     return HostCeilAlign(static_cast<int64_t>(td.m) * td.topK * MegaMoeBF16Training::TopkWeightBytes(td.topkWeightType),
                          ALIGN_512);
-}
-
-template <typename T>
-void PrintBuffer(void* buf, size_t rows, size_t cols, size_t stride, size_t offset = 0, size_t rankId = 0)
-{
-    if (buf == nullptr) {
-        std::cout << "buffer is nullptr" << std::endl;
-        return;
-    }
-
-    T* data = reinterpret_cast<T*>(static_cast<uint8_t*>(buf) + offset);
-
-    size_t printRows = rows;
-
-    std::cout << "===== Buffer Dump =====\n"
-              << "rows=" << rows << ", cols=" << cols << ", stride=" << stride << ", offset=" << offset << "\n";
-
-    for (size_t r = 0; r < printRows; ++r) {
-        std::cout << "[rankId:" << rankId << "] " << "[" << r << "] ";
-
-        for (size_t c = 0; c < cols; ++c) {
-            if constexpr (std::is_integral_v<T>) {
-                std::cout << std::setw(6) << static_cast<int32_t>(data[r * stride + c]) << " ";
-            } else {
-                std::cout << std::setw(6) << static_cast<float>(data[r * stride + c]) << " ";
-            }
-        }
-
-        std::cout << "\n";
-    }
-
-    std::cout << "=======================" << std::endl;
-}
-
-template <typename T>
-bool CompareTensor(const T* output, const T* golden, size_t tokenNum, size_t hiddenSize, float atol = 1e-3,
-                   float rtol = 0.1f,
-                   size_t maxTokenPrint = 100,  // 最多打印多少个错误token
-                   size_t maxDetailPrint = 10,  // 每个token最多打印几个错误位置
-                   bool printDetail = false)    // 是否打印具体错误值
-{
-    struct ErrorInfo {
-        size_t pos;
-        double golden;
-        double output;
-        double absErr;
-        double relErr;
-    };
-
-    std::map<size_t, std::vector<ErrorInfo>> tokenErrors;
-
-    size_t totalErrorCount = 0;
-
-    // 收集错误
-    for (size_t token = 0; token < tokenNum; token++) {
-        for (size_t pos = 0; pos < hiddenSize; pos++) {
-            size_t idx = token * hiddenSize + pos;
-
-            double outVal = static_cast<double>(output[idx]);
-            double goldVal = static_cast<double>(golden[idx]);
-
-            double absErr = std::abs(outVal - goldVal);
-
-            double relErr = absErr / (std::abs(goldVal) + 1e-12);
-
-            bool pass;
-            if constexpr (std::is_integral_v<T>) {
-                // 整型：允许 ±1
-                pass = (absErr <= 1.0);
-            } else {
-                // 浮点：原逻辑
-                pass = (absErr <= atol) || (relErr <= rtol);
-            }
-
-            if (!pass) {
-                totalErrorCount++;
-
-                tokenErrors[token].push_back({pos, goldVal, outVal, absErr, relErr});
-            }
-        }
-    }
-
-    std::cout << "\n========== Compare Summary ==========\n";
-
-    std::cout << "Total Error Count: " << totalErrorCount << "/" << tokenNum * hiddenSize << "\n\n";
-
-    if (tokenErrors.empty()) {
-        std::cout << "PASS\n";
-        return true;
-    }
-
-    // 第一阶段：打印token错误统计
-    std::cout << "Token Error Summary:\n";
-
-    size_t tokenPrintCount = 0;
-
-    for (auto& [token, errors] : tokenErrors) {
-        if (tokenPrintCount >= maxTokenPrint) break;
-
-        std::cout << "Token " << token << " : " << errors.size() << " errors\n";
-
-        tokenPrintCount++;
-    }
-
-    // 第二阶段：打印详细错误
-    if (printDetail) {
-        std::cout << "\n========== Error Detail ==========\n";
-
-        tokenPrintCount = 0;
-
-        for (auto& [token, errors] : tokenErrors) {
-            if (tokenPrintCount >= maxTokenPrint) break;
-
-            std::cout << "\nToken " << token << ":\n";
-
-            size_t detailCount = std::min(errors.size(), maxDetailPrint);
-
-            for (size_t i = 0; i < detailCount; i++) {
-                auto& e = errors[i];
-
-                std::cout << "[ERROR]"
-                          << " pos=" << e.pos << " golden=" << std::setprecision(10) << e.golden
-                          << " output=" << e.output << " abs_err=" << e.absErr << " rel_err=" << e.relErr << "\n";
-            }
-
-            if (errors.size() > maxDetailPrint) {
-                std::cout << "... " << errors.size() - maxDetailPrint << " more errors\n";
-            }
-
-            tokenPrintCount++;
-        }
-    }
-
-    return false;
 }
 
 }  // namespace optiling
