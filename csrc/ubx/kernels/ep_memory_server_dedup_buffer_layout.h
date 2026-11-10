@@ -1,0 +1,11 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by candy_cloud_fly 2026
+
+#pragma once
+// Reserve below 1 MiB for Dispatch with up to 72 AIVs. Payload retains
+// the 2 MiB boundary and 4 GiB bank stride. Rebuild all ranks together.
+#define COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_CONTROL_OFFSET (1024ULL * 1024ULL)
+#define COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET 0ULL
+#define COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET 18432ULL
+#define COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_CORE_READY_OFFSET 65536ULL
+#define COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET (2ULL * 1024ULL * 1024ULL)

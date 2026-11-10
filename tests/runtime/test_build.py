@@ -37,7 +37,7 @@ def test_native_topology_manifest_and_direct_source_paths():
     text = (ROOT / "CMakeLists.txt").read_text()
     manifest = json.loads(text.split("CONTENT [=[", 1)[1].split("]=])", 1)[0])
     entries = manifest["machine_backends"]
-    assert set(entries) == {"mesh_clos", "mesh_pcie", "global_clos"}
+    assert set(entries) == {"mesh_clos", "mesh_pcie", "global_clos", "ubx"}
     assert entries["mesh_pcie"]["transport"] == "mte"
     assert entries["global_clos"]["transport"] == "udma"
     assert entries["mesh_pcie"]["module"] == entries["global_clos"]["module"] == "deep_ep._clos_C"
@@ -284,6 +284,7 @@ def test_lock_declares_operators_without_claiming_device_qualification():
         "expanded-combine-urma-mte",
         "expanded-dispatch-low-latency",
         "expanded-combine-low-latency",
+        "ubx-combine-route-plan-mte-roce",
     ]
     assert len(lock["shmem"]["revision"]) == 40
     assert len(lock["shmem"]["header_sha256_lf"]) == 6
@@ -361,6 +362,7 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
 
 def test_cache_survives_source_edits_but_not_toolchain_changes(build):
     configuration = {
+        "ubx_ranks_per_host": 16,
         "source_sha256": "before",
         "source_version": "1",
         "build_type": "Release",
@@ -403,7 +405,15 @@ def source_native(build, monkeypatch, tmp_path):
     monkeypatch.setattr(build.sysconfig, "get_config_var", lambda key: ".test.so")
     destination = tmp_path / "temporary-staging"
     destination.mkdir()
-    names = ["_C.test.so", "_clos_C.test.so", "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    names = [
+        "_C.test.so",
+        "_clos_C.test.so",
+        "_ubx_C.test.so",
+        "libdeepep_ubx_kernels.so",
+        "libdeepep_kernels.so",
+        "libdeepep_clos_kernels.so",
+        "_build_info.json",
+    ]
     for name in names:
         (destination / name).write_bytes(("first:" + name).encode())
     (destination / ".libs").mkdir()
@@ -546,6 +556,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     monkeypatch.setitem(sys.modules, "pybind11", pybind11)
 
     configuration = {
+        "ubx_ranks_per_host": 16,
         "megamoe": {"enabled": beta, "timer": timer},
         "CATLASS_ROOT": "/private/catlass" if beta else "",
         "source_sha256": "current",

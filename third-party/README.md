@@ -6,11 +6,11 @@
 
 | 目录 | 用途 | 固定提交 |
 | --- | --- | --- |
-| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7` |
+| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `b41a8fa560b03ddfd9001052cd6002c6a28de809` |
 | `catlass/` | MegaMoE 编译时使用的模板头文件，不单独编译动态库 | `2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1` |
 
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
-SHMEM 固定到 `cann/shmem` 的 dev 提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
+SHMEM 固定到 `cann/shmem` 的 `release/v1.8.0` 提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
 两个子仓库的许可证均为 CANN Open Software License Agreement Version 2.0，原文保留在各自的 `LICENSE` 中。
 全 Clos 后端导入的 Ascend DeepEP 实现采用 CANN Open Software License Agreement Version 2.0。
 该许可与 MegaMoE 使用的 CANN 许可文本相同，统一归档于 [cann.LICENSE](cann.LICENSE)，随 wheel 分发。
@@ -37,7 +37,7 @@ python scripts/build_shmem.py
 
 未设置环境变量时，wheel 构建默认使用 `third-party/shmem/install/shmem` 与 `third-party/catlass`。
 已有 SDK/源码可继续用 `SHMEM_ROOT`、`CATLASS_ROOT` 显式覆盖。`pip wheel` 本身不下载、不编译外部 SDK。
-本入口按锁定版本和上游默认配置构建 SHMEM。
+本入口按锁定版本构建 SHMEM，并启用 HNS_1825 RDMA；记录实际编译的 doorbell 模式，供 UBX 使用相同配置。
 
 Python sdist/wheel 不携带这两个子模块源码；从 sdist 构建时需设置上述两个外部路径（基础 OFF 构建不需要 CATLASS）。
 wheel 携带构建所用 SDK 的四个 SHMEM 运行库，位于 `deep_ep/.libs/`，适用上述 `cann.LICENSE`；

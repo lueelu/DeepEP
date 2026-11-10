@@ -272,3 +272,5 @@ python scripts/validate_ep.py --backend npu-stub --devices 0,1 \
 脚本将测试复制到源码目录外，使用当前 Python 启动 torchrun，不自动安装依赖或选择设备。可用 `--case` 选择上述场景；每次 torchrun 默认超时 600 秒，进程组超时 120 秒。不要使用 `python -O` 或 `PYTHONOPTIMIZE` 禁用断言。
 
 仅当选定场景的全部 rank、精度和退出检查成功，参考闭环才生成成功摘要。保留日志与 `rank-*.json/summary.json`；缺失、失败或 skip 不记为通过。完整 wheel/sdist 构建及安装验证见[构建指南](../docs/build.md)。
+
+UBX 的独立 Combine 性能入口为 `tests/ubx/test_combine.py`，构造 CPU 输入、先初始化 HCCL 再初始化 SHMEM；命令和统计口径见 [UBX 说明](../docs/ubx.md)。

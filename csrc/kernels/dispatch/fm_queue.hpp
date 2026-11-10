@@ -21,12 +21,14 @@ __aicore__ inline void PublishFmSimtWqes(__ubuf__ uint8_t* wqes, uint32_t count,
     AscendC::LocalTensor<uint8_t> view;
     view.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
     view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes);
-    aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size),
+    aclshmemi_udma_copy_wqe_from_ub_async(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size),
                                     view, first * ctx->wqe_size, EVENT_ID0);
+    aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
     if (first != count) {
         view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes + first * ctx->wqe_size);
-        aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
+        aclshmemi_udma_copy_wqe_from_ub_async(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
                                         (count - first) * ctx->wqe_size, EVENT_ID0);
+        aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
     }
     aclshmemi_udma_post_send_update_info(head + count, ctx, state);
 }
@@ -44,12 +46,14 @@ __aicore__ inline void PublishFmPreparedRows(__ubuf__ uint8_t* wqes, uint32_t co
     AscendC::LocalTensor<uint8_t> view;
     view.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
     view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes);
-    aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size),
+    aclshmemi_udma_copy_wqe_from_ub_async(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size),
                                     view, first * ctx->wqe_size, EVENT_ID0);
+    aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
     if (first != count) {
         view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes + first * ctx->wqe_size);
-        aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
+        aclshmemi_udma_copy_wqe_from_ub_async(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
                                         (count - first) * ctx->wqe_size, EVENT_ID0);
+        aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
     }
     const uint32_t full = count / 4U;
     for (uint32_t batch = 0U; batch < full; ++batch)
@@ -101,12 +105,14 @@ __aicore__ inline void PublishFmSourceReady(DeepepSecondaryState& s, uint32_t pe
     auto* wqe = scratch + kFmControlScratchOffset;
     auto* flag = GetPeerCompletionFlag(s.rank, GetGroupRankIndex(peer, s.world), 0U, s.sync);
     auto* value = GetPeerCompletionFlag(s.rank, GetGroupRankIndex(peer, s.world), kPeerCompletionValueSlot, s.sync);
-    auto* target = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(flag, peer));
+    auto* memory = aclshmemi_udma_get_mem_info(info, slot, 0U);
+    const aclshmemi_udma_addr_ctx_t addr_ctx{
+        reinterpret_cast<uint64_t>(aclshmemi_get_state()->heap_base), memory->addr};
     // Immediate SDK put requires CQE=1, so build the unsignaled SO explicitly.
     aclshmemi_udma_fill_sqe_base_ctx<uint64_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                      kFmReadySoNoCqeConfig>(reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(wqe),
-                                                            target, aclshmemi_udma_get_mem_info(info, slot, 0U),
-                                                            state->sq_head);
+                                                            reinterpret_cast<__gm__ uint8_t*>(flag), memory,
+                                                            state->sq_head, addr_ctx);
     aclshmemi_fill_sge_header_ctx(reinterpret_cast<__ubuf__ aclshmemi_sge_ctx_t*>(wqe + sizeof(aclshmemi_sqe_ctx_t)),
                                   sizeof(uint64_t), reinterpret_cast<uint64_t>(value));
     PublishFmSimtWqes(wqe, 1U, ctx, state);
