@@ -3,7 +3,9 @@
 import csv
 import hashlib
 import json
+import os
 from collections import Counter
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -11,6 +13,21 @@ L2_CACHE_FLUSH_BYTES = 256_000_000
 L2_FLUSH_RANGE = "deepep_benchmark_l2_flush"
 PROFILE_SAMPLE_RANGE = "deepep_benchmark_sample/"
 PROFILE_GUARD_ITERS = 2
+COMBINE_NOTIFY_ENV = "DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY"
+
+
+@contextmanager
+def profile_combine_notify(enabled):
+    """Scope the extra UDMA rendezvous to capture; restore even on profiler exit."""
+    previous = os.environ.get(COMBINE_NOTIFY_ENV)
+    os.environ[COMBINE_NOTIFY_ENV] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(COMBINE_NOTIFY_ENV, None)
+        else:
+            os.environ[COMBINE_NOTIFY_ENV] = previous
 
 
 class ProfileSamples:

@@ -48,6 +48,29 @@ METADATA = dict(
 )
 
 
+@pytest.mark.parametrize("previous", [None, "0", "1"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_clos_notify_switch_is_restored_after_capture(monkeypatch, previous, fail):
+    import os
+    from benchmarks.clos.stage_metrics import COMBINE_NOTIFY_ENV, profile_combine_notify
+
+    if previous is None:
+        monkeypatch.delenv(COMBINE_NOTIFY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(COMBINE_NOTIFY_ENV, previous)
+    try:
+        with profile_combine_notify(True):
+            assert os.environ[COMBINE_NOTIFY_ENV] == "1"
+            with profile_combine_notify(False):
+                assert os.environ[COMBINE_NOTIFY_ENV] == "0"
+            assert os.environ[COMBINE_NOTIFY_ENV] == "1"
+            if fail:
+                raise RuntimeError("profiler exit")
+    except RuntimeError:
+        assert fail
+    assert os.environ.get(COMBINE_NOTIFY_ENV) == previous
+
+
 @pytest.mark.parametrize("expanded", [False, True])
 def test_clos_combine_notify_is_separate_and_complete(tmp_path, expanded):
     from benchmarks.clos.stage_metrics import parse_profile

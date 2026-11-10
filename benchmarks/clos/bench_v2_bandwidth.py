@@ -26,6 +26,7 @@ import time
 import traceback
 
 from stage_metrics import L2CacheFlush, L2_CACHE_FLUSH_BYTES, ProfileSamples, PROFILE_GUARD_ITERS
+from stage_metrics import COMBINE_NOTIFY_ENV, profile_combine_notify
 
 from route_workloads import (
     DEFAULTS as ROUTE_DEFAULTS,
@@ -369,6 +370,8 @@ def worker(args):
     args.profile_warmup, args.profile_iters = args.warmup, args.iterations
     args.profile_sample_markers = True
     args.combine_notify = True
+    # Precision and caller-stream timing exercise the ordinary library path.
+    os.environ[COMBINE_NOTIFY_ENV] = "0"
     device = args.first_device + local_rank
     destination = args.output / f"rank{rank}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -582,16 +585,17 @@ def worker(args):
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
-                profiling._profile_operator(
-                    rank,
-                    args,
-                    op,
-                    flush_cache.wrap(fn),
-                    sample_callback=ProfileSamples(torch),
-                    guard_iters=PROFILE_GUARD_ITERS,
-                    synchronize_each_iteration=True,
-                    before_iteration=before_iteration,
-                )
+                with profile_combine_notify(op.startswith("combine")):
+                    profiling._profile_operator(
+                        rank,
+                        args,
+                        op,
+                        flush_cache.wrap(fn),
+                        sample_callback=ProfileSamples(torch),
+                        guard_iters=PROFILE_GUARD_ITERS,
+                        synchronize_each_iteration=True,
+                        before_iteration=before_iteration,
+                    )
             except profiling._ProfileComplete:
                 pass
             profile = parse_profile_collective(
@@ -609,6 +613,7 @@ def worker(args):
             )
             # Independent caller-stream samples; do not subtract from profiler kernel times.
             profile["sampling"]["host_sync_each_iteration"] = True
+            profile["sampling"]["combine_notify_profile_only"] = op.startswith("combine")
             dist.barrier()
             for _ in range(args.warmup):
                 if before_iteration is not None:

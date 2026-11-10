@@ -1,6 +1,8 @@
 #include "launcher.h"
 
 #include <acl/acl.h>
+#include <cstdlib>
+#include <cstring>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 #include "common/launch.h"
@@ -119,12 +121,15 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
 
     aclrtStream stream = GetCurrentAclStream();
-    // V2 communication gets a separate all-rank/all-AIV rendezvous on this
-    // stream. It isolates arrival skew from the payload kernel; Begin still
-    // clears and synchronizes its control header before payload overwrite.
-    // Fused V1 UDMA already performs its entry rendezvous inside Begin.
-    const bool fused_udma = use_udma && phase == CombinePhase::Fused;
-    if (!fused_udma && phase != CombinePhase::Reduction && phase != CombinePhase::Remaining) {
+    // Profiling may separate arrival skew into an all-rank/all-AIV notify.
+    // The benchmark enables this process-local switch only during capture;
+    // every rank must use the same setting. Ordinary V1/V2 UDMA relies on
+    // Begin, which retains its control-header reset and synchronization.
+    const char* profile_notify = std::getenv("DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY");
+    const bool separate_notify = profile_notify && std::strcmp(profile_notify, "1") == 0;
+    const bool has_udma_begin =
+        use_udma && (phase == CombinePhase::Fused || (phase == CombinePhase::Communication && !separate_notify));
+    if (!has_udma_begin && phase != CombinePhase::Reduction && phase != CombinePhase::Remaining) {
         cached_notify_combine_kernel_do(tiling.block_dim, stream, ffts_addr);
     }
     auto* combine_kernel_do = use_udma ? &v1_combine_udma_kernel_do : &v1_combine_kernel_do;
