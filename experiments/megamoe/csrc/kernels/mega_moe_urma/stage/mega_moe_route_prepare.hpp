@@ -1,12 +1,67 @@
 // Copyright (c) 2026, Lu Lu
 // Modified by SimpleBright_Man 2026
 #pragma once
-#include "kernels/mega_moe_urma/parallel_route_plan.hpp"
-#include "kernels/mega_moe_urma/route_runtime.hpp"
-#include "kernels/mega_moe_urma/route_expert_vf.hpp"
-#include "kernels/mega_moe_urma/transport.hpp"
-#include "kernels/mega_moe_urma/timer.hpp"
+
+#include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
 #include "kernel_operator.h"
+#include "kernels/mega_moe_urma/common/mega_moe_route_plan.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_route_views.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_transport.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_timer.hpp"
+#include "kernels/mega_moe_urma/stage/mega_moe_pack.hpp"
+
+// Invocation flag reset, local routes, peer route exchange and receive summary.
+
+namespace MegaMoeUrma {
+constexpr uint32_t kExpertRouteBatch = 4096U;  // preserve the E<=384 path
+constexpr uint32_t kExpertWideBatch = 3072U;
+constexpr uint32_t kExpertRouteStorageItems = 10U * kExpertWideBatch;
+static_assert(7U * kExpertRouteBatch <= kExpertRouteStorageItems);
+constexpr uint32_t kExpertRoutesPerWorker = (kExperts + kLocalWorkers - 1U) / kLocalWorkers;
+
+// A worker owns complete experts. Each output slot can hold the entire input
+// batch, including repeated expert IDs in one token's top-k list. Flat route
+// IDs retain the top-k slot; only Pack divides by top-k to read X.
+__simd_vf__ inline void CompactOwnedExpertsVF(__ubuf__ int32_t* ids, __ubuf__ int32_t* routes, __ubuf__ int32_t* counts,
+                                              uint32_t valid, uint32_t flatBegin, uint32_t expertBegin,
+                                              uint32_t expertCount, uint32_t outputStride)
+{
+    constexpr uint32_t lanes = AscendC::GetVecLen() / sizeof(int32_t);
+    static_assert(kExpertRoutesPerWorker <= lanes);
+    auto full = AscendC::Reg::CreateMask<int32_t, AscendC::Reg::MaskPattern::ALL>();
+    AscendC::Reg::RegTensor<int32_t> idsReg, flat, compact, ones, totals, reduced, broadcast, packed, laneIndex;
+    AscendC::Reg::RegTensor<uint32_t> zeroIndex;
+    AscendC::Reg::Duplicate(ones, 1, full);
+    AscendC::Reg::Duplicate(zeroIndex, 0U, full);
+    AscendC::Reg::Duplicate(packed, 0, full);
+    AscendC::Reg::Arange(laneIndex, 0);
+    for (uint32_t e = 0; e < expertCount; ++e) {
+        AscendC::Reg::Duplicate(totals, 0, full);
+        auto* dst = routes + e * outputStride;
+        AscendC::Reg::UnalignRegForStore tail;
+        AscendC::Reg::ClearSpr<AscendC::SpecialPurposeReg::AR>();
+        for (uint32_t offset = 0; offset < valid; offset += lanes) {
+            uint32_t remaining = valid - offset;
+            auto active = AscendC::Reg::UpdateMask<int32_t>(remaining);
+            AscendC::Reg::LoadAlign(idsReg, ids + offset);
+            AscendC::Reg::Arange(flat, static_cast<int32_t>(flatBegin + offset));
+            AscendC::Reg::MaskReg match;
+            AscendC::Reg::Compares<int32_t, AscendC::CMPMODE::EQ>(match, idsReg, static_cast<int32_t>(expertBegin + e),
+                                                                  active);
+            AscendC::Reg::GatherMask<int32_t, AscendC::Reg::GatherMaskMode::STORE_REG>(compact, flat, match);
+            AscendC::Reg::StoreUnAlign(dst, compact, tail);
+            AscendC::Reg::Add<int32_t, AscendC::Reg::MaskMergeMode::MERGING>(totals, totals, ones, match);
+        }
+        if (valid) AscendC::Reg::StoreUnAlignPost(dst, tail);
+        AscendC::Reg::Reduce<AscendC::Reg::ReduceType::SUM>(reduced, totals, full);
+        AscendC::Reg::Gather(broadcast, reduced, zeroIndex);
+        AscendC::Reg::MaskReg lane;
+        AscendC::Reg::Compares<int32_t, AscendC::CMPMODE::EQ>(lane, laneIndex, static_cast<int32_t>(e), full);
+        AscendC::Reg::Select(packed, broadcast, packed, lane);
+    }
+    AscendC::Reg::StoreAlign(counts, packed, full);
+}
+}  // namespace MegaMoeUrma
 
 namespace MegaMoeUrma {
 using namespace AscendC;
@@ -403,5 +458,169 @@ __aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer)
     // this core's route-exchange UB/events before its Pack/compute path.
     timer.TraceEnd(TraceEvent::RoutePrepare, start);
     timer.CoarseEnd(CoarsePhase::Route);
+}
+}  // namespace MegaMoeUrma
+
+namespace MegaMoeUrma {
+__aicore__ inline __gm__ int32_t* RoutePhaseFlag(const Arguments& a, uint32_t index)
+{
+    return reinterpret_cast<__gm__ int32_t*>(a.localFlags + uint64_t(index) * kFlagBytes);
+}
+__aicore__ inline void WaitRoutePhase(const Arguments& a, uint32_t index, uint32_t value)
+{
+    while (AscendC::ReadGmByPassDCache(RoutePhaseFlag(a, index)) != static_cast<int32_t>(value)) {
+        const uint64_t tick = AscendC::GetSystemCycle();
+        while (AscendC::GetSystemCycle() - tick < 64U) {
+        }
+    }
+    RouteFence<AscendC::HardEvent::S_MTE2>();
+}
+
+// Each active source owner snapshots one mailbox. MTE stores are byte-exact:
+// adjacent incoming rows/returnBase entries may share GM cache lines, so no
+// concurrent Scalar cached writes or DCCI are allowed on these output arrays.
+__aicore__ inline void ReadRouteSource(const Arguments& a, uint32_t source)
+{
+    if (source >= a.config.world) return;
+    WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(a.symmetric + a.config.routeReadyOffset + source * kFlagBytes),
+                  a.config.epoch);
+    RouteLoad(a.symmetric + a.config.routeInboxOffset + uint64_t(source) * kRouteMailboxBytes, 0U,
+              8U + (a.config.localExperts + 1U) * 4U);
+    LocalTensor<uint32_t> inbox(TPosition::VECCALC, 0U, kRouteMailboxBytes / 4U);
+    LocalTensor<uint32_t> prefix(TPosition::VECCALC, 2048U, kMaxLocalExperts + 1U);
+    LocalTensor<uint64_t> base(TPosition::VECCALC, 4096U, 4U);
+    for (uint32_t e = 0; e <= a.config.localExperts; ++e) prefix.SetValue(e, inbox.GetValue(e + 2U));
+    base.SetValue(0, uint64_t(inbox.GetValue(0)) | (uint64_t(inbox.GetValue(1)) << 32U));
+    RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, incoming) + uint64_t(source) * (kMaxLocalExperts + 1U) * 4U,
+              2048U, (a.config.localExperts + 1U) * 4U);
+    RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, returnBase) + uint64_t(source) * 8U, 4096U, 8U);
+    AscendC::AtomicAdd(RoutePhaseFlag(a, kLocalFlagRouteSourcesDone), 1);
+}
+
+__aicore__ inline void BuildOwnedRouteExperts(const Arguments& a, uint32_t core)
+{
+    const uint32_t begin = uint64_t(a.config.localExperts) * core / kAic;
+    const uint32_t end = uint64_t(a.config.localExperts) * (core + 1U) / kAic;
+    if (begin != end) {
+        // Only incoming is needed and it is immutable after SourcesDone.
+        // Do not read the per-expert output arrays while other workers write.
+        constexpr uint32_t incomingOffset = offsetof(DeviceRouteInfo, incoming);
+        constexpr uint32_t incomingBytes = kWorld * (kMaxLocalExperts + 1U) * sizeof(uint32_t);
+        RouteLoad(a.routeInfo + incomingOffset, kRouteInfoUb + incomingOffset, incomingBytes);
+        auto* r = reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
+        SummarizeRouteExperts(a.config, *r, begin, end);
+        constexpr uint32_t quota = (kMaxLocalExperts + kAic - 1U) / kAic;
+        LocalTensor<uint32_t> sources(TPosition::VECCALC, 0U, quota * (kWorld + 1U));
+        LocalTensor<uint32_t> groups(TPosition::VECCALC, 4096U, quota);
+        LocalTensor<uint32_t> rows(TPosition::VECCALC, 6144U, quota);
+        LocalTensor<uint64_t> tiles(TPosition::VECCALC, 8192U, quota);
+        for (uint32_t e = begin; e < end; ++e) {
+            for (uint32_t s = 0; s <= kWorld; ++s) sources.SetValue((e - begin) * (kWorld + 1U) + s, r->sources[e][s]);
+            groups.SetValue(e - begin, r->groupBase[e + 1U]);
+            rows.SetValue(e - begin, r->compactBase[e + 1U]);
+            tiles.SetValue(e - begin, r->gmm1Base[e + 1U]);
+        }
+        RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, sources) + uint64_t(begin) * (kWorld + 1U) * 4U, 0U,
+                  (end - begin) * (kWorld + 1U) * 4U);
+        RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, groupBase) + uint64_t(begin + 1U) * 4U, 4096U,
+                  (end - begin) * 4U);
+        RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, compactBase) + uint64_t(begin + 1U) * 4U, 6144U,
+                  (end - begin) * 4U);
+        RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, gmm1Base) + uint64_t(begin + 1U) * 8U, 8192U,
+                  (end - begin) * 8U);
+    }
+    AscendC::AtomicAdd(RoutePhaseFlag(a, kLocalFlagRouteExpertsDone), 1);
+}
+
+// Called only by block0 AIV0, after all 28 expert shards are committed.
+__aicore__ inline void FinishParallelRouteSummary(Arguments& a)
+{
+    RouteLoad(a.routeInfo, kRouteInfoUb, sizeof(DeviceRouteInfo));
+    auto* r = reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
+    const bool wave12 = a.config.world == 4U && (!MEGAMOE_URMA_ROUTE_REORDER || a.sharedExperts != 0U);
+    FinishRouteSummaryPrefix(a.config, *r, wave12);
+    LocalTensor<int32_t> exported(TPosition::VECCALC, 0U, kMaxLocalExperts);
+    for (uint32_t e = 0; e < a.config.localExperts; ++e)
+        exported.SetValue(e, static_cast<int32_t>(r->sources[e][a.config.world]));
+    RouteSave(a.expertCountsOutput, 0U, a.config.localExperts * sizeof(int32_t));
+    constexpr uint32_t receiveOffset = offsetof(DeviceRouteInfo, incoming);
+    RouteSave(a.routeInfo + receiveOffset, kRouteInfoUb + receiveOffset, sizeof(DeviceRouteInfo) - receiveOffset);
+    RouteScheduleOutput out(a);
+    EmitRouteTasks(a.config, *r, out, wave12);
+    out.Finish();
+    RouteStore(a.routeConfig, 0U, a.config);
+    RouteFlush(a.routeConfig, sizeof(Config));
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::WriteGmByPassDCache(RoutePhaseFlag(a, kLocalFlagRouteSummaryDone), int32_t{1});
+}
+
+// No SyncAll: AIV1 continues Pack/Dispatch throughout these AIV0-only phases.
+// S0 invokes this AFTER the existing startup Pack join, not before it.
+__aicore__ inline void RunAiv0RouteSummary(Arguments& a, uint32_t core, Timer& timer)
+{
+    timer.CoarseBegin(CoarsePhase::RouteSummary);
+    const uint64_t start = timer.TraceBegin();
+    ReadRouteSource(a, core);
+    WaitRoutePhase(a, kLocalFlagRouteSourcesDone, a.config.world);
+    BuildOwnedRouteExperts(a, core);
+    if (core == 0U) {
+        WaitRoutePhase(a, kLocalFlagRouteExpertsDone, kAic);
+        FinishParallelRouteSummary(a);
+    }
+    timer.TraceEnd(TraceEvent::RouteSummary, start);
+    timer.CoarseEnd(CoarsePhase::RouteSummary);
+}
+}  // namespace MegaMoeUrma
+
+namespace MegaMoeUrma {
+__aicore__ inline __gm__ int32_t* RouteSummaryFlag(const Arguments& a)
+{
+    return reinterpret_cast<__gm__ int32_t*>(a.localFlags + kLocalFlagRouteSummaryDone * kFlagBytes);
+}
+__aicore__ inline bool RouteSummaryReady(const Arguments& a)
+{
+    return AscendC::ReadGmByPassDCache(RouteSummaryFlag(a)) == 1;
+}
+__aicore__ inline void AcquireRouteSummary(Arguments& a)
+{
+    // The producer never changes outgoing's cache lines. Only invalidate the
+    // newly published receive portion, including lines fetched speculatively.
+    constexpr uint32_t offset = offsetof(DeviceRouteInfo, incoming);
+    RouteFlush(a.routeInfo + offset, sizeof(DeviceRouteInfo) - offset);
+    RouteReloadConfig(a);
+    RouteFence<AscendC::HardEvent::S_MTE2>();
+}
+__aicore__ inline void WaitRouteSummary(Arguments& a, Timer& timer)
+{
+    const uint64_t start = timer.TraceWaitBegin();
+    while (!RouteSummaryReady(a)) {
+        const uint64_t tick = AscendC::GetSystemCycle();
+        while (AscendC::GetSystemCycle() - tick < 64U) {
+        }
+    }
+    AcquireRouteSummary(a);
+}
+
+// Called after the existing startup quotas. Pack assignments never change:
+// this loop advances the SAME nextPackRound cursor used by normal activation.
+// AIV0 builds the summary; helpers never wait for a remote source while they
+// still have local Pack work. No low-UB ownership is transferred to this loop.
+__aicore__ inline void PrepareActivationRoutes(Arguments& a, uint32_t helper, uint32_t& nextPackRound, PackBatch& pack,
+                                               Timer& timer)
+{
+    const uint32_t packOwner = helper + CommunicationWorkers(a.config.world);
+    while (!RouteSummaryReady(a)) {
+        if (nextPackRound < a.config.packRoundCount) {
+            PackOneRound(a, nextPackRound++, packOwner, kAic, pack);
+        } else {
+            pack.Close();
+            const uint64_t tick = AscendC::GetSystemCycle();
+            while (AscendC::GetSystemCycle() - tick < 64U) {
+            }
+        }
+    }
+    // No UB payload is touched here; non-owner helpers may retain their Pack
+    // ring until the first actual activation/scale-gather task closes it.
+    WaitRouteSummary(a, timer);
 }
 }  // namespace MegaMoeUrma

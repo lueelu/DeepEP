@@ -44,7 +44,7 @@
 | `csrc/runtime/udma_peer_masks.hpp` | Elastic peer QP masks 的生成 |
 | `csrc/kernels/common.hpp` | Elastic 调度映射与 `CombineQpMask`，包含默认 QP0 保留规则 |
 | `csrc/kernels/udma_layout.hpp` | Elastic QP 数量与 owner/lane 到 QP 的映射 |
-| `experiments/megamoe/csrc/kernels/mega_moe_urma/transport.hpp` | UBX QP0 的 RO 数据发送、SO flag 发布和 `quiet` |
+| `experiments/megamoe/csrc/kernels/mega_moe_urma/common/mega_moe_transport.hpp` | UBX QP0 的 RO 数据发送、SO flag 发布和 `quiet` |
 | `dependencies.lock.json` | 确定核实所依据的 SHMEM 版本 |
 
 ### 验收与处理方向

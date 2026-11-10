@@ -1,11 +1,192 @@
+
 #pragma once
-#include "kernels/mega_moe_urma/compute.hpp"
-#include "kernels/mega_moe_urma/shared_contract.hpp"
-#include "kernels/mega_moe_urma/shared_mx.hpp"
-#include "kernels/mega_moe_urma/tile_completion.hpp"
-#include "kernels/mega_moe_urma/shared_add.hpp"
-#include "kernels/mega_moe_urma/tail_completion.hpp"
-#include "kernels/mega_moe_urma/dispatch_completion.hpp"
+
+#include <cstdint>
+#include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
+#include "kernels/mega_moe_common/catlass_gmm/mega_moe_mx_matmul.hpp"
+#include "kernel_operator.h"
+#include "kernels/mega_moe_urma/stage/mega_moe_gmm.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_completion.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_transport.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_timer.hpp"
+
+// Shared-expert task layout, matmul, activation and final addition.
+
+namespace MegaMoeUrma {
+#if defined(__NPU_DEVICE__)
+#define SHARED_INLINE __aicore__ inline
+#else
+#define SHARED_INLINE inline
+#endif
+SHARED_INLINE constexpr uint32_t SharedTaskCount(uint32_t bs, uint32_t intermediate)
+{
+    return ((bs + 255U) / 256U) * (intermediate / 256U) * 2U;
+}
+SHARED_INLINE constexpr uint32_t SharedOwnedTasks(uint32_t total, uint32_t worker)
+{
+    return worker < total ? (total - 1U - worker) / 28U + 1U : 0U;
+}
+struct SharedTask {
+    uint32_t group, tile, slice;
+};
+SHARED_INLINE constexpr SharedTask SharedTaskAt(uint32_t task, uint32_t intermediate)
+{
+    const uint32_t n = intermediate / 256U;
+    return {task / (n * 2U), (task / 2U) % n, task % 2U};
+}
+constexpr uint32_t kSharedMaxOwnedTasks = SharedOwnedTasks(SharedTaskCount(kMaxTokensPerRank, 16384U), 0U);
+constexpr uint32_t kSharedDoneWords = (kSharedMaxOwnedTasks + 63U) / 64U;
+static_assert(kSharedMaxOwnedTasks == 293U && kSharedDoneWords == 5U);
+#undef SHARED_INLINE
+}  // namespace MegaMoeUrma
+
+namespace MegaMoeUrma {
+// Shared-only FP8xFP8. Raw weights are contiguous ND [N,K], interpreted as
+// column-major [K,N]. AIC loads B directly; no AIV0 prologue or UB mailbox.
+// One context lives across all tiles/groups in a shared GMM, with UnitFlag.
+template <bool First>
+class SharedMxGmm {
+    using Arch = Catlass::Arch::Ascend950;
+    using Row = Catlass::layout::RowMajor;
+    using Col = Catlass::layout::ColumnMajor;
+    using F = fp8_e4m3fn_t;
+    using S = fp8_e8m0_t;
+    using C = bfloat16_t;
+    using SA = decltype(tla::MakeMxScaleLayout<S, Row, false>(uint32_t{}, uint32_t{}));
+    using SB = decltype(tla::MakeMxScaleLayout<S, Col, true>(uint32_t{}, uint32_t{}));
+    using Copy = Catlass::Gemm::Tile::PackedMxTileCopyTla<Arch, F, Row, F, Col, S, SA, S, SB, C, Row, void>;
+    using Policy = Catlass::Gemm::MmadMx<Arch, true, 2, 1, false, 2, 2, 2, 2>;
+    using L1 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<256>>;
+    using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
+    using Block = Catlass::Gemm::Block::MegaMoeBlockMmadMx<Policy, L1, L0, F, F, C, void, Copy>;
+    Catlass::Gemm::Block::MegaMoeResource resource_;
+    Block block_;
+    UbxMegaMoeImpl::GMMAddrInfo addr_{};
+    uint32_t m_ = 0, n_ = 0, k_ = 0, scaleK_ = 0;
+    template <class Element, class Layout>
+    __aicore__ inline auto View(GM_ADDR p, const Layout& layout)
+    {
+        AscendC::GlobalTensor<Element> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(p));
+        return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
+    }
+    __aicore__ inline void Projection(uint32_t m, uint32_t n, uint32_t rows, uint32_t columns)
+    {
+        auto av = View<F>(addr_.aGlobal, tla::MakeLayout<F, Row>(m_, k_));
+        auto bv = View<F>(addr_.bGlobal, tla::MakeLayout<F, Col>(k_, n_));
+        auto sav = View<S>(addr_.aScaleGlobal, tla::MakeMxScaleLayout<S, Row, false>(m_, scaleK_));
+        auto sbv = View<S>(addr_.bScaleGlobal, tla::MakeMxScaleLayout<S, Col, true>(scaleK_, n_));
+        auto cv = View<C>(First ? addr_.gmm1OutGlobal : addr_.gmm2OutGlobal, tla::MakeLayout<C, Row>(m_, n_));
+        auto a = tla::GetTile(av, tla::MakeCoord(m, 0), tla::MakeShape(rows, k_));
+        auto b = tla::GetTile(bv, tla::MakeCoord(0, n), tla::MakeShape(k_, columns));
+        auto sa = tla::GetTile(sav, tla::MakeCoord(m, 0), tla::MakeShape(rows, scaleK_));
+        auto sb = tla::GetTile(sbv, tla::MakeCoord(0, n), tla::MakeShape(scaleK_, columns));
+        auto c = tla::GetTile(cv, tla::MakeCoord(m, n), tla::MakeShape(rows, columns));
+        block_(a, b, c, Catlass::GemmCoord{rows, columns, k_}, sa, sb);
+    }
+
+public:
+    __aicore__ inline SharedMxGmm() : block_(resource_) {}
+    template <class Problem>
+    __aicore__ inline void UpdateProblem(const Problem& p, const UbxMegaMoeImpl::GMMAddrInfo& addr)
+    {
+        m_ = p.m;
+        n_ = p.n;
+        k_ = p.k;
+        scaleK_ = p.scaleK;
+        addr_ = addr;
+    }
+    __aicore__ inline void Begin() {}
+    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
+    {
+        Projection(m, n, rows, cols);
+        if constexpr (First) Projection(m, n + n_ / 2U, rows, cols);
+    }
+    __aicore__ inline void End(bool = false)
+    {
+        AscendC::SetFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
+    }
+};
+}  // namespace MegaMoeUrma
+
+namespace MegaMoeUrma {
+// Six independent input/output slots. Routed accumulation remains FP32 across
+// the local join; shared GMM2 is BF16. Like main Unpermute, cast only after Add.
+struct SharedAddUb {
+    static constexpr uint32_t width = 2048U, slots = 6U;
+    static constexpr uint32_t routed = 0U;
+    static constexpr uint32_t shared = routed + slots * width * 4U;
+    static constexpr uint32_t expanded = shared + slots * width * 2U;
+    static constexpr uint32_t output = expanded + slots * width * 4U;
+    static constexpr uint32_t end = output + slots * width * 2U;
+};
+static_assert(SharedAddUb::end == 144U * 1024U);
+
+template <class TraceSink>
+__aicore__ inline void SharedAdd(const Arguments& a, uint32_t worker, TraceSink& timer)
+{
+    using namespace AscendC;
+    using U = SharedAddUb;
+    static_assert(U::end <= kRequiredUbBytes);
+    GlobalTensor<float> routed;
+    GlobalTensor<bfloat16_t> shared, output;
+    routed.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(a.sharedRoutedOutput));
+    shared.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(a.sharedOutput));
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(a.output));
+    LocalTensor<float> x(TPosition::VECCALC, U::routed, U::slots * U::width);
+    LocalTensor<bfloat16_t> y(TPosition::VECCALC, U::shared, U::slots * U::width);
+    LocalTensor<float> fy(TPosition::VECCALC, U::expanded, U::slots * U::width);
+    LocalTensor<bfloat16_t> result(TPosition::VECCALC, U::output, U::slots * U::width);
+    const auto start = timer.TraceBegin();
+    const uint64_t total = uint64_t(a.config.bs) * a.config.hidden;
+    const uint64_t tiles = (total + U::width - 1U) / U::width;
+    const uint64_t count = worker < tiles ? (tiles - 1U - worker) / kLocalWorkers + 1U : 0U;
+    for (uint32_t slot = 0; slot < U::slots; ++slot) {
+        SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
+        SetFlag<HardEvent::MTE3_V>(static_cast<TEventID>(slot));
+    }
+    uint64_t submitted = 0, consumed = 0;
+    while (consumed < count) {
+        // Prefill / replenish without waiting for MTE3 on the scalar pipe.
+        while (submitted < count && submitted - consumed < U::slots) {
+            const uint32_t slot = submitted % U::slots, base = slot * U::width;
+            const auto event = static_cast<TEventID>(slot);
+            const uint64_t offset = (worker + submitted * kLocalWorkers) * U::width;
+            const uint32_t n = total - offset < U::width ? total - offset : U::width;
+            WaitFlag<HardEvent::V_MTE2>(event);
+            DataCopy(x[base], routed[offset], n);
+            DataCopy(y[base], shared[offset], n);
+            SetFlag<HardEvent::MTE2_V>(event);
+            ++submitted;
+        }
+        const uint32_t slot = consumed % U::slots, base = slot * U::width;
+        const auto event = static_cast<TEventID>(slot);
+        const uint64_t offset = (worker + consumed * kLocalWorkers) * U::width;
+        const uint32_t n = total - offset < U::width ? total - offset : U::width;
+        WaitFlag<HardEvent::MTE2_V>(event);
+        Cast(fy[base], y[base], RoundMode::CAST_NONE, n);
+        PipeBarrier<PIPE_V>();
+        Add(fy[base], x[base], fy[base], n);
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE2>(event);   // input slot may be refilled
+        WaitFlag<HardEvent::MTE3_V>(event);  // protect previous output in this slot
+        Cast(result[base], fy[base], RoundMode::CAST_RINT, n);
+        SetFlag<HardEvent::V_MTE3>(event);
+        WaitFlag<HardEvent::V_MTE3>(event);
+        DataCopy(output[offset], result[base], n);
+        SetFlag<HardEvent::MTE3_V>(event);
+        ++consumed;
+    }
+    for (uint32_t slot = 0; slot < U::slots; ++slot) {
+        WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
+        WaitFlag<HardEvent::MTE3_V>(static_cast<TEventID>(slot));
+    }
+    PipeBarrier<PIPE_ALL>();  // one terminal drain, never a per-tile scalar wait
+    timer.TraceEnd(TraceEvent::SharedAdd, start);
+}
+}  // namespace MegaMoeUrma
+
 namespace MegaMoeUrma {
 using SharedGmm1 = SharedMxGmm<true>;
 using SharedGmm2 = SharedMxGmm<false>;

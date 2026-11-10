@@ -8,8 +8,8 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
-#include "kernels/mega_moe_urma/compute_contract.hpp"
-#include "kernels/mega_moe_urma/device_route_plan.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_compute_contract.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_route_plan.hpp"
 
 #include <acl/acl.h>
 #include "shmem.h"

@@ -4,9 +4,9 @@
 #include "version/asc_devkit_version.h"
 #endif
 #include "basic_api/kernel_basic_intf.h"
-#include "kernels/mega_moe_urma/abi.hpp"
+#include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
 #if defined(__NPU_DEVICE__)
-#include "kernels/mega_moe_urma/kernel.hpp"
+#include "kernels/mega_moe_urma/mega_moe_urma.hpp"
 #endif
 
 using namespace AscendC;

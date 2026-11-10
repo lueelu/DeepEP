@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 // Modified by SimpleBright_Man 2026
 #include "kernel_launch.hpp"
-#include "kernels/mega_moe_urma/abi.hpp"
+#include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
 #include <stdexcept>
 
 namespace deepep::megamoe {

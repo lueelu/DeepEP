@@ -1,13 +1,15 @@
 // Copyright (c) 2026, Lu Lu
 // Modified by SimpleBright_Man 2026
 #pragma once
-#include "kernels/mega_moe_urma/shared.hpp"
-#include "kernels/mega_moe_urma/peer_reorder_progress.hpp"
-#include "kernels/mega_moe_urma/consumer_completion.hpp"
-#include "kernels/mega_moe_urma/completion_batch.hpp"
-#include "kernels/mega_moe_urma/activation_ub.hpp"
-#include "kernels/mega_moe_urma/reorder.hpp"
-#include "kernels/mega_moe_urma/communication_schedule.hpp"
+
+// AIV1 cooperative Dispatch/Combine and compute-result consumption.
+#include "kernels/mega_moe_urma/stage/mega_moe_shared_expert.hpp"
+#include "kernels/mega_moe_urma/stage/mega_moe_reorder.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_completion.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_completion.hpp"
+#include "kernels/mega_moe_urma/stage/mega_moe_gmm.hpp"
+#include "kernels/mega_moe_urma/stage/mega_moe_reorder.hpp"
+#include "kernels/mega_moe_urma/stage/mega_moe_pack.hpp"
 
 namespace MegaMoeUrma {
 // Persistent per-peer send/self-ready counters use high UB only after this
