@@ -106,7 +106,6 @@ class UbxBuffer:
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             cv_rows=128,
             timeout=timeout,
-            allow_multi_host=True,
         )
         self._runtime = self._engine._runtime
         self._device = self._engine._device

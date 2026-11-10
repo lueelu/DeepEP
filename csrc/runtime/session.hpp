@@ -8,19 +8,22 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
-#ifdef DEEPEP_BUILD_EP_GMM_FUSED
 #include <memory>
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
 #include <vector>
 #endif
 
 namespace deepep {
+enum class RuntimeProfile { General, MegaMoEPod, MegaMoEUbx };
 // The framework owns ACL initialization, device and context. Only this workspace
 // and the SHMEM instance are owned here. Destruction is an explicit collective.
 class Session {
 public:
     Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
-            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false,
-            bool megamoe_urma = false);
+            RuntimeProfile profile = RuntimeProfile::General, bool mpi = false, bool combine_only = false,
+            bool use_1g_huge_pages = false);
+    static std::unique_ptr<Session> create_megamoe(int rank, int size, uint64_t bytes, const std::string& endpoint,
+                                                   unsigned timeout, const std::string& backend = "pod");
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
@@ -102,13 +105,9 @@ public:
     {
         return udma_;
     }
-    bool megamoe_urma() const
+    const std::string& peer_access_error() const
     {
-        return megamoe_urma_;
-    }
-    const std::string& megamoe_urma_topology_error() const
-    {
-        return megamoe_urma_topology_error_;
+        return peer_access_error_;
     }
 
 private:
@@ -132,8 +131,7 @@ private:
     int rank_ = 0;
     int world_ = 0;
     bool udma_ = false;
-    bool megamoe_urma_ = false;
-    std::string megamoe_urma_topology_error_;
+    std::string peer_access_error_;
     bool combine_only_ = false;
     bool sparse_qp_enabled_ = false;
     bool peer_table_ = false;

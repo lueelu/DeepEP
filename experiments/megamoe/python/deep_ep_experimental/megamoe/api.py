@@ -10,7 +10,8 @@ import importlib
 import threading
 from typing import TYPE_CHECKING
 
-from deep_ep._runtime import Runtime, integer, warn_unclosed
+from deep_ep._runtime import integer, warn_unclosed
+from ._runtime import _MegaRuntime
 from deep_ep._native import npu_api, require_native
 from deep_ep._store import StoreGroup
 from .validation import check_routing, collective_check
@@ -34,10 +35,6 @@ def _extension():
     if getattr(extension, "api_protocol", None) != 4:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
-
-
-class _MegaRuntime(Runtime):
-    _megamoe = True
 
 
 def _pair(value, name):

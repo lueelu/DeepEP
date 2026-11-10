@@ -29,8 +29,8 @@ PYBIND11_MODULE(_C, module)
     module.def(
         "create_mpi_runtime",
         [](int rank, int size, uint64_t bytes, unsigned timeout, bool use_1g_huge_pages) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, "", timeout, true, false, true, false,
-                                                     use_1g_huge_pages);
+            return std::make_unique<deepep::Session>(rank, size, bytes, "", timeout, true,
+                                                     deepep::RuntimeProfile::General, true, false, use_1g_huge_pages);
         },
         py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("timeout"), py::arg("use_1g_huge_pages") = false,
         py::call_guard<py::gil_scoped_release>());
@@ -38,16 +38,17 @@ PYBIND11_MODULE(_C, module)
         "create_combine_runtime",
         [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool mpi,
            bool use_1g_huge_pages) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, true, false, mpi, true,
-                                                     use_1g_huge_pages);
+            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, true,
+                                                     deepep::RuntimeProfile::General, mpi, true, use_1g_huge_pages);
         },
         py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("mpi"),
         py::arg("use_1g_huge_pages") = false, py::call_guard<py::gil_scoped_release>());
     py::class_<deepep::Session>(module, "Runtime")
         .def(py::init([](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
                          bool use_1g_huge_pages) {
-                 return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, udma, false, false,
-                                                          false, use_1g_huge_pages);
+                 return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, udma,
+                                                          deepep::RuntimeProfile::General, false, false,
+                                                          use_1g_huge_pages);
              }),
              py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"),
              py::arg("udma") = false, py::arg("use_1g_huge_pages") = false, py::call_guard<py::gil_scoped_release>())
@@ -58,25 +59,13 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("use_1g_huge_pages", &deepep::Session::use_1g_huge_pages)
         .def_property_readonly("workspace_allocation_bytes", &deepep::Session::workspace_allocation_bytes)
         .def_property_readonly("sparse_qp_enabled", &deepep::Session::sparse_qp_enabled)
-        .def_property_readonly("megamoe_urma", &deepep::Session::megamoe_urma)
-        .def_property_readonly("megamoe_urma_topology_error", &deepep::Session::megamoe_urma_topology_error)
+        .def_property_readonly("peer_access_error", &deepep::Session::peer_access_error)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
-    module.def(
-        "create_megamoe_runtime",
-        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, false, true);
-        },
-        py::call_guard<py::gil_scoped_release>());
+    module.def("create_megamoe_runtime", &deepep::Session::create_megamoe, py::arg("rank"), py::arg("size"),
+               py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("backend") = "pod",
+               py::call_guard<py::gil_scoped_release>());
     module.def("megamoe_workspace_address", &deepep::Session::workspace_address);
-    module.def(
-        "create_megamoe_urma_runtime",
-        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, true, true, false, false,
-                                                     false, true);
-        },
-        py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"),
-        py::call_guard<py::gil_scoped_release>());
 #endif
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
     module.def("create_udma_runtime", &deepep::Session::create_udma, py::arg("rank"), py::arg("size"),

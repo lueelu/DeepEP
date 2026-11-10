@@ -2159,7 +2159,7 @@ int main()
                 if (!dense) {
                     const int previous_allocations = allocations;
                     try {
-                        deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, false, false,
+                        deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, deepep::RuntimeProfile::General, false,
                                           combine);
                         assert(false);
                     } catch (const std::runtime_error& error) {
@@ -2169,7 +2169,7 @@ int main()
                     continue;
                 }
 #endif
-                deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, false, false, combine);
+                deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, deepep::RuntimeProfile::General, false, combine);
                 assert(s.combine_only() == combine);
 #ifdef WITH_MASKS
                 assert(s.sparse_qp_enabled() == !dense);

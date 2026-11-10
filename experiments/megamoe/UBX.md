@@ -19,6 +19,21 @@ device code and its required local headers are isolated under
 symbols. This deliberately preserves POD template defaults; deduplication of
 those headers is not a prerequisite for this integration.
 
+Both products use one internal `_MegaRuntime` and the core binding
+`create_megamoe_runtime(rank, size, bytes, endpoint, timeout, backend="pod")`.
+The existing five-argument call keeps POD defaults. Backend selection is
+internal; the public `SymmBuffer` signature does not gain a backend argument.
+Native `RuntimeProfile` configuration controls transport, queue ownership,
+capacity and required peer access. Shared state is queried through
+`Runtime.peer_access_error`, not a URMA-specific property or factory.
+
+There is no multi-host opt-in flag. Host identity and visible-device consistency
+remain checked, and backends requiring peer mappings validate actual MTE/UDMA
+access collectively before device communication. Cross-host participation alone
+does not reject a supported group or bypass these checks. Rebuild the complete
+wheel when changing this runtime ABI; do not mix the new Python code with an old
+native extension.
+
 UBX supports EP4/8/16, equal positive BS on all ranks, capacity up to 16384,
 H256..8192 and I256..16384 aligned to 256, TopK1..min(8,E), and equal contiguous
 expert partitions with 1..128 routed experts per rank. Expanded receive
@@ -115,9 +130,24 @@ all local-expert counts 1..128, EP4/8/16 and CV128/256 (768 combinations),
 including exact receive counts, group counts, mailbox size and bounded bucket
 storage; all passed. This is not device DMA or concurrency qualification.
 
-CANN compilation and NPU accuracy/performance have **not** been run in this
-environment. Linux-only compiler/SDK checks and real Torch runtime checks need
-the target environment. Before merging, build a complete wheel and run POD
+On 2026-11-10, runtime unification passed 144 local CPU/API checks (20 skipped
+without Torch). A complete wheel was then built on an aarch64 host in the
+`tpr` conda environment: Python 3.12.14, Torch 2.12.0+cpu, torch_npu 2.12.0.post2,
+CANN 9.2.0, SHMEM `836d3fd6` and the locked CATLASS revision. Core, Direct,
+POD MegaMoE and UBX consumer extensions/device libraries all compiled and
+linked. The initial device build exposed malformed residual statements from
+the earlier wait-trace removal; these were corrected without removing the
+underlying waits or synchronization, and the rebuilt wheel succeeded.
+After explicit `conda activate tpr`, all 24 runtime mock tests passed without
+skips. Loading the wheel from an isolated target directory confirmed the core
+and MegaMoE extensions load, the unified factory defaults to `backend="pod"`,
+the old URMA factory/properties are absent, and `Runtime.peer_access_error` is
+available. These checks did not create a Session or launch a kernel.
+
+The isolated build directory is
+`/home/codex-deepep/megamoe-runtime-unified-20261110-b89e367-check1`.
+The build did not replace any existing installed package or run NPU operators.
+NPU accuracy/performance for this revision remains unverified: run POD
 regression plus UBX S0/S1, CV-boundary/transition, empty/hot expert and E-limit
-accuracy cases. Performance and RO/SO hardware ordering require target-device
-results; the branch does not claim them from CPU checks.
+accuracy cases before qualification. Performance and RO/SO hardware ordering
+require device results; compilation and CPU checks do not establish them.

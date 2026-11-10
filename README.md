@@ -315,5 +315,3 @@ MegaMoE 将 dispatch、专家计算、激活/量化及 combine 融合为 W4A8 �
 ---
 
 Lu Lu 持有权利的项目内容采用 [BSD 2-Clause 许可证](LICENSE)。其他来源代码保留各自的版权声明和许可证文本。
-
-UBX consumer 的统一 MegaMoE 接口、支持范围与验证状态见 [UBX 集成说明](experiments/megamoe/UBX.md)。

@@ -7,6 +7,8 @@ import ipaddress
 import os
 import threading
 import warnings
+from functools import partial
+from typing import NamedTuple
 from contextlib import nullcontext
 from pathlib import Path
 from uuid import UUID
@@ -17,6 +19,19 @@ from ._store import StoreGroup
 from ._backend_lock import LOCK as _LOCK
 
 _OWNER = None
+
+
+class _MegaMoEProfile(NamedTuple):
+    maximum_capacity: int
+    udma: bool
+    peer_access_check: bool
+    world_sizes: tuple | None
+
+
+_MEGAMOE_PROFILES = {
+    "pod": _MegaMoEProfile(1 << 30, False, False, None),
+    "ubx": _MegaMoEProfile(32 << 30, True, True, (4, 8, 16)),
+}
 
 
 def integer(name, value, minimum, maximum):
@@ -68,8 +83,7 @@ class Runtime:
     """One explicit collective lifetime per process; a live owner is retained."""
 
     _megamoe = False
-    _megamoe_urma = False
-    _megamoe_urma_multi_host = False
+    _megamoe_backend = "pod"
 
     def __init__(
         self,
@@ -86,14 +100,13 @@ class Runtime:
         debug_collectives=False,
     ):
         global _OWNER
-        if self._megamoe_urma and not self._megamoe:
-            raise ValueError("The MegaMoE URMA profile requires a MegaMoE runtime owner")
-        if type(self._megamoe_urma_multi_host) is not bool:
-            raise TypeError("MegaMoE URMA multi-host opt-in must be bool")
-        if self._megamoe_urma_multi_host and not self._megamoe_urma:
-            raise ValueError("Multi-host opt-in requires the dedicated MegaMoE URMA runtime profile")
+        profile = None
+        if self._megamoe:
+            if self._megamoe_backend not in _MEGAMOE_PROFILES:
+                raise ValueError("MegaMoE backend must be pod or ubx")
+            profile = _MEGAMOE_PROFILES[self._megamoe_backend]
         native = require_native("Runtime.__init__")
-        maximum_capacity = (32 << 30) if self._megamoe_urma else (1 << 30) if self._megamoe else (1 << 63) - 1
+        maximum_capacity = profile.maximum_capacity if profile else (1 << 63) - 1
         integer("capacity", capacity, 2 << 20, maximum_capacity)
         if capacity % (2 << 20):
             raise ValueError("capacity must be aligned to 2 MiB")
@@ -128,10 +141,8 @@ class Runtime:
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap
         store_group = self._megamoe and isinstance(group, StoreGroup)
-        if self._megamoe_urma and not store_group:
-            raise TypeError("MegaMoE URMA requires a StoreGroup for collective MTE-domain readiness checks")
         if self._megamoe and (group is None or udma):
-            raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
+            raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup; its backend selects the transport")
         if store_group:
             if rank is not None or world_size is not None:
                 raise ValueError("Pass either group or rank/world_size, not both")
@@ -141,12 +152,12 @@ class Runtime:
         factory = native.Runtime
         if self._megamoe:
             integer("world_size", size, 2, 128)
-            if self._megamoe_urma and size not in (4, 8, 16):
-                raise ValueError("MegaMoE URMA requires EP4/EP8/EP16")
-            factory_name = "create_megamoe_urma_runtime" if self._megamoe_urma else "create_megamoe_runtime"
-            factory = getattr(native, factory_name, None)
-            if factory is None:
-                raise RuntimeError(f"Rebuild with DEEPEP_BUILD_MEGAMOE=ON; missing {factory_name}")
+            if profile.world_sizes is not None and size not in profile.world_sizes:
+                raise ValueError("Selected MegaMoE backend requires EP4/EP8/EP16")
+            create = getattr(native, "create_megamoe_runtime", None)
+            if create is None:
+                raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE=ON; missing create_megamoe_runtime")
+            factory = partial(create, backend=self._megamoe_backend)
         else:
             from .buffers._elastic_layout import WORLD_SIZES
 
@@ -186,13 +197,12 @@ class Runtime:
                         ]
                     )
                 local_values.append(
-                    int(udma or self._megamoe_urma)
+                    int(udma or (profile is not None and profile.udma))
                     + 2 * int(combine_only)
                     + 4 * int(dense_qps)
                     + 8 * int(use_1g_huge_pages)
                     + 16 * int(debug_collectives)
-                    + 32 * int(self._megamoe_urma)
-                    + 64 * int(self._megamoe_urma_multi_host)
+                    + 32 * int(profile is not None and profile.peer_access_check)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -211,7 +221,7 @@ class Runtime:
                 if any(value[-1] != values[0][-1] for value in values):
                     raise ValueError(
                         "Ranks disagree on MTE/URMA runtime engines, QP configuration, page size, "
-                        "debug_collectives or multi-host opt-in"
+                        "debug_collectives or MegaMoE backend profile"
                     )
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
@@ -221,11 +231,6 @@ class Runtime:
                             "host identity is required before SHMEM initialization"
                         )
                     hosts = {value[4] for value in values}
-                    if self._megamoe_urma and len(hosts) != 1 and not self._megamoe_urma_multi_host:
-                        raise ValueError(
-                            "MegaMoE URMA requires all ranks on one Linux host by default; "
-                            "set allow_multi_host=True explicitly on every rank for multi-host validation"
-                        )
                     for host in hosts:
                         local = [value for value in values if value[4] == host]
                         if len({value[5] for value in local}) != 1:
@@ -259,28 +264,33 @@ class Runtime:
                 )
             )
             _OWNER = self
-            if self._megamoe_urma:
+            if profile is not None and profile.peer_access_check:
                 # A non-null aclshmem_ptr can be a UDMA-only virtual address.
                 # Session reports the actual per-peer MTE topology bits after
                 # initialization and local heap memset. This host rendezvous
                 # precedes every device-domain barrier or signal operation.
                 try:
-                    topology_error = self.native.megamoe_urma_topology_error
+                    topology_error = self.native.peer_access_error
                     if not isinstance(topology_error, str):
-                        topology_error = "native URMA topology status must be a string"
+                        topology_error = "native peer-access status must be a string"
                 except Exception as error:
-                    topology_error = f"cannot inspect native URMA MTE topology: {error}"
+                    topology_error = f"cannot inspect native peer access: {error}"
                 try:
-                    readiness = group.all_gather(topology_error, "URMA MTE domain readiness")
+                    if store_group:
+                        readiness = group.all_gather(topology_error, "peer access readiness")
+                    else:
+                        readiness = [None] * size
+                        dist.all_gather_object(readiness, topology_error, group=group)
                     failures = [f"rank={peer}: {error}" for peer, error in enumerate(readiness) if error]
                     if failures:
-                        raise RuntimeError("URMA MTE domain is not ready: " + "; ".join(failures))
+                        raise RuntimeError("Required peer access is not ready: " + "; ".join(failures))
                 except Exception as error:
-                    group.abort(f"URMA MTE domain readiness: {error}")
+                    if store_group:
+                        group.abort(f"peer access readiness: {error}")
                     # Retain _OWNER. Finalize may itself require the broken
                     # device domain; the launcher must terminate every worker.
                     raise
-            if capacity == 8 << 30 and 16 <= size <= 256 and not self._megamoe_urma:
+            if capacity == 8 << 30 and 16 <= size <= 256 and not self._megamoe:
                 # LL peers must finish initialization before any payload writes.
                 self.native.barrier()
 

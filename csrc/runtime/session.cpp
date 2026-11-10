@@ -29,33 +29,54 @@ void check(int status, const char* operation)
     }
 }
 
-std::string megamoe_urma_topology_error(int rank, int world)
+struct SessionPolicy {
+    bool megamoe;
+    bool dedicated_peer_qp;
+    uint64_t maximum_bytes;
+    uint64_t required_peer_transports;
+};
+
+SessionPolicy policy_for(RuntimeProfile profile)
+{
+    switch (profile) {
+        case RuntimeProfile::General:
+            return {false, false, (1ULL << 63) - 1U, 0U};
+        case RuntimeProfile::MegaMoEPod:
+            return {true, false, 1ULL << 30, 0U};
+        case RuntimeProfile::MegaMoEUbx:
+            return {true, true, 32ULL << 30, ACLSHMEM_TRANSPORT_MTE | ACLSHMEM_TRANSPORT_UDMA};
+    }
+    throw std::invalid_argument("Unknown runtime profile");
+}
+
+std::string check_peer_access(int rank, int world, uint64_t required_transports)
 {
     // The pinned SDK exports this host state and its layout in an installed
     // header. aclshmem_ptr alone is insufficient: the SDK fills peer addresses
     // even when the corresponding peer has only UDMA reachability, not MTE.
     const auto* state = static_cast<const aclshmem_device_host_state_t*>(dlsym(RTLD_DEFAULT, "g_state"));
-    if (state == nullptr)
-        return "MegaMoE URMA cannot verify MTE reachability: SHMEM lacks the pinned SDK's g_state symbol";
+    if (state == nullptr) return "Cannot verify peer access: SHMEM lacks the pinned SDK's g_state symbol";
     if (state->mype != rank || state->npes != world)
-        return "MegaMoE URMA cannot verify MTE reachability: SHMEM host state rank/world mismatch";
+        return "Cannot verify peer access: SHMEM host state rank/world mismatch";
     std::string missing;
     std::string missing_udma;
     for (int peer = 0; peer < world; ++peer) {
-        if (peer != rank && (state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) == 0) {
+        if (peer != rank && (required_transports & ACLSHMEM_TRANSPORT_MTE) &&
+            (state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) == 0) {
             if (!missing.empty()) missing += ",";
             missing += std::to_string(peer);
         }
-        if (peer != rank && (state->topo_list[peer] & ACLSHMEM_TRANSPORT_UDMA) == 0) {
+        if (peer != rank && (required_transports & ACLSHMEM_TRANSPORT_UDMA) &&
+            (state->topo_list[peer] & ACLSHMEM_TRANSPORT_UDMA) == 0) {
             if (!missing_udma.empty()) missing_udma += ",";
             missing_udma += std::to_string(peer);
         }
     }
     if (!missing.empty())
-        return "MegaMoE URMA rank=" + std::to_string(rank) + " has peers without MTE mappings: " + missing +
+        return "Runtime rank=" + std::to_string(rank) + " has peers without MTE mappings: " + missing +
                "; all peers must share an MTE-accessible UB domain for completion signals";
     if (!missing_udma.empty())
-        return "MegaMoE URMA rank=" + std::to_string(rank) + " has peers without UDMA transport: " + missing_udma;
+        return "Runtime rank=" + std::to_string(rank) + " has peers without UDMA transport: " + missing_udma;
     return {};
 }
 }  // namespace
@@ -66,33 +87,46 @@ bool Session::busy()
     return occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED;
 }
 
-Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                 bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages, bool megamoe_urma)
+std::unique_ptr<Session> Session::create_megamoe(int rank, int size, uint64_t bytes, const std::string& endpoint,
+                                                 unsigned timeout, const std::string& backend)
 {
-    if (megamoe_urma &&
-        (!megamoe || !udma || (size != 4 && size != 8 && size != 16) || mpi || combine_only || use_1g_huge_pages))
-        throw std::invalid_argument("MegaMoE URMA requires its dedicated EP4/EP8/EP16 runtime");
+    RuntimeProfile profile;
+    if (backend == "pod")
+        profile = RuntimeProfile::MegaMoEPod;
+    else if (backend == "ubx")
+        profile = RuntimeProfile::MegaMoEUbx;
+    else
+        throw std::invalid_argument("MegaMoE backend must be pod or ubx");
+    const auto policy = policy_for(profile);
+    return std::make_unique<Session>(rank, size, bytes, endpoint, timeout, policy.dedicated_peer_qp, profile);
+}
+
+Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
+                 RuntimeProfile profile, bool mpi, bool combine_only, bool use_1g_huge_pages)
+{
+    const auto policy = policy_for(profile);
+    const bool megamoe = policy.megamoe;
+    if (policy.dedicated_peer_qp && (size != 4 && size != 8 && size != 16))
+        throw std::invalid_argument("Selected MegaMoE backend requires EP4/EP8/EP16");
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
         throw std::invalid_argument("1 GiB huge pages require the Elastic UDMA runtime");
     use_1g_huge_pages_ = use_1g_huge_pages;
     const char* dense_env = std::getenv("DEEPEP_SHMEM_DENSE_QPS");
-    // The pinned PR944 SDK creates all peer/QP channels; sparse masks were
-    // removed upstream. Preserve explicit sparse requests as a checked opt-in.
     const std::string dense = dense_env == nullptr ? "0" : dense_env;
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
-    const uint64_t maximum_bytes = megamoe_urma ? (32ULL << 30) : megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U);
+    const uint64_t maximum_bytes = policy.maximum_bytes;
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
         bytes < alignment || bytes > maximum_bytes || bytes % alignment != 0 || timeout < 1 || timeout > 3600 ||
-        (megamoe && (mpi || (udma && !megamoe_urma))) ||
+        (megamoe && (mpi || combine_only || use_1g_huge_pages || udma != policy.dedicated_peer_qp)) ||
         (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
                   endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     // BF16 and FP8 use the same peer-table transport at every supported EP size.
-    peer_table_ = udma && !megamoe_urma;
+    peer_table_ = udma && !megamoe;
     if (peer_table_ && (size < 2 || size > 512 || (size & (size - 1)))) {
         throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256/512");
     }
@@ -128,10 +162,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
     auto set_masks =
         udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
-    if (udma && !megamoe_urma && dense != "1" && !set_masks) {
+    if (peer_table_ && dense != "1" && !set_masks) {
         throw std::runtime_error(
-            "SHMEM lacks aclshmemx_set_udma_peer_qp_masks (removed in the PR944 SDK); "
-            "unset DEEPEP_SHMEM_DENSE_QPS or set it to 1 to select dense channels");
+            "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
+            "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
     }
     // A failed initialization can leave SDK state behind. Keep the process
     // reserved until a new process is launched; do not finalize foreign state.
@@ -139,15 +173,15 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool init_attempted = false;
     bool runtime_started = false;
     try {
-        if (megamoe_urma) {
+        if (policy.dedicated_peer_qp) {
             // Each of the world-1 communication workers owns one remote PE.
             // RO payload writes and SO completion atomics share QP0. Dispatch
             // submissions finish before Combine; no second QP is required.
             // Disable shared Clos SQs so different peer owners stay isolated.
-            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE URMA)");
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE)");
             check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false), "aclshmemx_set_shared_jetty(UBX)");
             if (set_masks) {
-                check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE URMA)");
+                check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE)");
             }
         } else if (udma) {
             // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
@@ -197,20 +231,19 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             throw std::runtime_error("SHMEM workspace allocation or translation failed");
         }
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
-        if (megamoe_urma) {
+        if (policy.required_peer_transports) {
             // Do not enter a device barrier before every rank has agreed that
             // MTE signals are reachable. Python gathers this result through
             // TCPStore after construction, also rendezvousing all memsets.
             // A topology rejection retains the runtime until process exit:
             // per-rank constructor cleanup/finalize could strand other ranks.
-            megamoe_urma_topology_error_ = deepep::megamoe_urma_topology_error(rank, size);
+            peer_access_error_ = check_peer_access(rank, size, policy.required_peer_transports);
         }
         bytes_ = bytes;
         allocation_bytes_ = allocation_bytes;
         rank_ = rank;
         world_ = size;
         udma_ = udma;
-        megamoe_urma_ = megamoe_urma;
         closed_ = false;
     } catch (...) {
         const auto original_error = std::current_exception();
@@ -380,8 +413,8 @@ void Session::check_context() const
     if (closed_) {
         throw std::runtime_error("Runtime is closed");
     }
-    if (!megamoe_urma_topology_error_.empty()) {
-        throw std::runtime_error(megamoe_urma_topology_error_ + "; restart the distributed job");
+    if (!peer_access_error_.empty()) {
+        throw std::runtime_error(peer_access_error_ + "; restart the distributed job");
     }
     aclrtContext current = nullptr;
     check(aclrtGetCurrentContext(&current), "aclrtGetCurrentContext");

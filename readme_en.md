@@ -324,5 +324,3 @@ We thank [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) for the upstre
 ---
 
 Project material for which Lu Lu holds the relevant rights is licensed under the [BSD 2-Clause License](LICENSE). Other source material retains its own copyright notices and license texts.
-
-See [UBX integration](experiments/megamoe/UBX.md) for the unified MegaMoE API, supported shapes, and validation status.

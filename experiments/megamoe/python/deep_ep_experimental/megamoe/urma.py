@@ -14,7 +14,8 @@ import importlib
 import threading
 
 from deep_ep._native import npu_api, require_native
-from deep_ep._runtime import Runtime, integer, warn_unclosed
+from deep_ep._runtime import integer, warn_unclosed
+from ._runtime import _MegaRuntime
 from deep_ep._store import StoreGroup
 from .urma_routing import DeviceRoutes
 from .validation import collective_check
@@ -30,7 +31,7 @@ def use_fused_gate_up(bs, world, topk=8, num_experts=384):
 @lru_cache(maxsize=1)
 def _extension():
     core = require_native("URMA MegaMoE")
-    if not hasattr(core, "create_megamoe_urma_runtime"):
+    if not hasattr(core, "create_megamoe_runtime"):
         raise RuntimeError("Install a wheel built with the MegaMoE URMA runtime")
     extension = importlib.import_module(__package__ + "._C")
     if getattr(extension, "urma_api_protocol", None) != 1:
@@ -74,17 +75,6 @@ def _trace_extension():
     return extension
 
 
-class _UrmaRuntime(Runtime):
-    _megamoe = True
-    _megamoe_urma = True
-
-    def __init__(self, group, capacity, timeout=120, *, allow_multi_host=False):
-        if type(allow_multi_host) is not bool:
-            raise TypeError("allow_multi_host must be bool")
-        self._megamoe_urma_multi_host = allow_multi_host
-        super().__init__(group, capacity, timeout)
-
-
 @dataclass(frozen=True)
 class PreparedUrmaRoutes:
     """Bound Device input plus reusable storage; routes are rebuilt on every launch."""
@@ -101,7 +91,7 @@ class PreparedUrmaRoutes:
 
 
 class UrmaBuffer:
-    """EP4/EP8/EP16 owner; multiple hosts require explicit opt-in on every rank."""
+    """EP4/EP8/EP16 owner; initialization checks actual peer access across the group."""
 
     def __init__(
         self,
@@ -118,7 +108,6 @@ class UrmaBuffer:
         gmm1_ahead_mgroups=12,
         max_recv_rows=None,
         timeout=120,
-        allow_multi_host=False,
     ):
         import torch
 
@@ -130,8 +119,6 @@ class UrmaBuffer:
         try:
             if group.size() not in (4, 8, 16):
                 raise ValueError("URMA MegaMoE requires EP4/EP8/EP16")
-            if type(allow_multi_host) is not bool:
-                raise TypeError("allow_multi_host must be bool")
             integer("hidden", hidden, 256, 8192)
             integer("intermediate_hidden", intermediate_hidden, 256, 16384)
             integer("num_experts", num_experts, group.size(), 128 * group.size())
@@ -169,7 +156,6 @@ class UrmaBuffer:
                 gmm1_ahead_mgroups,
                 max_recv_rows,
                 timeout,
-                allow_multi_host,
                 "combine-ready-scan-reduce-world-v1",
                 "unitflag-shared-fixub-both-v5",
                 COMMUNICATION_PROTOCOL,
@@ -183,7 +169,6 @@ class UrmaBuffer:
         self.num_max_tokens_per_rank, self.max_recv_rows = num_max_tokens_per_rank, max_recv_rows
         self.cv_rows = cv_rows
         self.gmm1_ahead_mgroups = gmm1_ahead_mgroups
-        self.allow_multi_host = allow_multi_host
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._lock = threading.RLock()
         self._epoch = 0
@@ -206,7 +191,7 @@ class UrmaBuffer:
         # No rank may enter collective SHMEM initialization after another rank
         # rejected the wheel/layout or failed its ordinary-device allocation.
         collective_check(group, "URMA pre-runtime allocation", error)
-        self._runtime = _UrmaRuntime(group, capacity, timeout, allow_multi_host=allow_multi_host)
+        self._runtime = _MegaRuntime(group, capacity, timeout, backend="ubx")
 
     @property
     def symmetric_buffer_bytes(self):
