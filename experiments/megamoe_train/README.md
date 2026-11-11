@@ -84,7 +84,7 @@ M 为每 rank 输入 token 数，H 为 hidden，F 为专家中间维，T 为 Top
 | --- | --- | --- |
 | `x` | BF16 `[M,H]` | 本 rank 输入；EP 不再切分 M |
 | `topk_ids` | int32 `[M,T]` | 专家编号 `ep_rank*E+local_expert`，范围 `[0,EP*E)`，同一 token 内不得重复；使用 EP 组内 rank，非全局 rank |
-| `topk_weights` | BF16 或 FP32 `[M,T]` | 路由权重 p，可求导；同次调用各 rank dtype 一致 |
+| `topk_weights` | BF16 或 FP32 `[M,T]` | TopK 路由权重，可求导；同次调用各 rank dtype 一致 |
 | `w1` | BF16 `[E,2F,H]` | 前 F 行为 Gate、后 F 行为 Up；另支持 `[E,H,2F]` |
 | `w2` | BF16 `[E,H,F]` | Down 权重；另支持 `[E,F,H]`，权重梯度保持输入布局 |
 | `max_recv_tokens` | int，1..int32 最大值 | 本 rank 所有本地专家合计的接收行容量；详见[max_recv_tokens](#max_recv_tokens) |
@@ -94,7 +94,7 @@ M 为每 rank 输入 token 数，H 为 hidden，F 为专家中间维，T 为 Top
 | `counts` | int32 `[E]` | 各本地专家接收行数，不可求导 |
 
 输入 Tensor 须连续且位于同一 NPU。支持对 `x`、`topk_weights`、`w1`、`w2` 求梯度，
-其中路由权重梯度与输入类型一致，其余梯度为 BF16。不支持二阶求导。
+返回的 `dtopk_weights` 与输入 `topk_weights` 类型一致，`dx`、`dw1`、`dw2` 为 BF16。不支持二阶求导。
 
 ## 关键参数说明
 
@@ -163,7 +163,7 @@ MegaMoE Train 支持多种激活保存方式。`save_gmm1_output` 控制反向�
   接口上限不代表相同规模已完成设备验证。
 - 每进程同一时刻仅允许一个存活的 SHMEM Session。多层共享同一 op、EP 组、设备和构造 stream，
   串行传入各层参数；不同时创建其他 DeepEP buffer、推理 Runtime 或 SHMEM Session。
-- 前后向使用构造 stream，各 rank 的形状、容量、p dtype、保存模式、裁剪、构建策略和调用顺序一致。
+- 前后向使用构造 stream，各 rank 的形状、容量、`topk_weights` 的 dtype、保存模式、裁剪、构建策略和调用顺序一致。
   可排队多个前向并各自保留状态、dtype 和保存模式，对应反向顺序须跨 rank 一致；所需反向完成前不修改权重。
 - 某 rank 校验失败或提前退出时，框架须终止整个作业。
 - 完成所有所需反向或丢弃不用的图后，各 rank 按相同顺序调用 `close()`，再销毁 EP group。

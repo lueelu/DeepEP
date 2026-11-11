@@ -122,7 +122,8 @@ python -u "$entry" "$MEGAMOE_TEST_DEVICES" \
 ATK 对每个 rank 的 `y`、`dx`、`dtopk_weights`、`dw1`、`dw2` 分别比较：
 
 - actual：融合 MegaMoE 的结果。
-- benchmark：`fp32-boundaries-v3-topk-dtype` NPU BigOp，BF16 GMM 输入输出与 FP32 激活、导数、dp 及有序 Y/dX 归并；p/dp 保持输入 BF16 或 FP32 类型。
+- benchmark：`fp32-boundaries-v3-topk-dtype` NPU BigOp，BF16 GMM 输入输出与 FP32 激活、导数、TopK 路由权重梯度计算及有序 Y/dX 归并；
+  输入 `topk_weights` 保持 BF16 或 FP32 类型，返回的 `dtopk_weights` 与输入 `topk_weights` 类型一致。
 - golden：独立 Torch CPU FP64 真值。
 
 显式最大/平均相对误差及 RMSE 比例门限为 5/1.5/1.5，`number_count_radio=2`。ATK 是唯一双标杆；另外仍须通过 `megamoe_contract` 混合容差与精确 counts。BF16 保存时，BigOp 与混合容差共用同一份小算子结果。逐 rank、逐输出判定并使用上述私有双标杆比较器，不为得到 PASS 修改真值、融合结果或门限。参考数值规则升级须记录新版本，保留旧报告。

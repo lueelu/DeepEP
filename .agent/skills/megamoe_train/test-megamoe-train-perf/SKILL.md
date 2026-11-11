@@ -40,7 +40,7 @@ npu-smi info | sed -n '1,40p'
 ```
 
 记录待测源码 commit 与 dirty 状态、实际原生库路径和 SHA256；使用 Host/设备库匹配的完整
-wheel，并保持 CANN、CATLASS 与输入一致。BF16/FP32 p 的新 tiling 布局不能混用旧 Host/设备 SO。
+wheel，并保持 CANN、CATLASS 与输入一致。BF16/FP32 `topk_weights` 的新 tiling 布局不能混用旧 Host/设备 SO。
 
 ## 2. 选择 case 与 EP
 

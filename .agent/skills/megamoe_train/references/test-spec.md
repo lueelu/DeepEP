@@ -44,12 +44,13 @@ FP32 softmax(logits) 乘模型缩放系数后按以下选择定型。路由 ID �
 | 输入选择 | CLI | 用途 |
 | --- | --- | --- |
 | BF16，默认 | `--topk-weight-dtype bf16` | BF16 路由权重与梯度 |
-| FP32，BF16 有效位 | `--topk-weight-dtype fp32 --topk-weight-values bf16-rounded` | 与同 seed 的 BF16 p.float() 逐位相同；其余输入完全一致 |
+| FP32，BF16 有效位 | `--topk-weight-dtype fp32 --topk-weight-values bf16-rounded` | 将同 seed 的 BF16 TopK 路由权重无损转换为 FP32；其余输入完全一致 |
 | FP32，完整有效位 | `--topk-weight-dtype fp32` | 默认 full-precision，保留 softmax 的额外有效位，检测隐式降精 |
 
 `--topk-weight-values full-precision` 只允许 FP32。snapshot、NPU BigOp、契约参考和融合
-输入保留所选 p 类型，CPU 真值直接提升到 FP64。dtopk_weights 与 p 类型相同；
-y、dx、dw1、dw2 保持 BF16。每次调用所有 EP rank 必须使用相同 p 类型。
+输入保留所选的 `topk_weights` 类型，CPU 真值直接提升到 FP64。
+返回的 `dtopk_weights` 与输入 `topk_weights` 类型一致；y、dx、dw1、dw2 保持 BF16。
+每次调用所有 EP rank 必须使用相同的 `topk_weights` 类型。
 
 本测试将固定随机 dy 作为上游梯度，执行 y.backward(dy)，数学上对应测试损失
 sum(y*dy)。随机的是反向输入，dx、dtopk_weights、dw1、dw2 都由实际反向计算得到。
@@ -59,8 +60,8 @@ sum(y*dy)。随机的是反向输入，dx、dtopk_weights、dw1、dw2 都由实�
 
 - [cpu_reference.py](../../../../experiments/megamoe_train/tests/bf16/cpu_reference.py)：Torch CPU FP64 前向和 autograd 真值，不插入 BF16 中间舍入。
 - [npu_baseline.py](../../../../experiments/megamoe_train/tests/bf16/npu_baseline.py)：`fp32-boundaries-v3-topk-dtype` NPU BigOp 作为 ATK 误差基线，
-  使用 FP32 激活、导数、dp 乘积/归约和按 TopK slot 顺序的 FP32 Y/dX 归并；
-  Y/dX 最终写 BF16，dp 写输入 p 的 BF16/FP32 类型，矩阵边界仍为 BF16。
+  使用 FP32 激活、导数、TopK 路由权重梯度的乘积/归约和按 TopK slot 顺序的 FP32 Y/dX 归并；
+  Y/dX 最终写 BF16，`dtopk_weights` 按输入 `topk_weights` 的 BF16/FP32 类型返回，矩阵边界仍为 BF16。
   两个参考角色复用公共数值实现；BF16 保存模式下，ATK 和混合容差直接复用同一份小算子结果。
   保存模式仅决定 Gate/Up 的保存、重算或解码，不选择不同的舍入规则。
 - [atk_compare.py](../../../../experiments/megamoe_train/tests/bf16/atk_compare.py)：使用 ATK 26.9.8/private 0.1.0 的
@@ -80,12 +81,12 @@ golden 保持 FP64。
 ## 4. 执行方式
 
 辅助参考的 CPU 回归使用 `python -m unittest discover -s experiments/megamoe_train/tests/bf16 -p test_reference_contract.py -v`。
-数值项需要 CPU Torch，检查公共 FP32 H/dH、dp、BF16 输出边界、clipping、按 slot 归并、保存复用，
-以及 FP32 p 的有效位、dP dtype、同输入变体、FP64 真值和 MXFP8 诊断重放；不启动 NPU 或 ATK。
+数值项需要 CPU Torch，检查公共 FP32 H/dH、TopK 路由权重梯度计算、BF16 输出边界、clipping、按 slot 归并、保存复用，
+以及 FP32 TopK 路由权重的有效位、`dtopk_weights` 的类型、同输入变体、FP64 真值和 MXFP8 诊断重放；不启动 NPU 或 ATK。
 CLI 默认值、合法参数及用例覆盖检查不依赖 Torch；没有 Torch 时数值项显示 SKIP，不能计为通过。
 
 `priority`、`model` 选择这 12 条；`dtype` 选择 24 条 H256/F512/M129 小用例，
-覆盖 BF16、BF16-rounded FP32、full-precision FP32 三类 p，逐一组合
+覆盖 BF16、BF16-rounded FP32、full-precision FP32 三类 TopK 路由权重，逐一组合
 bf16/none/mxfp8/auto 与 clipping 0/0.1。`gather` 选择六条 FP32 full-precision
 用例：M8191/8192/8193、TopK4 或 TopK8，对应 R=M*TopK 为
 32764/32768/32772 和 65528/65536/65544，覆盖 32768 元素窗口的边界和第三窗口尾块。
@@ -111,7 +112,8 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1 \
 `--skip precision` 仅运行有限值、计数检查和性能计时，不依赖 ATK；不加 --skip 则先精度后性能。
 性能按源仓 `test/bigop_fused` 的口径给出三个同步 Event 区间（前向、反向、前向+反向），`--warmup`/`--loops` 各一组样本，窗口前后各同步一次，不构建也不读取设备 Timer；报告把两侧记作 `megamoe_bf16` 与 `baseline`。`--baseline on`（默认）另测移植的 dropless 小算子链（permute、dispatch、GMM1、带路由权重的 SwiGLU、GMM2、combine、unpermute），与算子共用同一份路由、权重和上游梯度，GEMM 数量对齐（`none` 重算 GMM1，其余复用保存的 Gate/Up），输出各口径 speedup；`--baseline off` 只测 MegaMoE BF16。三个口径同时给 MFU（RFK 模型的 GMM FLOPs ÷ 432 TFLOPS 峰值）与 roofline（源仓 410.4 TFLOPS 分母的 floor/measured/overhead），`floor ÷ measured` 即相对该降额上限的达成率，比同口径 MFU 高约 5%，因此不再单独存百分比字段；区间内含 alltoall/permute/激活，属算子级 GMM 利用率，不是模型级 MFU。baseline 只作信息对照，不参与 PASS/FAIL，无法建立 HCCL 子组或超过 16 GiB 打包路由预算时记 `SKIPPED` 及原因。
 性能 baseline 与 ATK 的精度 BigOp 分开：保留移植源链的激活边界，不模拟 MXFP8 保存压缩；
-p 的通信和 dP 类型随输入，FP32 p 乘权后的 Hp 转回 BF16 后再进入 GMM。
+TopK 路由权重按输入类型通信，返回的 `dtopk_weights` 与输入 `topk_weights` 类型一致；
+使用 FP32 TopK 路由权重时，乘权后的 Hp 转回 BF16 后再进入 GMM。
 性能 baseline 的初始测试侧来源为 `ascend_deepep_hkq@f575fc1`。日志级由 `--log` 控制，
 默认 `quiet`，排查阻塞时用 `rank0`（保留 rank 0 的阶段日志与 `[PERF] stage` 标记）。
 默认跨用例复用 worker/runtime，输入和参考每次重新计算；`--isolate-cases` 使用独立执行器。
@@ -156,7 +158,7 @@ dirty diff、环境、卡号、命令和 seed。
 
 ## 5. 未覆盖范围
 
-dtype/gather 清单及 CPU 回归不等于设备验证。BF16/FP32 p 的完整保存模式、
+dtype/gather 清单及 CPU 回归不等于设备验证。BF16/FP32 TopK 路由权重的完整保存模式、
 窗口边界与手动大用例需在匹配 wheel 上逐项记录设备结果；BF16 路由权重用例的结果不能代替其他类型与窗口用例的验收。
 
 本清单是算子级回归，不构成发布资格，也不替代其他路由与数据分布、完整专家数、多机与 EP

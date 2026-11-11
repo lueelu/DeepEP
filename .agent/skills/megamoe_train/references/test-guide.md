@@ -72,8 +72,8 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 
 | `--list-cases` | 只打印配置，不导入 Torch/ATK、不访问设备 |
 | 不使用 `--suite` | 单 case 模式，全部参数由命令行给出（见下） |
 
-suite 内不接受 shape、p dtype/values、路由、数据分布、保存模式、clipping 和 seed 的覆盖。
-`dtype` 包含 BF16 p、BF16-rounded FP32 p 和 full-precision FP32 p，分别组合全部四种
+suite 内不接受 shape、TopK 路由权重类型/数值、路由、数据分布、保存模式、clipping 和 seed 的覆盖。
+`dtype` 包含 BF16、BF16-rounded FP32 和 full-precision FP32 三类 TopK 路由权重，分别组合全部四种
 保存模式及 clipping 开关；清单存在不等于设备已通过。
 
 自定义 shape 示例：
@@ -92,8 +92,9 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 
 `1 ≤ seq ≤ 16384`、`1 ≤ expert-per-rank ≤ 32`（EP8 时总专家 E ≤ 256）、
 `topk ≤ EP × expert_per_rank`。`seq` 是**每 rank** token 数，EP 不会把它再切分。
 单例参数 `--topk-weight-dtype bf16/fp32` 默认为 BF16；选择 FP32 时默认保留完整有效位，
-加 `--topk-weight-values bf16-rounded` 则使用相同 BF16 p.float() 数值。dtopk_weights 与 p
-同类型，GMM 输入/输出及其余最终浮点输出保持 BF16。旧命令 `--gmm-n N` 仍按 N=2F 解析，
+加 `--topk-weight-values bf16-rounded` 则将同一份 BF16 TopK 路由权重无损转换为 FP32（`topk_weights.float()`）。
+返回的 `dtopk_weights` 与输入 `topk_weights` 类型一致，GMM 输入/输出及其余最终浮点输出保持 BF16。
+旧命令 `--gmm-n N` 仍按 N=2F 解析，
 不能与 `--ffn F` 同时指定；清单和报告统一使用 `ffn`。
 
 ## 性能口径
@@ -114,8 +115,9 @@ GMM1、带路由权重的 SwiGLU、GMM2、combine、unpermute），与算子共�
 baseline 需要一条可复用的 HCCL 子组（协调组是 Gloo），建不出来或打包路由超过 16 GiB
 预算时记 `SKIPPED` 并打印原因，**不影响 PASS/FAIL**。`--baseline off` 只测算子。
 性能 baseline 保留移植源链的激活数值边界，和 ATK 使用的 `npu_baseline.py` 是两个不同角色。
-它不模拟 MXFP8 保存压缩，只对齐 GEMM 数量；p 的通信保持输入类型，FP32 p 乘权后的 Hp
-转回 BF16 供 GMM，dP 保持 FP32。精度结论仍由 ATK、量化契约和 counts 的原门禁决定。
+它不模拟 MXFP8 保存压缩，只对齐 GEMM 数量；TopK 路由权重按输入类型通信。
+使用 FP32 TopK 路由权重时，乘权后的 Hp 转回 BF16 供 GMM；返回的 `dtopk_weights` 与输入 `topk_weights` 类型一致。
+精度结论仍由 ATK、量化契约和 counts 的原门禁决定。
 
 四个派生量的定义（公式、RFK 构成、三个适用前提）以
 [TEST_SPEC 的性能指标定义](test-spec.md#性能指标定义)为准；跑之前只需要记住：
