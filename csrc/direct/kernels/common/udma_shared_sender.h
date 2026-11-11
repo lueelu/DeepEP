@@ -115,19 +115,20 @@ public:
                 if (!ctx->state_addr || !ctx->buf_addr || ctx->depth != shm::UDMA_SQ_BASKBLK_CNT ||
                     ctx->wqe_size != kWqeBytes)
                     trap();
-                auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(workspace, peer));
-                if (!remote)
-                    trap();
                 auto* memory = aclshmemi_udma_get_mem_info(info, slot, qp);
+                const aclshmemi_udma_addr_ctx_t addr_ctx{
+                    reinterpret_cast<uint64_t>(aclshmemi_get_state()->heap_base), memory->addr};
                 const uint32_t index = lane * Capacity + i;
                 auto* headers = scratch_ + kHeadersOffset + index * 2U * kWqeBytes;
                 aclshmemi_udma_fill_sqe_base_ctx<
                     uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kData>(
-                    reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers), remote, memory, 0U);
+                    reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers), workspace, memory, 0U, addr_ctx);
                 aclshmemi_udma_fill_sqe_base_ctx<
                     uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*, kLast>(
-                    reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers + kWqeBytes), remote, memory, 0U);
-                peers_[index] = {peer, slot, ctx->state_addr, reinterpret_cast<uint64_t>(remote), ctx};
+                    reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(headers + kWqeBytes), workspace, memory, 0U, addr_ctx);
+                // Cache the registered remote workspace VA, not its local MTE mapping.
+                const uint64_t remote_base = reinterpret_cast<__ubuf__ uint64_t*>(headers)[5];
+                peers_[index] = {peer, slot, ctx->state_addr, remote_base, ctx};
                 // Independent QP lanes must never alias the same SQ state, even
                 // when two peer endpoints within one lane share a Jetty.
                 if constexpr (Qps == 2) {

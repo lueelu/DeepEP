@@ -209,7 +209,8 @@ class ElasticBuffer:
         bootstrap="mpi" uses MPI_COMM_WORLD under MPICH instead of Config Store.
         combine_only=True omits Dispatch metadata and its QP admission pairs;
         Dispatch and LL require combine_only=False. SDKs with peer-mask support
-        use sparse channels; DEEPEP_SHMEM_DENSE_QPS=1 forces dense admission.
+        use sparse channels when supported by the SDK; SHMEM 1.8 uses dense
+        admission. DEEPEP_SHMEM_DENSE_QPS=1 forces dense admission on either SDK.
         All ranks must agree on configuration and collective call order.
         debug_collectives=True requires a group and enables HT preflight collectives.
         Otherwise HT checks parameters locally; the caller handles job-wide failure.

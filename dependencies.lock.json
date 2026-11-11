@@ -3,16 +3,21 @@
   "cann_version": "9.2.0",
   "shmem": {
     "repository": "https://gitcode.com/cann/shmem",
-    "ref": "refs/heads/dev",
-    "revision": "836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7",
+    "ref": "refs/heads/release/v1.8.0",
+    "revision": "b41a8fa560b03ddfd9001052cd6002c6a28de809",
     "distribution": "pinned third-party/shmem submodule or external SDK; headers and library recorded by record_shmem_sdk.py",
     "header_sha256_lf": {
-      "host/shmem_host_def.h": "659aaa719af9c38bafef72921a73cca325c3c30f0f43be30b6ba9f0535de6cf6",
-      "host/init/shmem_host_init.h": "9f17760542e9f3b6dfa8bd6aad724250f686233398b5b2043c7d28f66d6f5fbb",
+      "host/shmem_host_def.h": "901e48818b94154223203f9552d80ee841a3b90db476938db0c09a873f2b0140",
+      "host/init/shmem_host_init.h": "d2e5c97a75e04ebdac15394f7f16f496955a5ed10dfe3d70db6f2c5f8403242c",
       "host/mem/shmem_host_heap.h": "5ef864fd9c6c812169de6e1dfbbb6b55481cd9cb67e543a681c3e19d5ce627b4",
-      "host/data_plane/shmem_host_cc.h": "dc8704f0d3fe00abe99ad5c9fa0bb74a79f7cda8c2af9242dc717cdd9f45ceb6",
+      "host/data_plane/shmem_host_cc.h": "986dd4766c29b28682baf542eca39ea331ce818622bc32b302c5e7d4df6f6fa3",
       "host_device/shmem_common_types.h": "528cd9698815312358253c40b74f4f0668b86af637843f9f767f6d625c273a34",
       "host_device/shmem_common_macros.h": "d1540f47e041ddc544a975ddf9fda2e9801c5243d5730a5966598229adb7af60"
+    },
+    "device_header_sha256_lf": {
+      "src/device/gm2gm/engine/rdma_backends/rdma_device_backend_hns_1825.hpp": "35db8880dceafb941dcd9671bdea1167dc926c9f37de150998619ca6ade9e263",
+      "src/device/gm2gm/engine/rdma_backends/rdma_device_backend_base.h": "a9152b78d63d459c7131b53043f4499eebbc536b5384603f058796b87edd3555",
+      "src/host_device/shmemi_rdma_cqe_layout.h": "a37e5da39945f97871243dd95381125840407cb34adddf0c0ff3753686182bc9"
     }
   },
   "python_build": {
@@ -27,7 +32,8 @@
     "expanded-dispatch-urma-mte",
     "expanded-combine-urma-mte",
     "expanded-dispatch-low-latency",
-    "expanded-combine-low-latency"
+    "expanded-combine-low-latency",
+    "ubx-combine-route-plan-mte-roce"
   ],
   "qualification": "See docs/api.md; build success does not qualify EP operations",
   "megamoe": {

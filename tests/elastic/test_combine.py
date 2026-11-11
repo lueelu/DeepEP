@@ -2468,13 +2468,26 @@ void aclshmemi_kernel_abort(const char*, Args...)
     }
     std::abort();
 }
-void aclshmemi_udma_copy_wqe_from_ub(uint8_t* dst, LocalTensor<uint8_t> src, uint32_t bytes, uint32_t)
+uint8_t* pending_dst = nullptr;
+const void* pending_src = nullptr;
+uint32_t pending_bytes = 0;
+void aclshmemi_udma_copy_wqe_from_ub_async(uint8_t* dst, LocalTensor<uint8_t> src, uint32_t bytes, uint32_t)
 {
+    assert(!pending_dst);
+    pending_dst = dst;
+    pending_src = reinterpret_cast<void*>(src.address_.bufferAddr);
+    pending_bytes = bytes;
+}
+void aclshmemi_udma_wait_wqe_copy_from_ub(uint32_t)
+{
+    assert(pending_dst);
     ++copies;
-    std::memcpy(dst, reinterpret_cast<void*>(src.address_.bufferAddr), bytes);
+    std::memcpy(pending_dst, pending_src, pending_bytes);
+    pending_dst = nullptr;
 }
 void aclshmemi_udma_post_send_update_info(uint32_t head, Context*, aclshmemi_udma_queue_state_t* q)
 {
+    assert(!pending_dst);
     assert(uint32_t(head - q->sq_tail) < shm::UDMA_SQ_BASKBLK_CNT);
     q->sq_head = head;
 }

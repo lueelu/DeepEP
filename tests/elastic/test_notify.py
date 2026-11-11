@@ -2114,7 +2114,7 @@ def test_notify_cli_runs_only_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("with_masks", [False, True])
-def test_shmem_masks_require_explicit_dense_fallback(tmp_path, with_masks):
+def test_shmem_masks_optional_with_dense_fallback(tmp_path, with_masks):
     import shutil
     import subprocess
 
@@ -2155,21 +2155,8 @@ int main()
                 expected_combine = combine;
                 expected_dense = dense;
                 setenv("DEEPEP_SHMEM_DENSE_QPS", dense ? "1" : "0", 1);
-#ifndef WITH_MASKS
-                if (!dense) {
-                    const int previous_allocations = allocations;
-                    try {
-                        deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, deepep::RuntimeProfile::General, false,
-                                          combine);
-                        assert(false);
-                    } catch (const std::runtime_error& error) {
-                        assert(std::string(error.what()).find("aclshmemx_set_udma_peer_qp_masks") != std::string::npos);
-                    }
-                    assert(!deepep::Session::busy() && initialized == 0 && allocations == previous_allocations);
-                    continue;
-                }
-#endif
-                deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, deepep::RuntimeProfile::General, false, combine);
+                deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true,
+                                  deepep::RuntimeProfile::General, false, combine);
                 assert(s.combine_only() == combine);
 #ifdef WITH_MASKS
                 assert(s.sparse_qp_enabled() == !dense);

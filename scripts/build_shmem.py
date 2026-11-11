@@ -20,6 +20,17 @@ from record_shmem_sdk import record
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def rdma_build_mode(source):
+    modes = set()
+    for path in (source / "build").rglob("flags.make"):
+        if path.parent.name != "aclshmem_device.dir":
+            continue
+        modes.update(re.findall(r"-DACLSHMEMI_HNS_1825_PI_ON_CHIP=([01])(?:\s|$)", path.read_text()))
+    if len(modes) != 1:
+        raise RuntimeError("Cannot determine the compiled SHMEM HNS_1825 doorbell mode")
+    return int(modes.pop())
+
+
 def cann_version(expected):
     cann = os.environ.get("ASCEND_HOME_PATH")
     if not cann or not (Path(cann) / "compiler/version.info").is_file():
@@ -61,7 +72,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
     lock = json.loads((root / "dependencies.lock.json").read_text(encoding="utf-8"))
     source = root / "third-party/shmem"
     if not (source / ".git").exists() or not (source / "scripts/build.sh").is_file():
-        raise RuntimeError("Initialize dependencies first: git submodule update --init --recursive")
+        raise RuntimeError("Initialize SHMEM first: git submodule update --init --recursive -- third-party/shmem")
     if source.resolve() != source or source.parent.resolve() != source.parent:
         raise RuntimeError("SHMEM source must not be a symlink to another checkout")
 
@@ -98,6 +109,8 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
             "source_patches": patches,
+            "rdma_backend": "HNS_1825",
+            "hns_1825_pi_on_chip": rdma_build_mode(source),
         }
         if identity.get("revision") != revision or identity.get("build") != expected_build:
             raise RuntimeError(
@@ -136,7 +149,16 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
         build_env["PATH"] = git_dir + os.pathsep + build_env.get("PATH", os.defpath)
         # -e 防止上游中间命令失败后继续打包，随后误登记旧库为成功产物。
         subprocess.run(
-            ["bash", "-e", "scripts/build.sh", "-soc_type", lock["target"]],
+            [
+                "bash",
+                "-e",
+                "scripts/build.sh",
+                "-soc_type",
+                lock["target"],
+                "-enable_rdma",
+                "-rdma_backend",
+                "HNS_1825",
+            ],
             cwd=source,
             env=build_env,
             check=True,
@@ -152,6 +174,8 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
             "source_patches": patches,
+            "rdma_backend": "HNS_1825",
+            "hns_1825_pi_on_chip": rdma_build_mode(source),
         },
     )
     print(f"[SHMEM] SDK identity: {manifest}", flush=True)

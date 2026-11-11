@@ -172,7 +172,7 @@ def test_unified_factory_routes_backend_and_preserves_lifetime(unified_runtime_e
     assert env.events.count("close") == 1
 
 
-@pytest.mark.parametrize("backend", ["urma", "auto", "", None, True])
+@pytest.mark.parametrize("backend", ["unsupported", "auto", "", None, True])
 def test_unified_factory_rejects_invalid_backend_before_initialization(unified_runtime_environment, backend):
     env = unified_runtime_environment
     with pytest.raises((TypeError, ValueError), match="backend"):

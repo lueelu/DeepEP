@@ -7,7 +7,7 @@ include .gitmodules
 include requirements-dev.txt pytest.ini
 include requirements-build.txt
 recursive-include cmake *.cmake CMakeLists.txt
-recursive-include csrc *.cpp *.hpp *.h
+recursive-include csrc *.cpp *.hpp *.h *.cmake CMakeLists.txt
 recursive-include docs *.md
 recursive-include scripts *.py *.sh
 recursive-include tests *.py *.json *.cpp *.h *.md

@@ -179,6 +179,9 @@ def test_shmem_nested_git_preserves_compiler_environment_and_cleans_up(tmp_path,
     (source / "scripts/build.sh").write_text(
         'git clone --branch v3.11.3 --depth 1 https://example.invalid/json.git "json target"\n'
         f"{q(sys.executable)} -c {q(probe)} compiler-env.json\n"
+        "mkdir -p build/fixture/CMakeFiles/aclshmem_device.dir\n"
+        "printf '%s\\n' 'CXX_DEFINES = -DACLSHMEMI_HNS_1825_PI_ON_CHIP=0' "
+        "> build/fixture/CMakeFiles/aclshmem_device.dir/flags.make\n"
     )
     for name, value in {
         "PATH": str(tools) + os.pathsep + os.defpath,

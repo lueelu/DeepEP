@@ -24,7 +24,12 @@ def record(sdk, revision, *, build_info=None):
         normalized = header.read_bytes().replace(b"\r\n", b"\n")
         if hashlib.sha256(normalized).hexdigest() != digest:
             raise ValueError(f"SDK public header mismatch: {relative}")
-    files = sorted((sdk / "include").rglob("*.h")) + [sdk / "lib/libshmem.so"]
+    files = sorted(
+        p
+        for directory in ("include", "src")
+        for p in (sdk / directory).rglob("*")
+        if p.suffix in {".h", ".hpp"} and p.is_file()
+    ) + [sdk / "lib/libshmem.so"]
     hashes = {}
     for path in files:
         if not path.resolve().is_relative_to(sdk) or not path.is_file():
@@ -71,5 +76,16 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--revision", help="SDK provider's source revision attestation")
     mode.add_argument("--check", action="store_true", help="verify an existing SDK identity without modifying it")
+    parser.add_argument(
+        "--hns-1825-pi-on-chip",
+        type=int,
+        choices=(0, 1),
+        help="SDK provider's compiled HNS_1825 doorbell mode (required for UBX)",
+    )
     args = parser.parse_args()
-    print(check(args.sdk) if args.check else record(args.sdk, args.revision))
+    build_info = (
+        {"rdma_backend": "HNS_1825", "hns_1825_pi_on_chip": args.hns_1825_pi_on_chip}
+        if args.hns_1825_pi_on_chip is not None
+        else None
+    )
+    print(check(args.sdk) if args.check else record(args.sdk, args.revision, build_info=build_info))

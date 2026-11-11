@@ -162,11 +162,6 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
     auto set_masks =
         udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
-    if (peer_table_ && dense != "1" && !set_masks) {
-        throw std::runtime_error(
-            "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
-            "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
-    }
     // A failed initialization can leave SDK state behind. Keep the process
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
@@ -179,7 +174,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             // submissions finish before Combine; no second QP is required.
             // Disable shared Clos SQs so different peer owners stay isolated.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE)");
-            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false), "aclshmemx_set_shared_jetty(URMA)");
+            attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_DISABLED;
             if (set_masks) {
                 check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE)");
             }
@@ -189,9 +184,11 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
                   "aclshmemx_set_qp_num");
-            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");
+            attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_ENABLED;
             std::vector<uint64_t> masks;
-            if (dense != "1") {
+            // SHMEM 1.8 admits all peer/QP channels. Use sparse admission only
+            // when the SDK exports it; kernel QP indices and ownership stay unchanged.
+            if (set_masks && dense != "1") {
                 masks.resize(size);
                 for (int peer = 0; peer < size; ++peer)
                     masks[peer] = combine_only ? first_hit_schedule::CombineQpMask(rank, peer, size)
