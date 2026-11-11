@@ -1,23 +1,20 @@
 // Copyright (c) 2026, Lu Lu
 
 #include "runtime/session.hpp"
-#ifdef DEEPEP_LL_RDMA
-#include "runtime/ll_core_config.hpp"
-#include "runtime/ll_rdma_qp_config.hpp"
-#include "kernels/dispatch/low_latency/common/ll_rdma_layout.h"
-#endif
 #include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <dlfcn.h>
 #include <vector>
 #include "kernels/udma_layout.hpp"
+#include "kernels/common.hpp"
+#include "runtime/udma_peer_masks.hpp"
 #include <mutex>
 #include <stdexcept>
 #include "host/init/shmem_host_init.h"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_cc.h"
 #include <limits>
-#include <cstdio>
 
 namespace deepep {
 namespace {
@@ -28,34 +25,6 @@ void check(int status, const char* operation)
     if (status != 0) {
         throw std::runtime_error(std::string(operation) + " failed (status=" + std::to_string(status) + ")");
     }
-}
-
-// The SDK's void Host barrier drops aclrtSynchronizeStream's error. Own the
-// stream here so a failed initialization/close barrier cannot look successful.
-bool init_trace_enabled()
-{
-    const char* value = std::getenv("DEEPEP_LL_INIT_TRACE");
-    return value && std::strcmp(value, "1") == 0;
-}
-void init_trace(int rank, const char* stage)
-{
-    if (init_trace_enabled()) {
-        std::fprintf(stderr, "[DeepEP init] rank=%d %s\n", rank, stage);
-        std::fflush(stderr);
-    }
-}
-void checked_barrier(int rank)
-{
-    init_trace(rank, "barrier enter");
-    aclrtStream stream = nullptr;
-    check(aclrtCreateStream(&stream), "create SHMEM barrier stream");
-    aclshmemx_barrier_all_on_stream(stream);
-    init_trace(rank, "barrier launched; synchronize enter");
-    const int status = aclrtSynchronizeStream(stream);
-    init_trace(rank, "barrier synchronize return");
-    const int destroy_status = aclrtDestroyStream(stream);
-    check(status, "SHMEM barrier completion");
-    check(destroy_status, "destroy SHMEM barrier stream");
 }
 }  // namespace
 
@@ -68,16 +37,6 @@ bool Session::busy()
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
                  bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages)
 {
-    init_trace(rank, "Session constructor enter");
-    const char* backend_env = std::getenv("DEEPEP_LL_BACKEND");
-    const std::string backend = backend_env ? backend_env : "mte";
-    if (backend != "mte" && backend != "rdma") throw std::invalid_argument("DEEPEP_LL_BACKEND must be mte or rdma");
-    ll_rdma_ = backend == "rdma";
-    if (ll_rdma_ && (udma || megamoe || combine_only || use_1g_huge_pages))
-        throw std::invalid_argument("RDMA LL requires a plain LL Session; mixed HT/UDMA runtimes are unsupported");
-#ifndef DEEPEP_LL_RDMA
-    if (ll_rdma_) throw std::runtime_error("RDMA selected but wheel lacks DEEPEP_LL_RDMA=ON; no MTE fallback");
-#endif
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
         throw std::invalid_argument("1 GiB huge pages require the Elastic UDMA runtime");
@@ -85,11 +44,6 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     const char* dense_env = std::getenv("DEEPEP_SHMEM_DENSE_QPS");
     const std::string dense = dense_env == nullptr ? "0" : dense_env;
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
-    if (udma && dense != "1") {
-        throw std::runtime_error(
-            "Pinned SHMEM no longer supports sparse UDMA peer-QP masks; explicitly select dense channels "
-            "with DEEPEP_SHMEM_DENSE_QPS=1");
-    }
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
@@ -120,20 +74,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     aclshmemx_uniqueid_t uid{};
     attr.my_pe = rank;
     attr.n_pes = size;
-    const uint64_t workspace_bytes = bytes + ((bytes == (8ULL << 30)) ? (2ULL << 20) : 0ULL);
-    uint64_t staging_bytes = 0;
-#ifdef DEEPEP_LL_RDMA
-    if (ll_rdma_) {
-        if (bytes != (8ULL << 30)) throw std::invalid_argument("RDMA LL requires the 8 GiB workspace");
-        ll_rdma_qps_ = query_ll_core_config().active;
-        validate_ll_rdma_qps(ll_rdma_qps_, size > int(DispatchDedup::kLlPhysicalRanksPerHost));
-        low_latency_cores_ = ll_rdma_qps_;
-        const uint64_t used_staging = uint64_t(ll_rdma_qps_) * LlRdma::kCoreBytes;
-        if (size > int(DispatchDedup::kLlPhysicalRanksPerHost))
-            staging_bytes = (used_staging + alignment - 1U) / alignment * alignment;
-    }
-#endif
-    const uint64_t allocation_bytes = workspace_bytes + staging_bytes;
+    const uint64_t allocation_bytes = bytes + ((bytes == (8ULL << 30)) ? (2ULL << 20) : 0ULL);
     attr.local_mem_size = allocation_bytes;
     if (!mpi) {
         std::memcpy(attr.ip_port, endpoint.c_str(), endpoint.size() + 1);
@@ -143,31 +84,39 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.comm_args = mpi ? nullptr : &uid;
     attr.option_attr.data_op_engine_type =
         udma ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA) : ACLSHMEM_DATA_OP_MTE;
-#ifdef DEEPEP_LL_RDMA
-    if (ll_rdma_) attr.option_attr.data_op_engine_type = size > int(DispatchDedup::kLlPhysicalRanksPerHost)
-        ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE) : ACLSHMEM_DATA_OP_MTE;
-#endif
     attr.option_attr.shm_init_timeout = timeout;
     attr.option_attr.shm_create_timeout = timeout;
     attr.option_attr.control_operation_timeout = timeout;
-    // Preserve option_attr.version from attr{}: the SDK uses it to recognize
-    // the appended runtime_config layout.
-    if (udma) attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_ENABLED;
+    using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
+    auto set_masks =
+        udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
     // A failed initialization can leave SDK state behind. Keep the process
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
     bool init_attempted = false;
     bool runtime_started = false;
     try {
-#ifdef DEEPEP_LL_RDMA
-        if (ll_rdma_ && size > int(DispatchDedup::kLlPhysicalRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
-#endif
         if (udma) {
             // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
             // Serialized operators reuse the bank, not concurrent SQ writers.
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
                   "aclshmemx_set_qp_num");
+            attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_ENABLED;
+            std::vector<uint64_t> masks;
+            // SHMEM 1.8 admits all peer/QP channels. Use sparse admission only
+            // when the SDK exports it; kernel QP indices and ownership stay unchanged.
+            if (set_masks && dense != "1") {
+                masks.resize(size);
+                for (int peer = 0; peer < size; ++peer)
+                    masks[peer] = combine_only ? first_hit_schedule::CombineQpMask(rank, peer, size)
+                                               : udma_admission::PeerMask(rank, peer, size);
+            }
+            if (set_masks) {
+                check(set_masks(masks.empty() ? nullptr : masks.data(), masks.size()),
+                      "aclshmemx_set_udma_peer_qp_masks");
+                sparse_qp_enabled_ = !masks.empty();
+            }
         }
         const auto mode = mpi ? ACLSHMEMX_INIT_WITH_MPI : ACLSHMEMX_INIT_WITH_DEFAULT;
         if (use_1g_huge_pages_) {
@@ -188,24 +137,15 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
                 throw std::runtime_error("SHMEM returned an unaligned 1 GiB workspace");
         } else {
             init_attempted = true;
-            init_trace(rank, "SHMEM init enter");
             check(aclshmemx_init_attr(mode, &attr), "aclshmemx_init_attr");
-            init_trace(rank, "SHMEM init return");
             runtime_started = true;
             // Peer-table aggregate packets require physical 512B boundaries.
-            init_trace(rank, "workspace allocation enter");
-            workspace_ = (udma || ll_rdma_) ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
-            init_trace(rank, "workspace allocation return");
+            workspace_ = udma ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
         }
         if (workspace_ == nullptr) {
             throw std::runtime_error("SHMEM workspace allocation or translation failed");
         }
-        if (ll_rdma_ && reinterpret_cast<uintptr_t>(workspace_) % 512U)
-            throw std::runtime_error("RDMA workspace requires 512-byte alignment");
-        init_trace(rank, "workspace memset enter");
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
-        init_trace(rank, "workspace memset return");
-        if (staging_bytes) ll_rdma_stage_ = static_cast<uint8_t*>(workspace_) + workspace_bytes;
         bytes_ = bytes;
         allocation_bytes_ = allocation_bytes;
         rank_ = rank;
@@ -393,29 +333,21 @@ uintptr_t Session::workspace_address() const
     return reinterpret_cast<uintptr_t>(workspace_);
 }
 
-void Session::barrier(bool host_coordinated)
+void Session::barrier()
 {
     std::lock_guard<std::mutex> guard(runtime_mutex);
     check_context();
-    if (ll_rdma_) {
-        if (!host_coordinated) throw std::runtime_error("NDR barrier requires HCCL Host coordination");
-        return;
-    }
-    try { checked_barrier(rank_); }
-    catch (...) { poisoned_ = true; throw; }
+    aclshmem_barrier_all();
 }
 
-void Session::close(bool host_coordinated)
+void Session::close()
 {
     std::lock_guard<std::mutex> guard(runtime_mutex);
     if (closed_) {
         return;
     }
     check_context();
-    if (ll_rdma_ && !host_coordinated)
-        throw std::runtime_error("NDR close requires HCCL Host coordination");
-    try { if (!ll_rdma_) checked_barrier(rank_); }
-    catch (...) { poisoned_ = true; throw; }
+    aclshmem_barrier_all();
     if (workspace_ != nullptr && !use_1g_huge_pages_) {
         aclshmem_free(workspace_);
         workspace_ = nullptr;

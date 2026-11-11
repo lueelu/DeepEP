@@ -20,10 +20,14 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
 - 同一构建 Python 环境安装匹配的 Torch/torch_npu；Clos Host 扩展需要其头文件和库，构建指纹记录框架版本及 C++ ABI。
 - 由本仓子模块构建或使用外部固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
-- 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` dev 提交，不直接跟随分支最新版本。
+- 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` `release/v1.8.0` 提交，不直接跟随分支最新版本。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
 - 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
 - wheel 构建不自动下载/编译外部 SDK。构建时将所选 SHMEM SDK 的运行库打入 wheel；驱动和 CANN 仍由部署环境提供。
+
+全仓共用上述 SDK。1.8.0 含 IPv6 与 HNS_1825 全卡同步修复；UDMA shared-jetty 改由初始化属性配置。该 release 不含旧 dev 的稀疏 peer/QP 准入接口：有该符号时仍使用稀疏准入，否则完整建链，算子 QP 编号不变，但初始化资源和耗时需要在对应机型重新验证。
+
+UBX 的独立 Combine 构建与运行说明见 [UBX](ubx.md)。
 
 ## 可选实验组件
 
@@ -39,7 +43,7 @@ EpGmmFused 通过 `DEEPEP_BUILD_EP_GMM_FUSED=ON` 构建 AllToAllV → GMM 和 GM
 
 ```bash
 source /path/to/ascend-toolkit/set_env.sh
-git submodule update --init --recursive
+git submodule update --init --recursive -- third-party/shmem
 unset SHMEM_ROOT CATLASS_ROOT  # 使用仓内依赖；外部 SDK 用户见下文。
 python scripts/build_shmem.py
 export DEEPEP_NPU_ARCH=Ascend950
@@ -51,12 +55,15 @@ python -m pip install -r requirements-build.txt
 准备脚本默认要求 SHMEM 源码干净且提交与锁文件一致；已有 build/install 时要求显式 `--rebuild`（会再生成这些构建产物）。
 更换 SDK 前停止使用它的作业，之后重建 wheel。完整边界及离线依赖见 [第三方依赖](../third-party/README.md)。
 
+外部 SDK 必须以 HNS_1825 RDMA 构建。下面的 `HNS_1825_PI_ON_CHIP` 必须由 SDK 提供方根据编译记录设置为 0 或 1，不能由算子自行猜测。
+
 已有外部 SDK 时，加载 CANN 环境、设置 `DEEPEP_NPU_ARCH=Ascend950` 并安装 `requirements-build.txt` 后，跳过子模块准备和 SHMEM 构建，改用：
 
 ```bash
 export SHMEM_ROOT=/path/to/pinned/shmem-sdk
 # 仅未登记身份的 SDK 运行一次；不能改 manifest 来绕过源码/二进制检查。
 python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
+  --hns-1825-pi-on-chip "$HNS_1825_PI_ON_CHIP" \
   --revision "$(python -c 'import json; print(json.load(open("dependencies.lock.json"))["shmem"]["revision"])')"
 # 启用 MegaMoE 且不用仓内子模块时，再设置 CATLASS_ROOT=/path/to/pinned/catlass。
 ```

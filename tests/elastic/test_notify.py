@@ -2113,7 +2113,8 @@ def test_notify_cli_runs_only_metadata(monkeypatch, tmp_path):
     assert len(_cases["from_args"](calls.pop()[0])) == 8
 
 
-def test_shmem_requires_explicit_dense_channels(tmp_path):
+@pytest.mark.parametrize("with_masks", [False, True])
+def test_shmem_masks_optional_with_dense_fallback(tmp_path, with_masks):
     import shutil
     import subprocess
 
@@ -2128,28 +2129,40 @@ def test_shmem_requires_explicit_dense_channels(tmp_path):
 #define main lifecycle_main
 #include "session_test.cpp"
 #undef main
+#include "kernels/common.hpp"
+#include "runtime/udma_peer_masks.hpp"
+bool expected_combine = false, expected_dense = false;
+#ifdef WITH_MASKS
+extern "C" int aclshmemx_set_udma_peer_qp_masks(const uint64_t* masks, uint32_t count)
+{
+    if (expected_dense) {
+        assert(!masks && !count);
+        return 0;
+    }
+    assert(count == uint32_t(expected_world) && masks[0] == 0);
+    for (uint32_t peer = 1; peer < count; ++peer)
+        assert(masks[peer] == (expected_combine ? first_hit_schedule::CombineQpMask(0, peer, count)
+                                                : deepep::udma_admission::PeerMask(0, peer, count)));
+    return 0;
+}
+#endif
 int main()
 {
     for (int world : {128, 256, 512}) {
         expected_world = world;
         for (bool dense : {false, true})
             for (bool combine : {true, false}) {
+                expected_combine = combine;
+                expected_dense = dense;
                 setenv("DEEPEP_SHMEM_DENSE_QPS", dense ? "1" : "0", 1);
-                if (!dense) {
-                    const int previous_allocations = allocations;
-                    try {
-                        deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, false, false,
-                                          combine);
-                        assert(false);
-                    } catch (const std::runtime_error& error) {
-                        assert(std::string(error.what()).find("DEEPEP_SHMEM_DENSE_QPS=1") != std::string::npos);
-                    }
-                    assert(!deepep::Session::busy() && initialized == 0 && allocations == previous_allocations);
-                    continue;
-                }
+
                 deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, false, false, combine);
                 assert(s.combine_only() == combine);
+#ifdef WITH_MASKS
+                assert(s.sparse_qp_enabled() == !dense);
+#else
                 assert(!s.sparse_qp_enabled());
+#endif
                 s.close();
                 assert(!deepep::Session::busy());
             }
@@ -2166,14 +2179,18 @@ int main()
         compiler,
         "-std=c++17",
         "-O2",
+        "-rdynamic",
         "-I" + str(root / "tests/runtime/stubs"),
         "-I" + str(root / "tests/runtime"),
         "-I" + str(root / "csrc"),
         str(root / "csrc/runtime/session.cpp"),
         str(source),
+        "-ldl",
         "-o",
         str(binary),
     ]
+    if with_masks:
+        command.append("-DWITH_MASKS")
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
     subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=30)
 

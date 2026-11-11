@@ -36,10 +36,13 @@ __aicore__ inline void IssueFmRows(DeepepSecondaryState& s, uint32_t peer, __ubu
             trap();
             return;
         }
+        // The exchanged framework VA is already remote, outside the symmetric heap.
+        const aclshmemi_udma_addr_ctx_t addr_ctx{
+            reinterpret_cast<uint64_t>(target), reinterpret_cast<uint64_t>(target)};
         aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                          kUdmaDataRoNoCqeConfig>(
             reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header), target,
-            aclshmemi_udma_get_mem_info(info, slot, 0U), 0U);
+            aclshmemi_udma_get_mem_info(info, slot, 0U), 0U, addr_ctx);
         // WQE word5 caches the live peer base for this invocation only.
         header[5] = reinterpret_cast<uint64_t>(target);
         s.fm_context = reinterpret_cast<uint64_t>(ctx);

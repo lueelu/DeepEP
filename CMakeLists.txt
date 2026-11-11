@@ -33,6 +33,7 @@ target_link_options(_C PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 set_target_properties(_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS _C LIBRARY DESTINATION .)
 include(cmake/Direct.cmake)
+add_subdirectory(csrc/ubx)
 if(DEEPEP_BUILD_MEGAMOE)
     target_compile_definitions(_C PRIVATE DEEPEP_BUILD_MEGAMOE=1)
     add_subdirectory(experiments/megamoe)
@@ -49,10 +50,12 @@ endif()
 # Packaging consumes this file instead of maintaining another operator list.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/capabilities.json" CONTENT [=[
 {
-  "capabilities": ["runtime-mte", "runtime-urma", "runtime-mpi-bootstrap", "runtime-shmem-huge1g-v1", "event", "elastic-notify-metadata-v7", "elastic-notify-profile-v1", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3", "elastic-combine-rank-return-v1", "elastic-combine-return-slots-v2", "elastic-combine-chunk-tuning-v1", "elastic-combine-profile-v4", "elastic-combine-peers-v1", "elastic-combine-chunks-v2", "runtime-combine-sparse-qp-v1"],
+  "capabilities": ["runtime-mte", "runtime-urma", "runtime-mpi-bootstrap", "runtime-shmem-huge1g-v1", "event", "elastic-notify-metadata-v7", "elastic-notify-profile-v1", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3", "elastic-combine-rank-return-v1", "elastic-combine-return-slots-v2", "elastic-combine-chunk-tuning-v1", "elastic-combine-profile-v4", "elastic-combine-peers-v1", "elastic-combine-chunks-v2"],
   "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"],
   "machine_backends": {
     "mesh_clos": {"module": "deep_ep._C", "device_library": "libdeepep_kernels.so"},
+    "ubx": {"module": "deep_ep._ubx_C", "device_library": "libdeepep_ubx_kernels.so",
+      "interfaces": ["Combine"], "transport": "mte+roce", "scheme": "route-plan"},
     "mesh_pcie": {
       "module": "deep_ep._clos_C", "device_library": "libdeepep_clos_kernels.so",
       "interfaces": ["Buffer", "ElasticBuffer"], "transport": "mte", "topk_index_bits": 64

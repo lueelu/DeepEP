@@ -324,3 +324,5 @@ We thank [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) for the upstre
 ---
 
 Project material for which Lu Lu holds the relevant rights is licensed under the [BSD 2-Clause License](LICENSE). Other source material retains its own copyright notices and license texts.
+
+UBX provides a separate MTE/RDMA route-plan Combine with CPU-generated metadata and an HCCL pre-operation gate; see the [UBX guide](docs/ubx.md).

@@ -13,33 +13,23 @@ constexpr int ACLSHMEMX_INIT_WITH_MPI = 2;
 struct aclshmemx_uniqueid_t {
     char bytes[128]{};
 };
-enum aclshmem_config_state_t : uint32_t {
-    ACLSHMEM_CONFIG_DEFAULT = 0,
-    ACLSHMEM_CONFIG_DISABLED = 1,
-    ACLSHMEM_CONFIG_ENABLED = 2,
-};
-struct aclshmem_runtime_config_t {
-    aclshmem_config_state_t udma_shared_jetty = ACLSHMEM_CONFIG_DEFAULT;
-    uint32_t reserved[15]{};
-};
-struct aclshmem_init_optional_attr_t {
-    int version;
-    data_op_engine_type_t data_op_engine_type;
-    uint32_t shm_init_timeout, shm_create_timeout, control_operation_timeout;
-    int32_t sockFd;
-};
+constexpr int ACLSHMEM_CONFIG_DEFAULT = 0;
+constexpr int ACLSHMEM_CONFIG_DISABLED = 1;
+constexpr int ACLSHMEM_CONFIG_ENABLED = 2;
 struct aclshmemx_init_attr_t {
     int my_pe = 0;
     int n_pes = 0;
-    char ip_port[64]{};
     uint64_t local_mem_size = 0;
-    aclshmem_init_optional_attr_t option_attr = {
-        (2 << 16) + sizeof(aclshmemx_init_attr_t), ACLSHMEM_DATA_OP_MTE, 120, 120, 120, 0};
+    char ip_port[64]{};
     void* comm_args = nullptr;
-    uint64_t instance_id = 0;
-    aclshmem_runtime_config_t runtime_config{};
+    struct {
+        int data_op_engine_type = 0;
+        unsigned shm_init_timeout = 120, shm_create_timeout = 120, control_operation_timeout = 120;
+    } option_attr;
+    struct {
+        int udma_shared_jetty = ACLSHMEM_CONFIG_DEFAULT;
+    } runtime_config;
 };
-constexpr int32_t ACLSHMEM_INIT_ATTR_VERSION = (2 << 16) + sizeof(aclshmemx_init_attr_t);
 int aclshmemx_init_status();
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t*);
 struct aclshmemx_buffer_optional_attr_t {

@@ -19,6 +19,8 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
                                                              __ubuf__ uint8_t* scratch,
                                                              TBuf<QuePosition::VECCALC>& slots)
 {
+    // Preserve the exchanged framework VA; it is not a symmetric heap address.
+    const aclshmemi_udma_addr_ctx_t addr_ctx{target, target};
     // EP512 keeps the bounded per-visit builder; doubling this cache exceeds UB.
     if (s.world > kClosCacheEntries * 8U) {
         const uint64_t load_start = DetailClock<Profile>(s.detail_mode);
@@ -31,7 +33,7 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
         aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                          kUdmaDataRoNoCqeConfig>(
             reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header), reinterpret_cast<__gm__ uint8_t*>(target),
-            aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, qp), 0U);
+            aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, qp), 0U, addr_ctx);
         auto output = slots.GetWithOffset<uint64_t>(128U, 256U);
         SetFlag<HardEvent::S_V>(EVENT_ID0);
         WaitFlag<HardEvent::S_V>(EVENT_ID0);
@@ -58,7 +60,7 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
         aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                          kUdmaDataRoNoCqeConfig>(
             reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header), reinterpret_cast<__gm__ uint8_t*>(target),
-            aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, qp), 0U);
+            aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, qp), 0U, addr_ctx);
         tag[0] = key;
         tag[1] = 0U;
         tag[2] = 0U;

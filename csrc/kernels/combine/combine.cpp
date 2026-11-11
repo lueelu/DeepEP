@@ -1740,12 +1740,14 @@ struct CrossPutBatch {
         LocalTensor<uint8_t> ub;
         ub.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
         ub.address_.bufferAddr = reinterpret_cast<uint64_t>(scratch + lane * kWqeBatchScratchBytes);
-        aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(slot) * kWqeBytes),
+        aclshmemi_udma_copy_wqe_from_ub_async(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(slot) * kWqeBytes),
                                         ub, first * kWqeBytes, EVENT_ID0);
+        aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
         if (first != count) {
             ub.address_.bufferAddr += first * kWqeBytes;
-            aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), ub,
+            aclshmemi_udma_copy_wqe_from_ub_async(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), ub,
                                             (count - first) * kWqeBytes, EVENT_ID0);
+            aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
         }
         // Both wrap segments are visible before the one SQ doorbell update.
         aclshmemi_udma_post_send_update_info(head + count, ctx, queue);

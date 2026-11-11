@@ -52,11 +52,13 @@ __aicore__ inline void CacheCombinePutHeader(__ubuf__ uint64_t* header, GM_ADDR 
 {
     auto* info = aclshmemi_udma_qp_info_fetch();
     const uint32_t slot = aclshmemi_udma_compute_slot(peer, static_cast<uint32_t>(-1));
-    auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(workspace, peer));
+    auto* memory = aclshmemi_udma_get_mem_info(info, slot, qp);
+    const aclshmemi_udma_addr_ctx_t addr_ctx{
+        reinterpret_cast<uint64_t>(aclshmemi_get_state()->heap_base), memory->addr};
     aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                      kPayloadRoNoCqeConfig>(reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header),
-                                                            remote, aclshmemi_udma_get_mem_info(info, slot, qp), 0U);
-    header[7] = reinterpret_cast<uint64_t>(remote);
+                                                            workspace, memory, 0U, addr_ctx);
+    header[7] = header[5]; // Registered remote workspace VA for batched row offsets.
 }
 
 // Local URMA keeps the existing 128-row submit quantum and its single tail
@@ -102,16 +104,18 @@ struct LocalPutBatch {
         // EP8 return batches close every RO prefix with SO + CQE. This also
         // covers intermediate credit checkpoints, not only the window tail.
         // Other callers retain their upstream tail configuration.
-        auto* destination = reinterpret_cast<__gm__ uint8_t*>(rows[(row_count - 1U) * 4U + 1U]);
         auto* memory = aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, 0U);
+        const aclshmemi_udma_addr_ctx_t addr_ctx{
+            reinterpret_cast<uint64_t>(aclshmemi_get_state()->heap_base), memory->addr};
+        // The row builder supplies the final MR address; only header fields are reused.
         if (strong_tail) {
             aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE,
                                              __ubuf__ aclshmemi_sqe_ctx_t*, kCompletionSoConfig>(
-                reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(tail_header), destination, memory, row_count - 1U);
+                reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(tail_header), workspace, memory, row_count - 1U, addr_ctx);
         } else {
             aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE,
                                              __ubuf__ aclshmemi_sqe_ctx_t*, kPayloadRoConfig>(
-                reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(tail_header), destination, memory, row_count - 1U);
+                reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(tail_header), workspace, memory, row_count - 1U, addr_ctx);
         }
         rows[(row_count - 1U) * 4U + 2U] = reinterpret_cast<uint64_t>(tail_header);
         BuildCombinePutWqes(scratch, rows, row_count, bytes);
