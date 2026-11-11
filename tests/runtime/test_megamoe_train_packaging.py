@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPONENT = "deep_ep_experimental/megamoe_train/"
-TRAINING_FILES = ("__init__.py", "bf16.py", "_C.fake.so", "libdeepep_megamoe_train_bf16.so")
+TRAINING_FILES = ("__init__.py", "bf16.py", "api.py", "_C.fake.so", "libdeepep_megamoe_train_bf16.so")
 
 
 def inspect_wheel(path):

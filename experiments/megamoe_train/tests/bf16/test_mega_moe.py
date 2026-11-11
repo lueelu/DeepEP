@@ -118,6 +118,7 @@ def parse_args(argv=None):
         help="Default: BF16-rounded for BF16, full precision for FP32; rounded FP32 equals BF16 p.float()",
     )
     parser.add_argument("--expert-per-rank", type=int, default=2)
+    parser.add_argument("--api", choices=("module", "functional"), default="module", help="Training public entry style")
     parser.add_argument(
         "--routed-scaling-factor",
         type=float,
@@ -301,7 +302,7 @@ def suite_cases(args, *, include_skipped=False):
 
 def launch_options(args):
     argv = []
-    for key in ("chunk_rows", "warmup", "loops", "timeout", "skip", "local_mem_size", "baseline", "log"):
+    for key in ("chunk_rows", "warmup", "loops", "timeout", "skip", "local_mem_size", "baseline", "log", "api"):
         value = getattr(args, key)
         if value is not None:
             argv += ["--" + key.replace("_", "-"), str(value)]
@@ -1268,6 +1269,31 @@ def baseline_chain():
     return _BASELINE_CHAIN
 
 
+def fused_forward(op, x, ids, weights, w1, w2, capacity, *, save_gmm1_output, swiglu_limit, api):
+    """Adapt both public entry styles to the test's per-call (y, counts) contract."""
+    if api == "module":
+        return op(x, ids, weights, w1, w2, capacity, save_gmm1_output=save_gmm1_output, swiglu_limit=swiglu_limit)
+    import torch
+    from deep_ep_experimental.megamoe_train import bf16_mega_moe_train
+
+    y = torch.empty_like(x, requires_grad=False)
+    counts = torch.zeros(w1.shape[0], dtype=torch.int32, device=x.device)
+    bf16_mega_moe_train(
+        y,
+        w1,
+        w2,
+        op,
+        cumulative_local_expert_recv_stats=counts,
+        x=x,
+        topk_idx=ids,
+        topk_weights=weights,
+        max_recv_tokens=capacity,
+        save_gmm1_output=save_gmm1_output,
+        swiglu_limit=swiglu_limit,
+    )
+    return y, counts
+
+
 def measure(op, tensors, capacity, args, mode):
     """Three Event scopes for the MegaMoE BF16 operator, optional small-operator baseline.
 
@@ -1293,8 +1319,17 @@ def measure(op, tensors, capacity, args, mode):
 
     def megamoe_forward():
         reset()
-        y, counts = op(
-            x, ids, p, w1, w2, capacity, save_gmm1_output=args.save_gmm1_output, swiglu_limit=args.swiglu_limit
+        y, counts = fused_forward(
+            op,
+            x,
+            ids,
+            p,
+            w1,
+            w2,
+            capacity,
+            save_gmm1_output=args.save_gmm1_output,
+            swiglu_limit=args.swiglu_limit,
+            api=args.api,
         )
         return y, counts
 
@@ -1611,8 +1646,17 @@ def execute_case(local_rank, args, rank, world, op, local_mem, phase_seconds, ex
     # On runtime/device exceptions restart the job; do not attempt a collective
     # close while peers may still be executing a different operation.
     with phase("fused_forward_backward"):
-        y, counts = op(
-            x, ids, p, w1, w2, capacity, save_gmm1_output=args.save_gmm1_output, swiglu_limit=args.swiglu_limit
+        y, counts = fused_forward(
+            op,
+            x,
+            ids,
+            p,
+            w1,
+            w2,
+            capacity,
+            save_gmm1_output=args.save_gmm1_output,
+            swiglu_limit=args.swiglu_limit,
+            api=args.api,
         )
         y.backward(dy)
         torch.npu.synchronize()
@@ -1682,8 +1726,17 @@ def execute_case(local_rank, args, rank, world, op, local_mem, phase_seconds, ex
             def fused_control(save_mode):
                 for leaf in (x, p, w1, w2):
                     leaf.grad = None
-                control_y, control_counts = op(
-                    x, ids, p, w1, w2, capacity, save_gmm1_output=save_mode, swiglu_limit=args.swiglu_limit
+                control_y, control_counts = fused_forward(
+                    op,
+                    x,
+                    ids,
+                    p,
+                    w1,
+                    w2,
+                    capacity,
+                    save_gmm1_output=save_mode,
+                    swiglu_limit=args.swiglu_limit,
+                    api=args.api,
                 )
                 control_y.backward(dy)
                 torch.npu.synchronize()

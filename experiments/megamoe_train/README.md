@@ -1,6 +1,6 @@
 # MegaMoE 训练组件（Ascend950，实验性）
 
-`MegaMoeBF16Train` 提供融合 Dispatch、GMM1、SwiGLU、GMM2 和 Combine 的 MoE 前向计算，并支持输入、路由权重和专家权重的自动求导。
+`bf16_mega_moe_train` 提供融合 Dispatch、GMM1、SwiGLU、GMM2 和 Combine 的 MoE 前向计算，并支持输入、路由权重和专家权重的自动求导。公开入口采用 DeepGEMM 的输出在首位的格式，`SymmBuffer` 管理通信资源；原 `MegaMoeBF16Train` 模块调用继续可用。
 
 ## 构建与安装
 
@@ -44,57 +44,98 @@ master 节点须能在该地址监听，其他 rank 须能访问。
 以下展示算子调用方式，输入参数见下文。
 
 ```python
-from deep_ep_experimental.megamoe_train import MegaMoeBF16Train
+import torch
+from deep_ep_experimental.megamoe_train import SymmBuffer, bf16_mega_moe_train
 
-# 构造 MegaMoE Train 算子：初始化 SHMEM 通信、分配每个 rank 的通信窗口，
-op = MegaMoeBF16Train(ep_group, local_mem_size=local_mem_size)
-# 调用算子
-y, counts = op(x, topk_ids, topk_weights, w1, w2, max_recv_tokens,
-               swiglu_limit=0.0, save_gmm1_output="bf16")
+# 各层复用同一个 buffer；x、topk_weights、w1、w2 按需设置 requires_grad。
+buffer = SymmBuffer(ep_group, local_mem_size=local_mem_size)
+y = torch.empty_like(x, requires_grad=False)
+bf16_mega_moe_train(
+    y, w1, w2, buffer,
+    x=x, topk_idx=topk_ids, topk_weights=topk_weights,
+    max_recv_tokens=max_recv_tokens,
+    swiglu_limit=0.0, save_gmm1_output="bf16",
+)
 loss = loss_fn(y, target)
 loss.backward()
-op.close()  # 所有 rank 完成所需反向后集体关闭，再销毁 EP 进程组
+buffer.close()  # 所有 rank 完成所需反向后集体关闭，再销毁 EP 进程组
 ```
 
 ## 对外接口与参数
 
 ### 构造 MegaMoE 和销毁
 
-通过 `MegaMoeBF16Train(ep_group, local_mem_size, *, timeout=120)` 初始化算子，
-`*` 后参数仅接受关键字传参。使用结束后，各 EP rank 调用 `op.close()` 释放通信资源。
+通过 `SymmBuffer(ep_group, local_mem_size, *, timeout=120, debug_collectives=False)` 初始化资源，
+`*` 后参数仅接受关键字传参。`SymmBuffer` 与 `MegaMoeBF16Train` 是同一个资源类型，复用根 Runtime/Session。
+使用结束后，各 EP rank 调用 `buffer.close()` 释放通信资源。
 
 | 参数 | 说明 |
 | --- | --- |
 | `ep_group` | 调用方已有的 ProcessGroup 或 `deep_ep` StoreGroup，不能为 None，由调用方管理；ProcessGroup 支持 Gloo/HCCL 初始化协调，token 数据仍使用 SHMEM MTE 后端 |
 | `local_mem_size` | 每 rank 的固定 SHMEM 窗口字节数，至少 2 MiB、按 2 MiB 对齐，各 rank 相同；详见[local_mem_size](#local_mem_size) |
 | `timeout` | 初始化和控制操作超时，整数秒，默认 120，范围 1..3600；进程组超时另行设置，不保证覆盖设备内核全部等待 |
+| `debug_collectives` | 默认 False；开启后在前反向检查跨 rank 的调用阶段和 TopK weight dtype，一次 EP 调用各 rank 取值一致 |
 
 所有 EP rank 使用相同的通信窗口容量和超时。
 
 ### 算子输入与输出
 
 ```python
-y, counts = op(x, topk_ids, topk_weights, w1, w2, max_recv_tokens,
-               swiglu_limit=0.0, save_gmm1_output="bf16")
+def bf16_mega_moe_train(
+    y, l1_weights, l2_weights, sym_buffer,
+    shared_l1_weights=None, shared_l2_weights=None,
+    cumulative_local_expert_recv_stats=None,
+    activation="swiglu", activation_clamp=None, fast_math=True,
+    *, x, topk_idx, topk_weights, max_recv_tokens,
+    swiglu_limit=0.0, save_gmm1_output="bf16",
+) -> None: ...
 ```
+
+上面为函数签名，`*` 后为训练参数，调用时使用关键字传参。前四项及其后的公共选项参照
+[DeepGEMM BF16 MegaMoE](https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/mega/__init__.py)。
+训练直接接收原始 `x`、`topk_idx`、`topk_weights`，由 autograd 关联输入与梯度，不要求先复制到 buffer。
+专家权重沿用下表的训练布局，无需推理量化或权重重排。
 
 M 为每 rank 输入 token 数，H 为 hidden，F 为专家中间维，T 为 TopK，E 为每 rank 本地专家数，EP 为组大小。
 
 | 参数 / 输出 | 类型与形状 | 含义 |
 | --- | --- | --- |
 | `x` | BF16 `[M,H]` | 本 rank 输入；EP 不再切分 M |
-| `topk_ids` | int32 `[M,T]` | 专家编号 `ep_rank*E+local_expert`，范围 `[0,EP*E)`，同一 token 内不得重复；使用 EP 组内 rank，非全局 rank |
+| `topk_idx` | int32 `[M,T]` | 专家编号 `ep_rank*E+local_expert`，范围 `[0,EP*E)`，同一 token 内不得重复；使用 EP 组内 rank，非全局 rank；旧模块调用中的参数名为 `topk_ids` |
 | `topk_weights` | BF16 或 FP32 `[M,T]` | TopK 路由权重，可求导；同次调用各 rank dtype 一致 |
-| `w1` | BF16 `[E,2F,H]` | 前 F 行为 Gate、后 F 行为 Up；另支持 `[E,H,2F]` |
-| `w2` | BF16 `[E,H,F]` | Down 权重；另支持 `[E,F,H]`，权重梯度保持输入布局 |
+| `l1_weights` | BF16 `[E,2F,H]` | 前 F 行为 Gate、后 F 行为 Up；另支持 `[E,H,2F]`；旧模块参数名为 `w1` |
+| `l2_weights` | BF16 `[E,H,F]` | Down 权重；另支持 `[E,F,H]`，权重梯度保持输入布局；旧模块参数名为 `w2` |
 | `max_recv_tokens` | int，1..int32 最大值 | 本 rank 所有本地专家合计的接收行容量；详见[max_recv_tokens](#max_recv_tokens) |
 | `swiglu_limit` | 可表示为 float32 的有限数值，默认 0.0 | <=0 关闭裁剪；正值 L 对 Gate 做上界 L 裁剪、对 Up 做 `[-L,L]` 裁剪；仅接受关键字传参 |
 | `save_gmm1_output` | 字符串，默认 `bf16` | Gate/Up 保存方式，仅接受关键字传参；详见[save_gmm1_output](#save_gmm1_output) |
-| `y` | BF16 `[M,H]` | Combine 后恢复本 rank token 顺序的输出 |
-| `counts` | int32 `[E]` | 各本地专家接收行数，不可求导 |
+| `y` | BF16 `[M,H]` | 调用方预分配的连续输出；kernel 直接写入并连接训练计算图；每个尚需反向的前向使用独立 y，不能与输入共享存储 |
+| `cumulative_local_expert_recv_stats` | 可选 int32 `[E]` | 原位累加各本地专家接收行数；首次使用时由调用方清零，不可与输入或 y 共享存储 |
+| `activation` / `fast_math` | `"swiglu"` / True | 当前支持的激活和计算配置 |
+| `activation_clamp` | 可选有限 float | `swiglu_limit` 的别名；同时传入非零 `swiglu_limit` 时两者须相等，裁剪规则相同 |
+| `shared_l1_weights` / `shared_l2_weights` | None | 保留公共位置参数；当前训练仅计算路由专家，任意一项非 None 时在启动计算前报错 |
 
 输入 Tensor 须连续且位于同一 NPU。支持对 `x`、`topk_weights`、`w1`、`w2` 求梯度，
 返回的 `dtopk_weights` 与输入 `topk_weights` 类型一致，`dx`、`dw1`、`dw2` 为 BF16。不支持二阶求导。
+
+函数原位写入 `y`，返回 None；随后直接对 `y` 构造 loss 并执行 `backward()`。
+`y` 创建时不设置 `requires_grad=True`，调用后自动关联四项可求导输入。每个前向独立保存反向状态，
+同一个 buffer 可串行排队多个前向，再按各 rank 一致的顺序反向。
+
+### 原模块调用
+
+旧代码的构造、参数顺序和返回值保持不变，与函数式入口使用相同的训练 kernel：
+
+```python
+from deep_ep_experimental.megamoe_train import MegaMoeBF16Train
+
+op = MegaMoeBF16Train(ep_group, local_mem_size)
+y, counts = op(x, topk_ids, topk_weights, w1, w2, max_recv_tokens,
+               swiglu_limit=0.0, save_gmm1_output="bf16")
+y.backward(dy)
+op.close()
+```
+
+旧模块返回每次调用的 `counts`，函数式入口按需累加统计。两种入口共享一个资源实例，不能另建第二个存活的 SHMEM owner。
 
 ## 关键参数说明
 

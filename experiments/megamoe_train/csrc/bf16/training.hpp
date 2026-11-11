@@ -32,7 +32,7 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
                                  torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
                                  int64_t max_recv_tokens, int rank, int world_size, std::size_t symmetric_buffer_bytes,
                                  uint64_t ffts_addr, void* symmetric_buffer, double swiglu_limit = 0.0,
-                                 const std::string& save_gmm1_output = "bf16");
+                                 const std::string& save_gmm1_output = "bf16", torch::Tensor out = {});
 
 BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor grad_y, torch::Tensor topk_weights,
                                    torch::Tensor weight1, torch::Tensor weight2, torch::Tensor expert_token_nums,
@@ -55,6 +55,10 @@ public:
     ops::ForwardResult forward(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
                                torch::Tensor weight1, torch::Tensor weight2, int64_t max_recv_tokens,
                                double swiglu_limit, const std::string& save_gmm1_output);
+
+    ops::ForwardResult forward_out(torch::Tensor out, torch::Tensor x, torch::Tensor topk_ids,
+                                   torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
+                                   int64_t max_recv_tokens, double swiglu_limit, const std::string& save_gmm1_output);
 
     ops::BackwardResult backward(torch::Tensor grad_y, torch::Tensor topk_weights, torch::Tensor weight1,
                                  torch::Tensor weight2, torch::Tensor counts, torch::Tensor saved_state,

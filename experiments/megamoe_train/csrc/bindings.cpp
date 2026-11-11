@@ -22,6 +22,7 @@ PYBIND11_MODULE(_C, module)
     py::class_<BF16Executor>(module, "BF16")
         .def(py::init<uintptr_t, int64_t, int, int, torch::Tensor>())
         .def("forward", &BF16Executor::forward)
+        .def("forward_out", &BF16Executor::forward_out)
         .def("backward", &BF16Executor::backward)
         .def("close", &BF16Executor::close);
 }

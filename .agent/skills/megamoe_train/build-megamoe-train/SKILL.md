@@ -171,7 +171,7 @@ import deep_ep
 from deep_ep._native import require_native
 
 core_native = require_native("MegaMoE training installation check")
-from deep_ep_experimental.megamoe_train import MegaMoeBF16Train
+from deep_ep_experimental.megamoe_train import MegaMoeBF16Train, SymmBuffer, bf16_mega_moe_train
 from deep_ep_experimental.megamoe_train import _C as train_native
 
 info = json.loads((Path(deep_ep.__file__).parent / "_build_info.json").read_text())
@@ -180,6 +180,9 @@ print("Python:", sys.executable)
 print("Core extension:", core_native.__file__)
 print("Training extension:", train_native.__file__)
 print("Training API:", MegaMoeBF16Train.__name__)
+assert SymmBuffer is MegaMoeBF16Train
+assert callable(bf16_mega_moe_train)
+assert hasattr(train_native.BF16, "forward_out")
 print("PASS: installed training extensions load")
 PY
 )

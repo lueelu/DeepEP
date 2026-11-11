@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
 
-from deep_ep_experimental.megamoe_train import MegaMoeBF16Train
+from deep_ep_experimental.megamoe_train import MegaMoeBF16Train, SymmBuffer, bf16_mega_moe_train
 
 
 def expect_error(action, message):
@@ -49,12 +49,31 @@ def main():
         for dtype in (torch.bfloat16, torch.float32)
     ]
 
-    def forward(op, mode, limit, dtype=torch.bfloat16):
+    def forward(op, mode, limit, dtype=torch.bfloat16, *, functional=False):
         values = [value.clone() for value in templates]
         values[1] = values[1].to(dtype)
         values = [value.requires_grad_() for value in values]
         x, weights, w1, w2 = values
-        y, counts = op(x, ids, weights, w1, w2, m * size * e, save_gmm1_output=mode, swiglu_limit=limit)
+        if functional:
+            y = torch.empty_like(x, requires_grad=False)
+            counts = torch.zeros(e, dtype=torch.int32, device=device)
+            pointer = y.data_ptr()
+            result = bf16_mega_moe_train(
+                y,
+                w1,
+                w2,
+                op,
+                cumulative_local_expert_recv_stats=counts,
+                x=x,
+                topk_idx=ids,
+                topk_weights=weights,
+                max_recv_tokens=m * size * e,
+                save_gmm1_output=mode,
+                swiglu_limit=limit,
+            )
+            assert result is None and y.data_ptr() == pointer
+        else:
+            y, counts = op(x, ids, weights, w1, w2, m * size * e, save_gmm1_output=mode, swiglu_limit=limit)
         return values, y, counts
 
     def capture(values, y, counts):
@@ -73,7 +92,7 @@ def main():
         values, y, counts = forward(op, mode, limit, dtype)
         (y * dy).sum().backward()
         sequential.append(capture(values, y, counts))
-    pending = [forward(op, mode, limit, dtype) for mode, limit, dtype in modes]
+    pending = [forward(op, mode, limit, dtype, functional=True) for mode, limit, dtype in modes]
     with torch.npu.stream(torch.npu.Stream()):
         expect_error(lambda: forward(op, "bf16", 0.0), "construction stream")
     for index in reversed(range(len(pending))):
@@ -92,7 +111,7 @@ def main():
     actual[4], actual[5] = actual[4].transpose(1, 2), actual[5].transpose(1, 2)
     assert all(torch.equal(a, b) for a, b in zip(actual, sequential[0])), (rank, "legacy layouts")
     for iteration in range(32):
-        values, y, counts = forward(op, "bf16", 0.0)
+        values, y, counts = forward(op, "bf16", 0.0, functional=True)
         (y * dy).sum().backward()
     assert all(torch.equal(a, b) for a, b in zip(capture(values, y, counts), sequential[0])), (rank, "32 iterations")
     op.close()
@@ -100,8 +119,8 @@ def main():
     expect_error(lambda: forward(op, "bf16", 0.0), "closed")
     del pending, y, values, op
     # Recreating a closed owner must not retain stale generation/context state.
-    op = MegaMoeBF16Train(group, capacity)
-    values, y, counts = forward(op, "bf16", 0.0)
+    op = SymmBuffer(group, capacity)
+    values, y, counts = forward(op, "bf16", 0.0, functional=True)
     (y * dy).sum().backward()
     assert all(torch.equal(a, b) for a, b in zip(capture(values, y, counts), sequential[0]))
     op.close()

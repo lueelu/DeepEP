@@ -43,6 +43,10 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 
 
 不加 `--skip` 就是先精度、全部通过后再计时。
 
+`--api module`（默认）检查原 `MegaMoeBF16Train` 调用；`--api functional` 检查输出在首位的
+`bf16_mega_moe_train` 接口，包括预分配 `y` 的自动求导和专家计数累加。两者使用同一 kernel、输入和精度判据。
+测试适配器将累加计数清零后使用，因此报告中的 counts 仍为单次调用计数。
+
 ### 性能测试
 
 ```bash
@@ -100,6 +104,8 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 
 ## 性能口径
 
 三个口径各自独立采样，窗口前后各 `torch.npu.synchronize()` 一次：
+
+比较接口耗时时须使用相同 `--api`。functional 模式按公开接口累加专家计数，这项累加操作也在计时范围内。
 
 | 口径 | 窗口内容 |
 | --- | --- |

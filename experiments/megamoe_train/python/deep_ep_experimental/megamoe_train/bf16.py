@@ -47,10 +47,14 @@ class _TrainRuntime(Runtime):
 
 class _MegaMoeBF16TrainFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, op, x, ids, weights, w1, w2, max_recv, limit, mode):
+    def forward(ctx, op, x, ids, weights, w1, w2, max_recv, limit, mode, out):
         op._check_ready()
         op._runtime.validate_topk_weight_type(weights.dtype, 0)
-        result = op._executor.forward(x, ids, weights, w1, w2, max_recv, limit, mode)
+        if out is None:
+            result = op._executor.forward(x, ids, weights, w1, w2, max_recv, limit, mode)
+        else:
+            result = op._executor.forward_out(out, x, ids, weights, w1, w2, max_recv, limit, mode)
+            ctx.mark_dirty(out)
         ctx.op = op
         ctx.max_recv, ctx.limit, ctx.mode = max_recv, limit, mode
         ctx.save_for_backward(weights, w1, w2, result.counts, result.saved_state, result.dispatch_output)
@@ -76,7 +80,7 @@ class _MegaMoeBF16TrainFunction(torch.autograd.Function):
             ctx.limit,
             ctx.mode,
         )
-        return None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None, None, None
+        return None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None, None, None, None
 
 
 class MegaMoeBF16Train(torch.nn.Module):
@@ -144,7 +148,7 @@ class MegaMoeBF16Train(torch.nn.Module):
         if save_gmm1_output not in ("bf16", "none", "mxfp8", "auto"):
             raise ValueError("save_gmm1_output must be bf16, none, mxfp8 or auto")
         return _MegaMoeBF16TrainFunction.apply(
-            self, x, topk_ids, topk_weights, w1, w2, max_recv_tokens, limit, save_gmm1_output
+            self, x, topk_ids, topk_weights, w1, w2, max_recv_tokens, limit, save_gmm1_output, None
         )
 
     def close(self):

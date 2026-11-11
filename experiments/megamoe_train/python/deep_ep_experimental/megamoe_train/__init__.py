@@ -4,10 +4,14 @@
 
 """Ascend950 MegaMoE training. Native loading happens on construction."""
 
-__all__ = ["MegaMoeBF16Train"]
+__all__ = ["SymmBuffer", "bf16_mega_moe_train", "MegaMoeBF16Train"]
 
 
 def __getattr__(name):
+    if name in ("SymmBuffer", "bf16_mega_moe_train"):
+        from . import api
+
+        return getattr(api, name)
     if name == "MegaMoeBF16Train":
         from .bf16 import MegaMoeBF16Train
 

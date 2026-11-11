@@ -92,6 +92,7 @@ def inspect_wheel(path):
             required = {
                 training_component + "__init__.py",
                 training_component + "bf16.py",
+                training_component + "api.py",
                 training_component + "libdeepep_megamoe_train_bf16.so",
             }
             extensions = [

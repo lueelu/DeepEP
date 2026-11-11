@@ -6,6 +6,7 @@
 #include "tiling.hpp"
 
 #include <acl/acl.h>
+#include <ATen/MemoryOverlap.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -196,7 +197,7 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
                                  torch::Tensor topkWeights, torch::Tensor weight1, torch::Tensor weight2,
                                  int64_t maxRecvTokens, int rank, int worldSize, std::size_t symmetricBufferBytes,
                                  uint64_t ffts_addr, void* symmetricBuffer, double swigluLimit,
-                                 const std::string& save_gmm1_output)
+                                 const std::string& save_gmm1_output, torch::Tensor out)
 {
     CheckNpuContiguous(x, "x");
     CheckNpuContiguous(topkIds, "topk_ids");
@@ -216,6 +217,16 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
     TORCH_CHECK(topkWeights.sizes() == topkIds.sizes(), "topk_weights shape must match topk_ids");
     TORCH_CHECK(x.size(0) == topkIds.size(0), "x and topk_ids must have the same token count");
     TORCH_CHECK(weight1.dim() == 3 && weight2.dim() == 3, "weight1 and weight2 must be rank-3 tensors");
+
+    if (out.defined()) {
+        CheckNpuContiguous(out, "y");
+        TORCH_CHECK(out.scalar_type() == x.scalar_type() && out.device() == x.device() && out.sizes() == x.sizes(),
+                    "y must have the same BF16 shape and NPU device as x");
+        at::assert_no_internal_overlap(out);
+        for (const auto* input : {&context, &x, &topkIds, &topkWeights, &weight1, &weight2}) {
+            at::assert_no_overlap(out, *input);
+        }
+    }
 
     const int64_t m = x.size(0);
     const int64_t k = x.size(1);
@@ -266,7 +277,7 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
     // Both unpermute implementations overwrite every output token row once.
     // ExpertTokenNumCopyOut likewise writes all local-expert entries, so these
     // returned tensors do not need a device-wide pre-clear.
-    auto y = torch::empty({m, k}, x.options());
+    auto y = out.defined() ? out : torch::empty({m, k}, x.options());
     auto expertTokenNums = torch::empty({expertPerRank}, topkIds.options().dtype(torch::kInt32));
     auto trainingSavedState = AllocateTrainingSavedState(savedStateLayout, x);
     auto dispatchOutput =
@@ -477,6 +488,18 @@ ops::ForwardResult BF16Executor::forward(torch::Tensor x, torch::Tensor topk_ids
     return ops::MegaMoeBF16Forward(Context(x), x, topk_ids, topk_weights, weight1, weight2, max_recv_tokens, rank_,
                                    world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(), swiglu_limit,
                                    save_gmm1_output);
+}
+
+ops::ForwardResult BF16Executor::forward_out(torch::Tensor out, torch::Tensor x, torch::Tensor topk_ids,
+                                             torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
+                                             int64_t max_recv_tokens, double swiglu_limit,
+                                             const std::string& save_gmm1_output)
+{
+    TORCH_CHECK(address_ != 0, "training operator has been closed");
+    TORCH_CHECK(out.defined(), "y must be a defined output tensor");
+    return ops::MegaMoeBF16Forward(Context(x), x, topk_ids, topk_weights, weight1, weight2, max_recv_tokens, rank_,
+                                   world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(), swiglu_limit,
+                                   save_gmm1_output, out);
 }
 
 ops::BackwardResult BF16Executor::backward(torch::Tensor grad_y, torch::Tensor topk_weights, torch::Tensor weight1,
