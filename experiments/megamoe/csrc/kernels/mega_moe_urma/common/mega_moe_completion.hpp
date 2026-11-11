@@ -1,5 +1,5 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBrightMan 2026
 
 #pragma once
 

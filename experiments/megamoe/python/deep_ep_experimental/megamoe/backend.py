@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by SimpleBright_Man 2026
+# Modified by SimpleBrightMan 2026
 
 """Internal MegaMoE product selection; public signatures remain in api.py."""
 

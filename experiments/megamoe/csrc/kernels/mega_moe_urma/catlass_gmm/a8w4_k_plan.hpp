@@ -1,5 +1,5 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBrightMan 2026
 
 #ifndef MEGA_MOE_A8W4_K_PLAN_H
 #define MEGA_MOE_A8W4_K_PLAN_H

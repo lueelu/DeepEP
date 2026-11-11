@@ -1,5 +1,5 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBrightMan 2026
 
 // Compile each backend with its original namespace and timer symbols.
 // The selector is a build-target definition, never a device runtime input.

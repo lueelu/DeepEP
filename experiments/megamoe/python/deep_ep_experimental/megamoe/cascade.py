@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by SimpleBright_Man 2026
+# Modified by SimpleBrightMan 2026
 
 """NPU operator cascade for accuracy, using the same raw FP4 data as MegaMoE.
 
