@@ -292,12 +292,11 @@ void bind_low_latency(py::module_& module)
     module.def("low_latency_combine_tiling",
                [](int p, int b, int h, int k, int e, const std::string& dtype, int num_max_tokens_per_rank) {
                    CombineDedup::Layout plan{};
-                   if ((dtype != "bfloat16" && dtype != "float16") || !CombineDedup::BuildLayout(p, b, h, k, e, plan, query_ll_core_config().active)) {
+                   if ((dtype != "bfloat16" && dtype != "float16") || !CombineDedup::BuildLayout(p, b, h, k, e, plan)) {
                        throw std::invalid_argument("LL combine exceeds dtype, topology, UB or workspace limits");
                    }
                    CombineDedup::EpServerDedupCombineTilingData data{};
-                   data.tilingKey = DispatchDedup::LlTilingKeyForWorld(p);
-        data.bs = b;
+                   data.bs = b;
                    data.h = h;
                    data.numMaxTokensPerRank = num_max_tokens_per_rank;
                    data.topK = k;
@@ -353,37 +352,18 @@ void bind_low_latency(py::module_& module)
         session.invalidate_dispatch_controls();
         dispatch_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
     });
-    module.def("clear_low_latency_combine_windows", [](Session& session, int b, int h, int k, int e,
-                                                       uintptr_t stream_address) {
-        CombineDedup::Layout plan{};
-        if (!session.ll_rdma() || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
-            !CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active))
-            throw std::invalid_argument("Invalid NDR combine window preparation");
-        const uint64_t blocks = uint64_t(b) * k * ((uint64_t(h) * 2U + 479U) / 480U);
-        auto* local = peer_buffer_base(session, session.rank());
-        const uint32_t cores = pin_session_cores(session);
-        auto stream = reinterpret_cast<aclrtStream>(stream_address);
-        py::gil_scoped_release release;
-        // Called after local device completion and BEFORE HCCL completion
-        // exchange. Clear both banks because the next per-core magic is device-owned.
-        combine_clear_result_flags_kernel_do(stream, local, blocks, cores);
-        const int status = aclrtSynchronizeStream(stream);
-        if (status != 0) throw std::runtime_error("NDR combine result initialization failed: " + std::to_string(status));
-    });
     module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e,
                                          const std::string& dtype, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         CombineDedup::Layout plan{};
         if (!stream_address || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
             (dtype != "bfloat16" && dtype != "float16") ||
-            !CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active)) {
+            !CombineDedup::BuildLayout(session.world(), b, h, k, e, plan)) {
             throw std::invalid_argument("Invalid LL combine dtype, shape, workspace or stream");
         }
         const int64_t c = plan.capacityRows;
         auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
         deepep::EpServerDedupCombineKernelArgs args{};
-        args.coreNum = pin_session_cores(session);
-        args.stageTimer = stage_timer(tensors, args.coreNum, args.timerMode);
         args.commArgs = get("comm_args", {sizeof(DispatchDedup::CommArgs)}, "uint8");
         // Python validates rows against the dispatch handle. The device selects
         // rows below the actual receive count; C_B sizes metadata, not expert storage.
