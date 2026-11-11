@@ -34,8 +34,11 @@ public:
     void WaitHandle(aclrtStream stream) const;
     void Synchronize(aclrtStream stream) const;
     void Destroy();
-    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order,
-                                       int64_t group_peers, int64_t workers, int64_t qps);
+    // Serialized fresh dispatches may publish counts before Notify finishes.
+    void* PrepareNotifyHostCounts(std::size_t count);
+    std::vector<int32_t> WaitNotifyHostCounts(std::size_t count);
+    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                         int64_t workers, int64_t qps);
 
     uint64_t FftsAddr() const;
     bool Initialized() const;
@@ -112,4 +115,9 @@ private:
     void* workspace_ptr_;
 
     uint64_t ffts_addr_;
+    void* notify_host_counts_ = nullptr;
+    void* notify_device_counts_ = nullptr;
+    std::size_t notify_count_capacity_ = 0;
+    bool notify_host_unavailable_ = false;
+    bool notify_host_pending_ = false;
 };

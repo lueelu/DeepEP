@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 #include <torch_npu/csrc/aten/common/from_blob.h>
@@ -621,6 +623,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
             tiling.packed_scale_ready = self + padding;
     }
 
+    const char* host_poll = std::getenv("DEEPEP_CLOS_NOTIFY_HOST_POLL");
+    if (!cached_mode && num_worst_tokens == 0 && !capturing && use_udma &&
+        (!host_poll || std::strcmp(host_poll, "1") == 0)) {
+        tiling.notify_host_counts = reinterpret_cast<uint64_t>(shmem.PrepareNotifyHostCounts(1 + num_local_experts));
+    }
     if (cached_mode) {
         LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());
         if (rebuild_cached_plan)
@@ -638,14 +645,22 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     } else if (num_worst_tokens > 0) {
         num_recv_tokens = num_worst_tokens;
     } else {
-        // One blocking readback supplies the exact output size and expert counts.
-        // Fixed-capacity and cached paths still skip this readback.
-        auto recv_counts_cpu = notify_counts.cpu();
-        const int32_t* recv_counts = recv_counts_cpu.data_ptr<int32_t>();
+        // Mapped publication waits for counts only; the fallback copies both
+        // count arrays once after Notify. Fixed-capacity/cached skip both paths.
+        torch::Tensor recv_counts_cpu;
+        std::vector<int32_t> published_counts;
+        const int32_t* recv_counts;
+        if (tiling.notify_host_counts) {
+            published_counts = shmem.WaitNotifyHostCounts(1 + num_local_experts);
+            recv_counts = published_counts.data();
+        } else {
+            recv_counts_cpu = notify_counts.cpu();
+            recv_counts = recv_counts_cpu.data_ptr<int32_t>();
+        }
         num_recv_tokens = static_cast<int64_t>(recv_counts[0]);
         TORCH_CHECK(num_recv_tokens >= 0, "notify_dispatch returned a negative receive count");
 
-        const int32_t* recv_expert_counts = recv_counts + kNotifyExpertCountsOffset;
+        const int32_t* recv_expert_counts = recv_counts + (tiling.notify_host_counts ? 1 : kNotifyExpertCountsOffset);
         num_recv_tokens_per_expert_list.reserve(static_cast<std::size_t>(num_local_experts));
         // The notify kernel returns raw counts; the public list is aligned here.
         for (int64_t expert = 0; expert < num_local_experts; ++expert) {

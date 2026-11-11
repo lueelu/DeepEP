@@ -158,14 +158,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispa
             AscendC::DataCopyPad(temporary_ub, channel_values_gm, copy, int32_pad_params);
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            asc_vf_call<ascend_deepep::PrefixChannelCountsVf>(dim3(128),
-                reinterpret_cast<__ubuf__ int32_t*>(temporary_ub.GetPhyAddr()),
-                static_cast<uint32_t>(rank_stride), static_cast<uint32_t>(num_channels));
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-            AscendC::DataCopyPad(channel_values_gm, temporary_ub, copy);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+            asc_vf_call<ascend_deepep::PrefixAndPublishChannelsVf>(
+                dim3(128), reinterpret_cast<__ubuf__ int32_t*>(temporary_ub.GetPhyAddr()),
+                reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix), shmem_base + published_channel_prefix_offset,
+                static_cast<uint32_t>(world_size), static_cast<uint32_t>(rank_stride),
+                static_cast<uint32_t>(num_channels), static_cast<uint32_t>(channel_stride));
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         }
     } else if (rank_worker_elems > 0) {
         AscendC::Duplicate(accumulator_ub, static_cast<int32_t>(0), rank_worker_elems);
@@ -189,7 +188,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispa
     AscendC::SyncAll<true>();
 
     // Transpose [channel, rank] into [rank, channel] and publish a padded copy.
-    for (int32_t dst_rank = core_idx; dst_rank < world_size; dst_rank += core_num) {
+    for (int32_t dst_rank = channel_matrix_elems <= kMaxVectorTileElems ? world_size : core_idx; dst_rank < world_size;
+         dst_rank += core_num) {
         AscendC::Duplicate(accumulator_ub, static_cast<int32_t>(0), channel_stride);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
@@ -362,6 +362,15 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispa
     }
     AscendC::SyncAll<true>();
 
+    if (tiling.notify_host_counts != 0 && core_idx == 0) {
+        asc_vf_call<ascend_deepep::NotifyHostCountsVf>(
+            dim3(128), reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),
+            reinterpret_cast<__gm__ int32_t*>(num_recv_tokens_per_expert),
+            reinterpret_cast<volatile __gm__ uint32_t*>(tiling.notify_host_counts), tiling.rank, tiling.world_size,
+            tiling.num_local_experts);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+    }
     if (tiling.v2_rank_prefix != 0 && core_idx == 0) {
         asc_vf_call<ascend_deepep::V2HandleCountsVf>(dim3(128),
             reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),

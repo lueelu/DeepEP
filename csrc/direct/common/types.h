@@ -99,6 +99,8 @@ struct alignas(8) DispatchTilingData {
     uint64_t packed_peer_scales = 0;
     // Cache-isolated local producer flags in the unused self-peer interval.
     uint64_t packed_scale_ready = 0;
+    // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
+    uint64_t notify_host_counts = 0;
 };
 
 struct alignas(8) CombineTilingData {

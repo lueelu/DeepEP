@@ -5,6 +5,18 @@
 
 namespace ascend_deepep {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+// Each slot has exactly one writer. No mailbox access follows these stores.
+// Count+1 is also the ready indication, so an empty result is publishable.
+__simt_vf__ __launch_bounds__(128) inline void NotifyHostCountsVf(const __gm__ int32_t* ranks,
+                                                                  const __gm__ int32_t* experts,
+                                                                  volatile __gm__ uint32_t* host, uint32_t rank,
+                                                                  uint32_t world, uint32_t count)
+{
+    if (threadIdx.x == 0) host[0] = uint32_t(ranks[uint64_t(world - 1) * world + rank]) + 1U;
+    for (uint32_t e = threadIdx.x; e < count; e += 128) host[e + 1] = uint32_t(experts[e]) + 1U;
+    asc_threadfence();
+}
+
 // Notify's existing local barrier publishes both input arrays before this VF.
 __simt_vf__ __launch_bounds__(128) inline void V2HandleCountsVf(
     const __gm__ int32_t* ranks, const __gm__ int32_t* counts, __gm__ int32_t* rank_prefix,

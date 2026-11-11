@@ -1,6 +1,7 @@
 #include "shmem_instance.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -189,16 +190,16 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
         throw std::invalid_argument("tuning session requires shared-Jetty peer scheduling and a fixed group size");
 }
 
-std::vector<int64_t> ShmemInstance::ConfigureTuning(
-    int64_t dispatch_order, int64_t combine_order, int64_t group_peers, int64_t workers, int64_t qps)
+std::vector<int64_t> ShmemInstance::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                                    int64_t workers, int64_t qps)
 {
     if (!initialized_ || !tuning_session_ || g_runtime_refcount != 1)
         throw std::runtime_error("configure_tuning requires one active tuning-session Buffer per process");
     // Validate before any collective or mutation. The benchmark agrees the
     // complete plan across ranks before entering this private interface.
-    ShmemInstance candidate(rank_, world_size_, ip_port_, data_op_engine_type_, use_1g_huge_pages_,
-                            unique_id_, bootstrap_key_, true, false, dispatch_order, combine_order,
-                            ranks_per_group_, group_peers, workers, qps);
+    ShmemInstance candidate(rank_, world_size_, ip_port_, data_op_engine_type_, use_1g_huge_pages_, unique_id_,
+                            bootstrap_key_, true, false, dispatch_order, combine_order, ranks_per_group_, group_peers,
+                            workers, qps);
     ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
     Barrier();
     dispatch_peer_order_ = candidate.dispatch_peer_order_;
@@ -206,8 +207,7 @@ std::vector<int64_t> ShmemInstance::ConfigureTuning(
     peers_per_group_per_worker_ = candidate.peers_per_group_per_worker_;
     workers_per_peer_ = candidate.workers_per_peer_;
     qps_per_worker_ = candidate.qps_per_worker_;
-    return {dispatch_peer_order_, combine_peer_order_, peers_per_group_per_worker_,
-            workers_per_peer_, qps_per_worker_};
+    return {dispatch_peer_order_, combine_peer_order_, peers_per_group_per_worker_, workers_per_peer_, qps_per_worker_};
 }
 
 ShmemInstance::~ShmemInstance()
@@ -391,7 +391,7 @@ void ShmemInstance::InitRuntime()
                 for (int peer = 0; peer < world_size_; ++peer)
                     masks[peer] = tuning_session_
                                       ? ascend_deepep::udma::TuningPeerMask(rank_, peer, world_size_, ranks_per_group_)
-                                      : token_schedule_
+                                  : token_schedule_
                                       ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
                                       : ascend_deepep::udma::PeerMask(rank_, peer, world_size_, dispatch_peer_order_,
                                                                       combine_peer_order_, ranks_per_group_,
@@ -518,6 +518,16 @@ void ShmemInstance::DestroyImpl(bool synchronize)
         aclshmem_barrier_all();
     }
 
+    if (notify_host_counts_ != nullptr) {
+        // A failed polling call may leave a writer running. Never unmap its target.
+        ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
+        ASCEND_DEEPEP_CHECK_ACL(aclrtHostUnregister(notify_host_counts_));
+        ASCEND_DEEPEP_CHECK_ACL(aclrtFreeHost(notify_host_counts_));
+        notify_host_counts_ = nullptr;
+        notify_device_counts_ = nullptr;
+        notify_count_capacity_ = 0;
+        notify_host_pending_ = false;
+    }
     initialized_ = false;
     ffts_addr_ = 0;
 
@@ -588,4 +598,58 @@ void* ShmemInstance::WorkspacePtr() const
 bool ShmemInstance::Use1gHugePages() const
 {
     return use_1g_huge_pages_;
+}
+
+void* ShmemInstance::PrepareNotifyHostCounts(std::size_t count)
+{
+    TORCH_CHECK(initialized_, "Notify host counts require an initialized Buffer");
+    TORCH_CHECK(!notify_host_pending_, "previous Notify host-count publication did not complete");
+    if (notify_host_unavailable_) return nullptr;
+    TORCH_CHECK(count > 0 && count <= std::numeric_limits<std::size_t>::max() / sizeof(uint32_t),
+                "invalid Notify host-count capacity");
+    if (count > notify_count_capacity_) {
+        if (notify_host_counts_ != nullptr) {
+            ASCEND_DEEPEP_CHECK_ACL(aclrtHostUnregister(notify_host_counts_));
+            ASCEND_DEEPEP_CHECK_ACL(aclrtFreeHost(notify_host_counts_));
+            notify_host_counts_ = nullptr;
+            notify_device_counts_ = nullptr;
+            notify_count_capacity_ = 0;
+        }
+        ASCEND_DEEPEP_CHECK_ACL(aclrtMallocHost(&notify_host_counts_, count * sizeof(uint32_t)));
+        const auto status = aclrtHostRegister(notify_host_counts_, count * sizeof(uint32_t), ACL_HOST_REGISTER_MAPPED,
+                                              &notify_device_counts_);
+        if (status != ACL_SUCCESS) {
+            ASCEND_DEEPEP_CHECK_ACL(aclrtFreeHost(notify_host_counts_));
+            notify_host_counts_ = nullptr;
+            notify_device_counts_ = nullptr;
+            notify_host_unavailable_ = true;
+            TORCH_WARN("Notify host mapping unavailable (ACL status ", status, "); using count readback");
+            return nullptr;
+        }
+        notify_count_capacity_ = count;
+    }
+    // Zero is not ready; count+1 makes an empty receive distinguishable from it.
+    // The preceding wait consumed every sole-writer store before this reuse.
+    auto* slots = static_cast<uint32_t*>(notify_host_counts_);
+    for (std::size_t i = 0; i < count; ++i) __atomic_store_n(slots + i, 0U, __ATOMIC_RELEASE);
+    notify_host_pending_ = true;
+    return notify_device_counts_;
+}
+
+std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
+{
+    TORCH_CHECK(notify_host_pending_ && count <= notify_count_capacity_, "Notify host counts were not prepared");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    const auto* slots = static_cast<const uint32_t*>(notify_host_counts_);
+    std::vector<int32_t> counts(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        uint32_t value;
+        while ((value = __atomic_load_n(slots + i, __ATOMIC_ACQUIRE)) == 0) {
+            TORCH_CHECK(std::chrono::steady_clock::now() < deadline, "timed out waiting for Notify host counts");
+        }
+        TORCH_CHECK(value - 1U <= uint32_t(std::numeric_limits<int32_t>::max()), "invalid Notify host count");
+        counts[i] = static_cast<int32_t>(value - 1U);
+    }
+    notify_host_pending_ = false;
+    return counts;
 }
