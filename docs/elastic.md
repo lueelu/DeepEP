@@ -80,7 +80,7 @@ HT combine 默认使用三个 SO 窗口；T=4096、chunk=256 时按 8/4/4 个逻
 
 ### 输入与选项
 
-当前NDR的去重条件是`M>32 || (P>16 && B<32)`。EP16在M≤32时不执行server级去重；P>16时，小B<32即使M≤32也去重。因此在`B≤M`约束下，跨机非去重对应B=M32。例如B32/M96仍走去重。dispatch将M保存在handle中，combine使用相同的选择，实际token维度由B决定。逐函数流程、容量与有效行的区别见[非去重dispatch说明](../tests/ll_rdma/NON_DEDUP_DISPATCH_FLOW.md)。
+LL 按容量上限 M 选择传输路径：M≤32 不执行 server 级去重，32<M≤256 执行 server 级去重。路径由 M 决定，而非实际 B；例如 B=32、M=96 使用去重路径。dispatch 将 M 保存在 handle 中，combine 使用相同的选择，实际 Tensor shape 仍由 B 决定。
 
 | 项目 | 约束 |
 | --- | --- |

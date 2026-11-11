@@ -272,5 +272,3 @@ python scripts/validate_ep.py --backend npu-stub --devices 0,1 \
 脚本将测试复制到源码目录外，使用当前 Python 启动 torchrun，不自动安装依赖或选择设备。可用 `--case` 选择上述场景；每次 torchrun 默认超时 600 秒，进程组超时 120 秒。不要使用 `python -O` 或 `PYTHONOPTIMIZE` 禁用断言。
 
 仅当选定场景的全部 rank、精度和退出检查成功，参考闭环才生成成功摘要。保留日志与 `rank-*.json/summary.json`；缺失、失败或 skip 不记为通过。完整 wheel/sdist 构建及安装验证见[构建指南](../docs/build.md)。
-
-LL设备阶段打点：参见 [ll_stage_timer/README.md](ll_stage_timer/README.md)。默认关闭，通过独立诊断调用采集每rank/每AIV阶段累计ticks。

@@ -126,21 +126,10 @@ python -m pip show ascend-deepep
 ```
 
 在匹配的 Torch/torch_npu 环境中执行。实验构建入口默认开启 MegaMoE 和 timer，
-自动初始化固定版本 SHMEM 子模块、校验或构建 SHMEM，再构建安装 wheel。
-CATLASS已移出主仓子模块；仅启用MegaMoE时需要单独准备锁定版本并显式设置：
-
-```bash
-# 仅首次创建独立依赖目录；已有目录不覆盖、不自动切版本。
-git clone https://gitcode.com/cann/catlass.git third-party/catlass
-git -C third-party/catlass checkout 2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1
-export CATLASS_ROOT="$PWD/third-party/catlass"
-```
-
-普通NDR LL构建不需要CATLASS，也不会下载它。原有CATLASS本地checkout保留。
+自动初始化固定版本 SHMEM/CATLASS 子模块、校验或构建 SHMEM，再构建安装 wheel。
 `PYTHON=/path/to/python` 可指定解释器；`DEEPEP_MEGAMOE_TIMER=OFF` 关闭设备打点。
 已激活 Conda 时，入口会在 Python 启动前优先使用该环境的运行库。
-已有 SDK 可用 `SHMEM_ROOT` 指定；CATLASS通过 `CATLASS_ROOT` 指向独立checkout，
-其版本仍须与[依赖锁文件](../../dependencies.lock.json)一致。
+已有 SDK 可用 `SHMEM_ROOT`、`CATLASS_ROOT` 指定；已有子模块须保持干净且版本与[依赖锁文件](../../dependencies.lock.json)一致。
 需要重建仓内 SHMEM 时，停止使用该 SDK 的作业后传 `--rebuild-shmem`。
 wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBRARY_PATH`。
 基础包的 `pip wheel` 默认关闭 MegaMoE，详见[构建文档](../../docs/build.md)。
