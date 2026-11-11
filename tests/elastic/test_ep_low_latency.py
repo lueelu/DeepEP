@@ -967,6 +967,8 @@ def worker(local_rank, args):
                 case_m = validate_args(case, world)
                 case.run_directory = args.run_directory
                 case.case_id = case_id
+                case.store_group = store_group
+                case.global_rank = rank
                 if args.fresh_buffer_per_case:
                     buffer = create_buffer(case)
                 for mode in modes:

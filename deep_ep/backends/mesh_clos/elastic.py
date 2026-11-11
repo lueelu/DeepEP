@@ -200,7 +200,7 @@ class ElasticBuffer:
         world_size: Optional[int] = None,
         bootstrap: str = "default",
         combine_only: bool = False,
-        use_1g_huge_pages: bool = True,
+        use_1g_huge_pages: Optional[bool] = None,
         debug_collectives: bool = False,
         machine_type: str = "auto",
         rootinfo_path: Optional[str] = None,
@@ -262,8 +262,11 @@ class ElasticBuffer:
         if ll_backend not in ("mte", "rdma"):
             raise ValueError("DEEPEP_LL_BACKEND must be mte or rdma")
         rdma = ll_backend == "rdma"
-        if rdma and (use_1g_huge_pages or combine_only):
-            raise ValueError("RDMA LL requires use_1g_huge_pages=False and combine_only=False")
+        if use_1g_huge_pages is not None and type(use_1g_huge_pages) is not bool:
+            raise TypeError("use_1g_huge_pages must be bool or None")
+        if rdma and (use_1g_huge_pages is True or combine_only):
+            raise ValueError("RDMA LL rejects explicit 1 GiB huge pages and combine_only")
+        huge_pages = False if rdma else (True if use_1g_huge_pages is None else use_1g_huge_pages)
         self._runtime = Runtime(
             group,
             num_bytes,
@@ -273,7 +276,7 @@ class ElasticBuffer:
             world_size=world_size,
             bootstrap=bootstrap,
             combine_only=combine_only,
-            use_1g_huge_pages=False if rdma else use_1g_huge_pages,
+            use_1g_huge_pages=huge_pages,
             debug_collectives=debug_collectives,
         )
 
