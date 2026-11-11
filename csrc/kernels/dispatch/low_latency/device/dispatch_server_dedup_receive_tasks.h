@@ -16,12 +16,15 @@ using namespace AscendC;
 class ServerDedupReceiveTasks {
 public:
     __aicore__ inline void Build(LocalTensor<int32_t> prefix, uint32_t rank, uint32_t ranks, uint32_t experts,
-                                 uint32_t bs, uint32_t receiver, TPipe* pipe)
+                                 uint32_t bs, uint32_t receiver, TPipe* pipe, uint32_t recvCores)
     {
         const uint32_t total = uint32_t(prefix.GetValue(experts - 1U));
-        begin_ = uint32_t(uint64_t(receiver) * total / kEpServerDedupRecvCoreNum);
-        const uint32_t end = uint32_t(uint64_t(receiver + 1U) * total / kEpServerDedupRecvCoreNum);
-        count_ = end - begin_;
+        // 交错分配：receiver 核拥有全局行号 {receiver, receiver+recvCores, ...}。
+        // 这样每个核同时拿到早到源与晚到源的 token，relay 转发量也随 token 摊平，
+        // 不会再整段继承单个源的到达时刻；输出行由首行和步长直接还原。
+        begin_ = receiver;
+        stride_ = recvCores;
+        count_ = begin_ < total ? (total - 1U - begin_) / stride_ + 1U : 0U;
         pendingCount_ = count_;
         if (count_ == 0U) return;
 
@@ -32,37 +35,36 @@ public:
         pendingIdx_ = pendingIdxBuf_.Get<uint32_t>();
 
         const uint32_t localExperts = experts / ranks;
-        // Upper bound skips records ending at begin_, including zero-count runs.
-        // A nonempty partition has begin_ < total, so the result is < experts.
-        uint32_t record = 0U, limit = experts;
-        while (record < limit) {
-            const uint32_t middle = record + (limit - record) / 2U;
-            if (uint32_t(prefix.GetValue(middle)) <= begin_)
-                record = middle + 1U;
-            else
-                limit = middle;
-        }
-        // Keep the original record start: begin_ may split its q range.
-        uint32_t previous = record == 0U ? 0U : uint32_t(prefix.GetValue(record - 1U));
-        for (; record < experts && previous < end; ++record) {
-            const uint32_t cumulative = uint32_t(prefix.GetValue(record));
-            const uint32_t first = previous > begin_ ? previous : begin_;
-            const uint32_t last = cumulative < end ? cumulative : end;
+        uint32_t record = 0U;
+        // 行号递增，二分只需在剩余 record 区间内进行；小批量下约 1µs。
+        for (uint32_t j = 0; j < count_; ++j) {
+            const uint32_t row = begin_ + j * stride_;
+            uint32_t low = record, high = experts;
+            while (low < high) {
+                const uint32_t middle = low + (high - low) / 2U;
+                if (uint32_t(prefix.GetValue(middle)) <= row)
+                    low = middle + 1U;
+                else
+                    high = middle;
+            }
+            record = low;
+            const uint32_t previous = record == 0U ? 0U : uint32_t(prefix.GetValue(record - 1U));
             const uint32_t source = record % ranks;
             const uint32_t localExpert = record / ranks;
             const uint32_t region = ((source + rank) % ranks) * localExperts + localExpert;
-            for (uint32_t row = first; row < last; ++row) {
-                const uint32_t j = row - begin_;
-                tokenPos_.SetValue(j, region * bs + row - previous);
-                pendingIdx_.SetValue(j, j);
-            }
-            previous = cumulative;
+            tokenPos_.SetValue(j, region * bs + row - previous);
+            pendingIdx_.SetValue(j, j);
         }
     }
 
     __aicore__ inline uint32_t Begin() const
     {
         return begin_;
+    }
+    // 本核拥有的全局行号步长；输出行 = Begin() + j * Stride()。
+    __aicore__ inline uint32_t Stride() const
+    {
+        return stride_;
     }
     __aicore__ inline uint32_t Count() const
     {
@@ -90,7 +92,7 @@ public:
     }
 
 private:
-    uint32_t begin_ = 0U, count_ = 0U, pendingCount_ = 0U;
+    uint32_t begin_ = 0U, stride_ = 1U, count_ = 0U, pendingCount_ = 0U;
     TBuf<> tokenPosBuf_, pendingIdxBuf_;
     LocalTensor<uint32_t> tokenPos_, pendingIdx_;
 };

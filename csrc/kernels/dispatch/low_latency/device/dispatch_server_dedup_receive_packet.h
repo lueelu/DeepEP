@@ -49,10 +49,11 @@ private:
     LocalTensor<uint32_t> header_, index_;
 };
 
-__aicore__ inline void ReadServerDedupFlags(GM_ADDR slot, uint32_t blocks, LocalTensor<float> flags)
+__aicore__ inline void ReadServerDedupFlags(GM_ADDR slot, uint32_t blocks, LocalTensor<float> flags, bool uncached=false)
 {
     GlobalTensor<float> input;
     input.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(slot + 480U));
+    if (uncached) input.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
     DataCopy(flags, input, DataCopyParams{uint16_t(blocks), 1U, 15U, 0U});
 }
 
@@ -82,7 +83,7 @@ __aicore__ inline void WriteServerDedupPayloadRange(GlobalTensor<uint8_t> output
 }
 
 // Snapshot the local role independently of the header that forwarding changes.
-__aicore__ inline void BuildServerDedupMetadata(LocalTensor<uint32_t> type, LocalTensor<uint32_t> destination,
+__aicore__ inline uint32_t BuildServerDedupMetadata(LocalTensor<uint32_t> type, LocalTensor<uint32_t> destination,
                                                 ServerDedupPacketTail tail, uint32_t slot)
 {
     auto header = tail.Header();
@@ -95,6 +96,7 @@ __aicore__ inline void BuildServerDedupMetadata(LocalTensor<uint32_t> type, Loca
     } else {
         for (uint32_t i = 0U; i < 3U; ++i) destination.SetValue(i, header.GetValue(i));
     }
+    return role;
 }
 
 __aicore__ inline void PrepareServerDedupForward(ServerDedupPacketTail tail)

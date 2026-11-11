@@ -10,10 +10,12 @@ if(NOT DEEPEP_DEVICE_JOBS MATCHES "^[0-9]+$" OR
     message(FATAL_ERROR "DEEPEP_DEVICE_JOBS must be in [1, 64]")
 endif()
 
-# Always enter the child build. Its compiler-generated dependencies track all
-# included headers, including shared/SDK headers outside an operator directory.
-# Unchanged inputs leave the library timestamp unchanged (no compile/relink).
-add_custom_target(device_build
+# Configure with the parent, rather than before every child build. Forwarded
+# options therefore change together, while a no-op build skips configuration.
+# The child build system still regenerates itself when its CMake inputs change.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${SHMEM_ROOT}/deepep-sdk.json")
+execute_process(
     COMMAND "${CMAKE_COMMAND}" -S "${CMAKE_SOURCE_DIR}/cmake/device" -B "${DEEPEP_DEVICE_BINARY_DIR}"
         -G "${CMAKE_GENERATOR}"
         "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
@@ -21,8 +23,20 @@ add_custom_target(device_build
         "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
         "-DCMAKE_CXX_FLAGS:STRING=${CMAKE_CXX_FLAGS}"
         "-DCMAKE_SHARED_LINKER_FLAGS:STRING=${CMAKE_SHARED_LINKER_FLAGS}"
+        "-DDEEPEP_LL_STAGE_TIMER=${DEEPEP_LL_STAGE_TIMER}"
+        "-DDEEPEP_LL_REFERENCE_PROFILE=${DEEPEP_LL_REFERENCE_PROFILE}"
+        "-DDEEPEP_LL_COUNT_HISTOGRAM=${DEEPEP_LL_COUNT_HISTOGRAM}"
         "-DDEEPEP_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
         "-DASCEND_HOME_PATH=${ASCEND_HOME_PATH}" "-DSHMEM_ROOT=${SHMEM_ROOT}"
+    RESULT_VARIABLE _deepep_device_configure_result)
+if(NOT _deepep_device_configure_result STREQUAL "0")
+    message(FATAL_ERROR "Device CMake configuration failed: ${_deepep_device_configure_result}")
+endif()
+
+# Always enter the child build: compiler-generated dependencies track shared
+# and SDK headers as well as operator sources. Do not replace this with a stamp
+# depending only on the .cpp files; that would silently reuse stale kernels.
+add_custom_target(device_build
     COMMAND "${CMAKE_COMMAND}" --build "${DEEPEP_DEVICE_BINARY_DIR}" --parallel "${DEEPEP_DEVICE_JOBS}"
     BYPRODUCTS "${DEEPEP_DEVICE_LIBRARY}" "${DEEPEP_DEVICE_BINARY_DIR}/libdeepep_clos_kernels.so"
     VERBATIM)

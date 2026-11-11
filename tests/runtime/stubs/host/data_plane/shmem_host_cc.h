@@ -3,3 +3,4 @@
 
 #pragma once
 void aclshmem_barrier_all();
+void aclshmemx_barrier_all_on_stream(void*);

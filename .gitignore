@@ -58,3 +58,11 @@ Thumbs.db
 /.venv-ep-gmm-fused/
 /third-party/catccos/
 /third-party/shmem/
+/third-party/catlass/
+
+/.venv-ll-timer/
+/.venv-ll-rdma/
+/.tmp/
+/.cache/
+/.logs/
+/results/

@@ -39,9 +39,13 @@ def build(root=ROOT, *, rebuild_shmem=False):
             raise RuntimeError(f"Required build tool not found: {tool}")
     for name in ("SHMEM_ROOT", "CATLASS_ROOT"):
         if name in env:
-            if not env[name] or not Path(env[name]).is_dir():
+            path = Path(env[name])
+            path = path if path.is_absolute() else root / path
+            if not env[name] or not path.is_dir():
                 raise ValueError(f"{name} must be an existing dependency directory")
-            env[name] = str(Path(env[name]).resolve())
+            env[name] = str(path.resolve())
+    if beta == "ON" and "CATLASS_ROOT" not in env:
+        raise RuntimeError("MegaMoE requires explicit CATLASS_ROOT; CATLASS is no longer a submodule")
     if rebuild_shmem and "SHMEM_ROOT" in env:
         raise ValueError("--rebuild-shmem only rebuilds the bundled SDK; unset SHMEM_ROOT first")
 
@@ -72,13 +76,10 @@ def build(root=ROOT, *, rebuild_shmem=False):
 
     if "SHMEM_ROOT" not in env:
         submodule("shmem", lock["shmem"]["revision"])
-    if beta == "ON" and "CATLASS_ROOT" not in env:
-        submodule("catlass", lock["megamoe"]["catlass_revision"])
     run([sys.executable, "-m", "pip", "install", "-r", str(root / "requirements-build.txt")])
     if "SHMEM_ROOT" not in env:
         prepare(root, rebuild=rebuild_shmem, if_needed=True)
         env["SHMEM_ROOT"] = str(root / "third-party/shmem/install/shmem")
-    env.setdefault("CATLASS_ROOT", str(root / "third-party/catlass"))
     env["LD_LIBRARY_PATH"] = str(Path(env["SHMEM_ROOT"]) / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")
     # 复用与外部 SDK 同样走原有完整预检，主构建仍只有一个 CMake/wheel 路径。
     sys.path.insert(0, str(ROOT))

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from ..._native import _unavailable, npu_api, require_native
@@ -198,7 +200,7 @@ class ElasticBuffer:
         world_size: Optional[int] = None,
         bootstrap: str = "default",
         combine_only: bool = False,
-        use_1g_huge_pages: bool = True,
+        use_1g_huge_pages: Optional[bool] = None,
         debug_collectives: bool = False,
         machine_type: str = "auto",
         rootinfo_path: Optional[str] = None,
@@ -256,16 +258,25 @@ class ElasticBuffer:
         self.hidden = hidden
         self.num_topk = num_topk
         self._handle_token = object()
+        ll_backend = os.environ.get("DEEPEP_LL_BACKEND", "mte")
+        if ll_backend not in ("mte", "rdma"):
+            raise ValueError("DEEPEP_LL_BACKEND must be mte or rdma")
+        rdma = ll_backend == "rdma"
+        if use_1g_huge_pages is not None and type(use_1g_huge_pages) is not bool:
+            raise TypeError("use_1g_huge_pages must be bool or None")
+        if rdma and (use_1g_huge_pages is True or combine_only):
+            raise ValueError("RDMA LL rejects explicit 1 GiB huge pages and combine_only")
+        huge_pages = False if rdma else (True if use_1g_huge_pages is None else use_1g_huge_pages)
         self._runtime = Runtime(
             group,
             num_bytes,
             num_cpu_timeout_secs,
-            udma=True,
+            udma=not rdma,
             rank=rank,
             world_size=world_size,
             bootstrap=bootstrap,
             combine_only=combine_only,
-            use_1g_huge_pages=use_1g_huge_pages,
+            use_1g_huge_pages=huge_pages,
             debug_collectives=debug_collectives,
         )
 

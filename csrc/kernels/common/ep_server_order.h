@@ -23,7 +23,7 @@ __aicore__
     const uint32_t ownBase = lower ? 0U : split;
     const uint32_t ownLength = lower ? split : servers - split;
     const uint32_t relative = ownServer - ownBase;
-    if (servers >= 16U) {  // Eight ranks per server: 128P and above.
+    if (servers >= 16U) {  // Sixteen or more logical server groups.
         // Map alternating visits back to the contiguous half-order index.
         // For odd worlds, visit the larger half's unmatched last entry at the end.
         if (ordinal < 2U * split)
@@ -37,7 +37,7 @@ __aicore__
     return otherBase + (relative + ordinal - ownLength + 1U) % otherLength;
 }
 
-// Dispatch direct packets interleave halves at 128 ranks or more.
+// Dispatch direct packets interleave halves at 16 server groups or more.
 // Smaller Dispatch worlds retain their own-server-first full-ring traversal.
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__

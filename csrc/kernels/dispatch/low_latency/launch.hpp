@@ -24,9 +24,14 @@ struct EpServerDedupKernelArgs {
     uint8_t* tilingData;    // Per-launch device tiling, read from GM by the kernel.
     int64_t reservedMagic;  // Must be zero; device owns the persistent bank selector.
     uint8_t* inputScales;   // ABI: complete INT32 packed E8M0 input rows.
+    uint8_t* stageTimer;
+    uint32_t timerMode;
+    uint32_t coreNum;       // Queried pure-AIV launch size; must match Host layouts.
+    uint8_t* expertTimer;   // Optional per-core/per-expert diagnostics (ABI 5).
 };
 static_assert(std::is_standard_layout<EpServerDedupKernelArgs>::value, "launch arguments must be standard layout");
-static_assert(sizeof(EpServerDedupKernelArgs) == 128, "launch ABI has fifteen addresses and a reserved slot");
+static_assert(sizeof(EpServerDedupKernelArgs) == 152,
+              "launch ABI includes timer pointer, timer mode and active core count");
 static_assert(offsetof(EpServerDedupKernelArgs, dynamicScalesOut) == 40, "quant scale address");
 static_assert(offsetof(EpServerDedupKernelArgs, tokenTypeOut) == 64, "token type address");
 static_assert(offsetof(EpServerDedupKernelArgs, destinationIndexOut) == 72, "destination index address");
@@ -38,6 +43,19 @@ static_assert(offsetof(EpServerDedupKernelArgs, reservedMagic) == 112, "reserved
 
 static_assert(offsetof(EpServerDedupKernelArgs, inputScales) == 120, "input packed scale address");
 
+static_assert(offsetof(EpServerDedupKernelArgs, stageTimer) == 128, "timer address");
+static_assert(offsetof(EpServerDedupKernelArgs, timerMode) == 136, "timer mode");
+static_assert(offsetof(EpServerDedupKernelArgs, coreNum) == 140, "active cores");
+static_assert(offsetof(EpServerDedupKernelArgs, expertTimer) == 144, "expert timer address");
 }  // namespace deepep
 
+// Single internal launch entry. The 152-byte argument structure and the
+// communication protocol are unchanged.
 extern "C" void dispatch_server_dedup_kernel_do(void* stream, const deepep::EpServerDedupKernelArgs* args);
+
+extern "C" uint32_t deepep_ll_core_protocol_version();
+extern "C" uint32_t deepep_ll_rdma_enabled();
+extern "C" uint32_t deepep_ll_ranks_per_group(uint32_t world);
+extern "C" uint32_t deepep_ll_stage_timer_enabled();
+extern "C" uint32_t deepep_ll_reference_profile_enabled();
+extern "C" uint32_t deepep_ll_reference_profile_schema();

@@ -22,7 +22,8 @@ struct EpServerDedupTilingData {
     uint8_t dtype;
     uint8_t expandXOutDtype;
     uint8_t inputMode;  // EpServerDedupInputMode; P is derived from H.
-    uint8_t reserved[11];
+    uint8_t tilingKey;  // LlTilingKey: selects Group4/Group16 specialization.
+    uint8_t reserved[10];
 };
 static_assert(sizeof(EpServerDedupTilingData) == 32U, "tiling occupies one 32B block");
 // Keep the wire structure naturally aligned. Kernel reads use scalar GM

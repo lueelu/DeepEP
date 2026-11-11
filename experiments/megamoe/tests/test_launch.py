@@ -88,6 +88,9 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
     (tmp_path / "dependencies.lock.json").write_text(json.dumps(lock))
     for name in ("SHMEM_ROOT", "CATLASS_ROOT"):
         monkeypatch.delenv(name, raising=False)
+    catlass = tmp_path / "external catlass"
+    catlass.mkdir()
+    monkeypatch.setenv("CATLASS_ROOT", str(catlass))
     for name, value in {
         "DEEPEP_NPU_ARCH": lock["target"],
         "DEEPEP_BUILD_MEGAMOE": "ON",
@@ -143,8 +146,8 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
     monkeypatch.setattr(builder.subprocess, "check_output", check_output)
     with pytest.raises(DependenciesPrepared):
         builder.build(tmp_path)
-    assert clones == ["third-party/shmem", "third-party/catlass"]
-    assert len(queries) == 4
+    assert clones == ["third-party/shmem"]
+    assert len(queries) == 2
     assert len(framework_checks) == 1
     assert dict(os.environ) == original_environment
 

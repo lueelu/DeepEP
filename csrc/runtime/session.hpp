@@ -23,8 +23,8 @@ public:
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
-    void barrier();
-    void close();
+    void barrier(bool host_coordinated = false);
+    void close(bool host_coordinated = false);
     bool closed() const
     {
         return closed_;
@@ -40,6 +40,13 @@ public:
     uint64_t workspace_allocation_bytes() const
     {
         return use_1g_huge_pages_ ? huge_page_bytes_ : allocation_bytes_;
+    }
+    uint32_t pin_low_latency_cores(uint32_t cores) {
+        check_context();
+        if (low_latency_cores_ && low_latency_cores_ != cores)
+            throw std::runtime_error("LL core count changed within a Session; recreate it");
+        low_latency_cores_ = cores;
+        return cores;
     }
     static bool busy();
     // 仅借给可选 MegaMoE 扩展；内存仍由本 Session 独占并显式销毁。
@@ -101,6 +108,9 @@ public:
     {
         return udma_;
     }
+    bool ll_rdma() const { return ll_rdma_; }
+    uint32_t ll_rdma_qps() const { return ll_rdma_qps_; }
+    void* ll_rdma_stage() const { check_context(); return ll_rdma_stage_; }
 
 private:
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
@@ -109,6 +119,10 @@ private:
     void check_context() const;
     void allocate_huge_workspace(uint64_t bytes);
     void release_huge_workspace();
+    uint32_t low_latency_cores_ = 0;
+    bool ll_rdma_ = false;
+    uint32_t ll_rdma_qps_ = 0;
+    void* ll_rdma_stage_ = nullptr;
     aclrtContext context_ = nullptr;
     void* workspace_ = nullptr;
     void* huge_page_source_ = nullptr;

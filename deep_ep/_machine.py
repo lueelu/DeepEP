@@ -212,6 +212,11 @@ def gather_records(group, record):
     """Object collective scoped to the supplied EP group, including MPI."""
     import torch.distributed as dist
 
+    from ._store import StoreGroup
+
+    if isinstance(group, StoreGroup):
+        return group.all_gather(record, "machine selection")
+
     if isinstance(group, dist.ProcessGroup):
         records = [None] * dist.get_world_size(group)
         dist.all_gather_object(records, record, group=group)

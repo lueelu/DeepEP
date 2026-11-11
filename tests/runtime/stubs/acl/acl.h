@@ -5,6 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 using aclrtContext = void*;
+using aclrtStream = void*;
+int aclrtCreateStream(aclrtStream*);
+int aclrtSynchronizeStream(aclrtStream);
+int aclrtDestroyStream(aclrtStream);
 using aclrtDrvMemHandle = void*;
 constexpr int ACL_MEM_HANDLE_TYPE_NONE = 0;
 constexpr int ACL_MEM_ALLOCATION_TYPE_PINNED = 1;

@@ -10,6 +10,9 @@ namespace DispatchDedup {
 namespace PacketReceiveLayout {
 // A transport layout hint, independent of application-level packet types.
 // Only the first float of the first Flag block carries the hint.
+// NDR protocol10 sends a whole packet in one SO-ordered WQE. Keep checking ALL
+// flag blocks: this includes the last 32B tail, while preserving MTE/relay
+// readiness and the first-block 1.5 marker. Never reduce this to the first flag.
 constexpr uint32_t kMarkerOffset = 480U;
 constexpr float kCompact = 1.0f;
 constexpr float kKeepFlags = 1.5f;

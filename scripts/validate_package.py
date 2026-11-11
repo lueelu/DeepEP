@@ -114,6 +114,7 @@ def inspect_wheel(path):
             raise RuntimeError("Core wheel contains disabled EP_GMM_FUSED artifacts")
 
         kernel_capabilities = {
+            "elastic-low-latency-ndr-hns1825-v8",
             "elastic-notify-metadata-v6",
             "elastic-notify-metadata-v7",
             "elastic-dispatch-expanded-v1",

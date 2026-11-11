@@ -6,9 +6,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "ll_group_policy.h"
+
+#ifdef DEEPEP_LL_RANKS_PER_GROUP
+#error LL grouping is selected by tiling key; remove DEEPEP_LL_RANKS_PER_GROUP
+#endif
 
 namespace DispatchDedup {
-constexpr uint32_t kEpServerDedupRanksPerServer = 8U;
+// Routing group is selected by Host tiling key; this constant is capacity only.
+constexpr uint32_t kLlRanksPerGroup = kLlMaxRanksPerGroup;
 constexpr uint32_t kEpServerDedupAlignmentBytes = 32U;
 constexpr uint32_t kEpServerDedupMaxTopK = 32U;
 

@@ -26,6 +26,15 @@ size_t page_granularity = 1ULL << 30;
 std::string fault;
 std::vector<std::string> physical_calls;
 bool huge_registered = false;
+void check_init_attributes(const aclshmemx_init_attr_t* attr)
+{
+    assert(attr->option_attr.version == ACLSHMEM_INIT_ATTR_VERSION);
+    assert(attr->option_attr.sockFd == 0 && attr->instance_id == 0);
+    const bool udma = (attr->option_attr.data_op_engine_type & ACLSHMEM_DATA_OP_UDMA) != 0;
+    assert(attr->runtime_config.udma_shared_jetty ==
+           (udma ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DEFAULT));
+    for (auto value : attr->runtime_config.reserved) assert(value == 0);
+}
 template <class Action>
 void fails(Action action)
 {
@@ -120,6 +129,7 @@ int aclrtFreePhysical(aclrtDrvMemHandle handle)
 int aclshmemx_init_attr_with_buffers(int mode, aclshmemx_init_attr_t* attr, const aclshmemx_buffer_desc_t* descriptors,
                                      size_t count)
 {
+    check_init_attributes(attr);
     assert(mode == ACLSHMEMX_INIT_WITH_DEFAULT || mode == ACLSHMEMX_INIT_WITH_MPI);
     assert(attr->n_pes == expected_world && attr->local_mem_size == 0 && count == 1);
     assert(attr->runtime_config.udma_shared_jetty == ACLSHMEM_CONFIG_ENABLED);
@@ -148,6 +158,7 @@ int aclshmemx_init_status()
 }
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
+    check_init_attributes(attr);
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
     assert(attr->runtime_config.udma_shared_jetty == (qp_count ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DEFAULT));
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
@@ -191,6 +202,12 @@ void aclshmem_barrier_all()
 {
     ++barriers;
 }
+int barrier_sync_status = 0, barrier_streams = 0;
+int aclrtCreateStream(aclrtStream* stream) { *stream = &storage; ++barrier_streams; return 0; }
+int aclrtSynchronizeStream(aclrtStream) { return barrier_sync_status; }
+int aclrtDestroyStream(aclrtStream) { --barrier_streams; return 0; }
+void aclshmemx_barrier_all_on_stream(void*) { ++barriers; }
+extern "C" void deepep_ndr_host_barrier_launch_v2(void*, uint64_t, uint32_t) { ++barriers; }
 
 int main(int argc, char** argv)
 {
@@ -272,9 +289,19 @@ int main(int argc, char** argv)
         assert(session.capacity() == (2 << 20));
         session.close();
         assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
+    } else if (mode == "udma-sparse-default" || mode == "udma-sparse-disabled") {
+        if (mode == "udma-sparse-default") unsetenv("DEEPEP_SHMEM_DENSE_QPS");
+        else setenv("DEEPEP_SHMEM_DENSE_QPS", "0", 1);
+        try {
+            deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
+            assert(false);
+        } catch (const std::runtime_error& error) {
+            assert(std::string(error.what()).find("DEEPEP_SHMEM_DENSE_QPS=1") != std::string::npos);
+        }
+        assert(!deepep::Session::busy() && initialized == 0 && qp_count == 0 && allocations == 0);
     } else if (mode == "udma") {
         deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
-        assert(session.udma() && qp_count == 32);
+        assert(session.udma() && qp_count == 32 && !session.sparse_qp_enabled());
         session.close();
         assert(!deepep::Session::busy());
     } else if (mode == "megamoe") {
@@ -326,6 +353,14 @@ int main(int argc, char** argv)
             fails([&]() { session.close(); });
             fails([&]() { session.barrier(); });
             assert(finalized == 1 && frees == 1);
+            return 0;
+        }
+        if (mode == "barrier-fault") {
+            barrier_sync_status = -77;
+            fails([&]() { session.barrier(); });
+            assert(barrier_streams == 0 && frees == 0 && finalized == 0);
+            fails([&]() { session.close(); });
+            assert(barrier_streams == 0 && frees == 0 && finalized == 0);
             return 0;
         }
         session.barrier();

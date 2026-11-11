@@ -68,6 +68,42 @@ def test_kernel_csv_contract(tmp_path):
         st.kernel_durations(tmp_path, "combine_server_dedup_kernel", 1)
 
 
+@pytest.mark.parametrize("entry", ["dispatch_server_dedup_kernel"])
+def test_dispatch_profiler_entries_and_stable_tail(tmp_path, entry):
+    # Reverse CSV order to check timestamp ordering before last-50 selection.
+    rows = [f"void {entry}(),{i},{i}" for i in range(100, 0, -1)]
+    rows += [f"{name},999,0" for name in (
+        "dispatch_server_dedup_kernel_bf16_g8",
+        "dispatch_server_dedup_kernel_unknown_g4",
+        "dispatch_server_dedup_kernel_bf16_g4_suffix",
+        "dispatch_server_dedup_kernel_suffix",
+        "prefix_dispatch_server_dedup_kernel_bf16_g4",
+        "combine_server_dedup_kernel",
+        "HcomAllReduce",
+    )]
+    (tmp_path / "kernel_details.csv").write_text(
+        "Name,Duration(us),Start Time(us)\n" + "\n".join(rows))
+    samples = st.kernel_durations(tmp_path, "dispatch_server_dedup_kernel", 100)
+    assert samples == list(range(1, 101))
+    result = st.summarize_kernel([samples], "dispatch_server_dedup_kernel", 50)
+    assert result["ranks"][0]["samples"] == 50
+    assert result["ranks"][0]["mean_us"] == 75.5
+    with pytest.raises(ValueError, match="expected 101"):
+        st.kernel_durations(tmp_path, "dispatch_server_dedup_kernel", 101)
+
+
+@pytest.mark.parametrize("second", [
+    "dispatch_server_dedup_kernel [task=2]",
+    "void dispatch_server_dedup_kernel()",
+])
+def test_dispatch_profiler_rejects_different_task_names(tmp_path, second):
+    (tmp_path / "kernel_details.csv").write_text(
+        "Name,Duration(us)\ndispatch_server_dedup_kernel,2\n"
+        f"{second},3\n")
+    with pytest.raises(ValueError, match="Mixed dispatch profiler task names"):
+        st.kernel_durations(tmp_path, "dispatch_server_dedup_kernel", 2)
+
+
 def test_tail_stats_and_reports(tmp_path):
     import json
     import csv
@@ -259,18 +295,27 @@ def test_json_fp8_scale_matrix_covers_sync_modes(tmp_path):
     )
 
 
-@pytest.mark.parametrize("iterations,expected", [(1, 20), (40, 20), (41, 20), (100, 50), (101, 50)])
-def test_delay_defaults_follow_operator_iterations(iterations, expected):
+@pytest.mark.parametrize("iterations", [1, 40, 41, 100, 101])
+def test_exp_prefix_stays_fixed_independent_of_operator_iterations(iterations):
     args = st.parse_args(["--num-iters", str(iterations)])
-    assert (args.delay_exp_before, args.delay_exp_after) == (0, 1000)
+    assert (args.delay_exp_before, args.delay_exp_after) == (200, 0)
 
 
 def test_delay_defaults_honor_json_and_explicit_overrides(tmp_path):
     import json
 
     path = tmp_path / "delay.json"
-    path.write_text(json.dumps({"loops": 100, "delay_exp_before": 0}))
+    path.write_text(json.dumps({"loops": 100, "delay_exp_before": 200}))
     args = st.parse_args(["--config", str(path)])
-    assert (args.delay_exp_before, args.delay_exp_after) == (0, 1000)
+    assert (args.delay_exp_before, args.delay_exp_after) == (200, 0)
     args = st.parse_args(["--config", str(path), "--num-iters", "80", "--delay-exp-after", "7"])
-    assert (args.delay_exp_before, args.delay_exp_after) == (0, 7)
+    assert (args.delay_exp_before, args.delay_exp_after) == (200, 7)
+    with pytest.raises(ValueError, match="Reference profiler requires"):
+        st.validate_args(args, 16)
+
+
+@pytest.mark.parametrize('count', [0, 1, 199, 201, 1000])
+def test_cannot_change_the_fixed_exp200_prefix(count):
+    args = st.parse_args(['--delay-exp-before', str(count)])
+    with pytest.raises(ValueError, match='fixed batch'):
+        st.validate_args(args, 16)

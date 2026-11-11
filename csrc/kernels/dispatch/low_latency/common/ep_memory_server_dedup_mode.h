@@ -15,9 +15,10 @@ constexpr uint32_t kEpServerDedupDedupThreshold = 32U;
 __aicore__ inline
 #endif
     constexpr bool
-    EpServerDedupEnabled(uint32_t numMaxTokensPerRank)
+    EpServerDedupEnabled(uint32_t numMaxTokensPerRank, uint32_t actualBs = 32U, uint32_t world = 16U)
 {
-    return numMaxTokensPerRank > kEpServerDedupDedupThreshold;
+    (void)actualBs;  // Preserve callers; cross-host dedup no longer depends on actual B.
+    return (world > 16U) || (numMaxTokensPerRank > kEpServerDedupDedupThreshold);
 }
 }  // namespace DispatchDedup
 #endif

@@ -8,7 +8,9 @@
 #include "../common/ep_memory_server_dedup_count_layout.h"
 
 namespace DispatchDedup {
-// All 64 AIVs call exactly once per launch, including cores with no count work.
+// 中文审计：每轮每核仅调用一次，轮转本地双窗口状态；初值由Host清零，随后按1/0交替。
+// 每核独占本地对称内存中的512B槽，不能作为一个可省略的全局共享计数器处理。
+// All launched AIVs call exactly once per launch, including cores with no count work.
 // The initial Host clear seeds 0; launches use 1, 0, 1, 0, ... without overflow.
 // Each core owns a 512-byte slot in the LOCAL symmetric allocation's fixed
 // prefix. No other core/rank writes it. Both accesses use DataCopy.
