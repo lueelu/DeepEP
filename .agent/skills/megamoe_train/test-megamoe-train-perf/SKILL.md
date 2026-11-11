@@ -11,9 +11,9 @@ description: 在已授权的 Ascend950 机器上，用仓库单入口跑 MegaMoE
 
 开始前读取当前分支的以下文件，命令均从仓库根目录执行：
 
-- [测试入口说明](../../../../experiments/megamoe_train/tests/bf16/README.md)：前置条件、三种用法、输出结构与已知问题。
+- [测试入口说明](../references/test-guide.md)：前置条件、运行方式、输出结构与已知问题。
 - [测试入口](../../../../experiments/megamoe_train/tests/bf16/test_mega_moe.py)：实际参数、三口径实现、baseline 与指标公式。
-- [测试规范](../../../../experiments/megamoe_train/tests/bf16/TEST_SPEC.md)及[用例清单](../../../../experiments/megamoe_train/tests/bf16/cases.json)：12 条典型尺寸、覆盖理由和已知限制。
+- [测试规范](../references/test-spec.md)及[用例清单](../../../../experiments/megamoe_train/tests/bf16/cases.json)：12 条典型尺寸、覆盖理由和已知限制。
 - [训练模块 README](../../../../experiments/megamoe_train/README.md)：构建、保存模式与数值边界。
 
 只有用户明确指定并允许的主机、容器、物理卡和 shape 范围才能用于设备运行。运行前检查指定卡的

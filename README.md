@@ -63,7 +63,7 @@ DeepEP/
 └── figures/                 # 架构与性能图
 ```
 
-模块职责见[架构文档](docs/architecture.md)；训练算子的前后向计算、内存复用与同步协议见[MegaMoE BF16 训练设计](experiments/megamoe_train/docs/mega_moe_bf16_design.md)。
+模块职责见[架构文档](docs/architecture.md)；训练组件的接口与使用方式见[MegaMoE BF16 训练说明](experiments/megamoe_train/README.md)。
 
 ## 快速开始
 
@@ -100,7 +100,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
 ```
 
-贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，NPU 测试命令见[测试说明](tests/README.md)；训练组件的精度与性能入口见[训练测试说明](experiments/megamoe_train/tests/bf16/README.md)。
+贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，NPU 测试命令见[测试说明](tests/README.md)；训练组件的精度与性能入口见[训练测试说明](experiments/megamoe_train/README.md#测试)。
 
 ### 安装
 
@@ -126,7 +126,7 @@ bash experiments/megamoe/scripts/build.sh
 
 ### 安装 MegaMoE Train
 
-训练组件与推理组件同源构建，构建时开启 `DEEPEP_BUILD_MEGAMOE_TRAIN=ON`（默认关闭）；构建命令、产物约束与首跑示例见[训练模块 README](experiments/megamoe_train/README.md#build-and-installation)。
+训练组件与推理组件同源构建，构建时开启 `DEEPEP_BUILD_MEGAMOE_TRAIN=ON`（默认关闭）；构建命令、产物约束与首跑示例见[训练模块 README](experiments/megamoe_train/README.md#构建与安装)。
 
 ## 接口与示例
 
@@ -304,7 +304,7 @@ y, counts = op(
 op.close()  # 集体释放，须在所有 backward 之后
 ```
 
-各参数形状与取值、可直接运行的双卡脚本见[快速开始](experiments/megamoe_train/docs/BF16_QUICKSTART_ZH.md)，字段级契约与容量规划见[用户指南](experiments/megamoe_train/docs/BF16_USER_GUIDE_ZH.md)，前后向实现见[前后向设计](experiments/megamoe_train/docs/mega_moe_bf16_design.md)。
+对外接口、参数说明、使用示例与容量规划见[训练组件 README](experiments/megamoe_train/README.md)。
 
 ### 环境变量
 

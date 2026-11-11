@@ -6,9 +6,9 @@ Modified by guofanfeng 2026
 # MegaMoE BF16 测试入口
 
 本目录只有**一个**测试入口 `test_mega_moe.py`，精度与性能共用它。用例清单见
-[cases.json](cases.json)；12 条典型尺寸、24 条类型/保存模式和 6 条 Gather 边界的覆盖理由见
-[TEST_SPEC.md](TEST_SPEC.md)；模块级构建、接口与保存模式见
-[模块 README](../../README.md)。
+[cases.json](../../../../experiments/megamoe_train/tests/bf16/cases.json)；12 条典型尺寸、24 条类型/保存模式和 6 条 Gather 边界的覆盖理由见
+[TEST_SPEC.md](test-spec.md)；模块级构建、接口与保存模式见
+[模块 README](../../../../experiments/megamoe_train/README.md)。
 
 ## 前置条件
 
@@ -118,7 +118,7 @@ baseline 需要一条可复用的 HCCL 子组（协调组是 Gloo），建不出
 转回 BF16 供 GMM，dP 保持 FP32。精度结论仍由 ATK、量化契约和 counts 的原门禁决定。
 
 四个派生量的定义（公式、RFK 构成、三个适用前提）以
-[TEST_SPEC 的性能指标定义](TEST_SPEC.md#性能指标定义)为准；跑之前只需要记住：
+[TEST_SPEC 的性能指标定义](test-spec.md#性能指标定义)为准；跑之前只需要记住：
 
 | 量 | 一句话 |
 | --- | --- |

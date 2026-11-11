@@ -73,7 +73,7 @@ DeepEP/
 └── figures/                 # Architecture and performance figures
 ```
 
-See the [architecture guide](docs/architecture.md) for module responsibilities, and the [MegaMoE BF16 training design](experiments/megamoe_train/docs/mega_moe_bf16_design.md) for forward/backward computation, memory reuse and synchronization.
+See the [architecture guide](docs/architecture.md) for module responsibilities, and the [MegaMoE BF16 training README (Chinese)](experiments/megamoe_train/README.md) for training interfaces and usage.
 
 ## Quick start
 
@@ -111,7 +111,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and the [test guide](tests/README.md) for NPU test commands; the training component's precision and performance entry is the [training test guide](experiments/megamoe_train/tests/bf16/README.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and the [test guide](tests/README.md) for NPU test commands; the training component's precision and performance entry is the [training test guide](experiments/megamoe_train/README.md#测试).
 
 ### Installation
 
@@ -137,7 +137,7 @@ The script prepares dependencies and builds and installs a wheel with MegaMoE an
 
 ### Install MegaMoE Train
 
-The training component is built from the same tree with `DEEPEP_BUILD_MEGAMOE_TRAIN=ON` (OFF by default); build commands, artifact constraints and a first run are in the [training module README](experiments/megamoe_train/README.md#build-and-installation).
+The training component is built from the same tree with `DEEPEP_BUILD_MEGAMOE_TRAIN=ON` (OFF by default); build commands, artifact constraints and a first run are in the [training module README](experiments/megamoe_train/README.md#构建与安装).
 
 ## Interfaces and examples
 
@@ -315,7 +315,7 @@ y, counts = op(
 op.close()  # collective, after the last backward
 ```
 
-Parameter shapes and values, and a runnable two-card script, are in the [quickstart (Chinese)](experiments/megamoe_train/docs/BF16_QUICKSTART_ZH.md); the field-level contract and capacity planning are in the [user guide (Chinese)](experiments/megamoe_train/docs/BF16_USER_GUIDE_ZH.md), and the implementation in the [forward/backward design (Chinese)](experiments/megamoe_train/docs/mega_moe_bf16_design.md).
+Public interfaces, parameter descriptions, a usage example and capacity planning are in the [training component README (Chinese)](experiments/megamoe_train/README.md).
 
 ### Environment variables
 

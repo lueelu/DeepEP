@@ -1,6 +1,6 @@
 # MegaMoE BF16 训练测试规范
 
-当前 [cases.json](cases.json) 包含 12 条典型模型尺寸用例：Flash、Pro、GLM 各取
+当前 [cases.json](../../../../experiments/megamoe_train/tests/bf16/cases.json) 包含 12 条典型模型尺寸用例：Flash、Pro、GLM 各取
 每 rank M=512、2048、4096、8192；另有 24 条路由权重类型/保存模式用例及 6 条 FP32
 Gather 边界用例。
 清单与设备验收分开记录；设备精度、性能结果对应具体源码提交与构建产物。
@@ -36,7 +36,7 @@ EP 来自设备列表，本组按 EP2/4/8 检查配置合法性，设备资格�
 
 ## 2. 输入生成与反向含义
 
-单入口是 [test_mega_moe.py](test_mega_moe.py)。每个 source rank 和输入流使用
+单入口是 [test_mega_moe.py](../../../../experiments/megamoe_train/tests/bf16/test_mega_moe.py)。每个 source rank 和输入流使用
 独立、固定种子的 Torch CPU Generator；所有参考与融合实现共用同一份 CPU 输入快照。
 x/dy 从 [-0.1,0.1] 均匀采样，w1/w2 从 [-1,1] 均匀采样；路由权重由
 FP32 softmax(logits) 乘模型缩放系数后按以下选择定型。路由 ID 固定、合法且每 token 不重复。
@@ -57,15 +57,15 @@ sum(y*dy)。随机的是反向输入，dx、dtopk_weights、dw1、dw2 都由实�
 
 ## 3. 参考与验收
 
-- [cpu_reference.py](cpu_reference.py)：Torch CPU FP64 前向和 autograd 真值，不插入 BF16 中间舍入。
-- [npu_baseline.py](npu_baseline.py)：`fp32-boundaries-v3-topk-dtype` NPU BigOp 作为 ATK 误差基线，
+- [cpu_reference.py](../../../../experiments/megamoe_train/tests/bf16/cpu_reference.py)：Torch CPU FP64 前向和 autograd 真值，不插入 BF16 中间舍入。
+- [npu_baseline.py](../../../../experiments/megamoe_train/tests/bf16/npu_baseline.py)：`fp32-boundaries-v3-topk-dtype` NPU BigOp 作为 ATK 误差基线，
   使用 FP32 激活、导数、dp 乘积/归约和按 TopK slot 顺序的 FP32 Y/dX 归并；
   Y/dX 最终写 BF16，dp 写输入 p 的 BF16/FP32 类型，矩阵边界仍为 BF16。
   两个参考角色复用公共数值实现；BF16 保存模式下，ATK 和混合容差直接复用同一份小算子结果。
   保存模式仅决定 Gate/Up 的保存、重算或解码，不选择不同的舍入规则。
-- [atk_compare.py](atk_compare.py)：使用 ATK 26.9.8/private 0.1.0 的
+- [atk_compare.py](../../../../experiments/megamoe_train/tests/bf16/atk_compare.py)：使用 ATK 26.9.8/private 0.1.0 的
   cv_fused_double_benchmark，逐 rank、逐输出执行，不混合不同输出。
-- [precision_metrics.py](precision_metrics.py)：精确 counts 和现有混合容差报告。
+- [precision_metrics.py](../../../../experiments/megamoe_train/tests/bf16/precision_metrics.py)：精确 counts 和现有混合容差报告。
 
 每条用例完整检查 y、dx、dtopk_weights、dw1、dw2，不抽样 token、不跳反向。
 ATK 最大/平均/RMSE 误差比例门限为 5/1.5/1.5，小值域数量比例为 2。

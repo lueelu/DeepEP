@@ -14,7 +14,7 @@ Modified by Joyce_An 2026
 | 使用 dispatch/combine，核对 HT/LL 的输入、权重和容量约束 | [Elastic 接口](elastic.md) |
 | 使用 AllToAllV → GMM 和 GMM → AllToAllV 融合算子 | [EpGmmFused](../experiments/ep_gmm_fused/README.md) |
 | 了解 MegaMoE 融合计算流程 | [MegaMoE](../experiments/megamoe/README.md) |
-| 理解 MegaMoE BF16 训练的前后向计算、内存复用与同步 | [训练设计](../experiments/megamoe_train/docs/mega_moe_bf16_design.md) |
+| 使用 MegaMoE BF16 训练组件，了解接口、参数与测试方式 | [训练组件](../experiments/megamoe_train/README.md) |
 | 定位 Python、Host、Device 调用链 | [架构说明](architecture.md) |
 | 运行 CPU 检查和 NPU 系统测试 | [测试入口](../tests/README.md) |
 | 理解各测试的精度判据和 Golden | [精度说明](precision.md) |
