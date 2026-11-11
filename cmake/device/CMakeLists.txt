@@ -37,7 +37,9 @@ target_compile_options(deepep_kernels PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -x
     "-ffile-prefix-map=${DEEPEP_SOURCE_DIR}=."
     "-ffile-prefix-map=${ASCEND_HOME_PATH}=CANN_SDK"
     "-ffile-prefix-map=${SHMEM_ROOT}=SHMEM_SDK")
-target_compile_definitions(deepep_kernels PRIVATE CATLASS_ARCH=3510 USE_SIMT L2_CACHE_HINT)
+target_compile_definitions(deepep_kernels PRIVATE CATLASS_ARCH=3510 USE_SIMT L2_CACHE_HINT
+    DEEPEP_LL_RDMA=1 ACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1
+    ACLSHMEMI_HNS_1825_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP} deepep_kernels_EXPORTS)
 target_include_directories(deepep_kernels PRIVATE
     "${_sdk_include}" "${_arch_include}"
     "${_tikcpp}" "${_tikcpp}/tikcfw"

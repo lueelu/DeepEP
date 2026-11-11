@@ -23,6 +23,13 @@ option(DEEPEP_MEGAMOE_TIMER "Compile MegaMoE device tracing" OFF)
 include(cmake/Device.cmake)
 pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp)
 target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
+find_path(DEEPEP_PLATFORM_INCLUDE tiling/platform/platform_ascendc.h
+    HINTS "${ASCEND_HOME_PATH}/asc/include" "${ASCEND_HOME_PATH}/include/op_common"
+          "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include" NO_DEFAULT_PATH REQUIRED)
+target_include_directories(_C PRIVATE "${DEEPEP_PLATFORM_INCLUDE}")
+target_link_directories(_C PRIVATE "${ASCEND_HOME_PATH}/lib64")
+target_link_libraries(_C PRIVATE platform tiling_api unified_dlog)
+target_compile_definitions(_C PRIVATE DEEPEP_LL_RDMA=1)
 target_link_libraries(_C PRIVATE ascendcl shmem deepep_device ${CMAKE_DL_LIBS})
 target_compile_options(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -Wall -Wextra -Werror -fstack-protector-strong)
 target_compile_options(_C PRIVATE "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
