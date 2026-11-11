@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from ..._native import _unavailable, npu_api, require_native
@@ -256,16 +258,22 @@ class ElasticBuffer:
         self.hidden = hidden
         self.num_topk = num_topk
         self._handle_token = object()
+        ll_backend = os.environ.get("DEEPEP_LL_BACKEND", "mte")
+        if ll_backend not in ("mte", "rdma"):
+            raise ValueError("DEEPEP_LL_BACKEND must be mte or rdma")
+        rdma = ll_backend == "rdma"
+        if rdma and (use_1g_huge_pages or combine_only):
+            raise ValueError("RDMA LL requires use_1g_huge_pages=False and combine_only=False")
         self._runtime = Runtime(
             group,
             num_bytes,
             num_cpu_timeout_secs,
-            udma=True,
+            udma=not rdma,
             rank=rank,
             world_size=world_size,
             bootstrap=bootstrap,
             combine_only=combine_only,
-            use_1g_huge_pages=use_1g_huge_pages,
+            use_1g_huge_pages=False if rdma else use_1g_huge_pages,
             debug_collectives=debug_collectives,
         )
 

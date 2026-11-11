@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Lu Lu
+﻿# Copyright (c) 2026, Lu Lu
 # Modified by ryan_li 2026
 
 """Installed-wheel LL functional/performance ST, modeled on DeepEP test_ep.py.
@@ -113,7 +113,8 @@ def make_parser():
         help="FP8 scale formats; ignored for BF16/FP16",
     )
     parser.add_argument("--do-cpu-sync", nargs="+", action=MatrixValues, type=int, choices=(0, 1), default=1)
-    parser.add_argument("--group-backend", choices=("hccl", "gloo"), default="hccl")
+    parser.add_argument("--group-backend", choices=("hccl", "gloo", "tcpstore"), default="hccl")
+    parser.set_defaults(store_group=None)
     parser.add_argument(
         "--without-buffer-group",
         action="store_true",
@@ -545,7 +546,7 @@ def trace_call(args, label, action, *values, **kwargs):
             + json.dumps(
                 {
                     "time": datetime.now().isoformat(timespec="milliseconds"),
-                    "rank": dist.get_rank(),
+                    "rank": dist.get_rank() if dist.is_initialized() else getattr(args, "global_rank", -1),
                     "case_id": getattr(args, "case_id", None),
                     "phase": getattr(args, "_case_phase", None),
                     "op": label,
@@ -579,6 +580,12 @@ def agree_check(action, args, rank):
     except Exception as exc:
         error = exc
         print(f"[rank {rank}] check failed: {exc}", flush=True)
+    store_group = getattr(args, "store_group", None)
+    if store_group is not None:
+        failed = trace_call(args, "check.all_gather", store_group.all_gather, int(error is not None), "ll check")
+        if any(failed):
+            raise AssertionError("LL ST correctness failed on at least one rank") from error
+        return
     status = torch.tensor([int(error is not None)], dtype=torch.int32, device=control_device(args, torch))
     trace_call(args, "check.all_reduce", dist.all_reduce, status, op=dist.ReduceOp.MAX)
     if trace_call(args, "check.status.item", status.item):
@@ -591,7 +598,11 @@ def completion_boundary(args=None):
     import torch.distributed as dist
 
     trace_call(args, "boundary.synchronize.before", torch.npu.synchronize)
-    trace_call(args, "boundary.barrier", dist.barrier)
+    store_group = getattr(args, "store_group", None)
+    if store_group is not None:
+        trace_call(args, "boundary.store_barrier", store_group.barrier, "completion")
+    else:
+        trace_call(args, "boundary.barrier", dist.barrier)
     trace_call(args, "boundary.synchronize.after", torch.npu.synchronize)
 
 
@@ -874,13 +885,25 @@ def worker(local_rank, args):
     if not callable(getattr(native, "dispatch_low_latency", None)):
         raise RuntimeError("Installed wheel has no LL native entry; rebuild and install the migrated package")
     validate_native_cases(native, cases, world)
-    dist.init_process_group(
-        args.group_backend,
-        init_method="env://",
-        rank=rank,
-        world_size=world,
-        timeout=timedelta(seconds=args.num_cpu_timeout_secs),
-    )
+    args.global_rank = rank
+    store_group = None
+    if args.group_backend == "tcpstore":
+        if not (args.dispatch_only and args.skip_perf_test):
+            raise ValueError("tcpstore control backend supports dispatch correctness only")
+        from deep_ep._store import StoreGroup
+
+        store_group = StoreGroup.from_env(timeout=args.num_cpu_timeout_secs)
+        args.store_group = store_group
+        if dist.is_initialized():
+            raise RuntimeError("tcpstore control backend must not initialize a ProcessGroup")
+    else:
+        dist.init_process_group(
+            args.group_backend,
+            init_method="env://",
+            rank=rank,
+            world_size=world,
+            timeout=timedelta(seconds=args.num_cpu_timeout_secs),
+        )
     buffer = None
     try:
         run_directory = [None]
@@ -892,7 +915,10 @@ def worker(local_rank, args):
                 run_directory[0] = tempfile.mkdtemp(prefix=datetime.now().strftime("%m%d%H%M_"), dir=parent)
 
         agree_check(reserve_directory, args, rank)
-        dist.broadcast_object_list(run_directory, src=0)
+        if store_group is not None:
+            run_directory[0] = store_group.all_gather(run_directory[0], "run directory")[0]
+        else:
+            dist.broadcast_object_list(run_directory, src=0)
         args.run_directory = run_directory[0]
         modes = ("normal",)
 
@@ -911,8 +937,12 @@ def worker(local_rank, args):
                 print(f"[LL ST] run directory: {args.run_directory}", flush=True)
 
         agree_check(save_plan, args, rank)
+        if args.without_buffer_group and store_group is not None:
+            raise ValueError("tcpstore control backend requires a Buffer control group")
         identity_args = (
-            {"rank": rank, "world_size": world} if args.without_buffer_group else {"group": dist.group.WORLD}
+            {"rank": rank, "world_size": world}
+            if args.without_buffer_group
+            else {"group": store_group if store_group is not None else dist.group.WORLD}
         )
 
         def create_buffer(case):
@@ -972,8 +1002,9 @@ def worker(local_rank, args):
                 "world_size": world,
                 "case_count": len(cases),
                 "result_count": len(results),
-                "config": vars(args),
+                "config": {key: value for key, value in vars(args).items() if key != "store_group"},
                 "package": deep_ep.__file__,
+                "process_group_initialized": dist.is_initialized(),
                 "measurement": "torch_npu profiler kernel tasks; per-rank statistics and slowest rank mean",
                 "alignment": "separate dispatch/combine captures: all_reduce + exp padding; Gloo combine uses completion boundaries",
                 "results": results,
@@ -997,7 +1028,10 @@ def worker(local_rank, args):
         # Runtime/device failures are not recovered or retried on HT.
         if buffer is not None:
             buffer.destroy()
-        dist.destroy_process_group()
+        if store_group is not None:
+            store_group.close()
+        elif dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def configure_endpoints(args, environ):

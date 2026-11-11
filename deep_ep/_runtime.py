@@ -121,7 +121,7 @@ class Runtime:
         if dense_qps not in ("0", "1"):
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap
-        store_group = self._megamoe and isinstance(group, StoreGroup)
+        store_group = isinstance(group, StoreGroup)
         if self._megamoe and (group is None or udma):
             raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
         if store_group:
@@ -141,6 +141,7 @@ class Runtime:
 
             if size not in WORLD_SIZES:
                 raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256/512")
+        backend = None
         if group is not None and not store_group:
             import torch
             import torch.distributed as dist
@@ -153,8 +154,10 @@ class Runtime:
         self.group = group
         self.host_coordinated = self.ll_backend == "rdma"
         self.coordination_failed = False
-        if self.host_coordinated and (group is None or store_group or backend != "hccl"):
-            raise ValueError("NDR requires the existing HCCL ProcessGroup for Host coordination")
+        if self.host_coordinated and group is None:
+            raise ValueError("NDR requires Host coordination: pass a ProcessGroup or a StoreGroup")
+        if self.host_coordinated and not store_group and backend != "hccl":
+            raise ValueError("NDR requires an HCCL ProcessGroup for Host coordination")
         self.low_latency_comm_args = None
         self.closed = False
         with _LOCK:
@@ -234,7 +237,11 @@ class Runtime:
                     mapping = tuple(os.environ.get(key, "") for key in (
                         "ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES",
                         "CUDA_VISIBLE_DEVICES", "PROBE_VISIBLE_DEVICES"))
-                    dist.all_gather_object(topology, (_host_boot_id(), mapping, self.device), group=group)
+                    if store_group:
+                        topology = group.all_gather(
+                            [_host_boot_id(), list(mapping), self.device], "ndr topology")
+                    else:
+                        dist.all_gather_object(topology, (_host_boot_id(), mapping, self.device), group=group)
                     validate_ndr_topology(topology)
             self.rank, self.world_size = rank, size
             self.capacity = capacity
@@ -320,7 +327,10 @@ class Runtime:
             peers = [None] * self.world_size
             if os.environ.get("DEEPEP_LL_INIT_TRACE") == "1":
                 print(f"[DeepEP init] rank={self.rank} HCCL {operation} completion exchange enter", flush=True)
-            dist.all_gather_object(peers, (operation, error), group=self.group)
+            if isinstance(self.group, StoreGroup):
+                peers = self.group.all_gather([operation, error], f"ndr {operation}")
+            else:
+                dist.all_gather_object(peers, (operation, error), group=self.group)
             if any(peer[0] != operation for peer in peers):
                 raise RuntimeError(f"NDR collective order mismatch: {peers}")
             failures = [(rank, peer[1]) for rank, peer in enumerate(peers) if peer[1] is not None]
