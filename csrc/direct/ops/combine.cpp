@@ -1,6 +1,7 @@
 #include "ops/combine.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <algorithm>
 
@@ -313,6 +314,15 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
+    if (use_udma && epilogue && !tiling.udma_token_schedule && !topk_weights && !aggregate && !expanded_x &&
+        !pipeline_chunk_tokens) {
+        const char* overlap = std::getenv("DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY");
+        if (overlap && overlap[0] == '1' && overlap[1] == '\0') {
+            tiling.udma_self_copy_first_aiv = ascend_deepep::udma::MetadataFirst(
+                tiling.world_size, tiling.udma_peers_per_worker, tiling.num_channels,
+                tiling.udma_peer_order, tiling.udma_ranks_per_group, tiling.udma_workers_per_peer);
+        }
+    }
     tiling.has_topk_weights = topk_weights.has_value() ? 1U : 0U;
     tiling.has_bias_0 = bias_0.has_value() ? 1U : 0U;
     tiling.has_bias_1 = bias_1.has_value() ? 1U : 0U;

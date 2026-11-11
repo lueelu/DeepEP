@@ -121,8 +121,6 @@ __aicore__ inline void V1CombineUdmaImpl(
         }
     }
     if constexpr (DoCommunication && Phase != 1) {
-        // One AIV owns the source-channel slice produced by the matching dispatch
-        // AIV. (combine rank, original token) is a collision-free remote slot.
         uint32_t staging_row_bytes = hidden_bytes;
         staging_row_bytes = topk_weights_row_bytes > staging_row_bytes ? topk_weights_row_bytes : staging_row_bytes;
         const uint32_t staging_stride = CombineAlignUp32(staging_row_bytes);
@@ -152,86 +150,92 @@ __aicore__ inline void V1CombineUdmaImpl(
                 tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
         }
 
-        // Each AIV copies its self-rank channel before the remote send phase.
+        // With spare AIVs, assign every self-copy channel to a non-sending AIV.
+        // Slots remain indexed by (returning rank, original token).
+        const int32_t first_copy_aiv = tiling.udma_self_copy_first_aiv;
+        const int32_t copy_aivs = num_channels - first_copy_aiv;
+        const int32_t first_channel = core_idx < first_copy_aiv ? num_channels : core_idx - first_copy_aiv;
+        const int32_t channel_stride = first_copy_aiv == 0 ? num_channels : copy_aivs;
         const int32_t source_rank = rank;
         const int32_t source_rank_base =
             source_rank > 0 ? rank_prefix_gm.GetValue((source_rank - 1) * world_size + rank) : 0;
         const int32_t source_rank_end = rank_prefix_gm.GetValue(source_rank * world_size + rank);
         const int32_t source_rank_tokens = source_rank_end - source_rank_base;
-        const int32_t channel_begin = channel_prefix_gm.GetValue(source_rank * num_channels + core_idx);
-        const int32_t channel_end = core_idx + 1 < num_channels ?
-                                        channel_prefix_gm.GetValue(source_rank * num_channels + core_idx + 1) :
-                                        source_rank_tokens;
-
         __gm__ uint8_t* remote_shmem_base = static_cast<__gm__ uint8_t*>(
             aclshmem_ptr(reinterpret_cast<__gm__ uint8_t*>(symmetric_buffer), source_rank));
         AscendC::GlobalTensor<uint8_t> remote_shmem_gm;
         remote_shmem_gm.SetGlobalBuffer(remote_shmem_base);
 
-        for (int32_t source_token_tile_begin = channel_begin; source_token_tile_begin < channel_end;) {
-            const int32_t recv_token_tile_begin = source_rank_base + source_token_tile_begin;
-            const int32_t aligned_recv_token_tile_begin = recv_token_tile_begin / 8 * 8;
-            const int32_t src_idx_leading_elements = recv_token_tile_begin - aligned_recv_token_tile_begin;
-            const int32_t source_token_tile_count =
-                src_idx_buffer_elements > 0 ?
-                    CombineMin(
-                        src_idx_buffer_elements - src_idx_leading_elements, channel_end - source_token_tile_begin) :
-                    1;
-            if (src_idx_buffer_elements > 0) {
-                const int32_t src_idx_copy_elements = src_idx_leading_elements + source_token_tile_count;
-                AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID2);
-                AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID2);
-                AscendC::DataCopyExtParams src_idx_copy_params(
-                    1, static_cast<uint32_t>(src_idx_copy_elements) * sizeof(int32_t), 0, 0, 0);
-                AscendC::DataCopyPad(
-                    src_idx_ub, src_idx_gm[aligned_recv_token_tile_begin], src_idx_copy_params, int32_pad_params);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID2);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID2);
-            }
-
-            for (int32_t source_token_tile_idx = 0; source_token_tile_idx < source_token_tile_count;
-                 ++source_token_tile_idx) {
-                const int32_t recv_token = recv_token_tile_begin + source_token_tile_idx;
-                const int32_t source_token = src_idx_buffer_elements > 0 ?
-                                                 src_idx_ub.GetValue(src_idx_leading_elements + source_token_tile_idx) :
-                                                 src_idx_gm.GetValue(recv_token);
-                const uint64_t remote_slot = static_cast<uint64_t>(rank) * token_capacity + source_token;
-
-                const auto x_event_id = staging_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
-                AscendC::LocalTensor<uint8_t> x_staging_ub = staging_ub[staging_buffer_idx * staging_stride];
-                AscendC::DataCopyExtParams x_copy_params(1, hidden_bytes, 0, 0, 0);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(x_event_id);
-                AscendC::DataCopyPad(
-                    x_staging_ub, x_bytes_gm[static_cast<uint64_t>(recv_token) * hidden_bytes], x_copy_params,
-                    uint8_pad_params);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(x_event_id);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(x_event_id);
-                AscendC::DataCopyPad(
-                    remote_shmem_gm[tiling.x_buffer_offset + remote_slot * tiling.x_row_stride], x_staging_ub,
-                    x_copy_params);
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(x_event_id);
-                staging_buffer_idx = (staging_buffer_idx + 1) & staging_buffer_mask;
-
-                if (tiling.has_topk_weights != 0) {
-                    const auto weight_event_id = staging_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
-                    AscendC::LocalTensor<uint8_t> weight_staging_ub = staging_ub[staging_buffer_idx * staging_stride];
-                    AscendC::LocalTensor<float> weight_staging_float_ub = weight_staging_ub.ReinterpretCast<float>();
-                    AscendC::DataCopyExtParams weight_copy_params(1, topk_weights_row_bytes, 0, 0, 0);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(weight_event_id);
+        for (int32_t channel = first_channel; channel < num_channels; channel += channel_stride) {
+            const int32_t channel_begin = channel_prefix_gm.GetValue(source_rank * num_channels + channel);
+            const int32_t channel_end = channel + 1 < num_channels
+                                            ? channel_prefix_gm.GetValue(source_rank * num_channels + channel + 1)
+                                            : source_rank_tokens;
+            for (int32_t source_token_tile_begin = channel_begin; source_token_tile_begin < channel_end;) {
+                const int32_t recv_token_tile_begin = source_rank_base + source_token_tile_begin;
+                const int32_t aligned_recv_token_tile_begin = recv_token_tile_begin / 8 * 8;
+                const int32_t src_idx_leading_elements = recv_token_tile_begin - aligned_recv_token_tile_begin;
+                const int32_t source_token_tile_count =
+                    src_idx_buffer_elements > 0 ?
+                        CombineMin(
+                            src_idx_buffer_elements - src_idx_leading_elements, channel_end - source_token_tile_begin) :
+                        1;
+                if (src_idx_buffer_elements > 0) {
+                    const int32_t src_idx_copy_elements = src_idx_leading_elements + source_token_tile_count;
+                    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID2);
+                    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID2);
+                    AscendC::DataCopyExtParams src_idx_copy_params(
+                        1, static_cast<uint32_t>(src_idx_copy_elements) * sizeof(int32_t), 0, 0, 0);
                     AscendC::DataCopyPad(
-                        weight_staging_float_ub, topk_weights_gm[recv_token * num_topk], weight_copy_params,
-                        float_pad_params);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(weight_event_id);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(weight_event_id);
-                    AscendC::DataCopyPad(
-                        remote_shmem_gm
-                            [tiling.topk_weights_buffer_offset + remote_slot * tiling.topk_weights_row_stride],
-                        weight_staging_ub, weight_copy_params);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(weight_event_id);
-                    staging_buffer_idx = (staging_buffer_idx + 1) & staging_buffer_mask;
+                        src_idx_ub, src_idx_gm[aligned_recv_token_tile_begin], src_idx_copy_params, int32_pad_params);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID2);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID2);
                 }
+
+                for (int32_t source_token_tile_idx = 0; source_token_tile_idx < source_token_tile_count;
+                     ++source_token_tile_idx) {
+                    const int32_t recv_token = recv_token_tile_begin + source_token_tile_idx;
+                    const int32_t source_token = src_idx_buffer_elements > 0 ?
+                                                     src_idx_ub.GetValue(src_idx_leading_elements + source_token_tile_idx) :
+                                                     src_idx_gm.GetValue(recv_token);
+                    const uint64_t remote_slot = static_cast<uint64_t>(rank) * token_capacity + source_token;
+
+                    const auto x_event_id = staging_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
+                    AscendC::LocalTensor<uint8_t> x_staging_ub = staging_ub[staging_buffer_idx * staging_stride];
+                    AscendC::DataCopyExtParams x_copy_params(1, hidden_bytes, 0, 0, 0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(x_event_id);
+                    AscendC::DataCopyPad(
+                        x_staging_ub, x_bytes_gm[static_cast<uint64_t>(recv_token) * hidden_bytes], x_copy_params,
+                        uint8_pad_params);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(x_event_id);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(x_event_id);
+                    AscendC::DataCopyPad(
+                        remote_shmem_gm[tiling.x_buffer_offset + remote_slot * tiling.x_row_stride], x_staging_ub,
+                        x_copy_params);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(x_event_id);
+                    staging_buffer_idx = (staging_buffer_idx + 1) & staging_buffer_mask;
+
+                    if (tiling.has_topk_weights != 0) {
+                        const auto weight_event_id = staging_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
+                        AscendC::LocalTensor<uint8_t> weight_staging_ub = staging_ub[staging_buffer_idx * staging_stride];
+                        AscendC::LocalTensor<float> weight_staging_float_ub = weight_staging_ub.ReinterpretCast<float>();
+                        AscendC::DataCopyExtParams weight_copy_params(1, topk_weights_row_bytes, 0, 0, 0);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(weight_event_id);
+                        AscendC::DataCopyPad(
+                            weight_staging_float_ub, topk_weights_gm[recv_token * num_topk], weight_copy_params,
+                            float_pad_params);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(weight_event_id);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(weight_event_id);
+                        AscendC::DataCopyPad(
+                            remote_shmem_gm
+                                [tiling.topk_weights_buffer_offset + remote_slot * tiling.topk_weights_row_stride],
+                            weight_staging_ub, weight_copy_params);
+                        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(weight_event_id);
+                        staging_buffer_idx = (staging_buffer_idx + 1) & staging_buffer_mask;
+                    }
+                }
+                source_token_tile_begin += source_token_tile_count;
             }
-            source_token_tile_begin += source_token_tile_count;
         }
 
         // Drain local-copy slots before the remote phase takes ownership of UB.

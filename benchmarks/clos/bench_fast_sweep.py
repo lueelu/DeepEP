@@ -18,6 +18,7 @@ import time
 import zlib
 
 ORDERS = ("rank", "group", "group_staggered", "group_round_robin")
+COMBINE_SELF_COPY_ENV = "DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY"
 SHAPES = ((8192, 2816, 8, 32), (16384, 7168, 6, 64))
 
 
@@ -78,6 +79,7 @@ def parse_args(argv=None):
     p.add_argument("--quick", action="store_true", help="rank and group_round_robin search")
     p.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--flush-l2-cache", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--combine-parallel-self-copy", action="store_true", help="use spare AIVs for combine self-copy")
     p.add_argument("--replay-report", type=Path, help="rerun each operator's winner from a prior report")
     p.add_argument("--smoke", action="store_true", help="one legal candidate per peer order")
     p.add_argument("--plan-only", action="store_true")
@@ -390,8 +392,13 @@ def main():
     elastic_module._validate_group_consensus = lambda g, name, value: group.agree([name, value])
     group.agree([vars(args) | {"output": None, "case": shapes, "replay_report": None}, plans])
     os.environ["DEEPEP_CLOS_TUNING_SESSION"] = "1"
+    os.environ[COMBINE_SELF_COPY_ENV] = "1" if args.combine_parallel_self_copy else "0"
     for name, value in os.environ.items():
-        if name.startswith("DEEPEP_CLOS_") and value not in ("", "0") and name != "DEEPEP_CLOS_TUNING_SESSION":
+        if (
+            name.startswith("DEEPEP_CLOS_")
+            and value not in ("", "0")
+            and name not in ("DEEPEP_CLOS_TUNING_SESSION", COMBINE_SELF_COPY_ENV)
+        ):
             raise RuntimeError(f"conflicting experimental environment: {name}")
     group.agree(plans)
     import importlib.util
@@ -424,6 +431,7 @@ def main():
             workspace_bytes=workspace,
             huge_pages=args.huge_pages,
             flush_l2=args.flush_l2_cache,
+            combine_parallel_self_copy=args.combine_parallel_self_copy,
             pre_combine_notify=True,
             precision_checked=False,
         ),
@@ -562,6 +570,7 @@ def main():
                 ranks_per_group=args.ranks_per_group,
                 huge_pages=args.huge_pages,
                 flush_l2=args.flush_l2_cache,
+                combine_parallel_self_copy=args.combine_parallel_self_copy,
                 pre_combine_notify=True,
                 seed=args.seed,
                 bandwidth_formula="sum(rank payload bytes including self) / sum(rank mean communication us) / 1000",

@@ -52,6 +52,12 @@ filter. The default candidate list depends on EP, AIV and group size.
 Clos benchmark. Default: no eviction. Default: 1 GiB pages; use
 `--no-huge-pages` if the environment is not configured for them. All ranks must
 use the same settings. Remove inherited experimental `DEEPEP_CLOS_*` overrides.
+For an A/B run, replay the same strategy with and without
+`--combine-parallel-self-copy`, using separate output directories. The flag
+passes `DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY=1` for unweighted V2 peer combine.
+When the strategy leaves spare AIVs, they take all self-copy channels. When
+there are no spare AIVs, each core keeps its original channel.
+
 The script scopes the separate pre-combine notify to profile capture, preserving
 the PR's profiling-only behavior. Every call starts with a device Buffer barrier;
 L2 eviction, when enabled, follows the barrier and precedes the measured API.
