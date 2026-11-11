@@ -341,3 +341,92 @@ def test_bandwidth_reports_the_operation_policy_not_the_buffer_default():
         assert effective_udma_config(buffer, num_aiv=32)['udma_peers_per_worker'] == 1
         assert base.peers_per_worker == 1
     """)
+
+
+def test_udma_combine_core_overrides_reach_native_and_preserve_handle():
+    run_host("""
+        from contextlib import nullcontext
+        from deep_ep.backends.direct import elastic as m
+        calls, policies = [], []
+        epilogue = SimpleNamespace(run=lambda: ("out", None))
+        def begin(*args):
+            calls.append(args)
+            return epilogue
+        b = object.__new__(m.ElasticBuffer)
+        b._destroyed = False
+        b._native = SimpleNamespace(_intranode_combine_begin=begin)
+        b.num_device_aiv = 64
+        b.transport = "udma"
+        b._udma_auto_policy = SimpleNamespace(for_num_aiv=lambda n: (
+            policies.append(n) or SimpleNamespace(peers_per_worker=4, wqes_per_visit=8)))
+        b._aggregate_pipeline_chunk_tokens = 0
+        b._communication_stream = None
+        b._validate_handle = lambda h: None
+        b._unpack_bias = lambda bias: (None, None)
+        b._finish_comm_event = lambda *a: "event"
+        m._validate_combine_tensors = lambda *a: None
+        m._get_allocation_stream_id = lambda *a: None
+        m._try_record_event = lambda *a: None
+        m._use_stream_after_event = lambda *a: nullcontext()
+        m._record_recv_outputs_on_current_stream = lambda *a: None
+        layout = tuple(object() for _ in range(6))
+        h = SimpleNamespace(num_sms=48, do_expand=False, _dispatch_layout=layout,
+                            num_max_tokens_per_rank=128)
+        for opts, expected in [({}, (48,48)),
+                ({'combine_num_sms':8}, (8,48)),
+                ({'reduce_num_sms':8}, (48,8)),
+                ({'num_sms':48,'combine_num_sms':20,'reduce_num_sms':8}, (20,8)),
+                ({'combine_num_sms':64,'reduce_num_sms':16}, (64,16))]:
+            assert b.combine(object(), h, **opts) == ("out", None, "event")
+            assert (calls[-1][8], calls[-1][-1]) == expected
+            assert policies[-1] == expected[0]
+            assert calls[-1][6] is layout[2]
+            assert h.num_sms == 48 and h._dispatch_layout is layout
+        for field in ('combine_num_sms', 'reduce_num_sms'):
+            for value in (-2, 3, 66, True, 8.0):
+                before = len(calls)
+                try:
+                    b.combine(object(), h, **{field:value})
+                except (ValueError, TypeError):
+                    pass
+                else:
+                    raise AssertionError((field,value))
+                assert len(calls) == before
+        # Expanded input aggregation retains the original core count.
+        aggregates = []
+        b._native.aggregate = lambda *args: (aggregates.append(args) or (args[0], None))
+        b._use_single_source_combine = False
+        h.do_expand = True
+        h._expand_layout = (None, None, object(), None)
+        b.combine(object(), h, combine_num_sms=8, reduce_num_sms=16)
+        assert aggregates[-1][4] == 48
+        assert (calls[-1][8], calls[-1][-1]) == (8,16)
+        before = len(calls)
+        b._aggregate_pipeline_chunk_tokens = 32
+        try:
+            b.combine(object(), h, combine_num_sms=8)
+        except ValueError as e:
+            assert 'pipeline' in str(e)
+        else:
+            raise AssertionError('pipeline accepted changed channel count')
+        assert len(calls) == before
+        h.do_expand = False
+        b._aggregate_pipeline_chunk_tokens = 0
+        b.num_device_aiv = 56
+        for field in ('combine_num_sms', 'reduce_num_sms'):
+            try:
+                b.combine(object(), h, **{field:64})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('device core limit ignored')
+        b.transport = "mte"
+        for opts in ({'combine_num_sms':8}, {'reduce_num_sms':8}):
+            try:
+                b.combine(object(), h, **opts)
+            except ValueError as e:
+                assert 'UDMA' in str(e)
+            else:
+                raise AssertionError('MTE accepted independent cores')
+        b._destroyed = True
+    """)

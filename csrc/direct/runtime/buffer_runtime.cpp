@@ -184,8 +184,8 @@ bool BufferRuntime::IsInitialized() const
     return initialized_ && shmem_ != nullptr && shmem_->Initialized();
 }
 
-std::vector<int64_t> BufferRuntime::ConfigureTuning(
-    int64_t dispatch_order, int64_t combine_order, int64_t group_peers, int64_t workers, int64_t qps)
+std::vector<int64_t> BufferRuntime::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                                    int64_t workers, int64_t qps)
 {
     TORCH_CHECK(IsInitialized(), "Buffer is not initialized");
     return shmem_->ConfigureTuning(dispatch_order, combine_order, group_peers, workers, qps);
@@ -417,8 +417,10 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
     c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, c10::optional<torch::Tensor> expanded_x,
     c10::optional<torch::Tensor> single_source_slots, c10::optional<torch::Tensor> early_aggregate_map,
-    int64_t pipeline_chunk_tokens)
+    int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv)
 {
+    TORCH_CHECK(reduce_num_aiv >= 0 && reduce_num_aiv <= num_device_aiv_,
+                "reduce_num_aiv must be between zero and the device AIV count");
     TORCH_CHECK(num_aiv <= num_device_aiv_, "combine num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     TORCH_CHECK(pipeline_chunk_tokens == 0 || pipeline_chunk_tokens == 32 || pipeline_chunk_tokens == 64,
@@ -434,9 +436,10 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
                         single_source_slots.has_value(),
                     "early aggregate requires the expanded single-source UDMA path");
         TORCH_CHECK(x.is_same(*expanded_x), "early aggregate must consume the original expanded tensor");
-        auto plan = ascend_deepep::ops::PrepareAggregate(x, c10::nullopt, topk_weights, *early_aggregate_map, num_aiv,
-                                                         RequireShmem().FftsAddr(), allocation_stream_id,
-                                                         single_source_slots, rank_prefix_matrix,
+        // Preserve the dispatch-sized pre-aggregate when communication cores change.
+        auto plan = ascend_deepep::ops::PrepareAggregate(x, c10::nullopt, topk_weights, *early_aggregate_map,
+                                                         channel_prefix_matrix.size(1), RequireShmem().FftsAddr(),
+                                                         allocation_stream_id, single_source_slots, rank_prefix_matrix,
                                                          static_cast<int>(rank_), static_cast<int>(num_ranks_));
         x = plan.x;
         topk_weights = plan.values;
@@ -450,7 +453,7 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, &epilogue,
         expanded_x, single_source_slots, aggregate, pipeline_chunk_tokens ? early_aggregate_map : c10::nullopt,
-        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens);
+        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv);
     symmetric_workspace_active_ = true;
     epilogue->SetOwner(c10::intrusive_ptr<BufferRuntime>::reclaim_copy(this));
     return epilogue;

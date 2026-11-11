@@ -40,8 +40,8 @@ public:
     BufferRuntime& operator=(const BufferRuntime&) = delete;
 
     bool IsInitialized() const;
-    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order,
-                                       int64_t group_peers, int64_t workers, int64_t qps);
+    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                         int64_t workers, int64_t qps);
     void Barrier();
     void Destroy();
     void AbortInitialization();
@@ -126,7 +126,8 @@ public:
         c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt, int64_t udma_peers_per_worker = 4,
         int64_t udma_wqes_per_visit = 8, c10::optional<torch::Tensor> expanded_x = c10::nullopt,
         c10::optional<torch::Tensor> single_source_slots = c10::nullopt,
-        c10::optional<torch::Tensor> early_aggregate_map = c10::nullopt, int64_t pipeline_chunk_tokens = 0);
+        c10::optional<torch::Tensor> early_aggregate_map = c10::nullopt, int64_t pipeline_chunk_tokens = 0,
+        int64_t reduce_num_aiv = 0);
 
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor,
                torch::Tensor>

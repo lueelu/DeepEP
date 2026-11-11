@@ -146,3 +146,36 @@ random 仅指随机路由，hidden/权重仍使用确定性精度输入，不代
 
 单独使用 random 时按实际路由计算容量；dispatch 的 `--route all` 还包含 hotspot，保留全局热点容量要求。
 其他路由和运行方式见[测试说明](../tests/README.md)。
+
+
+### Global Clos V2 的独立 Combine / Reduce 核数
+
+UDMA 路径的 `combine()` 支持两个可选关键字参数：
+
+- `combine_num_sms=0`：Combine 通信 kernel 的 AIV 核数。
+- `reduce_num_sms=0`：最终 Reduce kernel 的 AIV 核数。
+
+两者分别回退到 `num_sms`；如果 `num_sms` 也为 0，则使用 dispatch handle
+记录的核数。例如 `num_sms=48, combine_num_sms=16, reduce_num_sms=8` 表示
+通信用 16 核、最终归并用 8 核；只指定 `combine_num_sms=16` 时，Reduce
+仍使用原 `num_sms`，不会跟着变为 16 核。Dispatch、cached dispatch、handle
+布局与展开后的预聚合保持原行为。原 `num_sms` 仍须与 handle 的核数一致，
+独立控核请使用新增参数。所有 rank 应使用相同配置。
+
+显式核数必须为正偶数，不超过设备 AIV 数及实现上限 64。通信核数还必须满足
+所选 peer/worker/QP 策略的资源预算。逻辑 channel 数不要求整除通信核数。
+默认两个参数均为 0 时保持原行为；MTE 路径仍要求与 dispatch 核数一致，
+实验性 aggregate pipeline 的通信核数也仍须与 dispatch channel 数一致。
+
+```python
+out, out_weights, event = buffer.combine(
+    expert_output, handle,
+    combine_num_sms=16,
+    reduce_num_sms=8,
+)
+```
+
+已有精度入口 `tests/clos/source/test_v1_v2_shared_backend.py` 的 V2 模式新增
+`--combine-num-sms` 和 `--reduce-num-sms`，可在同一 dispatch handle 上验证
+带/不带权重、bias、cached dispatch 和事件依赖。运行 NPU 用例前须按目标
+EP 和通信核数选择合法的 peer 策略。

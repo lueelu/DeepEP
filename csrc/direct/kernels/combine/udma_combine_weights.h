@@ -18,7 +18,7 @@ __aicore__ inline uint32_t CombineWeightFirst(const CombineTilingData& td)
 __aicore__ inline bool CombineSimtWeightsEnabled(const CombineTilingData& td)
 {
     return ASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS && td.has_topk_weights && td.num_topk &&
-           !td.udma_token_schedule && CombineWeightFirst(td) < td.num_channels;
+           !td.udma_token_schedule && CombineWeightFirst(td) < td.block_dim;
 }
 
 // Every remote (peer, source token, k) has one writer: rank_prefix partitions
@@ -51,7 +51,7 @@ __aicore__ inline void CombineRemoteWeights(
 {
     const uint32_t first = CombineWeightFirst(td);
     if (core < first) return;
-    const uint32_t worker = core - first, workers = td.num_channels - first;
+    const uint32_t worker = core - first, workers = td.block_dim - first;
     AscendC::GlobalTensor<int32_t> ranks;
     ranks.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
     for (uint32_t peer = 0; peer < td.world_size; ++peer) {

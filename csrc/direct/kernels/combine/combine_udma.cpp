@@ -63,7 +63,7 @@ __aicore__ inline void V1CombineUdmaImpl(
     const int32_t num_tokens = static_cast<int32_t>(tiling.num_tokens);
     const int32_t hidden = static_cast<int32_t>(tiling.hidden);
     const int32_t num_topk = static_cast<int32_t>(tiling.num_topk);
-    const int32_t num_channels = static_cast<int32_t>(tiling.num_channels);
+    const int32_t core_num = get_block_num() * get_subblockdim();
     const int32_t token_capacity = static_cast<int32_t>(tiling.token_capacity);
     const uint32_t hidden_bytes = static_cast<uint32_t>(hidden) * tiling.x_element_bytes;
     const uint32_t topk_weights_row_bytes = static_cast<uint32_t>(num_topk) * kCombineFloatBytes;
@@ -86,8 +86,8 @@ __aicore__ inline void V1CombineUdmaImpl(
 
     if constexpr (DoCommunication && Phase == 1) {
         ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-            core_idx, num_channels, resource.template GetBufferByByte<uint64_t>(0),
-            tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
+            core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
+            tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
         if (tiling.udma_token_schedule) {
             ascend_deepep::udma::CombineTokenRemote<1>(resource, x, topk_weights, src_idx, rank_prefix_matrix,
                 channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
@@ -99,8 +99,8 @@ __aicore__ inline void V1CombineUdmaImpl(
     if constexpr (DoCommunication && Phase != 1) {
         if constexpr (Phase == 0) {
             ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
-                core_idx, num_channels, resource.template GetBufferByByte<uint64_t>(0),
-                tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(num_channels) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
+                core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
+                tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
         }
 
         if (!tiling.udma_self_copy_after_submit) {
@@ -128,7 +128,7 @@ __aicore__ inline void V1CombineUdmaImpl(
             resource.template GetBufferByByte<uint8_t>(kCombineOutputOffset);
         AscendC::LocalTensor<T> output_ub = output_bytes_ub.ReinterpretCast<T>();
 
-        const int32_t tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
+        const int32_t tokens_per_channel = (num_tokens + core_num - 1) / core_num;
         const int32_t token_begin = CombineMin(core_idx * tokens_per_channel, num_tokens);
         const int32_t token_end = CombineMin(token_begin + tokens_per_channel, num_tokens);
 

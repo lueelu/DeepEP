@@ -64,11 +64,12 @@ __aicore__ inline void CombineSelfCopy(
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 
     // With spare AIVs, assign every self-copy channel to a non-sending AIV.
-    // Slots remain indexed by (returning rank, original token).
+    // Slots remain indexed by (returning rank, original token). Logical channels
+    // are visited exactly once even when launch cores differ from dispatch.
     const int32_t first_copy_aiv = tiling.udma_self_copy_first_aiv;
-    const int32_t copy_aivs = num_channels - first_copy_aiv;
+    const int32_t copy_aivs = static_cast<int32_t>(tiling.block_dim) - first_copy_aiv;
     const int32_t first_channel = core_idx < first_copy_aiv ? num_channels : core_idx - first_copy_aiv;
-    const int32_t channel_stride = first_copy_aiv == 0 ? num_channels : copy_aivs;
+    const int32_t channel_stride = copy_aivs;
     const int32_t source_rank = rank;
     const int32_t source_rank_base =
         source_rank > 0 ? rank_prefix_gm.GetValue((source_rank - 1) * world_size + rank) : 0;

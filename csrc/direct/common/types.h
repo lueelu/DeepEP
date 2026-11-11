@@ -108,8 +108,8 @@ struct alignas(8) CombineTilingData {
     uint32_t num_recv_tokens;
     uint32_t hidden;
     uint32_t num_topk;
-    uint32_t block_dim;
-    uint32_t num_channels;
+    uint32_t block_dim;     // Actual AIVs for this communication/reduction launch.
+    uint32_t num_channels;  // Logical channels retained from the dispatch handle.
     uint32_t has_topk_weights;
     uint32_t has_bias_0;
     uint32_t has_bias_1;
