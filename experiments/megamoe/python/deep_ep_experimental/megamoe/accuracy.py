@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by SimpleBright_Man
+# Modified by SimpleBright_Man 2026
 
 """CPU and NPU cascade error budgets for BF16 MegaMoE outputs.
 

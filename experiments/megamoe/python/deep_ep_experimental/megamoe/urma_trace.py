@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by SimpleBright_Man
+# Modified by SimpleBright_Man 2026
 
 """Validate URMA detailed trace schema 1 and export a rank-local Chrome trace.
 

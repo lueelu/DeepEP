@@ -8,7 +8,7 @@
  * See third-party/cann.LICENSE for the full text of the License.
  */
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man
+// Modified by SimpleBright_Man 2026
 /*!
  * \file block_epilogue_activation_mx_quant.h
  * \brief
