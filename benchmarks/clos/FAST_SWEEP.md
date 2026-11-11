@@ -6,7 +6,8 @@ script is insufficient. Use the SDK pinned in `dependencies.lock.json`.
 
 This performance-only runner uses one Buffer/SHMEM initialization per rank across
 all cases. It measures BF16, random distinct experts per token, expand=0,
-cached dispatch and unweighted combine. No numerical checks are performed;
+cached dispatch and unweighted combine; `--include-weighted-combine` also measures
+combine returning FP32 top-k weights. No numerical checks are performed;
 reports explicitly contain `precision_checked: false`. The ordinary
 `bench_v2_bandwidth.py` checks its default policy; qualification of a manually
 selected winner also requires accuracy checks using that exact configuration.
@@ -60,7 +61,9 @@ there are no spare AIVs, each core keeps its original channel.
 `--combine-self-copy-after-submit` keeps each AIV's original self-copy channel
 and starts it after posting remote requests and terminal markers. This mode
 uses `DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT=1` and is exclusive with the
-spare-AIV mode. Both switches default off.
+spare-AIV mode. It supports ordinary weighted and unweighted V2 peer combine;
+token scheduling, fused aggregate, expanded inputs and pipeline paths are excluded.
+Both switches default off. Spare-AIV self-copy remains unweighted-only.
 
 To sweep all three self-copy modes without reinitializing SHMEM, replace either
 single-mode switch with:
@@ -84,6 +87,35 @@ Mixed-mode runs require the Host and Device build containing both modes
 The top candidates are selected across modes together. `best_configs.json` and
 `summary.csv` record the winning self-copy mode as well as the sending strategy.
 
+For the weighted ordering experiment, rebuild/install the updated Host and Device
+code, then use the existing launcher with EP8 and the following runner arguments:
+
+```bash
+--ep-size 8 --ranks-per-group 8 --experts 256 \
+--case 8192,2816,8,32 --strategies group_p1_w1_q1_v32 \
+--include-weighted-combine \
+--combine-self-copy-modes default self_copy_after_submit \
+--huge-pages --no-flush-l2-cache --warmup 2 --samples 8 --final-samples 30 --top 2
+```
+
+The two copy modes and both combines share one Buffer; cached dispatch is measured
+once. Exact `--strategies` IDs prevent changing the sender configuration in an A/B
+comparison. They cannot be combined with quick/smoke/replay selection. Weighted
+combine omits the unsupported `parallel_self_copy` candidate rather than reporting
+it as effective. Replay can include the optional weighted operator and restores its
+saved copy mode. The runner remains performance-only: validate both modes against
+an independent reference for BF16 payload and FP32 weights before accepting gains.
+
+Weighted after-submit keeps the original self-copy channel ownership. Remote SIMT
+weights finish their per-AIV V_S wait before that AIV copies self; payload AIVs post
+UDMA first. Self stores target this rank's `(rank * token_capacity + token)` slot,
+disjoint from incoming contributors' slots. Input GM stays live through Quiet.
+No workspace offsets, strides, alignment or capacity change. Self-copy reuses the
+existing UB region after the MTE3-to-MTE2 fence; its payload/weight slots and
+metadata tile retain their original offsets and event drains. All launched AIVs,
+including empty workers, still reach WaitIncoming and the existing final collective
+for SIMT weights. This experiment does not remove a barrier or add stage timers.
+
 The script scopes the separate pre-combine notify to profile capture, preserving
 the PR's profiling-only behavior. Every call starts with a device Buffer barrier;
 L2 eviction, when enabled, follows the barrier and precedes the measured API.
@@ -101,11 +133,15 @@ Outputs under node0's output directory:
 - `summary.csv`: shape, strategy, confirmation bandwidth and communication time.
 - `rank*/`: plans, library hashes, profiler CSV/trace, raw samples and exit status.
 
-Bandwidth is sum(rank-deduplicated payload bytes including self) divided by
+Bandwidth is sum(rank-deduplicated payload bytes including self, plus FP32 top-k
+weights for weighted combine) divided by
 sum(rank mean communication microseconds), divided by 1000, in decimal GB/s.
 Notify and final reduce are recorded separately and excluded. The communication
 kernel includes its local work and completion waits; this is not isolated link
-bandwidth. This payload-only numerator excludes routing metadata. There is no
+bandwidth. The numerator excludes routing indices and protocol overhead. Weighted
+combine adds `topk * 4` bytes per row; `logical_row_bytes` and
+`bf16_payload_row_bytes` record the distinction. Weights are returned metadata,
+not multipliers of the BF16 payload. There is no
 aggregate stage in these expand=0 calls. Reported rank bandwidth ranges and
 forward/reverse repeat ranges are distinct fields.
 

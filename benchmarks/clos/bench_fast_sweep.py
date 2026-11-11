@@ -62,12 +62,13 @@ def parse_shape(value):
     return dict(tokens=tokens, hidden=hidden, topk=topk, aiv=aiv)
 
 
-def combine_candidates(configs, modes, aiv):
+def combine_candidates(configs, modes, aiv, weighted=False):
     """Mode is part of candidate identity, including in confirmations/replay."""
     return [
         c | {"id": f"{c['id']}__{mode}", "self_copy_mode": mode}
         for c in configs
         for mode in modes
+        if not (weighted and mode == "parallel_self_copy")
         if not (mode == "parallel_self_copy" and "default" in modes and c["payload_aivs"] >= aiv)
     ]
 
@@ -76,7 +77,7 @@ def replay_config(config, op, report, legal, mode_override=None):
     # Old reports stored the mode at report level; retain that behavior on replay.
     mode = config.get("self_copy_mode")
     if mode is not None:
-        if op != "combine_unweighted" or mode not in SELF_COPY_MODES:
+        if op not in ("combine_unweighted", "combine_weighted") or mode not in SELF_COPY_MODES:
             raise ValueError("replay contains an invalid candidate mode")
         suffix = "__" + mode
         if not config["id"].endswith(suffix):
@@ -94,7 +95,9 @@ def replay_config(config, op, report, legal, mode_override=None):
         raise ValueError("replay contains an invalid candidate")
     if mode_override is not None:
         mode = mode_override
-    return combine_candidates([base], [mode], 64)[0] if op == "combine_unweighted" else base
+    if op == "combine_weighted" and mode == "parallel_self_copy":
+        raise ValueError("weighted combine does not support parallel_self_copy")
+    return combine_candidates([base], [mode], 64)[0] if op != "cached_dispatch" else base
 
 
 def parse_args(argv=None):
@@ -114,6 +117,8 @@ def parse_args(argv=None):
     p.add_argument("--top", type=int, default=3)
     p.add_argument("--visits", type=int, nargs="+", default=[4, 8, 16, 32])
     p.add_argument("--quick", action="store_true", help="rank and group_round_robin search")
+    p.add_argument("--strategies", nargs="+", help="restrict to exact strategy IDs for a matched A/B run")
+    p.add_argument("--include-weighted-combine", action="store_true", help="also measure returned FP32 top-k weights")
     p.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--flush-l2-cache", action=argparse.BooleanOptionalAction, default=False)
     self_copy = p.add_mutually_exclusive_group()
@@ -154,6 +159,12 @@ def parse_args(argv=None):
         ]
     if len(set(args.combine_self_copy_modes)) != len(args.combine_self_copy_modes):
         p.error("duplicate self-copy modes")
+    if args.include_weighted_combine and args.combine_self_copy_modes == ["parallel_self_copy"]:
+        p.error("weighted combine does not support parallel_self_copy; include default or self_copy_after_submit")
+    if args.strategies and (args.replay_report or args.quick or args.smoke):
+        p.error("strategies cannot be combined with replay-report, quick or smoke")
+    if args.strategies and len(set(args.strategies)) != len(args.strategies):
+        p.error("duplicate strategy IDs")
     args.ranks_per_group = min(8, args.ep_size) if args.ranks_per_group is None else args.ranks_per_group
     if args.ranks_per_group < 1 or args.ep_size % args.ranks_per_group:
         p.error("ranks-per-group must be a positive EP divisor")
@@ -350,7 +361,7 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
     # Start/stop the profiler once for the entire strategy list, not per strategy.
     profiler = torch_npu.profiler
     with (
-        profile_combine_notify(op == "combine_unweighted"),
+        profile_combine_notify(op in ("combine_unweighted", "combine_weighted")),
         profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
             on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
@@ -439,14 +450,31 @@ def main():
             raise ValueError(f"no legal candidates for {shape}")
         if args.smoke:
             configs = [next(c for c in configs if c["order"] == o) for o in dict.fromkeys(c["order"] for c in configs)]
+        if args.strategies:
+            legal = {c["id"]: c for c in configs}
+            missing = set(args.strategies) - legal.keys()
+            if missing:
+                raise ValueError(f"invalid strategies for {shape}: {sorted(missing)}")
+            configs = [legal[name] for name in args.strategies]
         operations = {
             "cached_dispatch": configs,
             "combine_unweighted": combine_candidates(configs, args.combine_self_copy_modes, shape["aiv"]),
         }
+        if args.include_weighted_combine:
+            operations["combine_weighted"] = combine_candidates(
+                configs, args.combine_self_copy_modes, shape["aiv"], weighted=True
+            )
         if replay:
             prior = next(r for r in replay["results"] if r["shape"] == shape)
-            if set(prior["operations"]) != {"cached_dispatch", "combine_unweighted"}:
-                raise ValueError("replay must include both measured operators")
+            required = {"cached_dispatch", "combine_unweighted"}
+            if args.include_weighted_combine:
+                required.add("combine_weighted")
+            if not required <= prior["operations"].keys() or prior["operations"].keys() - {
+                "cached_dispatch",
+                "combine_unweighted",
+                "combine_weighted",
+            }:
+                raise ValueError("replay must include the requested measured operators")
             legal = {c["id"]: c for c in candidates(args.ep_size, shape["aiv"], args.ranks_per_group)}
             operations = {
                 op: [replay_config(r["winner"]["config"], op, replay, legal, args.replay_mode_override)]
@@ -572,14 +600,25 @@ def main():
             from deep_ep.backends.direct.dtypes import topk_idx_t
 
             idx = routes.to(dtype=topk_idx_t, device="npu")
+            weighted = "combine_weighted" in plan["operations"]
+            weights = torch.rand((t, k), generator=gen, dtype=torch.float32).npu() if weighted else None
             activate_candidate(torch, buffer, plan["operations"]["cached_dispatch"][0])
             fresh = buffer.dispatch(
-                x, topk_idx=idx, num_experts=args.experts, num_sms=a, do_expand=False, async_with_compute_stream=True
+                x,
+                topk_idx=idx,
+                topk_weights=weights,
+                num_experts=args.experts,
+                num_sms=a,
+                do_expand=False,
+                async_with_compute_stream=True,
             )
             fresh[-1].current_stream_wait()
             torch.npu.synchronize()
-            recv, _, _, handle, _ = fresh
+            recv, _, recv_weights, handle, _ = fresh
             owned = recv.clone()
+            if weighted and recv_weights is None:
+                raise RuntimeError("fresh dispatch did not return top-k weights")
+            owned_weights = recv_weights.clone() if weighted else None
             torch.npu.synchronize()
             invocations = {
                 "cached_dispatch": lambda x=x, handle=handle, a=a: buffer.dispatch(
@@ -589,9 +628,16 @@ def main():
                     owned, handle, num_sms=a, async_with_compute_stream=True
                 ),
             }
+            if weighted:
+                invocations["combine_weighted"] = (
+                    lambda owned=owned, handle=handle, a=a, w=owned_weights: buffer.combine(
+                        owned, handle, topk_weights=w, num_sms=a, async_with_compute_stream=True
+                    )
+                )
             item = dict(shape=shape, operations={})
             for op, invoke in invocations.items():
-                logical_bytes = (handle.num_recv_tokens if op == "cached_dispatch" else send_rows) * h * 2
+                row_bytes = h * 2 + (k * 4 if op == "combine_weighted" else 0)
+                logical_bytes = (handle.num_recv_tokens if op == "cached_dispatch" else send_rows) * row_bytes
                 op_configs = plan["operations"][op]
                 coarse = measure(
                     torch,
@@ -629,7 +675,13 @@ def main():
                     rows = [next(r for r in round_ if r["config"]["id"] == config["id"]) for round_ in rounds]
                     final.append(dict(config=config, score_GBps=min(r["GBps"] for r in rows), repeats=rows))
                 final.sort(key=lambda r: r["score_GBps"], reverse=True)
-                item["operations"][op] = dict(winner=final[0], finalists=final, coarse=coarse)
+                item["operations"][op] = dict(
+                    winner=final[0],
+                    finalists=final,
+                    coarse=coarse,
+                    logical_row_bytes=row_bytes,
+                    bf16_payload_row_bytes=h * 2,
+                )
                 if rank == 0:
                     print("WINNER", tag, op, json.dumps(final[0]), flush=True)
             result.append(item)
@@ -637,7 +689,7 @@ def main():
             write(
                 out / "results.json", dict(ep=world, buffer_initializations=1, precision_checked=False, results=result)
             )
-            del invocations, fresh, recv, handle, owned, x, idx
+            del invocations, fresh, recv, recv_weights, handle, owned, owned_weights, weights, x, idx
             torch.npu.synchronize()
             torch.npu.empty_cache()
     finally:
@@ -671,7 +723,7 @@ def main():
                 combine_self_copy_modes=effective_modes,
                 pre_combine_notify=True,
                 seed=args.seed,
-                bandwidth_formula="sum(rank payload bytes including self) / sum(rank mean communication us) / 1000",
+                bandwidth_formula="sum(rank deduplicated payload + optional FP32 weight bytes including self) / sum(rank mean communication us) / 1000",
                 identity=identity,
                 buffer_initializations=1,
                 precision_checked=False,

@@ -314,18 +314,20 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
-    if (use_udma && epilogue && !tiling.udma_token_schedule && !topk_weights && !aggregate && !expanded_x &&
-        !pipeline_chunk_tokens) {
+    if (use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !expanded_x && !pipeline_chunk_tokens) {
         const char* overlap = std::getenv("DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY");
         const char* after_submit = std::getenv("DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT");
         const bool use_spare_aivs = overlap && overlap[0] == '1' && overlap[1] == '\0';
         tiling.udma_self_copy_after_submit = after_submit && after_submit[0] == '1' && after_submit[1] == '\0';
         TORCH_CHECK(!(use_spare_aivs && tiling.udma_self_copy_after_submit),
                     "combine self-copy modes are mutually exclusive");
-        if (use_spare_aivs) {
+        // After-submit retains each AIV's self-copy channels, including weights.
+        // Spare-AIV self-copy is still unweighted-only: weighted peers already
+        // use spare AIVs for SIMT stores and must keep their original ownership.
+        if (use_spare_aivs && !topk_weights) {
             tiling.udma_self_copy_first_aiv = ascend_deepep::udma::MetadataFirst(
-                tiling.world_size, tiling.udma_peers_per_worker, tiling.num_channels,
-                tiling.udma_peer_order, tiling.udma_ranks_per_group, tiling.udma_workers_per_peer);
+                tiling.world_size, tiling.udma_peers_per_worker, tiling.num_channels, tiling.udma_peer_order,
+                tiling.udma_ranks_per_group, tiling.udma_workers_per_peer);
         }
     }
     tiling.has_topk_weights = topk_weights.has_value() ? 1U : 0U;

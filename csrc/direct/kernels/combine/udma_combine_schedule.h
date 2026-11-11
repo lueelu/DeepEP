@@ -101,6 +101,12 @@ __aicore__ inline void CombineRemoteImpl(
         sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
         if constexpr (Phase == 0) {
             if (td.udma_self_copy_after_submit) {
+                // SIMT weight AIVs finish CombineRemoteWeights (V_S) above before
+                // copying their self channels. Payload AIVs have posted all
+                // UDMA requests, including weights when no spare AIV exists.
+                // Self writes use (rank * capacity + token) on this rank;
+                // remote contributors use their own rank slots, so neither
+                // payload nor weight self stores collide with incoming writes.
                 // The SQ now owns the WQEs. Finish MTE3's reads of the reused
                 // UB before self-copy loads use it, while UDMA reads GM payload.
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);

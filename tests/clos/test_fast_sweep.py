@@ -82,9 +82,52 @@ def test_multi_mode_cli_and_conflicts():
         ["--combine-self-copy-modes", "default", "default"],
         ["--combine-self-copy-modes", "default", "--combine-self-copy-after-submit"],
         ["--combine-parallel-self-copy", "--combine-self-copy-after-submit"],
+        ["--include-weighted-combine", "--combine-parallel-self-copy"],
+        ["--strategies", "group_p1_w1_q1_v32", "--smoke"],
     ):
         with pytest.raises(SystemExit):
             sweep.parse_args(argv)
+
+
+def test_weighted_fixed_strategy_plan(tmp_path, monkeypatch, capsys):
+    argv = [
+        "sweep",
+        "--ep-size",
+        "8",
+        "--case",
+        "8192,2816,8,32",
+        "--include-weighted-combine",
+        "--strategies",
+        "group_p1_w1_q1_v32",
+        "--combine-self-copy-modes",
+        *sweep.SELF_COPY_MODES,
+        "--plan-only",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    sweep.main()
+    plan = json.loads(capsys.readouterr().out)["plans"][0]
+    ops = plan["operations"]
+    assert len(ops["cached_dispatch"]) == 1
+    assert len(ops["combine_unweighted"]) == 3
+    assert {c["self_copy_mode"] for c in ops["combine_weighted"]} == {"default", "self_copy_after_submit"}
+    assert all(
+        c["order"] == "group" and c["peers"] == c["workers"] == c["qps"] == 1 and c["visit"] == 32
+        for cs in ops.values()
+        for c in cs
+    )
+    argv[argv.index("group_p1_w1_q1_v32")] = "group_p1_w99_q1_v32"
+    with pytest.raises(ValueError, match="invalid strategies"):
+        sweep.main()
+
+
+def test_weighted_replay_modes():
+    c = sweep.candidates(8, 32, 8)[0]
+    legal = {c["id"]: c}
+    for mode in ("default", "self_copy_after_submit"):
+        candidate = sweep.combine_candidates([c], [mode], 32, weighted=True)[0]
+        assert sweep.replay_config(candidate, "combine_weighted", {}, legal) == candidate
+        with pytest.raises(ValueError, match="does not support"):
+            sweep.replay_config(candidate, "combine_weighted", {}, legal, "parallel_self_copy")
 
 
 def test_cli_plan_without_framework():
@@ -167,7 +210,8 @@ def test_replay_preserves_old_and_new_modes():
             sweep.replay_config(expected, "cached_dispatch", {}, legal)
 
 
-def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("weighted", [False, True])
+def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatch, weighted):
     """Exercise orchestration without NPU; this is not kernel validation."""
     from types import ModuleType
 
@@ -201,7 +245,8 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
             self.destroyed = False
 
         def dispatch(self, *args, **kwargs):
-            return tensor, None, None, SimpleNamespace(num_recv_tokens=8192), tensor
+            weights = tensor if kwargs.get("topk_weights") is not None else None
+            return tensor, None, weights, SimpleNamespace(num_recv_tokens=8192), tensor
 
         def combine(self, *args, **kwargs):
             return tensor, tensor
@@ -215,6 +260,7 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
     torch.Generator = lambda: tensor
     torch.rand = torch.randn = lambda *a, **kw: tensor
     torch.bfloat16 = "bf16"
+    torch.float32 = "fp32"
     dist = ModuleType("torch.distributed")
     dist.TCPStore = lambda *a, **kw: object()
     torch.distributed = dist
@@ -257,6 +303,8 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
 
     def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invoke, logical_bytes, samples):
         measured.append((op, directory.name, configs))
+        if op != "cached_dispatch":
+            assert logical_bytes == 8192 * (2816 * 2 + (8 * 4 if op == "combine_weighted" else 0))
         for c in configs:
             sweep.activate_candidate(torch, buffer, c)
             invoke()
@@ -283,28 +331,34 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
             str(out),
             "--combine-self-copy-modes",
             *sweep.SELF_COPY_MODES,
-        ],
+        ]
+        + (["--include-weighted-combine"] if weighted else []),
     )
     sweep.main()
     assert len(instances) == 1 and instances[0].destroyed
     assert all(b is instances[0] for b, c in configured)
     coarse = [(op, cs) for op, name, cs in measured if name.endswith("_coarse")]
-    assert len(coarse) == 4  # two AIVs, two operators; dispatch is not repeated per mode
+    assert len(coarse) == (6 if weighted else 4)  # dispatch is not repeated per mode
     for op, cs in coarse:
         if op == "cached_dispatch":
             assert all("self_copy_mode" not in c for c in cs)
-        else:
+        elif op == "combine_unweighted":
             assert {c["self_copy_mode"] for c in cs} == set(sweep.SELF_COPY_MODES)
+        else:
+            assert {c["self_copy_mode"] for c in cs} == {"default", "self_copy_after_submit"}
     report = json.loads((out / "report.json").read_text())
     assert report["buffer_initializations"] == 1 and len(report["results"]) == 2
     for result in report["results"]:
         winner = result["operations"]["combine_unweighted"]["winner"]
         assert "self_copy_mode" in winner["config"] and len(winner["repeats"]) == 2
+        assert ("combine_weighted" in result["operations"]) == weighted
+        if weighted:
+            assert result["operations"]["combine_weighted"]["logical_row_bytes"] == 5664
 
 
-@pytest.mark.parametrize("combine", [False, True])
-def test_profile_stage_separation_and_missing_sample(tmp_path, combine):
-    op = "combine_unweighted" if combine else "cached_dispatch"
+@pytest.mark.parametrize("op", ["cached_dispatch", "combine_unweighted", "combine_weighted"])
+def test_profile_stage_separation_and_missing_sample(tmp_path, op):
+    combine = op != "cached_dispatch"
     names = ["cached_notify_combine_kernel"]
     names += (
         ["cached_notify_combine_kernel", "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
