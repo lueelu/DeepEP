@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 #include "kernels/mega_moe_urma/catlass_gmm/segmented_row_layout.hpp"
@@ -7,7 +8,7 @@
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
-namespace UbxMegaMoeImpl::GmmKernel {
+namespace UrmaMegaMoeImpl::GmmKernel {
 
 // The default policy compiles out all segmented paths in the main MegaMoE
 // instantiations. It does not add runtime branches or alter their unit flags.
@@ -136,4 +137,4 @@ struct SegmentedRowIO {
     }
 };
 
-}  // namespace UbxMegaMoeImpl::GmmKernel
+}  // namespace UrmaMegaMoeImpl::GmmKernel

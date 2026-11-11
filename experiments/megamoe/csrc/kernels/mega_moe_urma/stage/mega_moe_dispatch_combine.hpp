@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 // AIV1 cooperative Dispatch/Combine and compute-result consumption.

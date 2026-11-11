@@ -7,8 +7,8 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See third-party/cann.LICENSE for the full text of the License.
  */
-// Modified by SimpleBright_Man 2026
-
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man
 /*!
  * \file block_epilogue_activation_mx_quant.h
  * \brief
@@ -36,14 +36,14 @@
 #include "kernels/mega_moe_common/epilogue/quant/mxfp8_quant.hpp"
 
 namespace ActivationQuantMsg {
-using ActMode = UbxMegaMoeImpl::MegaMoeActMode;
-using ActSubMode = UbxMegaMoeImpl::MegaMoeActSubMode;
+using ActMode = UrmaMegaMoeImpl::MegaMoeActMode;
+using ActSubMode = UrmaMegaMoeImpl::MegaMoeActSubMode;
 
 constexpr uint32_t Y_IDX = 0;
 constexpr uint32_t Y_SCALE_IDX = 1;
 }  // namespace ActivationQuantMsg
 
-namespace UbxMegaMoeImpl {
+namespace UrmaMegaMoeImpl {
 
 using namespace AscendC;
 using namespace ActivationQuantMsg;
@@ -450,7 +450,7 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     WaitFlag<HardEvent::MTE3_S>(0);
 }
 
-}  // namespace UbxMegaMoeImpl
+}  // namespace UrmaMegaMoeImpl
 
 #endif  // defined(__DAV_C310__)
 #endif  // BLOCK_EPILOGUE_ACTIVATION_MX_QUANT_H

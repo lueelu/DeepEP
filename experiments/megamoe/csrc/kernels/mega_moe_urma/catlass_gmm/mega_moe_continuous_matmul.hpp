@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 #include "kernel_operator.h"
@@ -10,7 +11,7 @@
 
 // Continuous routed matmul and paired-UB FIX output.
 
-namespace UbxMegaMoeImpl::GmmKernel {
+namespace UrmaMegaMoeImpl::GmmKernel {
 // Pinned CATLASS 2b4bd7c implements only NO_QUANT for L0C->UB. This adapter
 // follows its NO_SPLIT stride/subblock handling, but preserves the existing
 // W4 GM-output PER_TENSOR *64 restoration before the BF16 cast.
@@ -37,7 +38,7 @@ __aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t col
     const auto offset = src.layout()(src.coord());
     AscendC::Fixpipe<bfloat16_t, Accumulator, kPairedUbFixConfig>(dst, src.data()[offset], p);
 }
-}  // namespace UbxMegaMoeImpl::GmmKernel
+}  // namespace UrmaMegaMoeImpl::GmmKernel
 
 namespace MegaMoeUrma {
 
@@ -45,14 +46,14 @@ namespace MegaMoeUrma {
 // projections. Updating the expert or stage must never reset those indices.
 // Only GMM1 gathers A; both stages use one continuous Unit Flag output.
 struct ContinuousComputeRows
-    : UbxMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments> {
+    : UrmaMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments> {
     static constexpr bool kMayOutputToUb = true;
     bool gather = true;
     bool storeToUb = false;
     template <class TensorL0C>
     __aicore__ inline void StoreUb(const TensorL0C& source, uint32_t rows, uint32_t columns) const
     {
-        UbxMegaMoeImpl::GmmKernel::StoreUb(source, rows, columns, 0b11);
+        UrmaMegaMoeImpl::GmmKernel::StoreUb(source, rows, columns, 0b11);
     }
 
     template <class TensorL1>
@@ -60,7 +61,7 @@ struct ContinuousComputeRows
                                   uint32_t columns) const
     {
         if (gather) {
-            UbxMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments>::Gather(
+            UrmaMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments>::Gather(
                 dst, tileBegin, tileRows, columnBegin, columns);
             return;
         }
@@ -80,8 +81,8 @@ struct ContinuousComputeRows
 
 template <class Config>
 class ContinuousMatmul
-    : private UbxMegaMoeImpl::GmmKernel::detail::A8W4MatmulPipeline<Config, false, ContinuousComputeRows> {
-    using Pipeline = UbxMegaMoeImpl::GmmKernel::detail::A8W4MatmulPipeline<Config, false, ContinuousComputeRows>;
+    : private UrmaMegaMoeImpl::GmmKernel::detail::A8W4MatmulPipeline<Config, false, ContinuousComputeRows> {
+    using Pipeline = UrmaMegaMoeImpl::GmmKernel::detail::A8W4MatmulPipeline<Config, false, ContinuousComputeRows>;
     bool gateUp_ = false;
     bool fused_ = false;
     uint32_t halfN_ = 0U;
@@ -92,7 +93,7 @@ public:
     using Pipeline::SetRowIO;
 
     template <class Problem>
-    __aicore__ inline void UpdateProblem(const Problem& config, const UbxMegaMoeImpl::GMMAddrInfo& addr, bool gmm1)
+    __aicore__ inline void UpdateProblem(const Problem& config, const UrmaMegaMoeImpl::GMMAddrInfo& addr, bool gmm1)
     {
         fused_ = gmm1 && Problem::FUSED_GATE_UP;
         Pipeline::UpdateProblem(config, addr, gmm1 ? addr.gmm1OutGlobal : addr.gmm2OutGlobal);

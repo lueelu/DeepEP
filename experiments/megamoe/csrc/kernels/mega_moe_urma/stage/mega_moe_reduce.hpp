@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 #include "kernels/mega_moe_urma/common/mega_moe_route_views.hpp"

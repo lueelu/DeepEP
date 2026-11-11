@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
 // MegaMoE direct-call entry for the shared DeepEP kernel library.
 // Keep the wave implementations and their tiling layout independent of the launcher.
-// Modified by SimpleBright_Man 2026
 #if __has_include("version/asc_devkit_version.h")
 #include "version/asc_devkit_version.h"
 #endif

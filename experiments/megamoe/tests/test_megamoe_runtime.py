@@ -158,12 +158,12 @@ def unified_runtime_environment(monkeypatch):
     return SimpleNamespace(group=group, state=state, calls=calls, events=events, aborted=aborted)
 
 
-@pytest.mark.parametrize("backend", ["pod", "ubx"])
+@pytest.mark.parametrize("backend", ["pod", "urma"])
 def test_unified_factory_routes_backend_and_preserves_lifetime(unified_runtime_environment, backend):
     env = unified_runtime_environment
     runtime = _MegaRuntime(env.group, 2 << 20, backend=backend)
     assert env.calls == [(0, 4, 2 << 20, "tcp://127.0.0.1:19091", 120, backend)]
-    assert ("peer_access_error" in env.events) == (backend == "ubx")
+    assert ("peer_access_error" in env.events) == (backend == "urma")
     assert _runtime._OWNER is runtime
     runtime.close()
     assert env.events[-2:] == ["stream-sync", "close"]
@@ -181,10 +181,10 @@ def test_unified_factory_rejects_invalid_backend_before_initialization(unified_r
     assert _runtime._OWNER is None
 
 
-def test_ubx_multi_host_requires_peer_access_not_opt_in(unified_runtime_environment):
+def test_urma_multi_host_requires_peer_access_not_opt_in(unified_runtime_environment):
     env = unified_runtime_environment
     env.state.different_hosts = True
-    runtime = _MegaRuntime(env.group, 2 << 20, backend="ubx")
+    runtime = _MegaRuntime(env.group, 2 << 20, backend="urma")
     assert len(env.calls) == 1 and "peer_access_error" in env.events
     assert env.aborted == []
     runtime.close()
@@ -198,7 +198,7 @@ def test_peer_access_failure_is_shared_and_retains_owner(unified_runtime_environ
     else:
         env.state.peer_error = "peer mapping unavailable"
     with pytest.raises(RuntimeError, match="peer mapping unavailable"):
-        _MegaRuntime(env.group, 2 << 20, backend="ubx")
+        _MegaRuntime(env.group, 2 << 20, backend="urma")
     assert len(env.calls) == 1
     assert len(env.aborted) == 1
     assert _runtime._OWNER is not None
@@ -209,7 +209,7 @@ def test_backend_mismatch_fails_before_shmem(unified_runtime_environment):
     env = unified_runtime_environment
     env.state.mismatch = True
     with pytest.raises(ValueError, match="Ranks disagree"):
-        _MegaRuntime(env.group, 2 << 20, backend="ubx")
+        _MegaRuntime(env.group, 2 << 20, backend="urma")
     assert env.calls == []
     assert _runtime._OWNER is None
 
@@ -219,6 +219,6 @@ def test_backend_specific_capacity_limits(unified_runtime_environment):
     with pytest.raises(ValueError, match="capacity"):
         _MegaRuntime(env.group, 2 << 30, backend="pod")
     assert env.calls == []
-    runtime = _MegaRuntime(env.group, 2 << 30, backend="ubx")
+    runtime = _MegaRuntime(env.group, 2 << 30, backend="urma")
     assert env.calls[0][2] == 2 << 30
     runtime.close()

@@ -219,7 +219,7 @@ def backend(monkeypatch):
             events.append(("launch", args))
             output = out if out is not None else Tensor(np.zeros(x.shape), "bfloat16")
             output.data.fill(3)
-            if self.backend == "ubx" and timer is not None:
+            if self.backend == "urma" and timer is not None:
                 timer.data[-1] = generation
             return output, Tensor(np.arange(self.local_experts) + 2, "int32")
 
@@ -233,7 +233,7 @@ def backend(monkeypatch):
         ffts_config=lambda: 123,
         timer_enabled=True,
         timer_numel=64,
-        allocate_timer=lambda example, backend="pod": Tensor(np.zeros(65536 if backend == "ubx" else 64), "int64"),
+        allocate_timer=lambda example, backend="pod": Tensor(np.zeros(65536 if backend == "urma" else 64), "int64"),
         small_batch_max_tokens=256,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
@@ -511,7 +511,7 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan_bs == 17
 
 
-@pytest.mark.parametrize("board,expected", [(0x44, "ubx"), (7, "pod"), (3, "pod"), (None, "pod"), (0x6C, "pod")])
+@pytest.mark.parametrize("board,expected", [(0x44, "urma"), (7, "pod"), (3, "pod"), (None, "pod"), (0x6C, "pod")])
 def test_megamoe_product_selection(monkeypatch, board, expected):
     from deep_ep_experimental.megamoe import backend as selector
     from deep_ep import _machine
@@ -524,13 +524,13 @@ def test_megamoe_product_selection(monkeypatch, board, expected):
     assert calls == [expected]
 
 
-def ubx_buffer(backend, monkeypatch, *, shared=0):
+def urma_buffer(backend, monkeypatch, *, shared=0):
     from deep_ep_experimental.megamoe import backend as selector
 
-    monkeypatch.setattr(selector, "select_backend", lambda group: "ubx")
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
     # Also cover a module-level imported selector without coupling the test to
     # whether api.py imports the helper locally or at module initialization.
-    monkeypatch.setattr(api, "select_backend", lambda group: "ubx", raising=False)
+    monkeypatch.setattr(api, "select_backend", lambda group: "urma", raising=False)
     b = api.SymmBuffer(backend.group_type(16), 32, 2048, 2, 256, 256, num_shared_experts=shared)
     b.topk_idx.data[:] = [0, 1]
     b.topk_weights.data[:] = [0.4, 0.6]
@@ -541,8 +541,8 @@ def ubx_buffer(backend, monkeypatch, *, shared=0):
     return b, api.transform_weights_for_mega_moe(*raw)
 
 
-def test_ubx_uses_unified_plan_and_generation_survives_bs_changes(backend, monkeypatch):
-    b, (w1, w2) = ubx_buffer(backend, monkeypatch)
+def test_urma_uses_unified_plan_and_generation_survives_bs_changes(backend, monkeypatch):
+    b, (w1, w2) = urma_buffer(backend, monkeypatch)
 
     def forbidden_readback(*args, **kwargs):
         pytest.fail("Normal forward must not read routing tensors on Host")
@@ -553,15 +553,15 @@ def test_ubx_uses_unified_plan_and_generation_survives_bs_changes(backend, monke
     plans = []
     casts_before = sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
     try:
-        assert not hasattr(b, "_ubx")
+        assert not hasattr(b, "_urma")
         for bs in (17, 1024, 1025, 2048, 17):
             y = Tensor(np.zeros((bs, 256)), "bfloat16")
             assert api.fp8_fp4_mega_moe(y, w1, w2, b, cumulative_local_expert_recv_stats=stats) is None
             launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
             assert launch[-2] is y
-            assert launch[4] is w1.select(True)[0]  # UBX uses fused layout even above the POD threshold.
+            assert launch[4] is w1.select(True)[0]  # URMA uses fused layout even above the POD threshold.
             assert isinstance(b._plan, backend.ext.Plan)
-            assert b._plan.backend == "ubx"
+            assert b._plan.backend == "urma"
             generations.append(launch[-1])
             plans.append(b._plan)
             np.testing.assert_array_equal(y.data, 3)
@@ -574,10 +574,10 @@ def test_ubx_uses_unified_plan_and_generation_survives_bs_changes(backend, monke
         b.destroy()
 
 
-def test_ubx_shared_shapes_reach_same_forward_without_extra_host_interface(backend, monkeypatch):
+def test_urma_shared_shapes_reach_same_forward_without_extra_host_interface(backend, monkeypatch):
     import inspect
 
-    b, weights = ubx_buffer(backend, monkeypatch, shared=1)
+    b, weights = urma_buffer(backend, monkeypatch, shared=1)
     # Independent shared I=512; routed I=256. Native Plan is responsible for
     # inferring and preparing shared resources from these existing operands.
     sw1 = Tensor(np.zeros((1, 1024, 256)), "float8_e4m3fn")
@@ -590,14 +590,14 @@ def test_ubx_shared_shapes_reach_same_forward_without_extra_host_interface(backe
         api.fp8_fp4_mega_moe(y, *weights, b, shared_l1_weights=(sw1, ss1), shared_l2_weights=(sw2, ss2))
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
         assert launch[9:13] == (sw1, sw2, ss1, ss2)
-        assert b._plan.backend == "ubx"
+        assert b._plan.backend == "urma"
         assert b._plan.workspace_bytes == b.workspace_bytes
     finally:
         b.destroy()
 
 
-def test_ubx_timer_uses_unified_forward_and_plan_diagnostics(backend, monkeypatch):
-    b, weights = ubx_buffer(backend, monkeypatch)
+def test_urma_timer_uses_unified_forward_and_plan_diagnostics(backend, monkeypatch):
+    b, weights = urma_buffer(backend, monkeypatch)
     try:
         timer = b.allocate_timer()
         assert timer.data.size > backend.ext.timer_numel
@@ -608,26 +608,26 @@ def test_ubx_timer_uses_unified_forward_and_plan_diagnostics(backend, monkeypatc
         assert timer.data[-1] == launch[-1]
         assert not hasattr(b._plan, "diagnostic_timer")
         assert not hasattr(b._plan, "cv_rows")
-        assert not hasattr(b, "_ubx")
+        assert not hasattr(b, "_urma")
     finally:
         b.destroy()
 
 
-def test_ubx_plan_allocation_failure_poisoned_without_caching_shape(backend, monkeypatch):
-    b, weights = ubx_buffer(backend, monkeypatch)
+def test_urma_plan_allocation_failure_poisoned_without_caching_shape(backend, monkeypatch):
+    b, weights = urma_buffer(backend, monkeypatch)
     original_plan = backend.ext.Plan
     attempts = []
 
     def fail(*args, **kwargs):
         attempts.append((args, kwargs))
-        raise RuntimeError("UBX workspace allocation failed")
+        raise RuntimeError("URMA workspace allocation failed")
 
     backend.ext.Plan = fail
     y = Tensor(np.zeros((17, 256)), "bfloat16")
     try:
-        with pytest.raises(RuntimeError, match="UBX workspace allocation failed"):
+        with pytest.raises(RuntimeError, match="URMA workspace allocation failed"):
             api.fp8_fp4_mega_moe(y, *weights, b)
-        assert b._failure == "UBX workspace allocation failed"
+        assert b._failure == "URMA workspace allocation failed"
         assert b._plan is None and b._plan_bs is None
         assert len(attempts) == 1
         backend.ext.Plan = original_plan

@@ -229,7 +229,7 @@ def run(args, config, group):
     from .backend import select_backend
 
     backend = select_backend(group)
-    ubx = backend == "ubx"
+    urma = backend == "urma"
     import torch
     from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
@@ -252,8 +252,8 @@ def run(args, config, group):
             bool(getattr(args, "dual_reference", False)),
         ),
     )
-    if ubx and args.input != "fp8":
-        raise ValueError("UBX currently supports --input fp8; BF16 input remains a POD capability")
+    if urma and args.input != "fp8":
+        raise ValueError("URMA currently supports --input fp8; BF16 input remains a POD capability")
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
     if any(value >= world for value in timer_ranks):
         raise ValueError("timer rank exceeds EP world size")
@@ -290,13 +290,13 @@ def run(args, config, group):
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         backend=backend,
-        device_communication="shmem_mte_udma" if ubx else "shmem_mte",
+        device_communication="shmem_mte_udma" if urma else "shmem_mte",
         api="fp8_fp4_mega_moe",
         numerical_contract="ascend_post_gmm2_route_weight_v1",
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
-    if ubx:
+    if urma:
         manifest.update(
             implementation="consumer",
             precision="routed_w4_shared_w8",
@@ -307,7 +307,7 @@ def run(args, config, group):
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     model = config["model"]
     if (
-        not ubx
+        not urma
         and model.get("shared_intermediate_hidden", model["intermediate_hidden"]) != model["intermediate_hidden"]
     ):
         raise ValueError("POD shared width must match routed width")
@@ -340,7 +340,7 @@ def run(args, config, group):
         )
 
         def shared_pair(pair):
-            if not ubx:
+            if not urma:
                 return device_pair(pair)
             from .reference import expand_fp4_to_fp8
 
@@ -357,7 +357,7 @@ def run(args, config, group):
         cascade_owned = init_process_group(group)
         cascade = CascadeReference(model, raw, shared_raw, host_group=group)
     guard = None
-    if ubx and args.mode == "perf":
+    if urma and args.mode == "perf":
         from .performance import UrmaLaunchGuard
 
         alignment = config["alignment"]
@@ -378,7 +378,7 @@ def run(args, config, group):
             activation = None
         buffer.topk_idx[:bs].copy_(torch.from_numpy(ids))
         buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
-        if not ubx:
+        if not urma:
             buffer.validate_inputs(bs, x=activation)
         buffer.prepare(bs)
         result = torch.empty((bs, model["hidden"]), device="npu", dtype=torch.bfloat16)
@@ -394,7 +394,7 @@ def run(args, config, group):
                 **shared_kwargs,
             )
 
-        if ubx:
+        if urma:
             # Shared dimensions are inferred by native forward. Allocate its
             # workspace before profiling, using the same public call as POD.
             call()
@@ -414,7 +414,7 @@ def run(args, config, group):
                 error = str(failure)
             collective_check(group, f"timer allocation BS={bs}", error)
         prefix = None
-        if not ubx and (args.mode == "perf" or args.timer):
+        if not urma and (args.mode == "perf" or args.timer):
             error = None
             try:
                 alignment = config["alignment"]
@@ -430,7 +430,7 @@ def run(args, config, group):
                     f"batch_iterations={config['iters']}",
                     flush=True,
                 )
-        if not (ubx and args.mode == "perf"):
+        if not (urma and args.mode == "perf"):
             for _ in range(config["warmup"]):
                 call()
             torch.npu.synchronize()
@@ -488,7 +488,7 @@ def run(args, config, group):
                     f"[ACCURACY] BS={bs} all {world} ranks passed ({args.input}, sampled={args.check_tokens})",
                     flush=True,
                 )
-        elif ubx:
+        elif urma:
             from .performance import measure_profiled_forward, summarize_profile_rounds
 
             capture = measure_profiled_forward(
@@ -522,7 +522,7 @@ def run(args, config, group):
                 )
         if args.timer:
             uninstrumented = result.float().cpu().numpy() if args.mode == "accuracy" else None
-            if ubx:
+            if urma:
                 if args.mode == "accuracy":
                     call(timer)
             else:
@@ -542,7 +542,7 @@ def run(args, config, group):
                 (case / "timer_accuracy.json").write_text(json.dumps(comparisons, indent=2), encoding="utf-8")
                 if any(not item["finite"] or item["relative_rmse"] > args.relative_rmse for item in comparisons):
                     raise AssertionError(f"BS={bs}: timer-on/off output mismatch")
-            if ubx:
+            if urma:
                 from .urma_trace import export_diagnostics
 
                 export_diagnostics(group, timer, case, timer_ranks=timer_ranks)

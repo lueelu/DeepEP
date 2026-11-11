@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
@@ -34,7 +35,7 @@ URMA_REORDER_INLINE constexpr ReorderSpan PlanReorderSpan(const RowSegment& segm
                                                           uint32_t sliceRows)
 {
     const auto part =
-        UbxMegaMoeImpl::GmmKernel::SegmentedRows::Intersect(segment.tileRow, segment.rows, sliceBegin, sliceRows);
+        UrmaMegaMoeImpl::GmmKernel::SegmentedRows::Intersect(segment.tileRow, segment.rows, sliceBegin, sliceRows);
     const bool self = segment.sourceRank == rank;
     return {self, part.tileRow, part.rows, (self ? segment.returnRow : segment.receiveRow) + part.segmentRow};
 }

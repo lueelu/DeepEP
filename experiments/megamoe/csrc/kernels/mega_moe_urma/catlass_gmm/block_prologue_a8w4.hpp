@@ -7,8 +7,8 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See third-party/cann.LICENSE for the full text of the License.
  */
-// Modified by SimpleBright_Man 2026
-
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man
 #ifndef MEGA_MOE_CATLASS_BLOCK_PROLOGUE_A8W4_HPP
 #define MEGA_MOE_CATLASS_BLOCK_PROLOGUE_A8W4_HPP
 
@@ -29,7 +29,7 @@ template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, cl
 struct MegaMoeBlockPrologueA8W4 {
 public:
     using DispatchPolicy = MxA8W4Prologue<ArchTag, L1B_STAGES_>;
-    using Buffers = UbxMegaMoeImpl::GmmKernel::A8W4BDeepResources;
+    using Buffers = UrmaMegaMoeImpl::GmmKernel::A8W4BDeepResources;
     using ElementIn = typename InType_::Element;
     using ElementOut = typename OutType_::Element;
     using LayoutIn = typename InType_::Layout;
@@ -129,7 +129,7 @@ public:
     {
         uint32_t kSize = tla::get<0>(params.layoutPrologueB.originShape());
         const auto kPlan =
-            UbxMegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
+            UrmaMegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
         const uint32_t kL1Size = kPlan.kb;
         const uint32_t halfK = kL1Size / 2U;
         const uint32_t kGmLoop = CeilDiv(kSize, kL1Size);

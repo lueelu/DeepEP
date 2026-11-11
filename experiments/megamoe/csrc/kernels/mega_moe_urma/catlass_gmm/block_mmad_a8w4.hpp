@@ -8,8 +8,8 @@
  * BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
  * third-party/cann.LICENSE for the full text of the License.
  */
-// Modified by SimpleBright_Man 2026
-
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man
 #ifndef MEGA_MOE_CATLASS_BLOCK_MMAD_A8W4_HPP
 #define MEGA_MOE_CATLASS_BLOCK_MMAD_A8W4_HPP
 
@@ -78,7 +78,7 @@ public:
     static constexpr bool ENABLE_UNIT_FLAG = DispatchPolicy::ENABLE_UNIT_FLAG;
     static constexpr uint32_t STAGES = DispatchPolicy::STAGES;
     static constexpr bool ENABLE_L1_RESIDENT = DispatchPolicy::ENABLE_L1_RESIDENT;
-    using Buffers = UbxMegaMoeImpl::GmmKernel::A8W4BDeepResources;
+    using Buffers = UrmaMegaMoeImpl::GmmKernel::A8W4BDeepResources;
     static constexpr uint32_t SCALE_STAGES = Buffers::ScaleStages;
     static constexpr uint32_t L1A_STAGES = DispatchPolicy::L1A_STAGES;
     static constexpr uint32_t L1B_STAGES = DispatchPolicy::L1B_STAGES;
@@ -312,7 +312,7 @@ public:
 
     /// Perform a block-scoped matrix multiply-accumulate
     template <class TensorA, class TensorC, class TensorMxScaleA = EmptyClass, class TensorMxScaleB = EmptyClass,
-              class TensorBias = EmptyClass, class RowIO = UbxMegaMoeImpl::GmmKernel::ContiguousRowIO>
+              class TensorBias = EmptyClass, class RowIO = UrmaMegaMoeImpl::GmmKernel::ContiguousRowIO>
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
                                    bool allowDynamicB = false, TensorBias const& tensorBias = {},
@@ -360,7 +360,7 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0CListId]);
         }
 
-        const auto kPlan = UbxMegaMoeImpl::GmmKernel::MakeA8W4KPlan(mBlockActual, nBlockActual, allowDynamicB);
+        const auto kPlan = UrmaMegaMoeImpl::GmmKernel::MakeA8W4KPlan(mBlockActual, nBlockActual, allowDynamicB);
         const uint32_t ka = kPlan.ka;
         const uint32_t kb = kPlan.kb;
         const uint32_t kL1Loop = CeilDiv(kBlockActual, kb);

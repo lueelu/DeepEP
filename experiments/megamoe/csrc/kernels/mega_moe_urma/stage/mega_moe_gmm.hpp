@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 #include <cfloat>
@@ -19,7 +20,7 @@
 namespace MegaMoeUrma {
 
 using namespace AscendC;
-using UbxMegaMoeImpl::Get;
+using UrmaMegaMoeImpl::Get;
 
 // A fragment is a compute M256 group of one expert. Row segments preserve its
 // input/output correspondence with the original source-major communication CVs.
@@ -50,13 +51,13 @@ __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragme
     return ComputeTileCount(fragment.rows, args.config.hidden);
 }
 
-__aicore__ inline UbxMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment)
+__aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment)
 {
     const uint64_t h = args.config.hidden;
     const uint64_t n = static_cast<uint64_t>(args.config.intermediate) * 2U;
     const uint64_t scaleH = h / 32U;
     const uint64_t expert = fragment.expert;
-    UbxMegaMoeImpl::GMMAddrInfo addr{};
+    UrmaMegaMoeImpl::GMMAddrInfo addr{};
     // X is gathered directly from source-major receive rows. MX scale rows
     // have been packed once by AIV1 to preserve the normal aligned L1 loader.
     addr.aGlobal = reinterpret_cast<GM_ADDR>(args.symmetric + args.config.receiveXOffset);
@@ -68,13 +69,13 @@ __aicore__ inline UbxMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& arg
     return addr;
 }
 
-__aicore__ inline UbxMegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, const Fragment& fragment)
+__aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, const Fragment& fragment)
 {
     const uint64_t h = args.config.hidden;
     const uint64_t i = args.config.intermediate;
     const uint64_t scaleI = i / 32U;
     const uint64_t expert = fragment.expert;
-    UbxMegaMoeImpl::GMMAddrInfo addr{};
+    UrmaMegaMoeImpl::GMMAddrInfo addr{};
     addr.aGlobal = reinterpret_cast<GM_ADDR>(args.activation + fragment.rowBegin * i);
     addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(args.activationScale + fragment.rowBegin * scaleI);
     addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight2 + expert * i * h / 2U);
@@ -84,22 +85,22 @@ __aicore__ inline UbxMegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& arg
     return addr;
 }
 
-using UrmaGmmConfig = UbxMegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t,
-                                                        fp8_e8m0_t, false, false, false, false, false, false, false>;
+using UrmaGmmConfig = UrmaMegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t,
+                                                         fp8_e8m0_t, false, false, false, false, false, false, false>;
 using UrmaProblemConfig = UrmaGmmConfig::ProblemConfig;
 using UrmaRoutedGmmConfig =
-    UbxMegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t, fp8_e8m0_t, false,
-                                      false, false, false, false, false, true>;
-using UrmaInputRows = UbxMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments>;
-using UrmaOutputRows = UbxMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true, RuntimeGroupSegments>;
+    UrmaMegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t, fp8_e8m0_t, false,
+                                       false, false, false, false, false, true>;
+using UrmaInputRows = UrmaMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments>;
+using UrmaOutputRows = UrmaMegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true, RuntimeGroupSegments>;
 // Only URMA uses a separate FP32 sigmoid, matching the NPU cascade's operation order.
-using UrmaActivation = UbxMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, kActivationTileM,
-                                                                      kComputeTileN, false, false, true>;
+using UrmaActivation = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, kActivationTileM,
+                                                                       kComputeTileN, false, false, true>;
 
 // Tie the host-testable memory contract to the shared arithmetic's real UB
 // layout. Top-k weights are consumed by Reduce, so no prefetch buffer exists.
 constexpr auto kActualActivationUb =
-    UbxMegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, kActivationTileM, kComputeTileN, false>();
+    UrmaMegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, kActivationTileM, kComputeTileN, false>();
 static_assert(kActualActivationUb.firstInputOffsetBytes == ActivationUbContract::gateOffset &&
                   kActualActivationUb.secondInputOffsetBytes == ActivationUbContract::upOffset &&
                   kActualActivationUb.activationOutputOffsetBytes == ActivationUbContract::activationOffset &&
@@ -126,7 +127,7 @@ __aicore__ inline RowIO FragmentRowIO(const Arguments& args, const Fragment& fra
             RuntimeSegments(args, fragment)};
 }
 
-__aicore__ inline UbxMegaMoeImpl::ProblemShape FragmentShape(const Arguments& args, const Fragment& fragment)
+__aicore__ inline UrmaMegaMoeImpl::ProblemShape FragmentShape(const Arguments& args, const Fragment& fragment)
 {
     return {fragment.rows, static_cast<int64_t>(args.config.intermediate) * 2, args.config.hidden, 0};
 }
@@ -162,7 +163,7 @@ __aicore__ inline TraceMeta ComputeTileTraceMeta(const TraceMeta& fragmentMeta, 
 // full-core barrier. Only this AIC and its paired AIV0 use the context-end flag beyond the four B slots.
 __aicore__ inline void CompleteComputeContext()
 {
-    constexpr uint16_t kContextEndFlag = UbxMegaMoeImpl::GmmKernel::A8W4BDeepResources::ContextEnd;
+    constexpr uint16_t kContextEndFlag = UrmaMegaMoeImpl::GmmKernel::A8W4BDeepResources::ContextEnd;
     if constexpr (g_coreType == AIC) {
         CrossCoreWaitFlag<4, PIPE_MTE1>(kContextEndFlag);
     } else {
@@ -179,15 +180,15 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
                                           uint32_t firstTile, bool gmm1, UrmaContinuousGmm& pipeline,
                                           RoutedCompletionProducer& completion, TimerT& timer)
 {
-    const UbxMegaMoeImpl::BlockJobContext job{block, kAic};
+    const UrmaMegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
     auto config = gmm1 ? UrmaRoutedGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM)
                        : UrmaRoutedGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
-    UbxMegaMoeImpl::GmmKernel::BlockScheduler schedule(
+    UrmaMegaMoeImpl::GmmKernel::BlockScheduler schedule(
         {config.m, config.schedulerN, config.k},
-        UbxMegaMoeImpl::GmmKernel::BlockScheduler::Params{
+        UrmaMegaMoeImpl::GmmKernel::BlockScheduler::Params{
             Te::MakeCoord(static_cast<int64_t>(config.tileM), static_cast<int64_t>(config.tileN))});
     if constexpr (g_coreType == AIC) {
         const uint64_t flags = gmm1 ? args.inputScaleDone : args.activationDone;
@@ -217,10 +218,10 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
     for (uint32_t tile = firstTile; tile < count; tile += kAic) {
         const auto coord = schedule.GetBlockCoord(tile);
         const auto tileShape = schedule.GetBlockShape(coord);
-        const uint32_t m = Get<UbxMegaMoeImpl::M_VALUE>(coord);
-        const uint32_t n = Get<UbxMegaMoeImpl::N_VALUE>(coord);
-        const uint32_t rows = Get<UbxMegaMoeImpl::M_VALUE>(tileShape);
-        const uint32_t columns = Get<UbxMegaMoeImpl::N_VALUE>(tileShape);
+        const uint32_t m = Get<UrmaMegaMoeImpl::M_VALUE>(coord);
+        const uint32_t n = Get<UrmaMegaMoeImpl::N_VALUE>(coord);
+        const uint32_t rows = Get<UrmaMegaMoeImpl::M_VALUE>(tileShape);
+        const uint32_t columns = Get<UrmaMegaMoeImpl::N_VALUE>(tileShape);
         const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
         if constexpr (g_coreType == AIC) {
             const uint64_t start = timer.TraceBegin();
@@ -359,7 +360,7 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
                                               uint32_t fragmentIndex, uint32_t tile, UrmaActivation& epilogue,
                                               Timer& timer, uint32_t workers = 0U)
 {
-    const UbxMegaMoeImpl::BlockJobContext job{worker, workers ? workers : ActivationWorkers(args.config.world)};
+    const UrmaMegaMoeImpl::BlockJobContext job{worker, workers ? workers : ActivationWorkers(args.config.world)};
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     auto addr = Gmm1Addresses(args, fragment);
     addr.activationToGmm2Flag = nullptr;
@@ -369,26 +370,26 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     const auto layouts = UrmaRoutedGmmConfig::BuildLayouts(config);
     auto gmC = Te::MakeTensor(
         Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ bfloat16_t*>(addr.gmm1OutGlobal)), layouts.c);
-    UbxMegaMoeImpl::GmmKernel::BlockScheduler scheduler(
+    UrmaMegaMoeImpl::GmmKernel::BlockScheduler scheduler(
         {config.m, config.outputN, config.k},
-        UbxMegaMoeImpl::GmmKernel::BlockScheduler::Params{
+        UrmaMegaMoeImpl::GmmKernel::BlockScheduler::Params{
             Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(kGmm1LogicalTileN))});
     epilogue.UpdateNextProblem({config.m, config.outputN, config.k, 0});
     const auto coord = scheduler.GetBlockCoord(tile);
     const auto tileShape = scheduler.GetBlockShape(coord);
-    const uint32_t m = Get<UbxMegaMoeImpl::M_VALUE>(coord);
-    const uint32_t n = Get<UbxMegaMoeImpl::N_VALUE>(coord);
-    const uint32_t rows = Get<UbxMegaMoeImpl::M_VALUE>(tileShape);
-    const uint32_t columns = Get<UbxMegaMoeImpl::N_VALUE>(tileShape);
+    const uint32_t m = Get<UrmaMegaMoeImpl::M_VALUE>(coord);
+    const uint32_t n = Get<UrmaMegaMoeImpl::N_VALUE>(coord);
+    const uint32_t rows = Get<UrmaMegaMoeImpl::M_VALUE>(tileShape);
+    const uint32_t columns = Get<UrmaMegaMoeImpl::N_VALUE>(tileShape);
     // Only the staging copy changes to M128; ready counters stay M256.
     config.tileM = kActivationTileM;
     timer.Begin(Phase::Activation);
     for (uint32_t offset = 0U; offset < rows; offset += kActivationTileM) {
         const auto slice = ActivationSlice(m, rows, offset);
-        const UbxMegaMoeImpl::GmmKernel::BlockScheduler::BlockShape sliceShape{slice.rows, columns, config.k};
+        const UrmaMegaMoeImpl::GmmKernel::BlockScheduler::BlockShape sliceShape{slice.rows, columns, config.k};
         const auto sliceMeta = ComputeTileTraceMeta(fragmentMeta, slice.rowBegin, n, slice.rows, columns);
         const uint64_t sliceStart = timer.TraceBegin();
-        UbxMegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t, UrmaRoutedGmmConfig::MakeLayoutC, true>(
+        UrmaMegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t, UrmaRoutedGmmConfig::MakeLayoutC, true>(
             epilogue, gmC, addr, config, sliceShape, slice.rowBegin, n);
         timer.TraceEnd(TraceEvent::ActivationSlice, sliceStart, sliceMeta);
     }
@@ -521,9 +522,9 @@ namespace MegaMoeUrma {
 // The caller must have consumed real FIX full and must NOT return UB empty
 // until Run() returns (its final activation/scale MTE3 stores are complete).
 class UbRoutedActivation {
-    using Op = UbxMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, false, true, true>;
+    using Op = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, false, true, true>;
     static constexpr auto offsets =
-        UbxMegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, 256U, 256U, true>();
+        UrmaMegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, 256U, 256U, true>();
     static_assert(offsets.firstInputElementCapacity * sizeof(bfloat16_t) == 128U * 1024U);
     static_assert(offsets.reciprocalScaleOffsetBytes + offsets.scaleElementCapacity * sizeof(uint16_t) <= 128U * 1024U);
 

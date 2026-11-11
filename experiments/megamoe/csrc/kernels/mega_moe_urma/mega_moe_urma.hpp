@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 // Device execution entry: ProcessRouted (S0) and ProcessShared (S1).
@@ -81,8 +82,8 @@ __aicore__ inline void ProcessRouted(Arguments& args)
     const uint32_t block = GetBlockIdx() / GetTaskRation();
     const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
     const int64_t originalOverflow =
-        GetCtrlSpr<UbxMegaMoeImpl::OVERFLOW_MODE_CTRL, UbxMegaMoeImpl::OVERFLOW_MODE_CTRL>();
-    SetCtrlSpr<UbxMegaMoeImpl::OVERFLOW_MODE_CTRL, UbxMegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
+        GetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>();
+    SetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
 
     // 2. Publish readiness and fill the startup Pack rounds.
     if constexpr (g_coreType == AIV) {
@@ -134,7 +135,7 @@ __aicore__ inline void ProcessRouted(Arguments& args)
     // must finish before returning and reusing this invocation's workspaces.
     TraceLocalSync(timer, 3U);
     timer.FinishTrace();
-    SetCtrlSpr<UbxMegaMoeImpl::OVERFLOW_MODE_CTRL, UbxMegaMoeImpl::OVERFLOW_MODE_CTRL>(originalOverflow);
+    SetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>(originalOverflow);
 }
 
 template <class T>
@@ -165,8 +166,8 @@ __aicore__ inline void ProcessShared(Arguments& a)
     // S1 overlaps shared GMM, routed work and communication by engine role.
     PrepareDeviceRoutes(a, timer);
     const uint32_t block = GetBlockIdx() / GetTaskRation(), comm = CommunicationWorkers(a.config.world);
-    const int64_t overflow = GetCtrlSpr<UbxMegaMoeImpl::OVERFLOW_MODE_CTRL, UbxMegaMoeImpl::OVERFLOW_MODE_CTRL>();
-    SetCtrlSpr<UbxMegaMoeImpl::OVERFLOW_MODE_CTRL, UbxMegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
+    const int64_t overflow = GetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>();
+    SetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
     if constexpr (g_coreType == AIC) {
         WaitRouteSummary(a, timer);
         timer.CoarseBegin(CoarsePhase::Gmm);
@@ -244,7 +245,7 @@ __aicore__ inline void ProcessShared(Arguments& a)
     m.cv = 4;
     timer.TraceEnd(TraceEvent::LocalSync, join, m);
     timer.FinishTrace();
-    SetCtrlSpr<UbxMegaMoeImpl::OVERFLOW_MODE_CTRL, UbxMegaMoeImpl::OVERFLOW_MODE_CTRL>(overflow);
+    SetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>(overflow);
 }
 
 }  // namespace MegaMoeUrma

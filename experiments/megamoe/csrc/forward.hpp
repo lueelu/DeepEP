@@ -21,7 +21,7 @@ struct PlatformInfo {
     uint32_t system_workspace;
 };
 
-struct UbxWorkspace;
+struct UrmaWorkspace;
 
 // One Host plan; backend selects private resource layout and the device entry.
 class Plan {
@@ -42,7 +42,7 @@ public:
 
 private:
     Backend backend_;
-    std::unique_ptr<UbxWorkspace> ubx_;
+    std::unique_ptr<UrmaWorkspace> urma_;
     PlatformInfo platform_{};
     MegaMoeTilingData tiling_;
     torch::Tensor workspace_;

@@ -1,4 +1,7 @@
-"""One internal MegaMoE resource owner for POD and UBX backends."""
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man
+
+"""One internal MegaMoE resource owner for POD and URMA backends."""
 
 from deep_ep._runtime import Runtime
 

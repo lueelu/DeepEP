@@ -16,7 +16,7 @@ namespace MegaMoeUrma {
 struct Arguments;
 }
 namespace deepep::megamoe {
-enum class Backend : uint8_t { Pod, Ubx };
+enum class Backend : uint8_t { Pod, Urma };
 // Host-only launch description; the separate device ABIs remain unchanged.
 struct PodLaunchArgs {
     bool is_a8w4 = false;
@@ -29,5 +29,5 @@ struct PodLaunchArgs {
     uint64_t ffts = 0;
 };
 void launch_kernel(Backend backend, uint32_t block_dim, uint32_t ub_bytes, void* stream, const PodLaunchArgs& pod,
-                   const MegaMoeUrma::Arguments* ubx);
+                   const MegaMoeUrma::Arguments* urma);
 }  // namespace deepep::megamoe

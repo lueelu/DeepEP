@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man
+
 """Internal MegaMoE product selection; public signatures remain in api.py."""
 
 from .validation import collective_check
@@ -12,6 +15,7 @@ def select_backend(group):
         product = board_id(physical_device())
     except Exception:
         product = None
-    selected = "ubx" if product == 0x44 else "pod"
+    # Board 0x44 identifies the UBX product; its implementation uses URMA.
+    selected = "urma" if product == 0x44 else "pod"
     collective_check(group, "MegaMoE product selection", None, selected)
     return selected

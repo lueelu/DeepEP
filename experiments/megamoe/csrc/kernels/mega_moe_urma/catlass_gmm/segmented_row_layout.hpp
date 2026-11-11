@@ -1,12 +1,13 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #pragma once
 
 #include <cstdint>
 
 // The arithmetic below is shared with the CPU layout test. It deliberately
 // contains no Ascend or URMA types.
-namespace UbxMegaMoeImpl::GmmKernel::SegmentedRows {
+namespace UrmaMegaMoeImpl::GmmKernel::SegmentedRows {
 
 #if defined(__NPU_DEVICE__)
 #define MEGAMOE_SEGMENTED_INLINE __aicore__ inline
@@ -59,6 +60,6 @@ MEGAMOE_SEGMENTED_INLINE constexpr uint64_t OutputOffset(uint64_t row, uint32_t 
     return row * stride + column;
 }
 
-}  // namespace UbxMegaMoeImpl::GmmKernel::SegmentedRows
+}  // namespace UrmaMegaMoeImpl::GmmKernel::SegmentedRows
 
 #undef MEGAMOE_SEGMENTED_INLINE

@@ -43,7 +43,7 @@ SessionPolicy policy_for(RuntimeProfile profile)
             return {false, false, (1ULL << 63) - 1U, 0U};
         case RuntimeProfile::MegaMoEPod:
             return {true, false, 1ULL << 30, 0U};
-        case RuntimeProfile::MegaMoEUbx:
+        case RuntimeProfile::MegaMoEUrma:
             return {true, true, 32ULL << 30, ACLSHMEM_TRANSPORT_MTE | ACLSHMEM_TRANSPORT_UDMA};
     }
     throw std::invalid_argument("Unknown runtime profile");
@@ -93,10 +93,10 @@ std::unique_ptr<Session> Session::create_megamoe(int rank, int size, uint64_t by
     RuntimeProfile profile;
     if (backend == "pod")
         profile = RuntimeProfile::MegaMoEPod;
-    else if (backend == "ubx")
-        profile = RuntimeProfile::MegaMoEUbx;
+    else if (backend == "urma")
+        profile = RuntimeProfile::MegaMoEUrma;
     else
-        throw std::invalid_argument("MegaMoE backend must be pod or ubx");
+        throw std::invalid_argument("MegaMoE backend must be pod or urma");
     const auto policy = policy_for(profile);
     return std::make_unique<Session>(rank, size, bytes, endpoint, timeout, policy.dedicated_peer_qp, profile);
 }
@@ -179,7 +179,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             // submissions finish before Combine; no second QP is required.
             // Disable shared Clos SQs so different peer owners stay isolated.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE)");
-            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false), "aclshmemx_set_shared_jetty(UBX)");
+            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false), "aclshmemx_set_shared_jetty(URMA)");
             if (set_masks) {
                 check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE)");
             }

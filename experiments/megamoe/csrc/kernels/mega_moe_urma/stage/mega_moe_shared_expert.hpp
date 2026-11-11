@@ -1,3 +1,5 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man
 
 #pragma once
 
@@ -61,7 +63,7 @@ class SharedMxGmm {
     using Block = Catlass::Gemm::Block::MegaMoeBlockMmadMx<Policy, L1, L0, F, F, C, void, Copy>;
     Catlass::Gemm::Block::MegaMoeResource resource_;
     Block block_;
-    UbxMegaMoeImpl::GMMAddrInfo addr_{};
+    UrmaMegaMoeImpl::GMMAddrInfo addr_{};
     uint32_t m_ = 0, n_ = 0, k_ = 0, scaleK_ = 0;
     template <class Element, class Layout>
     __aicore__ inline auto View(GM_ADDR p, const Layout& layout)
@@ -88,7 +90,7 @@ class SharedMxGmm {
 public:
     __aicore__ inline SharedMxGmm() : block_(resource_) {}
     template <class Problem>
-    __aicore__ inline void UpdateProblem(const Problem& p, const UbxMegaMoeImpl::GMMAddrInfo& addr)
+    __aicore__ inline void UpdateProblem(const Problem& p, const UrmaMegaMoeImpl::GMMAddrInfo& addr)
     {
         m_ = p.m;
         n_ = p.n;
@@ -240,7 +242,7 @@ __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
         const uint32_t count = First ? a.sharedIntermediate / 256 : a.config.hidden / 256;
         const uint32_t first = FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(First, core), kAic);
         if (first >= count) continue;
-        const UbxMegaMoeImpl::BlockJobContext job{core, kAic};
+        const UrmaMegaMoeImpl::BlockJobContext job{core, kAic};
         auto config = UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape(v, f), job, kComputeTileM);
         // Both builders have the same ProblemConfig type; shared gate/up stays planar.
         if constexpr (!First) config = UrmaGmmConfig::BuildGmm2ProblemConfig(FragmentShape(v, f), job, kComputeTileM);
@@ -319,8 +321,8 @@ public:
             before.Before();  // End a prior idle bar before recording actual shared work.
             // Soft shared activation must never overwrite the low128KiB FIX
             // mailbox, even while no issue has yet been observed by Scalar.
-            using HighUbActivation =
-                UbxMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 64U, 256U, false, false, true>;
+            using HighUbActivation = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 64U,
+                                                                                     256U, false, false, true>;
             constexpr uint32_t highUb = 128U * 1024U, planeBytes = 64U * 256U * 2U;
             static_assert(highUb + 2U * planeBytes <= kAiv1PersistentUbBase);
             HighUbActivation op;

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man
+
 """Validate URMA detailed trace schema 1 and export a rank-local Chrome trace.
 
 Raw records separate submission, waiting and drain. The default display joins
@@ -765,7 +768,7 @@ def export_diagnostics(group, trace, directory, *, timer_ranks):
             )
         except Exception as error:
             failure = str(error)
-    collective_check(group, "UBX trace export", failure)
+    collective_check(group, "URMA trace export", failure)
 
 
 if __name__ == "__main__":

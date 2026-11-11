@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #ifndef MEGA_MOE_CATLASS_GROUPED_MATMUL_H
 #define MEGA_MOE_CATLASS_GROUPED_MATMUL_H
 
@@ -9,7 +10,7 @@
 #include "kernels/mega_moe_urma/catlass_gmm/block_mmad_a8w4.hpp"
 #include "kernels/mega_moe_urma/catlass_gmm/block_prologue_a8w4.hpp"
 
-namespace UbxMegaMoeImpl::GmmKernel {
+namespace UrmaMegaMoeImpl::GmmKernel {
 
 // Shared CATLASS physical layout choices for grouped matmul.
 struct CatlassGroupedMatmulLayouts {
@@ -297,5 +298,5 @@ public:
     }
 };
 
-}  // namespace UbxMegaMoeImpl::GmmKernel
+}  // namespace UrmaMegaMoeImpl::GmmKernel
 #endif

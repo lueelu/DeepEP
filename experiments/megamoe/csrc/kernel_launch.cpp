@@ -1,16 +1,17 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
+
 #include "kernel_launch.hpp"
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
 #include <stdexcept>
 
 namespace deepep::megamoe {
 void launch_kernel(Backend backend, uint32_t block_dim, uint32_t ub_bytes, void* stream, const PodLaunchArgs& p,
-                   const MegaMoeUrma::Arguments* ubx)
+                   const MegaMoeUrma::Arguments* urma)
 {
-    if (backend == Backend::Ubx) {
-        if (!ubx) throw std::invalid_argument("Missing UBX device arguments");
-        mega_moe_urma_kernel_do(block_dim, ub_bytes, stream, ubx);
+    if (backend == Backend::Urma) {
+        if (!urma) throw std::invalid_argument("Missing URMA device arguments");
+        mega_moe_urma_kernel_do(block_dim, ub_bytes, stream, urma);
         return;
     }
     mega_moe_kernel_do(block_dim, ub_bytes, stream, p.is_a8w4, p.context, p.x, p.x_scales, p.topk_ids, p.topk_weights,

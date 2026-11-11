@@ -1,14 +1,17 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man
+
 // Compile each backend with its original namespace and timer symbols.
 // The selector is a build-target definition, never a device runtime input.
 #pragma once
 
 #if defined(DEEPEP_MEGAMOE_URMA)
-#define DEEPEP_MEGAMOE_IMPL_NAMESPACE UbxMegaMoeImpl
-#define DEEPEP_MEGAMOE_TIMER_NAMESPACE UbxAscendTimer
-#define DEEPEP_MEGAMOE_TIMER_DEVICE UbxAscendTimerDevice
-#define DEEPEP_MEGAMOE_TIMER_TILE_SCOPE UbxAscendTimerTileScope
-#define DEEPEP_MEGAMOE_TIMER_SPAN_SCOPE UbxAscendTimerSpanScope
-#define DEEPEP_MEGAMOE_TIMER_WAIT_SCOPE UbxAscendTimerWaitScope
+#define DEEPEP_MEGAMOE_IMPL_NAMESPACE UrmaMegaMoeImpl
+#define DEEPEP_MEGAMOE_TIMER_NAMESPACE UrmaAscendTimer
+#define DEEPEP_MEGAMOE_TIMER_DEVICE UrmaAscendTimerDevice
+#define DEEPEP_MEGAMOE_TIMER_TILE_SCOPE UrmaAscendTimerTileScope
+#define DEEPEP_MEGAMOE_TIMER_SPAN_SCOPE UrmaAscendTimerSpanScope
+#define DEEPEP_MEGAMOE_TIMER_WAIT_SCOPE UrmaAscendTimerWaitScope
 
 #else
 #define DEEPEP_MEGAMOE_IMPL_NAMESPACE MegaMoeImpl

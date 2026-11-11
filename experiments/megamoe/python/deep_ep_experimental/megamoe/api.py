@@ -32,7 +32,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 6:
+    if getattr(extension, "api_protocol", None) != 7:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -88,23 +88,23 @@ class SymmBuffer:
         from .backend import select_backend
 
         self._backend_name = select_backend(group)
-        ubx = self._backend_name == "ubx"
+        urma = self._backend_name == "urma"
         error = None
         try:
             integer("num_experts", num_experts, 1, 16384)
-            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384 if ubx else 65536)
-            integer("num_topk", num_topk, 1, min(8 if ubx else 32, num_experts))
-            integer("hidden", hidden, 256 if ubx else 1024, 8192)
-            integer("intermediate_hidden", intermediate_hidden, 256, 16384 if ubx else 4096)
-            integer("num_shared_experts", num_shared_experts, 0, 1 if ubx else 8)
+            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384 if urma else 65536)
+            integer("num_topk", num_topk, 1, min(8 if urma else 32, num_experts))
+            integer("hidden", hidden, 256 if urma else 1024, 8192)
+            integer("intermediate_hidden", intermediate_hidden, 256, 16384 if urma else 4096)
+            integer("num_shared_experts", num_shared_experts, 0, 1 if urma else 8)
             integer("world_size", size, 2, 128)
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
-            h_align, i_align = (256, 256) if ubx else (64, 128)
+            h_align, i_align = (256, 256) if urma else (64, 128)
             if hidden % h_align or intermediate_hidden % i_align:
                 raise ValueError(f"hidden must be divisible by {h_align}; intermediate_hidden by {i_align}")
-            if ubx and (size not in (4, 8, 16) or mma_type != "fp8xfp4"):
-                raise ValueError("UBX supports EP4/EP8/EP16 and routed FP8xFP4")
+            if urma and (size not in (4, 8, 16) or mma_type != "fp8xfp4"):
+                raise ValueError("URMA supports EP4/EP8/EP16 and routed FP8xFP4")
             if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
                 raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8 is implemented; no BF16xBF16")
             if mma_type != "fp8xfp4" and num_shared_experts:
@@ -180,7 +180,7 @@ class SymmBuffer:
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
         if self._plan_bs == bs:
             return
-        if self._backend_name == "ubx":
+        if self._backend_name == "urma":
             # Resource changes retire prior network sources before reusing the
             # fixed control regions. Exchange shape metadata, never route data.
             self._runtime.stream.synchronize()
@@ -457,9 +457,9 @@ def _run(
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
         shared = (sw1, sw2, ss1, ss2)
     b = sym_buffer
-    ubx = b._backend_name == "ubx"
-    if ubx and scales is None:
-        raise TypeError("UBX input requires (FP8 E4M3, E8M0 scales)")
+    urma = b._backend_name == "urma"
+    if urma and scales is None:
+        raise TypeError("URMA input requires (FP8 E4M3, E8M0 scales)")
     if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
         raise ValueError("x must be nonempty [BS,H] within the buffer capacity")
     if data.device != b._device:
@@ -474,11 +474,11 @@ def _run(
         raise TypeError("Weight dtype differs from buffer mma_type")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
-        fused = ubx or data.shape[0] <= _extension().small_batch_max_tokens
+        fused = urma or data.shape[0] <= _extension().small_batch_max_tokens
         if isinstance(l1_weights, _RoutedWeightPair):
             prepared_inputs = (*l1_weights, *l1_weights._planar)
             w1, s1 = l1_weights.select(fused)
-        elif ubx or not fused:
+        elif urma or not fused:
             raise ValueError(
                 "Prefill requires both prepared GMM1 layouts; call transform_weights_for_mega_moe "
                 "on raw ND weights and keep its returned l1 pair intact"
@@ -501,7 +501,7 @@ def _run(
             ("shared_l2_weights", shared[1]),
         ):
             if weight is not None:
-                if ubx and name.startswith("shared_"):
+                if urma and name.startswith("shared_"):
                     import torch_npu
 
                     if (
@@ -509,7 +509,7 @@ def _run(
                         or not weight.is_contiguous()
                         or torch_npu.get_npu_format(weight) != 2
                     ):
-                        raise ValueError("UBX shared weights require contiguous ND FP8 E4M3")
+                        raise ValueError("URMA shared weights require contiguous ND FP8 E4M3")
                 else:
                     _check_fp4_weight_format(weight, name)
     if cumulative_stats is not None:
@@ -543,7 +543,7 @@ def _run(
                     data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out, b._generation
                 )
             except Exception as error:
-                if ubx:
+                if urma:
                     b._failure = str(error)
                     if isinstance(b.group, StoreGroup):
                         b.group.abort(b._failure)

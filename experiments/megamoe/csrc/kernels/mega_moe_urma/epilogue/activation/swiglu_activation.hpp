@@ -1,5 +1,5 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by SimpleBright_Man 2026
+// Modified by SimpleBright_Man
 
 /*!
  * \file swiglu_activation.h
@@ -12,7 +12,7 @@
 #if defined(__DAV_C310__)
 #include "kernels/mega_moe_common/epilogue/activation/activation_common.hpp"
 
-namespace UbxMegaMoeImpl {
+namespace UrmaMegaMoeImpl {
 namespace Activation {
 
 // SwiGLU 直接调用接口使用的最小参数集。
@@ -155,7 +155,7 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
 }
 
 }  // namespace Activation
-}  // namespace UbxMegaMoeImpl
+}  // namespace UrmaMegaMoeImpl
 
 #endif  // defined(__DAV_C310__)
 #endif  // MEGA_MOE_ARCH35_SWIGLU_ACTIVATION_H

@@ -14,7 +14,7 @@
 #endif
 
 namespace deepep {
-enum class RuntimeProfile { General, MegaMoEPod, MegaMoEUbx };
+enum class RuntimeProfile { General, MegaMoEPod, MegaMoEUrma };
 // The framework owns ACL initialization, device and context. Only this workspace
 // and the SHMEM instance are owned here. Destruction is an explicit collective.
 class Session {
