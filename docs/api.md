@@ -9,6 +9,8 @@ Modified by Joyce_An 2026
 
 下文初始化方式与算子参数限制描述 Mesh+Clos 路径；公共对象表注明后端差异。新增 Clos V1/V2、自动选择和使用方式见
 [机型后端说明](machine_backends.md)，不能把 Mesh+Clos 的限制套到 Clos 路径。
+UBX 的 MTE/RDMA Combine 使用独立的 `deep_ep.backends.ubx` 入口；导入、参数、同步与完整调用示例见
+[UBX 接口](ubx.md#python-接口)。它不使用 `ElasticBuffer`、`EPHandle` 或 `machine_type` 自动选择。
 
 ## 公共对象
 
@@ -18,8 +20,12 @@ Modified by Joyce_An 2026
 | `Buffer` | `deep_ep`、`deep_ep.buffers`、`deep_ep.buffers.legacy` | 按机型选择 V1 后端；Clos/CARD 支持高吞吐 dispatch/combine，Mesh+Clos 仅支持资源构造、通信流、事件与销毁 |
 | `Config` | `deep_ep` | Clos V1 的核数、分块配置与容量查询，默认 32 AIV；不表示 Mesh+Clos 已支持 V1 通信 |
 | `EventHandle`、`EventOverlap` | `deep_ep`、`deep_ep.utils`、`deep_ep.utils.event` | 记录 NPU 事件、建立流依赖和保留相关 Tensor |
+| `Session`、`Combine` | `deep_ep.backends.ubx` | UBX 独立通信资源和预先上传输入的同步 Combine；接收 CPU 字节串，输出和计时通过独立方法取得 |
+| `routes`、`ranks_per_host` | `deep_ep.backends.ubx` | UBX CPU 测试路由生成函数与编译时每机参与卡数 |
 
 同一对象的不同导入路径指向同一个类。普通 `import deep_ep` 不加载 Torch、torch_npu 或原生扩展；通信运行时调用按需加载当前安装目录的扩展并校验 SHMEM 库身份。普通导入成功不表示运行环境、算法或设备验证通过。
+UBX 对象不在 `deep_ep` 顶层导出；仅导入 `ubx` 模块不初始化 NPU，首次访问其导出对象时才加载原生扩展。
+以下 Buffer 初始化、事件和生命周期约定不适用于 UBX，后者以独立接口说明为准。
 
 ### 公共事件与后端兼容
 
