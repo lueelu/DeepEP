@@ -3,10 +3,12 @@
 import csv
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,6 +40,51 @@ def test_quick_subset_and_auto_baseline():
     quick = sweep.candidates(64, 32, 8, quick=True)
     assert {c["id"] for c in quick} < {c["id"] for c in configs}
     assert {c["order"] for c in quick} == {"rank", "group_round_robin"}
+
+
+@pytest.mark.parametrize("ep", [4, 8, 16, 32])
+@pytest.mark.parametrize("aiv", [8, 20])
+def test_modes_keep_identity_and_prune_only_equivalent_spare_copy(ep, aiv):
+    base = sweep.candidates(ep, aiv, min(8, ep))
+    combined = sweep.combine_candidates(base, sweep.SELF_COPY_MODES, aiv)
+    assert len({c["id"] for c in combined}) == len(combined)
+    assert len([c for c in combined if c["self_copy_mode"] == "default"]) == len(base)
+    assert len([c for c in combined if c["self_copy_mode"] == "self_copy_after_submit"]) == len(base)
+    assert len([c for c in combined if c["self_copy_mode"] == "parallel_self_copy"]) == sum(
+        c["payload_aivs"] < aiv for c in base
+    )
+    assert len(sweep.combine_candidates(base, ["parallel_self_copy"], aiv)) == len(base)
+
+
+def test_mode_switch_drains_work_and_clears_previous_flags(monkeypatch):
+    events = []
+    monkeypatch.setenv(sweep.COMBINE_SELF_COPY_ENV, "1")
+    monkeypatch.setenv(sweep.COMBINE_AFTER_SUBMIT_ENV, "1")
+    torch = SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: events.append("drain")))
+    buffer = object()
+
+    def configure(actual_buffer, config):
+        assert actual_buffer is buffer
+        assert events[-1] == "drain"
+        events.append((os.environ[sweep.COMBINE_SELF_COPY_ENV], os.environ[sweep.COMBINE_AFTER_SUBMIT_ENV]))
+
+    monkeypatch.setattr(sweep, "configure", configure)
+    for mode in ("self_copy_after_submit", "parallel_self_copy", "default", "self_copy_after_submit"):
+        sweep.activate_candidate(torch, buffer, {"self_copy_mode": mode})
+    sweep.activate_candidate(torch, buffer, {"id": "dispatch"})
+    assert events[1::2] == [("0", "1"), ("1", "0"), ("0", "0"), ("0", "1"), ("0", "0")]
+
+
+def test_multi_mode_cli_and_conflicts():
+    args = sweep.parse_args(["--combine-self-copy-modes", *sweep.SELF_COPY_MODES])
+    assert args.combine_self_copy_modes == list(sweep.SELF_COPY_MODES)
+    for argv in (
+        ["--combine-self-copy-modes", "default", "default"],
+        ["--combine-self-copy-modes", "default", "--combine-self-copy-after-submit"],
+        ["--combine-parallel-self-copy", "--combine-self-copy-after-submit"],
+    ):
+        with pytest.raises(SystemExit):
+            sweep.parse_args(argv)
 
 
 def test_cli_plan_without_framework():
@@ -90,6 +137,7 @@ def test_replay_rejects_incomplete_or_illegal_strategy(tmp_path, monkeypatch, ca
     plan = json.loads(capsys.readouterr().out)["plans"][0]
     assert len(plan["configs"]) == 2
     assert plan["operations"]["cached_dispatch"] == [configs[0]]
+    assert plan["operations"]["combine_unweighted"] == sweep.combine_candidates([configs[-1]], ["default"], 20)
     selected["combine_unweighted"]["winner"]["config"] = configs[-1] | {"qps": 99}
     path.write_text(json.dumps(report))
     with pytest.raises(ValueError, match="invalid candidate"):
@@ -98,6 +146,160 @@ def test_replay_rejects_incomplete_or_illegal_strategy(tmp_path, monkeypatch, ca
     path.write_text(json.dumps(report))
     with pytest.raises(ValueError, match="settings must match"):
         sweep.main()
+
+
+def test_replay_preserves_old_and_new_modes():
+    config = sweep.candidates(4, 8, 4)[0]
+    legal = {config["id"]: config}
+    for mode in sweep.SELF_COPY_MODES:
+        old = dict(
+            combine_parallel_self_copy=mode == "parallel_self_copy",
+            combine_self_copy_after_submit=mode == "self_copy_after_submit",
+        )
+        expected = sweep.combine_candidates([config], [mode], 8)[0]
+        assert sweep.replay_config(config, "combine_unweighted", old, legal) == expected
+        assert sweep.replay_config(expected, "combine_unweighted", {}, legal) == expected
+        overridden = sweep.replay_config(expected, "combine_unweighted", {}, legal, "default")
+        assert overridden["self_copy_mode"] == "default"
+        with pytest.raises(ValueError, match="invalid candidate"):
+            sweep.replay_config(expected | {"id": config["id"]}, "combine_unweighted", {}, legal)
+        with pytest.raises(ValueError, match="invalid candidate"):
+            sweep.replay_config(expected, "cached_dispatch", {}, legal)
+
+
+def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatch):
+    """Exercise orchestration without NPU; this is not kernel validation."""
+    from types import ModuleType
+
+    class Tensor:
+        def __getattr__(self, name):
+            return self
+
+        def __call__(self, *args, **kwargs):
+            return self
+
+        def __getitem__(self, key):
+            return self
+
+        def __ne__(self, other):
+            return self
+
+        def __floordiv__(self, other):
+            return self
+
+        def __int__(self):
+            return 0
+
+    tensor = Tensor()
+    instances, measured, configured = [], [], []
+
+    class Buffer:
+        get_buffer_size_hint = staticmethod(lambda *args: 1024)
+
+        def __init__(self, *args, **kwargs):
+            instances.append(self)
+            self.destroyed = False
+
+        def dispatch(self, *args, **kwargs):
+            return tensor, None, None, SimpleNamespace(num_recv_tokens=8192), tensor
+
+        def combine(self, *args, **kwargs):
+            return tensor, tensor
+
+        def destroy(self):
+            self.destroyed = True
+
+    group = SimpleNamespace(agree=lambda value: None)
+    torch = ModuleType("torch")
+    torch.npu = SimpleNamespace(set_device=lambda d: None, synchronize=lambda: None, empty_cache=lambda: None)
+    torch.Generator = lambda: tensor
+    torch.rand = torch.randn = lambda *a, **kw: tensor
+    torch.bfloat16 = "bf16"
+    dist = ModuleType("torch.distributed")
+    dist.TCPStore = lambda *a, **kw: object()
+    torch.distributed = dist
+    names = [
+        "deep_ep",
+        "deep_ep.backends",
+        "deep_ep.backends.direct",
+        "deep_ep.backends.direct.buffer",
+        "deep_ep.backends.direct.elastic",
+        "deep_ep.backends.direct.dtypes",
+        "torch_npu",
+    ]
+    for name in names:
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    elastic = sys.modules["deep_ep.backends.direct.elastic"]
+    elastic.ElasticBuffer = Buffer
+    elastic.__file__ = str(tmp_path / "elastic.py")
+    (tmp_path / "elastic.py").write_text("# fake")
+    native = tmp_path / "_clos_C.so"
+    native.write_bytes(b"fake")
+    (tmp_path / "libdeepep_clos_kernels.so").write_bytes(b"fake")
+    (tmp_path / ".libs").mkdir()
+    (tmp_path / ".libs/libshmem.so").write_bytes(b"fake")
+    sys.modules["deep_ep.backends.direct.dtypes"].topk_idx_t = "int64"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: SimpleNamespace(origin=str(native)))
+    monkeypatch.setattr(sweep, "StoreGroup", lambda *a: group)
+    monkeypatch.setattr(sweep, "configure", lambda b, c: configured.append((b, c)))
+    for name, value in {
+        "RANK": "0",
+        "WORLD_SIZE": "4",
+        "LOCAL_RANK": "0",
+        "MASTER_ADDR": "localhost",
+        sweep.COMBINE_SELF_COPY_ENV: "0",
+        sweep.COMBINE_AFTER_SUBMIT_ENV: "0",
+        "DEEPEP_CLOS_TUNING_SESSION": "0",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invoke, logical_bytes, samples):
+        measured.append((op, directory.name, configs))
+        for c in configs:
+            sweep.activate_candidate(torch, buffer, c)
+            invoke()
+        return [
+            dict(config=c, GBps=100 + i, mean_us=10, samples_per_rank=samples)
+            for i, c in reversed(list(enumerate(configs)))
+        ]
+
+    monkeypatch.setattr(sweep, "measure", measure)
+    out = tmp_path / "run"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sweep",
+            "--ep-size",
+            "4",
+            "--case",
+            "8192,2816,8,8",
+            "--case",
+            "8192,2816,8,20",
+            "--smoke",
+            "--output",
+            str(out),
+            "--combine-self-copy-modes",
+            *sweep.SELF_COPY_MODES,
+        ],
+    )
+    sweep.main()
+    assert len(instances) == 1 and instances[0].destroyed
+    assert all(b is instances[0] for b, c in configured)
+    coarse = [(op, cs) for op, name, cs in measured if name.endswith("_coarse")]
+    assert len(coarse) == 4  # two AIVs, two operators; dispatch is not repeated per mode
+    for op, cs in coarse:
+        if op == "cached_dispatch":
+            assert all("self_copy_mode" not in c for c in cs)
+        else:
+            assert {c["self_copy_mode"] for c in cs} == set(sweep.SELF_COPY_MODES)
+    report = json.loads((out / "report.json").read_text())
+    assert report["buffer_initializations"] == 1 and len(report["results"]) == 2
+    for result in report["results"]:
+        winner = result["operations"]["combine_unweighted"]["winner"]
+        assert "self_copy_mode" in winner["config"] and len(winner["repeats"]) == 2
 
 
 @pytest.mark.parametrize("combine", [False, True])

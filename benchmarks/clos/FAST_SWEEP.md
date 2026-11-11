@@ -62,6 +62,28 @@ and starts it after posting remote requests and terminal markers. This mode
 uses `DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT=1` and is exclusive with the
 spare-AIV mode. Both switches default off.
 
+To sweep all three self-copy modes without reinitializing SHMEM, replace either
+single-mode switch with:
+
+```bash
+--combine-self-copy-modes default parallel_self_copy self_copy_after_submit \
+--case 8192,2816,8,8 --case 8192,2816,8,20
+```
+
+Launch once per EP. Both AIV settings, all sending strategies, all three combine
+modes and the confirmation rounds share one Buffer per rank. EP4/8/16/32 still
+require four separate launches because communication group membership changes.
+Omit `--quick` to include all four peer orders. Cached dispatch is measured only
+once per sending strategy; combine candidates include the self-copy mode in their
+IDs. If no spare AIV exists and default mode is included, the equivalent
+parallel-self-copy candidate is skipped. Each switch drains previous device work
+before changing the host flags; the next invocation starts with the usual Buffer
+barrier. This uses the existing per-call native flags and does not change kernels.
+Mixed-mode runs require the Host and Device build containing both modes
+(`371039b` or later); copying this script onto an older build is insufficient.
+The top candidates are selected across modes together. `best_configs.json` and
+`summary.csv` record the winning self-copy mode as well as the sending strategy.
+
 The script scopes the separate pre-combine notify to profile capture, preserving
 the PR's profiling-only behavior. Every call starts with a device Buffer barrier;
 L2 eviction, when enabled, follows the barrier and precedes the measured API.
@@ -91,6 +113,10 @@ For replay, copy node0's `report.json` to every machine and add
 `--replay-report /path/to/report.json` to the same command with a fresh RUN_ID.
 Keep the cases, EP, experts, seed, group size, L2 and page options unchanged.
 Only each operator's winning configuration is rerun, still with one initialization.
+Replay restores the saved combine mode, including the report-level flags in older
+reports. To compare the same strategy in another mode, explicitly pass one mode
+with `--combine-self-copy-modes MODE` (or either legacy single-mode flag).
+Multi-mode scanning and winner replay are separate operations.
 Accept a run only when every rank has exit code 0, complete=true and
 buffer_initializations=1. Missing/reordered kernels fail the run.
 

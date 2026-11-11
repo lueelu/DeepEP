@@ -20,6 +20,7 @@ import zlib
 ORDERS = ("rank", "group", "group_staggered", "group_round_robin")
 COMBINE_SELF_COPY_ENV = "DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY"
 COMBINE_AFTER_SUBMIT_ENV = "DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT"
+SELF_COPY_MODES = ("default", "parallel_self_copy", "self_copy_after_submit")
 SHAPES = ((8192, 2816, 8, 32), (16384, 7168, 6, 64))
 
 
@@ -61,6 +62,41 @@ def parse_shape(value):
     return dict(tokens=tokens, hidden=hidden, topk=topk, aiv=aiv)
 
 
+def combine_candidates(configs, modes, aiv):
+    """Mode is part of candidate identity, including in confirmations/replay."""
+    return [
+        c | {"id": f"{c['id']}__{mode}", "self_copy_mode": mode}
+        for c in configs
+        for mode in modes
+        if not (mode == "parallel_self_copy" and "default" in modes and c["payload_aivs"] >= aiv)
+    ]
+
+
+def replay_config(config, op, report, legal, mode_override=None):
+    # Old reports stored the mode at report level; retain that behavior on replay.
+    mode = config.get("self_copy_mode")
+    if mode is not None:
+        if op != "combine_unweighted" or mode not in SELF_COPY_MODES:
+            raise ValueError("replay contains an invalid candidate mode")
+        suffix = "__" + mode
+        if not config["id"].endswith(suffix):
+            raise ValueError("replay contains an invalid candidate id")
+        base = {k: v for k, v in config.items() if k != "self_copy_mode"}
+        base["id"] = base["id"][: -len(suffix)]
+    else:
+        base = config
+        parallel = report.get("combine_parallel_self_copy", False)
+        after = report.get("combine_self_copy_after_submit", False)
+        if parallel and after:
+            raise ValueError("replay contains conflicting self-copy modes")
+        mode = "parallel_self_copy" if parallel else "self_copy_after_submit" if after else "default"
+    if base != legal.get(base["id"]):
+        raise ValueError("replay contains an invalid candidate")
+    if mode_override is not None:
+        mode = mode_override
+    return combine_candidates([base], [mode], 64)[0] if op == "combine_unweighted" else base
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ep-size", type=int, choices=(2, 4, 8, 16, 32, 64, 128, 256), default=64)
@@ -87,10 +123,37 @@ def parse_args(argv=None):
     self_copy.add_argument(
         "--combine-self-copy-after-submit", action="store_true", help="submit remote combine before self-copy"
     )
+    self_copy.add_argument(
+        "--combine-self-copy-modes",
+        nargs="+",
+        choices=SELF_COPY_MODES,
+        help="sweep these combine modes in the same Buffer session",
+    )
     p.add_argument("--replay-report", type=Path, help="rerun each operator's winner from a prior report")
     p.add_argument("--smoke", action="store_true", help="one legal candidate per peer order")
     p.add_argument("--plan-only", action="store_true")
     args = p.parse_args(argv)
+    if args.replay_report and args.combine_self_copy_modes and len(args.combine_self_copy_modes) != 1:
+        p.error("replay accepts only one explicit self-copy mode")
+    args.replay_mode_override = (
+        args.combine_self_copy_modes[0]
+        if args.combine_self_copy_modes and args.replay_report
+        else "parallel_self_copy"
+        if args.combine_parallel_self_copy
+        else "self_copy_after_submit"
+        if args.combine_self_copy_after_submit
+        else None
+    )
+    if args.combine_self_copy_modes is None:
+        args.combine_self_copy_modes = [
+            "parallel_self_copy"
+            if args.combine_parallel_self_copy
+            else "self_copy_after_submit"
+            if args.combine_self_copy_after_submit
+            else "default"
+        ]
+    if len(set(args.combine_self_copy_modes)) != len(args.combine_self_copy_modes):
+        p.error("duplicate self-copy modes")
     args.ranks_per_group = min(8, args.ep_size) if args.ranks_per_group is None else args.ranks_per_group
     if args.ranks_per_group < 1 or args.ep_size % args.ranks_per_group:
         p.error("ranks-per-group must be a positive EP divisor")
@@ -190,6 +253,22 @@ def configure(buffer, config):
     buffer._udma_workers_per_peer, buffer._udma_qps_per_worker = config["workers"], config["qps"]
 
 
+def activate_candidate(torch, buffer, config):
+    # Drain all previous device work before changing host launch flags or QP routing.
+    # The next call's Buffer barrier aligns ranks before the measured invocation.
+    torch.npu.synchronize()
+    mode = config.get("self_copy_mode", "default")
+    if mode not in SELF_COPY_MODES:
+        raise ValueError(f"unknown self-copy mode: {mode}")
+    os.environ[COMBINE_SELF_COPY_ENV] = "0"
+    os.environ[COMBINE_AFTER_SUBMIT_ENV] = "0"
+    if mode == "parallel_self_copy":
+        os.environ[COMBINE_SELF_COPY_ENV] = "1"
+    elif mode == "self_copy_after_submit":
+        os.environ[COMBINE_AFTER_SUBMIT_ENV] = "1"
+    configure(buffer, config)
+
+
 def parse_capture(directory, op, configs, warmup, samples):
     paths = list(directory.rglob("kernel_details.csv"))
     if len(paths) != 1:
@@ -285,11 +364,11 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
             ),
         ),
     ):
-        configure(buffer, configs[0])
+        activate_candidate(torch, buffer, configs[0])
         for _ in range(2):
             call()
         for index, config in enumerate(configs):
-            configure(buffer, config)
+            activate_candidate(torch, buffer, config)
             for _ in range(args.warmup + samples + 2):
                 call()
             if group.rank() == 0 and (index % 20 == 0 or index == len(configs) - 1):
@@ -360,17 +439,24 @@ def main():
             raise ValueError(f"no legal candidates for {shape}")
         if args.smoke:
             configs = [next(c for c in configs if c["order"] == o) for o in dict.fromkeys(c["order"] for c in configs)]
-        operations = None
+        operations = {
+            "cached_dispatch": configs,
+            "combine_unweighted": combine_candidates(configs, args.combine_self_copy_modes, shape["aiv"]),
+        }
         if replay:
             prior = next(r for r in replay["results"] if r["shape"] == shape)
             if set(prior["operations"]) != {"cached_dispatch", "combine_unweighted"}:
                 raise ValueError("replay must include both measured operators")
-            operations = {op: [r["winner"]["config"]] for op, r in prior["operations"].items()}
             legal = {c["id"]: c for c in candidates(args.ep_size, shape["aiv"], args.ranks_per_group)}
-            if any(c != legal.get(c["id"]) for cs in operations.values() for c in cs):
-                raise ValueError("replay contains an invalid candidate")
+            operations = {
+                op: [replay_config(r["winner"]["config"], op, replay, legal, args.replay_mode_override)]
+                for op, r in prior["operations"].items()
+            }
             configs = list({c["id"]: c for cs in operations.values() for c in cs}.values())
         plans.append(dict(shape=shape, configs=configs, operations=operations))
+    effective_modes = list(
+        dict.fromkeys(c["self_copy_mode"] for p in plans for c in p["operations"]["combine_unweighted"])
+    )
     if args.plan_only:
         print(json.dumps(dict(ep=args.ep_size, plans=plans), indent=2))
         return
@@ -399,8 +485,8 @@ def main():
     elastic_module._validate_group_consensus = lambda g, name, value: group.agree([name, value])
     group.agree([vars(args) | {"output": None, "case": shapes, "replay_report": None}, plans])
     os.environ["DEEPEP_CLOS_TUNING_SESSION"] = "1"
-    os.environ[COMBINE_SELF_COPY_ENV] = "1" if args.combine_parallel_self_copy else "0"
-    os.environ[COMBINE_AFTER_SUBMIT_ENV] = "1" if args.combine_self_copy_after_submit else "0"
+    os.environ[COMBINE_SELF_COPY_ENV] = "0"
+    os.environ[COMBINE_AFTER_SUBMIT_ENV] = "0"
     for name, value in os.environ.items():
         if (
             name.startswith("DEEPEP_CLOS_")
@@ -439,8 +525,9 @@ def main():
             workspace_bytes=workspace,
             huge_pages=args.huge_pages,
             flush_l2=args.flush_l2_cache,
-            combine_parallel_self_copy=args.combine_parallel_self_copy,
-            combine_self_copy_after_submit=args.combine_self_copy_after_submit,
+            combine_parallel_self_copy=effective_modes == ["parallel_self_copy"],
+            combine_self_copy_after_submit=effective_modes == ["self_copy_after_submit"],
+            combine_self_copy_modes=effective_modes,
             pre_combine_notify=True,
             precision_checked=False,
         ),
@@ -485,7 +572,7 @@ def main():
             from deep_ep.backends.direct.dtypes import topk_idx_t
 
             idx = routes.to(dtype=topk_idx_t, device="npu")
-            configure(buffer, configs[0])
+            activate_candidate(torch, buffer, plan["operations"]["cached_dispatch"][0])
             fresh = buffer.dispatch(
                 x, topk_idx=idx, num_experts=args.experts, num_sms=a, do_expand=False, async_with_compute_stream=True
             )
@@ -505,7 +592,7 @@ def main():
             item = dict(shape=shape, operations={})
             for op, invoke in invocations.items():
                 logical_bytes = (handle.num_recv_tokens if op == "cached_dispatch" else send_rows) * h * 2
-                op_configs = plan["operations"][op] if plan["operations"] else configs
+                op_configs = plan["operations"][op]
                 coarse = measure(
                     torch,
                     torch_npu,
@@ -579,8 +666,9 @@ def main():
                 ranks_per_group=args.ranks_per_group,
                 huge_pages=args.huge_pages,
                 flush_l2=args.flush_l2_cache,
-                combine_parallel_self_copy=args.combine_parallel_self_copy,
-                combine_self_copy_after_submit=args.combine_self_copy_after_submit,
+                combine_parallel_self_copy=effective_modes == ["parallel_self_copy"],
+                combine_self_copy_after_submit=effective_modes == ["self_copy_after_submit"],
+                combine_self_copy_modes=effective_modes,
                 pre_combine_notify=True,
                 seed=args.seed,
                 bandwidth_formula="sum(rank payload bytes including self) / sum(rank mean communication us) / 1000",
@@ -600,6 +688,7 @@ def main():
                 "aiv",
                 "operator",
                 "config",
+                "self_copy_mode",
                 "GBps_min",
                 "GBps_max",
                 "comm_us_min",
@@ -614,6 +703,7 @@ def main():
                         **item["shape"],
                         operator=item["operator"],
                         config=item["config"]["id"],
+                        self_copy_mode=item["config"].get("self_copy_mode", "not_applicable"),
                         GBps_min=min(r["GBps"] for r in runs),
                         GBps_max=max(r["GBps"] for r in runs),
                         comm_us_min=min(r["mean_us"] for r in runs),
