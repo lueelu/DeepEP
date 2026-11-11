@@ -57,6 +57,10 @@ For an A/B run, replay the same strategy with and without
 passes `DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY=1` for unweighted V2 peer combine.
 When the strategy leaves spare AIVs, they take all self-copy channels. When
 there are no spare AIVs, each core keeps its original channel.
+`--combine-self-copy-after-submit` keeps each AIV's original self-copy channel
+and starts it after posting remote requests and terminal markers. This mode
+uses `DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT=1` and is exclusive with the
+spare-AIV mode. Both switches default off.
 
 The script scopes the separate pre-combine notify to profile capture, preserving
 the PR's profiling-only behavior. Every call starts with a device Buffer barrier;

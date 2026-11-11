@@ -138,6 +138,7 @@ struct alignas(8) CombineTilingData {
     uint32_t udma_workers_per_peer = 1;
     uint32_t udma_qps_per_worker = 1;
     uint32_t udma_self_copy_first_aiv = 0;
+    uint32_t udma_self_copy_after_submit = 0;
 };
 
 struct alignas(8) ExpandTilingData {

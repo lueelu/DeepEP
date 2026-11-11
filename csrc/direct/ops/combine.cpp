@@ -317,7 +317,12 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     if (use_udma && epilogue && !tiling.udma_token_schedule && !topk_weights && !aggregate && !expanded_x &&
         !pipeline_chunk_tokens) {
         const char* overlap = std::getenv("DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY");
-        if (overlap && overlap[0] == '1' && overlap[1] == '\0') {
+        const char* after_submit = std::getenv("DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT");
+        const bool use_spare_aivs = overlap && overlap[0] == '1' && overlap[1] == '\0';
+        tiling.udma_self_copy_after_submit = after_submit && after_submit[0] == '1' && after_submit[1] == '\0';
+        TORCH_CHECK(!(use_spare_aivs && tiling.udma_self_copy_after_submit),
+                    "combine self-copy modes are mutually exclusive");
+        if (use_spare_aivs) {
             tiling.udma_self_copy_first_aiv = ascend_deepep::udma::MetadataFirst(
                 tiling.world_size, tiling.udma_peers_per_worker, tiling.num_channels,
                 tiling.udma_peer_order, tiling.udma_ranks_per_group, tiling.udma_workers_per_peer);

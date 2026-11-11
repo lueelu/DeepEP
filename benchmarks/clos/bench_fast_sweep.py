@@ -19,6 +19,7 @@ import zlib
 
 ORDERS = ("rank", "group", "group_staggered", "group_round_robin")
 COMBINE_SELF_COPY_ENV = "DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY"
+COMBINE_AFTER_SUBMIT_ENV = "DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT"
 SHAPES = ((8192, 2816, 8, 32), (16384, 7168, 6, 64))
 
 
@@ -79,7 +80,13 @@ def parse_args(argv=None):
     p.add_argument("--quick", action="store_true", help="rank and group_round_robin search")
     p.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--flush-l2-cache", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--combine-parallel-self-copy", action="store_true", help="use spare AIVs for combine self-copy")
+    self_copy = p.add_mutually_exclusive_group()
+    self_copy.add_argument(
+        "--combine-parallel-self-copy", action="store_true", help="use spare AIVs for combine self-copy"
+    )
+    self_copy.add_argument(
+        "--combine-self-copy-after-submit", action="store_true", help="submit remote combine before self-copy"
+    )
     p.add_argument("--replay-report", type=Path, help="rerun each operator's winner from a prior report")
     p.add_argument("--smoke", action="store_true", help="one legal candidate per peer order")
     p.add_argument("--plan-only", action="store_true")
@@ -393,11 +400,12 @@ def main():
     group.agree([vars(args) | {"output": None, "case": shapes, "replay_report": None}, plans])
     os.environ["DEEPEP_CLOS_TUNING_SESSION"] = "1"
     os.environ[COMBINE_SELF_COPY_ENV] = "1" if args.combine_parallel_self_copy else "0"
+    os.environ[COMBINE_AFTER_SUBMIT_ENV] = "1" if args.combine_self_copy_after_submit else "0"
     for name, value in os.environ.items():
         if (
             name.startswith("DEEPEP_CLOS_")
             and value not in ("", "0")
-            and name not in ("DEEPEP_CLOS_TUNING_SESSION", COMBINE_SELF_COPY_ENV)
+            and name not in ("DEEPEP_CLOS_TUNING_SESSION", COMBINE_SELF_COPY_ENV, COMBINE_AFTER_SUBMIT_ENV)
         ):
             raise RuntimeError(f"conflicting experimental environment: {name}")
     group.agree(plans)
@@ -432,6 +440,7 @@ def main():
             huge_pages=args.huge_pages,
             flush_l2=args.flush_l2_cache,
             combine_parallel_self_copy=args.combine_parallel_self_copy,
+            combine_self_copy_after_submit=args.combine_self_copy_after_submit,
             pre_combine_notify=True,
             precision_checked=False,
         ),
@@ -571,6 +580,7 @@ def main():
                 huge_pages=args.huge_pages,
                 flush_l2=args.flush_l2_cache,
                 combine_parallel_self_copy=args.combine_parallel_self_copy,
+                combine_self_copy_after_submit=args.combine_self_copy_after_submit,
                 pre_combine_notify=True,
                 seed=args.seed,
                 bandwidth_formula="sum(rank payload bytes including self) / sum(rank mean communication us) / 1000",
