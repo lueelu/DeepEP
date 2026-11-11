@@ -14,3 +14,5 @@ Modified by Joyce_An 2026
 Host 封装位于 `csrc/ops`，本目录的设备入口由 `cmake/device/CMakeLists.txt` 构建到同一个
 `libdeepep_kernels.so`。
 接口和测试命令见 [Elastic 文档](../../docs/elastic.md)。
+
+UBX 的 RDMA route-plan Combine 单独位于 [`csrc/ubx`](../ubx/)，编译为独立设备库；本目录原有机型实现不参与替换。

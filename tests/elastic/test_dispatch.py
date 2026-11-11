@@ -1917,7 +1917,7 @@ def test_direct_and_external_launcher(monkeypatch):
     parser = argparse.ArgumentParser()
     _add_launch_args(parser)
     args = parser.parse_args(
-        ["--ep-size", "64", "--nproc-per-node", "8", "--node-rank", "5", "--master-addr", "141.61.54.91"]
+        ["--ep-size", "64", "--nproc-per-node", "8", "--node-rank", "5", "--master-addr", "192.0.2.10"]
     )
     calls = []
 
@@ -1935,14 +1935,14 @@ def test_direct_and_external_launcher(monkeypatch):
 
     _launch(args, worker)
     assert calls == [(rank, 64) for rank in range(40, 48)]
-    assert os.environ["DEEPEP_SHMEM_ENDPOINT"] == "tcp://141.61.54.91:8900"
+    assert os.environ["DEEPEP_SHMEM_ENDPOINT"] == "tcp://192.0.2.10:8900"
     calls.clear()
     monkeypatch.setenv("RANK", "23")
     monkeypatch.setenv("WORLD_SIZE", "32")
     monkeypatch.setenv("LOCAL_RANK", "7")
     _launch(args, worker)
     assert calls == [(23, 32)]
-    assert os.environ["DEEPEP_SHMEM_ENDPOINT"] == "tcp://141.61.54.91:8900"
+    assert os.environ["DEEPEP_SHMEM_ENDPOINT"] == "tcp://192.0.2.10:8900"
     monkeypatch.delenv("WORLD_SIZE")
     with pytest.raises(ValueError, match="supplied together"):
         _launch(args, worker)
