@@ -30,7 +30,7 @@ __aicore__ inline int32_t NotifyIntMin(int32_t lhs, int32_t rhs)
 
 } // namespace
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispatch_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void notify_dispatch_kernel(
     GM_ADDR num_tokens_per_rank, GM_ADDR num_tokens_per_expert, GM_ADDR is_token_in_rank, GM_ADDR symmetric_buffer,
     GM_ADDR rank_prefix_matrix, GM_ADDR channel_prefix_matrix, GM_ADDR recv_channel_prefix_matrix,
     GM_ADDR num_recv_tokens,
@@ -413,7 +413,7 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
         dispatch_plan, send_head, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr)
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr)
 {
     util_set_ffts_config(ffts_addr);
     aclshmemi_sync_npu_v4<true>(0);

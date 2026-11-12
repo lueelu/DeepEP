@@ -133,6 +133,12 @@ Mesh+Clos 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `sh
 
 ## 全 Clos 的默认调度与手动调优
 
+全 Clos 中含核间同步或跨核等待的 kernel 入口使用 `__schedmode__(1)`（batch mode），
+等待所需核资源可用后整体调度，避免多 stream 竞争时部分核先启动并阻塞在同步点。
+此设置覆盖 layout、notify、dispatch、combine 通信阶段和 expand；独立 reduce、
+aggregate 和 cached dispatch plan 构建没有跨核同步，保留普通调度。
+batch mode 不替代 stream/event 依赖、跨 rank 完成确认，也不保证所有 rank 同时进入。
+
 V1/V2 在 UDMA 下默认 `udma_auto_policy=True`。机型识别先选择通信实现，
 Clos 策略再选择发送参数。`clos-v4` 将初始化资源与逐次调用的策略分开：
 
