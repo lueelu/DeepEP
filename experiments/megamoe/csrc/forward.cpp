@@ -617,7 +617,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
     c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
     c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
-    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out, int64_t generation)
+    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out, int64_t generation, float activation_clamp)
 {
     const bool urma = backend_ == Backend::Urma;
     CheckTensor(x, 2, "x");
@@ -634,6 +634,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                 "topk_ids must be int32 [BS,TopK]");
     TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32 && topk_weights.sizes() == topk_ids.sizes(),
                 "topk_weights must be FP32 [BS,TopK]");
+    TORCH_CHECK(activation_clamp >= 0.0F, "activation_clamp must be nonnegative and not NaN");
+    tiling_.clampLimit = std::min(activation_clamp, std::numeric_limits<float>::max());
     const bool prequantized = x_scales.has_value();
     TORCH_CHECK(!urma || prequantized, "URMA requires prequantized FP8 input with E8M0 scales");
     TORCH_CHECK(x.scalar_type() == (prequantized ? c10::ScalarType::Float8_e4m3fn : torch::kBFloat16),
@@ -746,6 +748,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     MegaMoeUrma::Arguments* urma_args = nullptr;
     if (urma) {
         auto& args = urma_->args_;
+        args.activationClamp = tiling_.clampLimit;
         args.config.epoch = generation;
         args.x = Address(x);
         args.xScale = Address(*x_scales);

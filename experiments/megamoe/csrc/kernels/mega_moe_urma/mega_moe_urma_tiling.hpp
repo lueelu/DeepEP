@@ -292,6 +292,7 @@ struct Arguments {
     uint64_t systemWorkspace;
     uint64_t ffts;
     uint32_t sharedExperts, sharedIntermediate;
+    float activationClamp;
     uint64_t sharedWeight1, sharedWeight2, sharedScale1, sharedScale2;
     uint64_t sharedGmm1, sharedActivation, sharedActivationScale, sharedOutput;
     uint64_t sharedGmm1Done, sharedActivationDone;

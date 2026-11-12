@@ -25,7 +25,7 @@ def token_indices(bs, check_tokens):
 
 
 def contract(config, world, bs, input_kind, routing, check_tokens):
-    from . import reference
+    from . import reference, numerics
     from .benchmark import inputs
 
     if world <= 0 or config["model"]["num_experts"] % world:
@@ -34,7 +34,7 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
         raise ValueError("Invalid Golden input/routing")
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
-    source = inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
+    source = inspect.getsource(numerics) + inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
     if routing == "random-balanced":
         from .benchmark import ROUTING_SEED, _global_routes, random_balanced_indices
 
@@ -178,7 +178,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
-            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2)
+            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2, model.get("activation_clamp"))
         if route_weight is not None:
             result *= route_weight[:, None]
         return token, result

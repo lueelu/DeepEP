@@ -328,7 +328,7 @@ public:
             HighUbActivation op;
             op.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivation),
                      .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivationScale),
-                     .clampLimit = FLT_MAX,
+                     .clampLimit = a_.activationClamp,
                      .ubOffsetBytes = highUb});
             const uint32_t inter = a_.sharedIntermediate, n = tile * 256U;
             op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * inter),
@@ -406,7 +406,7 @@ __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Tim
     // which clamps every up value to zero and makes the entire FFN zero.
     epilogue.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(args.activation),
                    .yScaleGmAddr = reinterpret_cast<GM_ADDR>(args.activationScale),
-                   .clampLimit = FLT_MAX});
+                   .clampLimit = args.activationClamp});
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;

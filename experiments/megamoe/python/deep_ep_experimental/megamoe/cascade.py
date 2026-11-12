@@ -10,6 +10,7 @@ Golden contract. This module does not import Torch or initialize HCCL on import.
 
 import math
 import struct
+from .numerics import normalize_clamp
 
 
 def _positive_fp32(name, value):
@@ -103,6 +104,7 @@ class CascadeReference:
         self.topk = int(model["num_topk"])
         self.shared_experts = int(model["num_shared_experts"])
         self.shared_intermediate = int(model.get("shared_intermediate_hidden", self.intermediate))
+        self.activation_clamp = normalize_clamp(model.get("activation_clamp"))
         self.shared_output_rounding = model.get("shared_output_rounding", "single_cast")
         if self.experts <= 0 or self.experts % self.world:
             raise ValueError("Cascade requires global experts divisible by EP world size")
@@ -262,6 +264,8 @@ class CascadeReference:
         torch = self.torch
         if self.activation == "swiglu":
             gate, up = first.to(torch.float32).chunk(2, dim=-1)
+            gate = torch.clamp_max(gate, self.activation_clamp)
+            up = torch.clamp(up, -self.activation_clamp, self.activation_clamp)
             activated = gate * torch.sigmoid(gate) * up
         else:
             # Official aclnnSituGlu takes planar [gate | up], computes in FP32

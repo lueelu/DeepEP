@@ -8,6 +8,7 @@ are modeled; this is not a bitwise emulator of Cube accumulation or exp.
 """
 
 import numpy as np
+from .numerics import normalize_clamp
 
 FP4 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 _code = np.arange(127)
@@ -81,9 +82,12 @@ def make_weights(experts, hidden, intermediate, seed):
     return tuple(result)
 
 
-def expert_forward(x, w1, w2):
+def expert_forward(x, w1, w2, activation_clamp=None):
     first = bf16(x @ w1.T)
     gate, up = np.split(first, 2, axis=-1)
+    limit = normalize_clamp(activation_clamp)
+    gate = np.minimum(gate, limit)
+    up = np.clip(up, -limit, limit)
     activated = bf16(gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up)
     quantized = dequantize_input(*quantize_input(activated))
     return bf16(quantized @ w2.T)

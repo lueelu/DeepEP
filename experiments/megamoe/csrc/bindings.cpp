@@ -11,7 +11,7 @@ namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
 {
     using deepep::megamoe::Plan;
-    module.attr("api_protocol") = 8;
+    module.attr("api_protocol") = 9;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size, py::arg("world"), py::arg("experts"), py::arg("tokens"),
                py::arg("topk"), py::arg("hidden"), py::arg("backend") = "mte");
@@ -25,7 +25,7 @@ PYBIND11_MODULE(_C, module)
         .def("forward", &Plan::forward, py::arg("x"), py::arg("x_scales"), py::arg("topk_ids"), py::arg("topk_weights"),
              py::arg("weight1"), py::arg("weight2"), py::arg("weight_scales1"), py::arg("weight_scales2"),
              py::arg("timer"), py::arg("shared_weight1"), py::arg("shared_weight2"), py::arg("shared_weight_scales1"),
-             py::arg("shared_weight_scales2"), py::arg("out"), py::arg("generation") = 0)
+             py::arg("shared_weight_scales2"), py::arg("out"), py::arg("generation") = 0, py::arg("activation_clamp") = std::numeric_limits<float>::max())
         .def_property_readonly("workspace_bytes", &Plan::workspace_bytes);
     module.def("ffts_config", [] { return shmemx_get_ffts_config(); });
     module.attr("timer_numel") = AscendTimer::TOTAL_BUFFER_SIZE;

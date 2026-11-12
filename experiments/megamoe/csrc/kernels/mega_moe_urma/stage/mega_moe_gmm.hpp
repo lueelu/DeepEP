@@ -419,7 +419,7 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
     // which clamps every up value to zero and makes the entire FFN zero.
     epilogue.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(args.activation),
                    .yScaleGmAddr = reinterpret_cast<GM_ADDR>(args.activationScale),
-                   .clampLimit = FLT_MAX});
+                   .clampLimit = args.activationClamp});
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
@@ -534,7 +534,7 @@ public:
     {
         op_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
                   .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
-                  .clampLimit = FLT_MAX,
+                  .clampLimit = a.activationClamp,
                   .ubOffsetBytes = 0U});
         op_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
     }

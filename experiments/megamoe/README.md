@@ -37,7 +37,11 @@ def fp8_fp4_mega_moe(
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
 
-`recipe/activation/activation_clamp/fast_math` 当前仅支持签名中的默认值。所有张量在 buffer 所在 NPU 上。
+`recipe/activation/fast_math` 当前仅支持签名中的默认值。
+`activation_clamp` 支持非负 FP32 上限；`None` 或正无穷等价于 FLT_MAX。
+MTE/URMA 均在 SwiGLU 前将 gate 上截断至 limit，up 截断至 [-limit, limit]，路由和共享专家均适用。
+例如 `fp8_fp4_mega_moe(y, w1, w2, buffer, activation_clamp=7.0)`。
+CPU Golden 和级联参考同步应用该限制。MTE SwiGLU 使用与级联参考一致的 FP32 sigmoid 后乘 gate 顺序，随后才进行 BF16 舍入/MX 量化。所有张量在 buffer 所在 NPU 上。
 FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示打包，不是重新量化。
 
 权重在测试/推理前转换一次，转换过程不计入性能测量：

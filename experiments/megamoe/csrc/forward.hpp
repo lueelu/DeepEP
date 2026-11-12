@@ -7,6 +7,7 @@
 #include <tuple>
 #include <memory>
 #include <string>
+#include <limits>
 #include "kernel_launch.hpp"
 #include <torch/extension.h>
 #include "kernels/mega_moe_common/mega_moe_tiling.hpp"
@@ -36,7 +37,8 @@ public:
         torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
         c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
         c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
-        c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out, int64_t generation = 0);
+        c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out, int64_t generation = 0,
+        float activation_clamp = std::numeric_limits<float>::max());
 
     int64_t workspace_bytes() const;
 

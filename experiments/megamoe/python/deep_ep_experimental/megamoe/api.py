@@ -15,6 +15,7 @@ from ._runtime import _MegaRuntime
 from deep_ep._native import npu_api, require_native
 from deep_ep._store import StoreGroup
 from .validation import check_routing, collective_check
+from .numerics import normalize_clamp
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -32,7 +33,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 8:
+    if getattr(extension, "api_protocol", None) != 9:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -406,6 +407,7 @@ def mega_moe(
     shared_l2_weights=None,
     out=None,
     timer=None,
+    activation_clamp=None,
 ):
     """Explicit-input convenience API; prefer fp8_fp4_mega_moe for DeepGEMM-style use.
 
@@ -425,6 +427,7 @@ def mega_moe(
         shared_l2_weights=shared_l2_weights,
         out=out,
         timer=timer,
+        activation_clamp=activation_clamp,
     )
 
 
@@ -441,6 +444,7 @@ def _run(
     out=None,
     timer=None,
     cumulative_stats=None,
+    activation_clamp=None,
 ):
     import torch
 
@@ -456,6 +460,7 @@ def _run(
         sw1, ss1 = _pair(shared_l1_weights, "shared_l1_weights")
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
         shared = (sw1, sw2, ss1, ss2)
+    clamp = normalize_clamp(activation_clamp)
     b = sym_buffer
     urma = b._backend_name == "urma"
     if urma and scales is None:
@@ -540,7 +545,7 @@ def _run(
                 b._prepare(data.shape[0])
                 b._generation += 1
                 result = b._plan.forward(
-                    data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out, b._generation
+                    data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out, b._generation, clamp
                 )
             except Exception as error:
                 if urma:
@@ -580,8 +585,8 @@ def fp8_fp4_mega_moe(
     timer is a fresh buffer.allocate_timer() for a separate diagnostic call.
     Routed weights are applied after GMM2; see README numerical compatibility.
     """
-    if recipe != (1, 1, 32) or activation != "swiglu" or activation_clamp is not None or fast_math is not True:
-        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, no clamp, default math only")
+    if recipe != (1, 1, 32) or activation != "swiglu" or fast_math is not True:
+        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, default math only")
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
     import torch
@@ -604,4 +609,5 @@ def fp8_fp4_mega_moe(
         out=y,
         timer=timer,
         cumulative_stats=cumulative_local_expert_recv_stats,
+        activation_clamp=activation_clamp,
     )

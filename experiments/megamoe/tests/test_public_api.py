@@ -198,6 +198,7 @@ def backend(monkeypatch):
             shared_s2,
             out,
             generation=0,
+            activation_clamp=None,
         ):
             args = (
                 x,
@@ -217,6 +218,7 @@ def backend(monkeypatch):
                 generation,
             )
             events.append(("launch", args))
+            events.append(("activation_clamp", activation_clamp))
             output = out if out is not None else Tensor(np.zeros(x.shape), "bfloat16")
             output.data.fill(3)
             if self.backend == "urma" and timer is not None:
@@ -639,3 +641,11 @@ def test_urma_plan_allocation_failure_poisoned_without_caching_shape(backend, mo
     finally:
         backend.ext.Plan = original_plan
         b.destroy()
+
+
+def test_activation_clamp_reaches_native_forward(backend):
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=0.25)
+    assert ("activation_clamp", 0.25) in backend.events
+    with pytest.raises(ValueError, match="activation_clamp"):
+        api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=-1)

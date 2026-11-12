@@ -25,7 +25,7 @@ def load_config(name, bs_values=None):
     required = {"schema_version", "model", "bs_values", "warmup", "iters", "seed"}
     if not required <= set(config) or set(config) - required - {"alignment"} or config["schema_version"] != 1:
         raise ValueError("Invalid config schema; see the packaged smoke.json")
-    if set(config["model"]) - {"shared_intermediate_hidden", "shared_output_rounding"} != {
+    if set(config["model"]) - {"shared_intermediate_hidden", "shared_output_rounding", "activation_clamp"} != {
         "hidden",
         "intermediate_hidden",
         "num_experts",
@@ -317,7 +317,7 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
-        **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding")},
+        **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
 
     def device_pair(pair):
@@ -391,6 +391,7 @@ def run(args, config, group):
                 cumulative_local_expert_recv_stats=stats,
                 x=activation,
                 timer=timer,
+                activation_clamp=model.get("activation_clamp"),
                 **shared_kwargs,
             )
 
