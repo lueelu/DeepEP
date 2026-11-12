@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernels/combine/udma_combine_sender.h"
+#include "kernels/combine/udma_combine_self_copy.h"
 #include "common/types.h"
 #include "kernels/aggregate/aggregate_pipeline.h"
 #include "kernels/combine/udma_combine_weights.h"
@@ -26,7 +27,6 @@ __aicore__ inline void CombineRemoteImpl(
     rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
     // Dispatch stores all channels of one source rank contiguously. Ownership
     // here is per peer, so channel boundaries need not split the return stream.
-    (void)channel_prefix;
     const uint32_t fields = td.has_topk_weights && !simt_weights ? 2U : 1U;
     uint32_t row[Capacity]{}, end[Capacity]{}, loaded[Capacity]{}, cursor[Capacity]{}, field[Capacity]{};
     uint32_t ready_chunk[Capacity];
@@ -99,7 +99,22 @@ __aicore__ inline void CombineRemoteImpl(
         sender.Flush(); // Drain WQE staging, not the asynchronous payload reads.
     } else {
         sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
-        WaitIncoming<false>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, td.num_channels, td.udma_workers_per_peer * Qps);
+        if constexpr (Phase == 0) {
+            if (td.udma_self_copy_after_submit) {
+                // SIMT weight AIVs finish CombineRemoteWeights (V_S) above before
+                // copying their self channels. Payload AIVs have posted all
+                // UDMA requests, including weights when no spare AIV exists.
+                // Self writes use (rank * capacity + token) on this rank;
+                // remote contributors use their own rank slots, so neither
+                // payload nor weight self stores collide with incoming writes.
+                // The SQ now owns the WQEs. Finish MTE3's reads of the reused
+                // UB before self-copy loads use it, while UDMA reads GM payload.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
+            }
+        }
+        WaitIncoming<false>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, td.block_dim, td.udma_workers_per_peer * Qps);
         sender.Quiet();
         // UDMA SO markers do not cover SIMT stores issued by other AIVs.
         // Match Dispatch's full-rank completion before Reduce/workspace reuse.

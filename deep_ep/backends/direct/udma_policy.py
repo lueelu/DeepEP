@@ -10,7 +10,8 @@ from .config import Config, _MAX_NUM_AIV
 @lru_cache(maxsize=128)
 def _warn_ignored(name, supplied, effective):
     logging.getLogger(__name__).warning(
-        "UDMA auto policy: ignoring explicit %s=%s; effective %s=%s. "
+        "UDMA auto policy: ignoring explicit %s=%s; constructor fallback %s=%s. "
+        "The effective launch plan also depends on shape and communication cores. "
         "Set udma_auto_policy=False to enable manual tuning.",
         name,
         supplied,
@@ -76,10 +77,17 @@ class UdmaPolicy:
     workers_per_peer: int
     qps_per_worker: int
     wqes_per_visit: int
-    version: str = "clos-v2"
+    version: str = "clos-v4"
+    ranks_per_group: int = 0
+    topology_known: bool = False
+    peer_order: int = 0
+    self_copy: int = 0  # 0: before send; 1: spare AIVs; 2: after submit.
+    weight_mode: int = 0  # 0: legacy; 1: UDMA; 2: SIMT when spare AIVs exist.
 
     @property
     def send_workers(self):
+        if self.peer_order == 3:
+            return ((self.ranks_per_group - 1) // self.peers_per_worker + 1) * self.workers_per_peer
         return ((self.world_size - 2) // self.peers_per_worker + 1) * self.workers_per_peer
 
     def signature(self):
@@ -90,6 +98,8 @@ class UdmaPolicy:
             self.workers_per_peer,
             self.qps_per_worker,
             self.wqes_per_visit,
+            self.ranks_per_group,
+            self.topology_known,
         )
 
     def validate_num_aiv(self, num_aiv):
@@ -108,12 +118,10 @@ class UdmaPolicy:
 
     @lru_cache(maxsize=512, typed=True)
     def for_num_aiv(self, num_aiv):
-        """Fit peer ownership to the operation budget without changing QP lanes.
+        """Fit ownership without mutating resources or another handle's plan.
 
-        PeerMask provisions all P=1/2/4/8 mappings for this immutable W/Q.
-        W is at most two in auto mode, so every supported even core budget
-        can retain W; only the peer count may need to grow. No runtime state
-        changes, including when different handles use different core counts.
+        Grow P first, then use single-worker round robin if rank ownership
+        cannot fit. Every candidate must fit the reserved mapping union.
         """
         if isinstance(num_aiv, bool) or not isinstance(num_aiv, int):
             raise TypeError("num_aiv/num_sms must be an integer")
@@ -123,8 +131,109 @@ class UdmaPolicy:
         policy = self
         while policy.send_workers > budget and policy.peers_per_worker < 8:
             policy = replace(policy, peers_per_worker=policy.peers_per_worker * 2)
+        if policy.send_workers > budget:
+            # Rank ownership cannot fit EP128/AIV8. Logical groups are a
+            # correctness fallback, never evidence of physical server locality.
+            group = self.ranks_per_group or _logical_group(self.world_size)
+            for p in (1, 2, 4):
+                candidate = replace(
+                    self, ranks_per_group=group, peer_order=3, peers_per_worker=p, workers_per_peer=1, qps_per_worker=1
+                )
+                if candidate.send_workers <= min(32, num_aiv or 32) and candidate.valid_group_capacity():
+                    policy = candidate
+                    break
         policy.validate_num_aiv(num_aiv)
         return policy
+
+    def valid_group_capacity(self):
+        if self.peer_order != 3:
+            return True
+        owners = self.send_workers // self.workers_per_peer
+        return ((self.ranks_per_group + owners - 1) // owners) * (self.world_size // self.ranks_per_group) <= 64
+
+    def native_plan(self):
+        """Versioned, per-launch value. No mutation of Buffer or SHMEM state."""
+        return [
+            1,
+            self.peer_order,
+            self.ranks_per_group,
+            self.peers_per_worker,
+            self.workers_per_peer,
+            self.qps_per_worker,
+            self.wqes_per_visit,
+            self.self_copy,
+            self.weight_mode,
+        ]
+
+    def bind_group(self, group):
+        """Collect host identities once at construction, in EP-rank order."""
+        from pathlib import Path
+        import uuid
+        from ..._machine import gather_records
+
+        # Boot identity is shared across containers on the same Linux host.
+        # Never guess G from the process count or a user-overridden hostname.
+        try:
+            host = uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+            identity = str(host) if host.int else None
+        except (OSError, ValueError):
+            identity = None
+        hosts = gather_records(group, identity)
+        if len(hosts) != self.world_size:
+            raise ValueError("topology records do not match the EP group")
+        size = _contiguous_group_size(hosts)
+        return replace(self, ranks_per_group=size or _logical_group(self.world_size), topology_known=bool(size))
+
+    @lru_cache(maxsize=1024, typed=True)
+    def for_launch(self, num_aiv, row_bytes, operation, *, bf16=False, expanded=False, v2=True):
+        """Select using rank-invariant metadata only; never read tensor values.
+
+        Profiles are in-sample BF16 fits, not performance guarantees. Unmeasured
+        dtypes/expanded/V1 paths retain the baseline algorithm. Token/receive
+        counts deliberately do not participate, so skew cannot split protocols.
+        """
+        if operation not in ("dispatch", "combine", "weighted"):
+            raise ValueError("unknown UDMA operation")
+        if isinstance(row_bytes, bool) or not isinstance(row_bytes, int) or row_bytes <= 0:
+            raise ValueError("payload row bytes must be a positive integer")
+        base = self.for_num_aiv(num_aiv)
+        cores = num_aiv or 32
+        plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
+        if v2 and not expanded and bf16:
+            bucket = "small" if row_bytes <= 4096 else "large"
+            entry = _PROFILES.get((self.world_size, cores, bucket, operation))
+            if (
+                entry is not None
+                and 2048 <= row_bytes <= 12288
+                and self.topology_known
+                and self.ranks_per_group in entry[0]
+            ):
+                _, order, p, w, q, visit, copy = entry
+                plan = replace(
+                    self,
+                    peer_order=order,
+                    peers_per_worker=p,
+                    workers_per_peer=w,
+                    qps_per_worker=q,
+                    wqes_per_visit=visit,
+                    self_copy=copy,
+                )
+            elif operation != "dispatch":
+                plan = replace(plan, self_copy=2)
+            if operation == "combine":
+                # Count payload AIVs, not QPs. Keep at least one spare copy
+                # AIV per sender; otherwise overlap self-copy after submission.
+                # Use this launch's communication budget, independent of reduce.
+                spare_aivs = cores - plan.send_workers
+                plan = replace(plan, self_copy=1 if spare_aivs >= plan.send_workers else 2)
+            if operation == "weighted":
+                # Low-core weighted cases prefer payload QPs even with spare
+                # cores. A spare core alone is not a reason to enable SIMT.
+                plan = replace(plan, weight_mode=2 if cores >= 32 and plan.send_workers < cores else 1)
+        plan.validate_num_aiv(num_aiv)
+        if not plan.valid_group_capacity():
+            raise ValueError("automatic UDMA plan exceeds the per-worker peer table")
+        return plan
 
     def config(self, num_aiv=0):
         policy = self.for_num_aiv(num_aiv)
@@ -215,3 +324,67 @@ def resolve_udma_policy(
     ):
         _check_override(name, supplied, effective, rank)
     return UdmaPolicy(world_size, p, w, q, visit)
+
+
+def _logical_group(world):
+    return next((g for g in (16, 8, 4, 2) if world % g == 0), world)
+
+
+def _contiguous_group_size(hosts):
+    if not hosts or any(not isinstance(host, str) or not host for host in hosts):
+        return 0
+    blocks = []
+    for host in hosts:
+        if not blocks or blocks[-1][0] != host:
+            blocks.append([host, 1])
+        else:
+            blocks[-1][1] += 1
+    sizes = {count for _, count in blocks}
+    if len(sizes) != 1 or len({host for host, _ in blocks}) != len(blocks):
+        return 0
+    return blocks[0][1]
+
+
+# In-sample conservative fits: BF16, non-expanded, EP4/8/16/32,
+# 2 KiB / 5.5 KiB / 12 KiB rows, random routing. Group sizes are
+# eligibility constraints, NOT an assumed physical rank-to-server mapping.
+# key: EP, communication AIVs, row-byte bucket, operation.
+# value: measured G, order (rank/group/staggered/RR), P, W, Q, visit, self-copy.
+_PROFILES = {
+    (4, 8, "large", "dispatch"): ((4,), 2, 1, 1, 2, 32, 0),
+    (4, 8, "large", "combine"): ((4,), 3, 1, 2, 1, 32, 2),
+    (4, 8, "large", "weighted"): ((4,), 3, 1, 2, 1, 32, 2),
+    (4, 8, "small", "dispatch"): ((4,), 3, 1, 2, 1, 32, 0),
+    (4, 8, "small", "combine"): ((4,), 3, 1, 2, 1, 32, 2),
+    (4, 8, "small", "weighted"): ((4,), 1, 1, 1, 2, 32, 2),
+    (4, 32, "small", "dispatch"): ((4,), 0, 1, 2, 1, 32, 0),
+    (4, 32, "small", "combine"): ((4,), 3, 1, 2, 1, 32, 1),
+    (4, 32, "small", "weighted"): ((4,), 3, 1, 2, 1, 32, 2),
+    (8, 8, "large", "dispatch"): ((8,), 0, 2, 1, 2, 32, 0),
+    (8, 8, "large", "combine"): ((8,), 1, 1, 1, 2, 32, 2),
+    (8, 8, "large", "weighted"): ((8,), 3, 1, 1, 1, 32, 2),
+    (8, 8, "small", "dispatch"): ((8,), 3, 1, 1, 2, 32, 0),
+    (8, 8, "small", "combine"): ((8,), 2, 1, 1, 2, 32, 2),
+    (8, 8, "small", "weighted"): ((8,), 3, 1, 1, 2, 32, 2),
+    (8, 32, "large", "dispatch"): ((8,), 2, 1, 1, 1, 16, 0),
+    (8, 32, "large", "combine"): ((8,), 3, 1, 1, 1, 16, 1),
+    (8, 32, "large", "weighted"): ((8,), 2, 2, 2, 1, 8, 0),
+    (8, 32, "small", "dispatch"): ((8,), 3, 1, 2, 1, 16, 0),
+    (8, 32, "small", "combine"): ((8,), 2, 1, 2, 1, 8, 1),
+    (8, 32, "small", "weighted"): ((8,), 3, 1, 1, 1, 16, 2),
+    (16, 8, "large", "dispatch"): ((8, 16), 2, 2, 1, 1, 16, 0),
+    (16, 8, "large", "combine"): ((8, 16), 0, 2, 1, 1, 16, 2),
+    (16, 8, "large", "weighted"): ((8, 16), 2, 2, 1, 1, 32, 2),
+    (16, 8, "small", "dispatch"): ((8, 16), 1, 2, 1, 2, 32, 0),
+    (16, 8, "small", "combine"): ((8, 16), 0, 2, 1, 2, 32, 2),
+    (16, 8, "small", "weighted"): ((8, 16), 2, 4, 2, 1, 32, 2),
+    (16, 32, "large", "dispatch"): ((8, 16), 2, 4, 2, 1, 16, 0),
+    (16, 32, "large", "combine"): ((8, 16), 2, 2, 1, 1, 8, 1),
+    (16, 32, "large", "weighted"): ((8, 16), 2, 2, 1, 1, 4, 0),
+    (16, 32, "small", "dispatch"): ((8, 16), 0, 2, 2, 1, 8, 0),
+    (16, 32, "small", "combine"): ((8, 16), 0, 2, 1, 1, 32, 1),
+    (16, 32, "small", "weighted"): ((8, 16), 1, 2, 2, 1, 4, 0),
+    (32, 32, "large", "dispatch"): ((8,), 1, 4, 1, 1, 32, 0),
+    (32, 32, "large", "combine"): ((8,), 3, 1, 1, 1, 8, 1),
+    (32, 32, "large", "weighted"): ((8,), 2, 4, 1, 1, 4, 0),
+}

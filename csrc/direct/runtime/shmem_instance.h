@@ -20,7 +20,7 @@ public:
                   bool v1_shared_jetty = false, bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1);
+                  int64_t udma_qps_per_worker = 1, bool auto_resources = false);
 
     ~ShmemInstance();
 
@@ -34,6 +34,20 @@ public:
     void WaitHandle(aclrtStream stream) const;
     void Synchronize(aclrtStream stream) const;
     void Destroy();
+    // Serialized fresh dispatches may publish counts before Notify finishes.
+    void* PrepareNotifyHostCounts(std::size_t count);
+    std::vector<int32_t> WaitNotifyHostCounts(std::size_t count);
+    std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                         int64_t workers, int64_t qps);
+
+    // Launch-local values; resolving this object never mutates the resource owner.
+    struct LaunchPlan {
+        uint32_t order, group, peers, workers, qps, visit;
+        int64_t self_copy;
+        uint32_t weight_mode;
+    };
+    LaunchPlan ResolveLaunch(const std::vector<int64_t>& values, bool combine, int64_t peers, int64_t visit,
+                             int64_t cores) const;
 
     uint64_t FftsAddr() const;
     bool Initialized() const;
@@ -93,6 +107,8 @@ private:
     int64_t data_op_engine_type_;
     bool use_1g_huge_pages_;
     bool shared_jetty_;
+    bool tuning_session_ = false;
+    bool auto_resources_ = false;
     bool token_schedule_;
     uint32_t dispatch_peer_order_ = 0;
     uint32_t combine_peer_order_ = 0;
@@ -109,4 +125,9 @@ private:
     void* workspace_ptr_;
 
     uint64_t ffts_addr_;
+    void* notify_host_counts_ = nullptr;
+    void* notify_device_counts_ = nullptr;
+    std::size_t notify_count_capacity_ = 0;
+    bool notify_host_unavailable_ = false;
+    bool notify_host_pending_ = false;
 };

@@ -31,6 +31,9 @@ def public_runtime(monkeypatch):
 
     class Native:
         def __init__(self, *args):
+            assert len(args) == 18
+            assert type(args[16]) is int and args[16] in (1, 2)
+            assert type(args[17]) is bool and args[17] == (args[3] == "udma")
             calls.append(("native", args[3]))
 
         def mte_mapping_errors(self):
@@ -43,7 +46,7 @@ def public_runtime(monkeypatch):
     def bootstrap(*args, **kwargs):
         calls.append(("bootstrap", args[5]))
         if args[5] == "udma":
-            assert kwargs["udma_auto_options"][0] == "clos-v2"
+            assert kwargs["udma_auto_options"][0] == "clos-v4"
         return [], "test"
 
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)

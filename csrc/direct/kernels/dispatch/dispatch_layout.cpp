@@ -32,7 +32,7 @@ __aicore__ inline int32_t AlignUpBytes(int32_t value, int32_t alignment)
 
 } // namespace
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_layout_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void dispatch_layout_kernel(
     GM_ADDR topk_idx, GM_ADDR scratch_buffer, GM_ADDR num_tokens_per_rank, GM_ADDR num_tokens_per_expert,
     GM_ADDR is_token_in_rank, ascend_deepep::DispatchLayoutTilingData tiling, uint64_t ffts_addr)
 {

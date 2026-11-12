@@ -1,6 +1,7 @@
 #include "ops/combine.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <algorithm>
 
@@ -149,8 +150,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, c10::intrusive_ptr<CombineEpilogue>* epilogue,
     c10::optional<torch::Tensor> expanded_x, c10::optional<torch::Tensor> single_source_slots,
     std::function<void()> aggregate, c10::optional<torch::Tensor> pipeline_mapping,
-    c10::optional<torch::Tensor> pipeline_values, int64_t pipeline_chunk_tokens)
+    c10::optional<torch::Tensor> pipeline_values, int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv,
+    const std::vector<int64_t>& launch_plan)
 {
+    const auto udma_launch =
+        shmem.ResolveLaunch(launch_plan, true, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
+    udma_peers_per_worker = udma_launch.peers;
+    udma_wqes_per_visit = udma_launch.visit;
     StreamAllocator allocator(allocation_stream_id);
     allocator.Record({x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
                       expanded_x, single_source_slots});
@@ -187,9 +193,17 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                 "num_max_nvl_chunked_send_tokens must be smaller than num_max_nvl_chunked_recv_tokens");
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
-    const int64_t num_channels = resolved_num_aiv;
-    if (shmem.CombinePeerOrder() == ascend_deepep::udma::kGroupRoundRobinOrder)
-        udma_peers_per_worker = shmem.PeersPerGroupPerWorker();
+    const int64_t num_channels = channel_prefix_matrix.size(1);
+    TORCH_CHECK(num_channels > 0 && num_channels <= kMaxCombineAiv && num_channels % 2 == 0,
+                "invalid dispatch channel count");
+    TORCH_CHECK(reduce_num_aiv >= 0, "reduce_num_aiv must be nonnegative");
+    const int64_t reduce_aivs = reduce_num_aiv == 0 ? resolved_num_aiv : ResolveNumAiv(reduce_num_aiv);
+    TORCH_CHECK(use_udma || (resolved_num_aiv == num_channels && reduce_aivs == num_channels),
+                "independent combine/reduce core counts require UDMA");
+    TORCH_CHECK(epilogue || reduce_aivs == resolved_num_aiv, "independent reduction cores require split combine");
+    TORCH_CHECK(!pipeline_chunk_tokens || resolved_num_aiv == num_channels,
+                "aggregate pipeline requires combine cores to match dispatch channels");
+    if (udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder) udma_peers_per_worker = udma_launch.peers;
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
         TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
@@ -198,16 +212,14 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         TORCH_CHECK(udma_wqes_per_visit == 4 || udma_wqes_per_visit == 8 || udma_wqes_per_visit == 16 ||
                         udma_wqes_per_visit == 32,
                     "udma_wqes_per_visit must be 4, 8, 16 or 32");
-        const int64_t workers = shmem.TokenSchedule()
-                                    ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
-                                    : shmem.WorkersPerPeer() *
-                                          ascend_deepep::udma::Workers(world_size, udma_peers_per_worker,
-                                                                       shmem.CombinePeerOrder(), shmem.RanksPerGroup());
-        TORCH_CHECK(workers <= resolved_num_aiv && workers * shmem.QpsPerWorker() <= ascend_deepep::udma::kQpCount,
+        const int64_t workers =
+            shmem.TokenSchedule()
+                ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
+                : udma_launch.workers * ascend_deepep::udma::Workers(world_size, udma_peers_per_worker,
+                                                                     udma_launch.order, udma_launch.group);
+        TORCH_CHECK(workers <= resolved_num_aiv && workers * udma_launch.qps <= ascend_deepep::udma::kQpCount,
                     "UDMA peer grouping exceeds the AIV or 32-QP pool budget");
     }
-    TORCH_CHECK(channel_prefix_matrix.size(1) == num_channels,
-                "channel_prefix_matrix second dim must equal num_channels");
 
     const int64_t num_tokens = send_head.size(0);
     const int64_t token_capacity = num_max_tokens_per_rank.value_or(num_tokens);
@@ -222,7 +234,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(AlignUpInt64(hidden_bytes, kCombineAlignmentBytes) <= communication_ub_bytes,
                 "one combine token row requires ", hidden_bytes,
                 " bytes plus alignment, but the combine staging area provides ", communication_ub_bytes, " bytes");
-    auto recv_x = allocator.Zeros({num_tokens, hidden}, x.options());
+    // The ordinary UDMA V2 epilogue writes every original token, including
+    // tokens with no contributors. Its UB accumulators remain zero-initialized;
+    // no previous output contents are read. Other paths retain their allocation.
+    const bool overwrite_output =
+        use_udma && epilogue && !aggregate && !pipeline_chunk_tokens && !shmem.TokenSchedule();
+    auto recv_x = overwrite_output ? allocator.Empty({num_tokens, hidden}, x.options())
+                                   : allocator.Zeros({num_tokens, hidden}, x.options());
 
     c10::optional<torch::Tensor> recv_topk_weights = c10::nullopt;
     int64_t num_topk = 0;
@@ -234,7 +252,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         TORCH_CHECK(num_topk > 0, "topk_weights second dim must be greater than zero");
         TORCH_CHECK(num_topk <= kMaxCombineTopk, "num_topk must not exceed ", kMaxCombineTopk,
                     " for the combine UB layout");
-        recv_topk_weights = allocator.Zeros({num_tokens, num_topk}, topk_weights->options());
+        recv_topk_weights = overwrite_output ? allocator.Empty({num_tokens, num_topk}, topk_weights->options())
+                                             : allocator.Zeros({num_tokens, num_topk}, topk_weights->options());
     }
     if (bias_0.has_value()) {
         TORCH_CHECK(bias_0->dim() == 2 && bias_0->size(0) == num_tokens && bias_0->size(1) == hidden,
@@ -299,13 +318,33 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.num_topk = static_cast<uint32_t>(num_topk);
     tiling.block_dim = static_cast<uint32_t>(resolved_num_aiv);
     tiling.num_channels = static_cast<uint32_t>(num_channels);
-    tiling.udma_peer_order = shmem.CombinePeerOrder();
-    tiling.udma_ranks_per_group = shmem.RanksPerGroup();
-    tiling.udma_workers_per_peer = shmem.WorkersPerPeer();
-    tiling.udma_qps_per_worker = shmem.QpsPerWorker();
+    tiling.udma_peer_order = udma_launch.order;
+    tiling.udma_ranks_per_group = udma_launch.group;
+    tiling.udma_workers_per_peer = udma_launch.workers;
+    tiling.udma_qps_per_worker = udma_launch.qps;
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
+    if (use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !expanded_x && !pipeline_chunk_tokens) {
+        const char* overlap = std::getenv("DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY");
+        const char* after_submit = std::getenv("DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT");
+        const bool use_spare_aivs = udma_launch.self_copy >= 0 ? udma_launch.self_copy == 1
+                                                               : overlap && overlap[0] == '1' && overlap[1] == '\0';
+        tiling.udma_self_copy_after_submit = udma_launch.self_copy >= 0
+                                                 ? udma_launch.self_copy == 2
+                                                 : after_submit && after_submit[0] == '1' && after_submit[1] == '\0';
+        TORCH_CHECK(!(use_spare_aivs && tiling.udma_self_copy_after_submit),
+                    "combine self-copy modes are mutually exclusive");
+        // After-submit retains each AIV's self-copy channels, including weights.
+        // Spare-AIV self-copy is still unweighted-only: weighted peers already
+        // use spare AIVs for SIMT stores and must keep their original ownership.
+        if (use_spare_aivs && !topk_weights) {
+            tiling.udma_self_copy_first_aiv = ascend_deepep::udma::MetadataFirst(
+                tiling.world_size, tiling.udma_peers_per_worker, tiling.block_dim, tiling.udma_peer_order,
+                tiling.udma_ranks_per_group, tiling.udma_workers_per_peer);
+        }
+    }
+    tiling.udma_weight_mode = udma_launch.weight_mode;
     tiling.has_topk_weights = topk_weights.has_value() ? 1U : 0U;
     tiling.has_bias_0 = bias_0.has_value() ? 1U : 0U;
     tiling.has_bias_1 = bias_1.has_value() ? 1U : 0U;
@@ -321,19 +360,18 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
 
     c10::optional<torch::Tensor> pipeline_ready;
     if (pipeline_chunk_tokens) {
-        TORCH_CHECK(shmem.QpsPerWorker() == 1, "aggregate pipeline requires one QP per worker");
+        TORCH_CHECK(udma_launch.qps == 1, "aggregate pipeline requires one QP per worker");
         TORCH_CHECK(use_udma && epilogue && !aggregate && pipeline_mapping.has_value() && expanded_x.has_value(),
                     "invalid aggregate pipeline mode");
         TORCH_CHECK(!shmem.TokenSchedule() || (resolved_num_aiv == 32 && world_size <= 8),
                     "self-send aggregate pipeline requires 32 AIV and EP <= 8");
         TORCH_CHECK(pipeline_chunk_tokens == 32 || pipeline_chunk_tokens == 64, "invalid pipeline chunk size");
         TORCH_CHECK(resolved_num_aiv == 32 || resolved_num_aiv == 64, "pipeline requires 32/64 AIV");
-        TORCH_CHECK(
-            shmem.TokenSchedule() ||
-                shmem.WorkersPerPeer() * ascend_deepep::udma::Workers(world_size, udma_peers_per_worker,
-                                                                      shmem.CombinePeerOrder(), shmem.RanksPerGroup()) <
-                    resolved_num_aiv,
-            "aggregate pipeline needs at least one producer core");
+        TORCH_CHECK(shmem.TokenSchedule() ||
+                        udma_launch.workers * ascend_deepep::udma::Workers(world_size, udma_peers_per_worker,
+                                                                           udma_launch.order, udma_launch.group) <
+                            resolved_num_aiv,
+                    "aggregate pipeline needs at least one producer core");
         TORCH_CHECK(num_recv_tokens <= std::numeric_limits<int32_t>::max() - 64,
                     "pipeline receive rows exceed signed device range");
         CheckNpuContiguous(*pipeline_mapping, "pipeline_mapping");
@@ -365,8 +403,12 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         (void)pipeline_mapping;
         (void)pipeline_values;
         (void)pipeline_ready;
+        auto phase_tiling = tiling;
+        if (phase == CombinePhase::Reduction) {
+            phase_tiling.block_dim = static_cast<uint32_t>(reduce_aivs);
+        }
         LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
-                              send_head, recv_x, recv_topk_weights, tiling, symmetric_buffer, ffts_addr, use_udma,
+                              send_head, recv_x, recv_topk_weights, phase_tiling, symmetric_buffer, ffts_addr, use_udma,
                               phase);
 
         return CombineResult{recv_x, recv_topk_weights};

@@ -124,9 +124,11 @@ class Buffer:
             operation_config=True,
         )
         if self._udma_auto_policy is not None:
+            self._udma_auto_policy = self._udma_auto_policy.bind_group(resolved_group)
             udma_schedule = "peer"
             udma_dispatch_peer_order = udma_combine_peer_order = "rank"
-            udma_ranks_per_group = udma_peers_per_group_per_worker = None
+            udma_ranks_per_group = self._udma_auto_policy.ranks_per_group
+            udma_peers_per_group_per_worker = None
             udma_workers_per_peer = self._udma_auto_policy.workers_per_peer
             udma_qps_per_worker = self._udma_auto_policy.qps_per_worker
         else:
@@ -226,7 +228,10 @@ class Buffer:
                 bootstrap_key,
                 True,  # V1 requests shared Jetty when the resolved transport is UDMA.
                 udma_schedule == "token",
-                *peer_options,
+                # Older manual options omit trailing defaults. Fill them before
+                # appending the resource flag so it cannot become a QP count.
+                *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
+                self._udma_auto_policy is not None,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -515,6 +520,16 @@ class Buffer:
         elif config is None:
             config = self.get_dispatch_config(self.group_size)
         num_aiv, nvl_send, nvl_recv = _config_to_native_args(config)
+        launch_policy = (
+            self._udma_auto_policy.for_launch(
+                num_aiv,
+                int(x_tensor.size(1)) * x_tensor.element_size(),
+                "dispatch",
+                v2=False,
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         del num_tokens_per_rdma_rank
 
         if handle is not None:
@@ -566,6 +581,7 @@ class Buffer:
                     config.udma_peers_per_worker,
                     config.udma_wqes_per_visit,
                     getattr(handle, "_dispatch_plan", None),
+                    launch_policy.native_plan() if launch_policy else [],
                 )
             if not zero_copy:
                 _record_recv_outputs_on_current_stream(recv_x, recv_x_scales)
@@ -622,6 +638,8 @@ class Buffer:
                 self.num_max_tokens_per_rank,
                 config.udma_peers_per_worker,
                 config.udma_wqes_per_visit,
+                None,
+                launch_policy.native_plan() if launch_policy else [],
             )
         if not zero_copy:
             _record_recv_outputs_on_current_stream(recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights)
@@ -685,6 +703,16 @@ class Buffer:
         elif config is None:
             config = self.get_combine_config(self.group_size)
         num_aiv, nvl_send, nvl_recv = _config_to_native_args(config)
+        launch_policy = (
+            self._udma_auto_policy.for_launch(
+                num_aiv,
+                int(x.size(1)) * x.element_size(),
+                "weighted" if topk_weights is not None else "combine",
+                v2=False,
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         if isinstance(handle, _V1Handle) and handle._buffer_owner is not self:
             raise ValueError("V1 handle belongs to a different Buffer")
         (
@@ -714,6 +742,7 @@ class Buffer:
                 self.num_max_tokens_per_rank,
                 config.udma_peers_per_worker,
                 config.udma_wqes_per_visit,
+                launch_policy.native_plan() if launch_policy else [],
             )
         _record_recv_outputs_on_current_stream(recv_x, recv_topk_weights)
         event = self._finish_comm_event(async_finish, (recv_x, recv_topk_weights))

@@ -86,6 +86,8 @@ def check_combine_events(buffer, owned, handle, recv_weights, bias0, bias1, rank
                         pending_x,
                         handle,
                         num_sms=args.num_aiv,
+                        combine_num_sms=args.combine_num_sms,
+                        reduce_num_sms=args.reduce_num_sms,
                         previous_event_before_epilogue=bias_event,
                         async_with_compute_stream=asynchronous,
                         **kwargs,
@@ -245,7 +247,15 @@ def run_rank(rank, args):
         kwargs = dict(topk_weights=route_weights, bias=bias, allocate_on_comm_stream=args.allocate_on_comm_stream)
         if args.api == "v1":
             return buffer.combine(value, handle, config=config, async_finish=True, **kwargs)
-        return buffer.combine(value, handle, num_sms=args.num_aiv, async_with_compute_stream=True, **kwargs)
+        return buffer.combine(
+            value,
+            handle,
+            num_sms=args.num_aiv,
+            combine_num_sms=args.combine_num_sms,
+            reduce_num_sms=args.reduce_num_sms,
+            async_with_compute_stream=True,
+            **kwargs,
+        )
 
     success = False
     try:
@@ -344,6 +354,8 @@ def main():
     p.add_argument("--num-topk", type=int, default=8)
     p.add_argument("--experts-per-rank", type=int, default=32)
     p.add_argument("--num-aiv", type=int, default=64)
+    p.add_argument("--combine-num-sms", type=int, default=0)
+    p.add_argument("--reduce-num-sms", type=int, default=0)
     p.add_argument("--udma-peers-per-worker", type=int, default=1)
     p.add_argument("--udma-wqes-per-visit", type=int, default=8)
     p.add_argument("--transport", choices=("udma", "mte"), default=None)
@@ -367,6 +379,8 @@ def main():
     p.add_argument("--inject-error", action="store_true")
     p.add_argument("--check-events", action="store_true")
     args = p.parse_args()
+    if args.api != "v2" and (args.combine_num_sms or args.reduce_num_sms):
+        p.error("independent combine/reduce cores require --api v2")
     if (args.public_auto or args.public_clos) and args.transport is not None:
         p.error("--public-auto selects the engine from topology; omit --transport")
     args.dtype, args.expert_alignment = "bf16", 1

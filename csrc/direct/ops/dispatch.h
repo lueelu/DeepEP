@@ -31,6 +31,6 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt, int64_t udma_peers_per_worker = 4,
            int64_t udma_wqes_per_visit = 8, c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt,
            std::vector<torch::Tensor>* public_handle = nullptr, bool defer_public_expert_prefix = false,
-           void* dispatch_output_control = nullptr);
+           void* dispatch_output_control = nullptr, const std::vector<int64_t>& launch_plan = {});
 
 }  // namespace ascend_deepep::ops

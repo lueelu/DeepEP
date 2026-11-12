@@ -95,6 +95,12 @@ struct alignas(8) DispatchTilingData {
     uint64_t v2_dst_slots;
     // Buffer-owned symmetric address mailbox; never part of a cached handle.
     uint64_t udma_output_control;
+    // Reserved symmetric scale staging, owned until dispatch completion.
+    uint64_t packed_peer_scales = 0;
+    // Cache-isolated local producer flags in the unused self-peer interval.
+    uint64_t packed_scale_ready = 0;
+    // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
+    uint64_t notify_host_counts = 0;
 };
 
 struct alignas(8) CombineTilingData {
@@ -104,8 +110,8 @@ struct alignas(8) CombineTilingData {
     uint32_t num_recv_tokens;
     uint32_t hidden;
     uint32_t num_topk;
-    uint32_t block_dim;
-    uint32_t num_channels;
+    uint32_t block_dim;     // Actual AIVs for this communication/reduction launch.
+    uint32_t num_channels;  // Logical channels retained from the dispatch handle.
     uint32_t has_topk_weights;
     uint32_t has_bias_0;
     uint32_t has_bias_1;
@@ -133,6 +139,9 @@ struct alignas(8) CombineTilingData {
     uint32_t pipeline_topk;
     uint32_t udma_workers_per_peer = 1;
     uint32_t udma_qps_per_worker = 1;
+    uint32_t udma_self_copy_first_aiv = 0;
+    uint32_t udma_self_copy_after_submit = 0;
+    uint32_t udma_weight_mode = 0;  // 0 legacy, 1 UDMA, 2 SIMT if spare AIVs exist.
 };
 
 struct alignas(8) ExpandTilingData {

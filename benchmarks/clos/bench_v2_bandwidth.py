@@ -26,6 +26,7 @@ import time
 import traceback
 
 from stage_metrics import L2CacheFlush, L2_CACHE_FLUSH_BYTES, ProfileSamples, PROFILE_GUARD_ITERS
+from stage_metrics import COMBINE_NOTIFY_ENV, profile_combine_notify
 
 from route_workloads import (
     DEFAULTS as ROUTE_DEFAULTS,
@@ -102,7 +103,11 @@ def arguments(argv=None, *, description=None):
         ("case-timeout", 1800),
     ]:
         p.add_argument("--" + name, type=int, default=default)
-    p.add_argument("--huge-pages", action="store_true", help="explicitly request 1 GiB SHMEM pages")
+    p.add_argument(
+        "--huge-pages",
+        action="store_true",
+        help="request 1 GiB SHMEM pages; eligible FP8 dispatches also use packed scale staging",
+    )
     p.add_argument(
         "--output", type=Path, default=Path("bandwidth_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     )
@@ -284,7 +289,9 @@ def check_idle(text, first_device, ep_size):
             raise RuntimeError(f"NPU {device} is busy, unhealthy or cannot be verified; no job started")
 
 
-def effective_udma_config(buffer, config=None, *, num_aiv=None):
+def effective_udma_config(
+    buffer, config=None, *, num_aiv=None, row_bytes=None, bf16=False, expanded=False, v2=True, combine_row_bytes=None
+):
     """Report resolved runtime values rather than caller defaults (V1 uses Config)."""
     result = {
         name: getattr(buffer, name)
@@ -302,7 +309,33 @@ def effective_udma_config(buffer, config=None, *, num_aiv=None):
     if policy is not None:
         if num_aiv is None:
             num_aiv = config.num_aiv if config is not None else 32
-        policy = policy.for_num_aiv(num_aiv)
+        if row_bytes is None:
+            policy = policy.for_num_aiv(num_aiv)
+            result["policy_scope"] = "buffer_default_only"
+        else:
+            plans = {
+                op: policy.for_launch(
+                    num_aiv,
+                    row_bytes if op == "dispatch" else (combine_row_bytes or row_bytes),
+                    op,
+                    bf16=bf16 if op == "dispatch" else True,
+                    expanded=expanded,
+                    v2=v2,
+                )
+                for op in ("dispatch", "combine", "weighted")
+            }
+            result["operation_plans"] = {op: asdict(plan) for op, plan in plans.items()}
+            policy = plans["dispatch"]
+            names = ("rank", "group", "group_staggered", "group_round_robin")
+            result.update(
+                policy_scope="dispatch; see operation_plans for combine",
+                udma_dispatch_peer_order=names[policy.peer_order],
+                udma_combine_peer_order=names[plans["combine"].peer_order],
+                udma_ranks_per_group=policy.ranks_per_group,
+                udma_peers_per_group_per_worker=policy.peers_per_worker if policy.peer_order == 3 else None,
+                udma_workers_per_peer=policy.workers_per_peer,
+                udma_qps_per_worker=policy.qps_per_worker,
+            )
     for name in ("udma_peers_per_worker", "udma_wqes_per_visit"):
         result[name] = (
             getattr(policy, name.removeprefix("udma_"))
@@ -364,6 +397,9 @@ def worker(args):
     args.expert_alignment = 1
     args.profile_warmup, args.profile_iters = args.warmup, args.iterations
     args.profile_sample_markers = True
+    args.combine_notify = True
+    # Precision and caller-stream timing exercise the ordinary library path.
+    os.environ[COMBINE_NOTIFY_ENV] = "0"
     device = args.first_device + local_rank
     destination = args.output / f"rank{rank}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -393,11 +429,18 @@ def worker(args):
             transport="udma",
             use_1g_huge_pages=args.huge_pages,
         )
-        args.effective_udma_config = effective_udma_config(buffer, num_aiv=args.num_aiv)
+        args.effective_udma_config = effective_udma_config(
+            buffer,
+            num_aiv=args.num_aiv,
+            row_bytes=args.hidden * (1 if args.dtype == "fp8" else 2),
+            bf16=args.dtype == "bf16",
+            expanded=bool(args.expand),
+            combine_row_bytes=args.hidden * 2,
+        )
         if rank == 0:
             print("EFFECTIVE_UDMA_CONFIG", json.dumps(args.effective_udma_config, sort_keys=True), flush=True)
         if getattr(args, "udma_auto_policy", False):
-            args.resolved_udma_policy = asdict(buffer.udma_auto_policy.for_num_aiv(args.num_aiv))
+            args.resolved_udma_policy = args.effective_udma_config["operation_plans"]["dispatch"]
             if rank == 0:
                 print("AUTO_POLICY", json.dumps(args.resolved_udma_policy, sort_keys=True), flush=True)
         identity = loaded_identity()
@@ -577,16 +620,17 @@ def worker(args):
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
-                profiling._profile_operator(
-                    rank,
-                    args,
-                    op,
-                    flush_cache.wrap(fn),
-                    sample_callback=ProfileSamples(torch),
-                    guard_iters=PROFILE_GUARD_ITERS,
-                    synchronize_each_iteration=True,
-                    before_iteration=before_iteration,
-                )
+                with profile_combine_notify(op.startswith("combine")):
+                    profiling._profile_operator(
+                        rank,
+                        args,
+                        op,
+                        flush_cache.wrap(fn),
+                        sample_callback=ProfileSamples(torch),
+                        guard_iters=PROFILE_GUARD_ITERS,
+                        synchronize_each_iteration=True,
+                        before_iteration=before_iteration,
+                    )
             except profiling._ProfileComplete:
                 pass
             profile = parse_profile_collective(
@@ -600,9 +644,11 @@ def worker(args):
                 args.num_aiv,
                 flush_l2_cache=args.flush_l2_cache,
                 sample_markers=True,
+                require_combine_notify=True,
             )
             # Independent caller-stream samples; do not subtract from profiler kernel times.
             profile["sampling"]["host_sync_each_iteration"] = True
+            profile["sampling"]["combine_notify_profile_only"] = op.startswith("combine")
             dist.barrier()
             for _ in range(args.warmup):
                 if before_iteration is not None:
@@ -767,6 +813,7 @@ def report(root):
                 ("flush_l2_cache", False),
                 ("combine_bias", "two"),
                 ("profile_sample_markers", False),
+                ("combine_notify", False),
             ):
                 if config.get(key, default) != plan["arguments"].get(key, default):
                     raise ValueError(f"peer order configuration mismatch: {key}")
@@ -837,6 +884,7 @@ def report(root):
                     api=api,
                     flush_l2_cache=config.get("flush_l2_cache", False),
                     sample_markers=config.get("profile_sample_markers", False),
+                    require_combine_notify=config.get("combine_notify", False),
                 )
                 import_size = plan["topk_idx_bytes"]
                 expected = byte_ledger(
@@ -1088,6 +1136,7 @@ def launch(args, *, entrypoint=None):
     ]
     api = getattr(args, "api", "v2")
     args.profile_sample_markers = True
+    args.combine_notify = True
     plan = dict(
         format_version=2,
         api=api,
