@@ -5,6 +5,7 @@
 #define COMBINE_DEDUP_EP_COMBINE_MEMORY_SERVER_DEDUP_KERNEL_H
 
 #include "kernel_operator.h"
+#include "../../common/core_context.h"
 #include "../../dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h"
 #include "../../dispatch/low_latency/common/comm_args.h"
 #include "ep_memory_server_dedup_buffer_layout.h"
@@ -24,10 +25,13 @@ public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
                                 GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK, uint32_t experts, uint8_t dtype,
-                                uint8_t quantMode, int64_t magic, bool enableDedup = true)
+                                uint8_t quantMode, int64_t magic, uint32_t world, deepep::CoreContext core,
+                                bool enableDedup = true)
     {
         (void)quantMode;
-        core_ = GetBlockIdx();
+        coreContext_ = core;
+        core_ = core.index;
+        world_ = world;
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
         enableDedup_ = enableDedup;
         h_ = h;
@@ -54,9 +58,9 @@ public:
         DataCopyPad(tokenCount, prefix[experts - 1U], {1U, 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0});
         Sync<HardEvent::MTE2_S>();
         const int32_t tokens = tokenCount.GetValue(0U);
-        const uint32_t localExperts = experts / uint32_t(args_->rankSize);
+        const uint32_t localExperts = experts / world_;
         const uint32_t copies = topK < localExperts ? topK : localExperts;
-        const uint64_t capacity = uint64_t(args_->rankSize) * bs * copies;
+        const uint64_t capacity = uint64_t(world_) * bs * copies;
         if (tokens < 0 || uint32_t(tokens) > kEpServerDedupCombineMaxTokenNum || uint64_t(tokens) > capacity) {
             Trap();  // Invalid device data must not become a truncated successful launch.
             return;
@@ -124,6 +128,11 @@ public:
         // no arena/pipe reset or exit may precede completion of their DMA reads.
         PipeBarrier<PIPE_ALL>();
     }
+
+    // SuperKernel sub-task boundary. Retires the member TPipe without the
+    // implicit whole-pipe barrier; all business DMA and output retirement has
+    // already completed in Process().
+    __aicore__ inline void Destroy() { pipe_.DestroyWithoutPipeAll(); }
 
 private:
     __aicore__ inline void AggregateSourceTokensM6()
@@ -281,7 +290,7 @@ private:
             Muls(typeUb_, indexUb_, int32_t(1), tokens_);
         }
         Sync<HardEvent::V_S>();
-        ServerDedupRankMask(maskUb_, tableUb_.ReinterpretCast<uint8_t>(), typeUb_, 0, int32_t(args_->rankSize),
+        ServerDedupRankMask(maskUb_, tableUb_.ReinterpretCast<uint8_t>(), typeUb_, 0, int32_t(world_),
                             uint32_t(selected_));
         uint64_t valid = 0U;
         GatherMask(indexUb_, packedUb_, maskUb_.ReinterpretCast<uint32_t>(), true, uint32_t(selected_),
@@ -303,7 +312,7 @@ private:
     {
         PrepareDirectRows();
         if (selected_ == 0U) return;
-        const uint32_t servers = uint32_t(args_->rankSize) / 8U;
+        const uint32_t servers = world_ / 8U;
         const uint32_t ownServer = uint32_t(args_->rank) / 8U;
         uint32_t owner = 0U, sendSequence = 0U;
         uint64_t flagMask[2] = {0xffU, 0U};
@@ -373,7 +382,7 @@ private:
         ServerDedupPartial partial;
         partial.Init(args_, &pipe_, arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes], expertAddr_,
                      tableAddr_, relayAddr_, typesAddr_, tokens_, bs_, h_, topK_, experts_, dtype_, window_,
-                     workspace_);
+                     workspace_, world_, core_);
         partialTasks_ = partial.Process();
         // Retire only input and Vector users before scalar metadata reuse.
         // M4 output slots and MTE3_V events stay live for M5's per-slot waits.
@@ -432,8 +441,9 @@ private:
     GM_ADDR weightsAddr_ = nullptr;
     GM_ADDR masksAddr_ = nullptr;
     GM_ADDR outputAddr_ = nullptr;
+    deepep::CoreContext coreContext_{};
     bool enableDedup_ = false;
-    uint32_t bs_ = 0, experts_ = 0;
+    uint32_t bs_ = 0, experts_ = 0, world_ = 0;
     uint8_t dtype_ = 0;
     uint32_t core_ = 0, h_ = 0, topK_ = 0, blocks_ = 0, resultStride_ = 0, tokens_ = 0, lanes_ = 0, laneBytes_ = 0,
              usedBytes_ = 0;

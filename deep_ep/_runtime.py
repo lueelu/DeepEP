@@ -88,6 +88,12 @@ class Runtime:
         self.ll_backend = os.environ.get("DEEPEP_LL_BACKEND", "mte")
         if self.ll_backend not in ("mte", "rdma"):
             raise ValueError("DEEPEP_LL_BACKEND must be mte or rdma")
+        value = os.environ.get("DEEPEP_LL_JIT", "0").upper()
+        if value not in ("0", "1", "OFF", "ON", "FALSE", "TRUE"):
+            raise ValueError("DEEPEP_LL_JIT must be ON or OFF")
+        self.low_latency_jit = value in ("1", "ON", "TRUE")
+        if self.low_latency_jit and not getattr(native, "low_latency_jit_available", lambda: False)():
+            raise RuntimeError("DEEPEP_LL_JIT requires an extension built with DEEPEP_LL_JIT=ON")
         integer("capacity", capacity, 2 << 20, (1 << 30) if self._megamoe else (1 << 63) - 1)
         if capacity % (2 << 20):
             raise ValueError("capacity must be aligned to 2 MiB")

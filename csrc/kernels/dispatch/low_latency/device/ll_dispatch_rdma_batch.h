@@ -9,6 +9,7 @@ namespace LlTransport {
 class DispatchRdmaBatch {
     static constexpr uint32_t kPeerWords = (DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE + 31U) / 32U;
     const __gm__ Args* args_ = nullptr;
+    deepep::CoreContext core_{};
     uint32_t bytes_ = 0, capacity_ = 0, count_ = 0;
     GM_ADDR stageBase_ = nullptr;
     GM_ADDR pendingStage_ = nullptr;
@@ -34,7 +35,7 @@ class DispatchRdmaBatch {
             if (!mask) continue;
             for (uint32_t bit = 0; bit < 32U; ++bit) if (mask & (1U << bit)) {
                 const uint32_t peer = word * 32U + bit;
-                Quiet(peer, scratch);
+                Quiet(peer, scratch, core_);
                 if (countRetirement_) countRetirement_->Completed(peer);
             }
             peerMask_[word] = 0U;
@@ -49,14 +50,14 @@ public:
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
     __aicore__ inline void SetProfile(LlReferenceProfile::DeviceProfile* p) { profile_ = p; }
 #endif
-    __aicore__ inline void Init(const __gm__ Args* args, uint32_t bytes) {
+    __aicore__ inline void Init(const __gm__ Args* args, uint32_t bytes, deepep::CoreContext core) {
         if (count_) { Trap(); return; }
-        args_ = args; bytes_ = bytes; count_ = 0;
+        args_ = args; bytes_ = bytes; count_ = 0; core_ = core;
         if (!bytes || bytes % 512U || bytes > LlRdma::kCoreBytes) { Trap(); return; }
         const uint32_t slots = LlRdma::kCoreBytes / bytes_;
         capacity_ = slots; // use every complete packet slot in the 128KiB GM stage
-        if (uint32_t(args_->rankSize) > DispatchDedup::kLlPhysicalRanksPerHost)
-            stageBase_ = Stage(args_, capacity_ * bytes_);
+        if (DEEPEP_LL_LAUNCH_WORLD(args_) > DispatchDedup::kLlPhysicalRanksPerHost)
+            stageBase_ = Stage(args_, capacity_ * bytes_, core_);
     }
     __aicore__ inline bool Pending() const { return count_ != 0U; }
     __aicore__ inline bool HasStaged() const { return staged_; }
@@ -92,7 +93,7 @@ public:
 #endif
         // Only after the wait may NIC read GM and SDK overwrite the old UB lane.
         Put(args_, pendingPeer_, RemoteAddress(args_, pendingPeer_, pendingOffset_),
-            pendingStage_, bytes_, pendingScratch_);
+            pendingStage_, bytes_, pendingScratch_, core_);
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
         if (profile_) profile_->PutReturned(pendingSecond_);
 #endif

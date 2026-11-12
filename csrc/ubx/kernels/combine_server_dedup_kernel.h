@@ -5,6 +5,8 @@
 #define COMBINE_DEDUP_EP_COMBINE_MEMORY_SERVER_DEDUP_KERNEL_H
 
 #include "kernel_operator.h"
+#include "../../kernels/common/core_context.h"
+#include "ubx_jit_spec.h"
 
 #include "ep_memory_server_dedup_count_layout.h"
 #include "comm_args.h"
@@ -25,9 +27,10 @@ public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
                                 GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK, uint32_t experts, uint8_t dtype,
-                                int64_t magic, bool enableDedup = true)
+                                int64_t magic, deepep::CoreContext core, bool enableDedup = true)
     {
-        coreNum_ = GetBlockNum();
+        coreContext_ = core;
+        coreNum_ = core.count;
         recvCores_ = EpCombineRecvCoreCount(coreNum_);
         if (recvCores_ == 0U) {
             Trap();
@@ -35,7 +38,7 @@ public:
         }
         // Task partitions and control rows retain physical core ordering.
 
-        core_ = CombineLogicalCore(GetBlockIdx(), coreNum_);
+        core_ = CombineLogicalCore(core.index, coreNum_);
         sendCores_ = coreNum_ - recvCores_;
         notifyBegin_ = coreNum_ - UbxDispatch::kLlNotifyCoreNum;
         args_ = reinterpret_cast<const __gm__ UbxDispatch::CommArgs*>(commArgs);
@@ -65,9 +68,9 @@ public:
         Sync<HardEvent::MTE2_S>();
 
         const int32_t tokens = tokenCount.GetValue(0U);
-        const uint32_t localExperts = experts / uint32_t(args_->rankSize);
+        const uint32_t localExperts = experts / DEEPEP_UBX_LAUNCH_WORLD(args_);
         const uint32_t copies = topK < localExperts ? topK : localExperts;
-        const uint64_t capacity = uint64_t(args_->rankSize) * bs * copies;
+        const uint64_t capacity = uint64_t(DEEPEP_UBX_LAUNCH_WORLD(args_)) * bs * copies;
         if (tokens < 0 || uint32_t(tokens) > kEpServerDedupCombineMaxTokenNum || uint64_t(tokens) > capacity) {
             Trap();  // Invalid device data must not become a truncated successful launch.
             return;
@@ -154,6 +157,11 @@ public:
 
         returnBatch_.Flush(arena_.Get<uint8_t>());
     }
+
+    // SuperKernel sub-task boundary. Retires the member TPipe without the
+    // implicit whole-pipe barrier; all business DMA and output retirement has
+    // already completed in Process().
+    __aicore__ inline void Destroy() { pipe_.DestroyWithoutPipeAll(); }
 
 private:
     __aicore__ inline void AggregateSourceTokensM6()
@@ -378,7 +386,8 @@ private:
         directRoutesCached_ = tokens_ <= kEpServerDedupCombineTableRows;
         auto upper = tableUb_.ReinterpretCast<uint8_t>();
         if (directRoutesCached_) upper = readyWork_.ReinterpretCast<uint8_t>();
-        ServerDedupRankMask(maskUb_, upper, typeUb_, 0, int32_t(args_->rankSize), uint32_t(selected_));
+        ServerDedupRankMask(maskUb_, upper, typeUb_, 0, int32_t(DEEPEP_UBX_LAUNCH_WORLD(args_)),
+                            uint32_t(selected_));
         uint64_t valid = 0U;
         GatherMask(indexUb_, packedUb_, maskUb_.ReinterpretCast<uint32_t>(), true, uint32_t(selected_),
                    {1U, 1U, 0U, 0U}, valid);
@@ -404,8 +413,8 @@ private:
 
         if (selected_ == 0U) return;
 
-        if (UbxTransport::Rdma(args_)) returnBatch_.Init(args_, resultStride_);
-        const uint32_t servers = uint32_t(args_->rankSize) / Group;
+        if (UbxTransport::Rdma(args_)) returnBatch_.Init(args_, resultStride_, coreContext_);
+        const uint32_t servers = DEEPEP_UBX_LAUNCH_WORLD(args_) / Group;
         const uint32_t ownServer = uint32_t(args_->rank) / Group;
         uint32_t owner = 0U, sendSequence = 0U;
         uint32_t activeLanes = lanes_;
@@ -498,7 +507,7 @@ private:
         ServerDedupPartial<Group> partial;
         partial.Init(args_, &pipe_, arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes], expertAddr_,
                      tableAddr_, relayAddr_, typesAddr_, tokens_, bs_, h_, topK_, experts_, dtype_, window_, workspace_,
-                     &returnBatch_);
+                     &returnBatch_, coreContext_);
 
         partial.SetReady(&groupReady_);
         partialTasks_ = partial.Process();
@@ -576,6 +585,7 @@ private:
 
     EpCombineM45WorkspaceLayout workspace_{};
     ReturnBatch returnBatch_;
+    deepep::CoreContext coreContext_{};
     uint32_t partialTasks_ = 0U;
     uint32_t coreNum_ = 0, sendCores_ = 0, recvCores_ = 0, notifyBegin_ = 0;
     TPipe pipe_;

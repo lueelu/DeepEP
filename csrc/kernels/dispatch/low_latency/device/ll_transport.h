@@ -1,6 +1,8 @@
 #pragma once
 #include "../common/ll_rdma_layout.h"
 #include "../common/ll_group_policy.h"
+#include "../common/ll_jit_spec.h"
+#include "../../../common/core_context.h"
 #include "kernel_operator.h"
 #ifdef DEEPEP_LL_RDMA
 #include "device/gm2gm/engine/shmem_device_rdma.h"
@@ -19,7 +21,7 @@ __aicore__ inline bool SameHost(const __gm__ Args* a, uint32_t peer) {
 }
 __aicore__ inline bool RemoteWrite(const __gm__ Args* a, uint32_t peer) { return Rdma(a) && !SameHost(a, peer); }
 __aicore__ inline void Check(const __gm__ Args* a, uint32_t peer, uint64_t offset, uint64_t bytes) {
-    if (peer >= uint32_t(a->rankSize) || offset > a->peerMemBytes || bytes > a->peerMemBytes - offset) Trap();
+    if (peer >= DEEPEP_LL_LAUNCH_WORLD(a) || offset > a->peerMemBytes || bytes > a->peerMemBytes - offset) Trap();
 }
 __aicore__ inline GM_ADDR RemoteAddress(const __gm__ Args* a, uint32_t peer, uint64_t offset) {
     return a->reservedAddresses[0] + uint64_t(peer) * 1024U + offset;
@@ -32,21 +34,26 @@ __aicore__ inline GlobalTensor<uint8_t> Tensor(GM_ADDR p, bool uncached=false) {
     if (uncached) t.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
     return t;
 }
-__aicore__ inline GM_ADDR Stage(const __gm__ Args* a, uint32_t bytes) {
-    if (GetBlockNum() != a->reservedConfig[1] || GetBlockIdx() >= a->reservedConfig[1] || bytes > LlRdma::kCoreBytes) Trap();
-    return a->reservedAddresses[1] + uint64_t(GetBlockIdx()) * LlRdma::kCoreBytes;
+// The QP id and staging slot are the logical core index. Under a fused
+// SuperKernel task AscendC::GetBlockIdx() is the fused grid index, so the
+// caller passes its own CoreContext instead of relying on the accessor.
+__aicore__ inline GM_ADDR Stage(const __gm__ Args* a, uint32_t bytes, deepep::CoreContext core) {
+    if (core.count != a->reservedConfig[1] || core.index >= a->reservedConfig[1] || bytes > LlRdma::kCoreBytes) Trap();
+    return a->reservedAddresses[1] + uint64_t(core.index) * LlRdma::kCoreBytes;
 }
 __aicore__ inline void Put(const __gm__ Args* a, uint32_t peer, GM_ADDR dst, GM_ADDR src,
-                           uint32_t bytes, LocalTensor<uint8_t> scratch, uint32_t syncId=7U) {
+                           uint32_t bytes, LocalTensor<uint8_t> scratch, deepep::CoreContext core,
+                           uint32_t syncId=7U) {
 #ifdef DEEPEP_LL_RDMA
-    aclshmemx_roce_qp_put_nbi(dst, src, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), bytes, peer, GetBlockIdx(), syncId);
+    aclshmemx_roce_qp_put_nbi(dst, src, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), bytes, peer, core.index, syncId);
 #else
     Trap();
 #endif
 }
-__aicore__ inline void Quiet(uint32_t peer, LocalTensor<uint8_t> scratch, uint32_t syncId=7U) {
+__aicore__ inline void Quiet(uint32_t peer, LocalTensor<uint8_t> scratch, deepep::CoreContext core,
+                             uint32_t syncId=7U) {
 #ifdef DEEPEP_LL_RDMA
-    aclshmemx_roce_qp_quiet(peer, GetBlockIdx(), (__ubuf__ uint8_t*)scratch.GetPhyAddr(), syncId);
+    aclshmemx_roce_qp_quiet(peer, core.index, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), syncId);
 #else
     Trap();
 #endif
@@ -57,8 +64,8 @@ __aicore__ inline void Quiet(uint32_t peer, LocalTensor<uint8_t> scratch, uint32
 // Quiet still owns registered source reuse, not receiver consumption.
 // See ROCE_SO_CONTRACT.md. No cross-WQE/QP ordering is assumed.
 __aicore__ inline void Packet(const __gm__ Args* a, uint32_t peer, uint64_t offset,
-                              LocalTensor<uint8_t> packet, uint32_t bytes, uint32_t syncId=7U,
-                              bool preservePacket=true) {
+                              LocalTensor<uint8_t> packet, uint32_t bytes, deepep::CoreContext core,
+                              uint32_t syncId=7U, bool preservePacket=true) {
     Check(a, peer, offset, bytes);
     auto dst = Address(a, peer, offset);
     if (!RemoteWrite(a, peer)) {
@@ -68,15 +75,15 @@ __aicore__ inline void Packet(const __gm__ Args* a, uint32_t peer, uint64_t offs
         return;
     }
     if (bytes == 0U || bytes % 512U || syncId >= 8U) { Trap(); return; }
-    auto stage = Stage(a, bytes);
+    auto stage = Stage(a, bytes, core);
 
     PipeBarrier<PIPE_ALL>();
     DataCopy(Tensor(stage,true), packet, bytes);
     Sync<HardEvent::MTE3_S>(syncId); // registered GM complete before Scalar posts NIC WQEs
 
-    Put(a, peer, dst, stage, bytes, packet, syncId);
+    Put(a, peer, dst, stage, bytes, packet, core, syncId);
 
-    Quiet(peer, packet, syncId);
+    Quiet(peer, packet, core, syncId);
 
     if (preservePacket) {
 
@@ -93,23 +100,25 @@ __aicore__ inline void Packet(const __gm__ Args* a, uint32_t peer, uint64_t offs
 // producers have completed. scratch is a retired, independent >=128B UB view.
 __aicore__ inline void Records(const __gm__ Args* a, uint32_t peer, uint64_t offset,
                                LocalTensor<uint8_t> records, uint32_t count, uint32_t stride,
-                               bool counts, LocalTensor<uint8_t> scratch) {
+                               bool counts, LocalTensor<uint8_t> scratch, deepep::CoreContext core) {
     if (!count) return;
     Check(a, peer, offset, uint64_t(count - 1U) * stride + 32U);
     auto dst = Address(a, peer, offset);
     if (!RemoteWrite(a, peer)) {
         DataCopyPad(Tensor(dst,Rdma(a)), records, {uint16_t(count), 32U, 0U, stride - 32U, 0U}); return;
     }
-    auto stage = Stage(a, count * 32U);
+    auto stage = Stage(a, count * 32U, core);
     PipeBarrier<PIPE_ALL>();
     DataCopy(Tensor(stage,true), records, count * 32U);
     Sync<HardEvent::MTE3_S>(7U);
     if (counts) {
-        for (uint32_t i = 0; i < count; ++i) Put(a, peer, dst + uint64_t(i)*stride + 4U, stage + i*32U + 4U, 28U, scratch);
-        Quiet(peer, scratch);
+        for (uint32_t i = 0; i < count; ++i)
+            Put(a, peer, dst + uint64_t(i)*stride + 4U, stage + i*32U + 4U, 28U, scratch, core);
+        Quiet(peer, scratch, core);
     }
-    for (uint32_t i = 0; i < count; ++i) Put(a, peer, dst + uint64_t(i)*stride, stage + i*32U, counts ? 4U : 32U, scratch);
-    Quiet(peer, scratch);
+    for (uint32_t i = 0; i < count; ++i)
+        Put(a, peer, dst + uint64_t(i)*stride, stage + i*32U, counts ? 4U : 32U, scratch, core);
+    Quiet(peer, scratch, core);
 }
 // Partial members belong to one aligned logical group (4 or 16), always
 // within one physical host. Cross-host reads are forbidden, including fallback.

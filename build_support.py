@@ -249,6 +249,7 @@ def build_configuration(environment=None):
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
+    ll_jit = enabled("DEEPEP_LL_JIT", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
     default_shmem = ROOT / "third-party/shmem/install/shmem"
 
@@ -334,6 +335,12 @@ def build_configuration(environment=None):
         "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
         "topk_idx_bits": 64,
     }
+    result["ll_jit"] = {"enabled": ll_jit}
+    if ll_jit:
+        # DeepJIT loads kernels through torch_npu stream types, so the Host
+        # module compiles and links against that SDK when JIT is selected.
+        result["TORCH_NPU_PATH"] = str(Path(torch_npu.__file__).parent.resolve())
+        result["Torch_DIR"] = str(Path(torch.__file__).parent / "share/cmake/Torch")
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
@@ -522,8 +529,16 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
+            f"-DDEEPEP_LL_JIT={'ON' if configuration.get('ll_jit', {}).get('enabled', False) else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
         ]
+        if configuration.get("ll_jit", {}).get("enabled", False):
+            arguments.extend(
+                [
+                    f"-DTORCH_NPU_PATH={configuration['TORCH_NPU_PATH']}",
+                    f"-DTorch_DIR={configuration['Torch_DIR']}",
+                ]
+            )
         if ep_gmm_fused:
             arguments.extend(
                 [
@@ -535,6 +550,12 @@ class CMakeBuild(build_ext):
         checked_run(arguments)
         checked_run([cmake, "--build", directory, "--parallel", jobs])
         checked_run([cmake, "--install", directory])
+        if configuration.get("ll_jit", {}).get("enabled", False):
+            # DeepJIT compiles the LL entries on first launch, so the installed
+            # package carries the same device headers this build configured from.
+            kernel_src = destination / "_kernel_src"
+            shutil.rmtree(kernel_src, ignore_errors=True)
+            shutil.copytree(ROOT / "csrc", kernel_src / "csrc")
         # A reused setuptools build_lib may still contain the former library.
         (destination / "libdeepep_notify.so").unlink(missing_ok=True)
         # Elastic implementation/layout modules now live under buffers/.
@@ -550,6 +571,8 @@ class CMakeBuild(build_ext):
                 "ASCEND_HOME_PATH",
                 "SHMEM_ROOT",
                 "CATLASS_ROOT",
+                "TORCH_NPU_PATH",
+                "Torch_DIR",
                 "compiler_path",
                 "ep_gmm_fused_paths",
                 "cmake_path",

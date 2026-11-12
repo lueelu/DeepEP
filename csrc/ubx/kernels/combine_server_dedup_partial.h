@@ -30,19 +30,21 @@ public:
     __aicore__ inline void Init(const __gm__ UbxDispatch::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch,
                                 GM_ADDR expert, GM_ADDR table2, GM_ADDR table3, GM_ADDR types, uint32_t tokens,
                                 uint32_t bs, uint32_t h, uint32_t k, uint32_t experts, uint8_t dtype, uint64_t window,
-                                const EpCombineM45WorkspaceLayout& layout, ReturnBatch* batch)
+                                const EpCombineM45WorkspaceLayout& layout, ReturnBatch* batch,
+                                deepep::CoreContext core)
     {
         args_ = args;
         rdmaBatch_ = batch;
+        coreContext_ = core;
 
-        recvCores_ = EpCombineRecvCoreCount(GetBlockNum());
+        recvCores_ = EpCombineRecvCoreCount(core.count);
         pipe_ = pipe;
         scratch_ = scratch[layout.phaseOffset];
         tokens_ = tokens;
         bs_ = bs;
         h_ = h;
         k_ = k;
-        localExperts_ = experts / uint32_t(args->rankSize);
+        localExperts_ = experts / DEEPEP_UBX_LAUNCH_WORLD(args);
         dtype_ = dtype;
         window_ = window;
         blocks_ = (h * 2U + 479U) / 480U;
@@ -94,15 +96,16 @@ public:
         // future output slots. No payload DMA has started on this receive core.
 
         planned_ = plan_.Prepare(planScratch_, planScratchBytes_, rows_, types_, table2_, tokens_,
-                                 uint32_t(args_->rankSize), uint32_t(args_->rank),
-                                 CombineReceiveCoreIndex(GetBlockIdx(), GetBlockNum(), recvCores_), recvCores_);
+                                 DEEPEP_UBX_LAUNCH_WORLD(args_), uint32_t(args_->rank),
+                                 CombineReceiveCoreIndex(coreContext_.index, coreContext_.count, recvCores_),
+                                 recvCores_);
 
         // Hand Vector scratch back to MTE2 before any input lane can overwrite
         // it. Preserve the caller's seeded MTE3_V output events.
         SetFlag<HardEvent::V_MTE2>(7U);
         WaitFlag<HardEvent::V_MTE2>(7U);
 
-        if (UbxTransport::Rdma(args_)) rdmaBatch_->Init(args_, packetBytes_);
+        if (UbxTransport::Rdma(args_)) rdmaBatch_->Init(args_, packetBytes_, coreContext_);
 
         for (uint32_t lane = 0; lane < inputLanes_; ++lane) SetFlag<HardEvent::V_MTE2>(lane);
         uint64_t flagMask[2] = {0xffU, 0U};
@@ -112,7 +115,7 @@ public:
         }
         PipeBarrier<PIPE_V>();
 
-        const uint32_t servers = uint32_t(args_->rankSize) / Group;
+        const uint32_t servers = DEEPEP_UBX_LAUNCH_WORLD(args_) / Group;
         const uint32_t ownServer = uint32_t(args_->rank) / Group;
         uint32_t completed = 0U;
         completed = ProcessReadyTasks(servers, ownServer);
@@ -258,7 +261,7 @@ private:
     __aicore__ inline uint32_t SelectServer(uint32_t server, uint32_t& owner, bool validateRanks, uint32_t append = 0U)
     {
         uint32_t count = append;
-        const uint32_t localCore = CombineReceiveCoreIndex(GetBlockIdx(), GetBlockNum(), recvCores_);
+        const uint32_t localCore = CombineReceiveCoreIndex(coreContext_.index, coreContext_.count, recvCores_);
         const uint32_t vectorBytes = EpCombineAlign(scanRows_ * 4U, 256U);
         const uint32_t maskBytes = EpCombineAlign((scanRows_ + 7U) / 8U, 32U);
         auto table = scan_.ReinterpretCast<int32_t>();
@@ -292,7 +295,7 @@ private:
             if (validateRanks) {
                 uint64_t typed = 0U, valid = 0U;
                 GatherMask(table, indices, typeMask.ReinterpretCast<uint32_t>(), true, span, {1U, 1U, 0U, 0U}, typed);
-                ServerDedupRankMask(mask, upper, ranks, 0, int32_t(args_->rankSize), span);
+                ServerDedupRankMask(mask, upper, ranks, 0, int32_t(DEEPEP_UBX_LAUNCH_WORLD(args_)), span);
                 And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(),
                     typeMask.ReinterpretCast<uint16_t>(), int32_t((span + 15U) / 16U));
                 PipeBarrier<PIPE_V>();
@@ -342,7 +345,8 @@ private:
             const uint32_t expert = packed & 0xffffU, q = packed >> 16U;
             const uint32_t memberRank = expert / localExperts_, localExpert = expert % localExperts_;
             const uint64_t slot =
-                (((uint64_t(source) + memberRank) % uint32_t(args_->rankSize)) * localExperts_ + localExpert) * bs_ + q;
+                (((uint64_t(source) + memberRank) % DEEPEP_UBX_LAUNCH_WORLD(args_)) * localExperts_ + localExpert) * bs_ +
+                q;
             if (memberRank / Group != uint32_t(args_->rank) / Group) {
                 Trap();
                 return;
@@ -429,6 +433,7 @@ private:
     uint32_t recvCores_ = 0;
     ReturnBatch* rdmaBatch_ = nullptr;
     const __gm__ UbxDispatch::CommArgs* args_ = nullptr;
+    deepep::CoreContext coreContext_{};
     TPipe* pipe_ = nullptr;
     LocalTensor<uint8_t> scratch_, outputs_, scan_;
     LocalTensor<int32_t> rows_, table2Ub_;

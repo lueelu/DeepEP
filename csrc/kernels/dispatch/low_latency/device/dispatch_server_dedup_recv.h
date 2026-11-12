@@ -9,6 +9,7 @@
 #include "ll_transport.h"
 #include "adv_api/reduce/sum.h"
 #include "../common/ep_memory_server_dedup_protocol.h"
+#include "../common/ll_jit_spec.h"
 #include "../../../common/ep_packet_receive_layout.h"
 #include "dispatch_server_dedup_receive_tasks.h"
 #include "dispatch_server_dedup_receive_packet.h"
@@ -25,20 +26,21 @@ public:
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, GM_ADDR expandX, GM_ADDR dynamicScales,
                                 GM_ADDR tokenType, GM_ADDR destinationIndex, GM_ADDR relayReadIndex, uint32_t bs,
                                 uint32_t h, uint32_t k, uint32_t experts, EpServerDedupInputMode inputMode,
-                                TPipe* pipe, int64_t magic = 0, bool enableDedup = true)
+                                TPipe* pipe, deepep::CoreContext core, int64_t magic = 0, bool enableDedup = true)
     {
         args_ = args;
         wireFp8_ = inputMode != EpServerDedupInputMode::Plain16;
 
-        coreNum_ = GetBlockNum();
+        coreContext_ = core;
+        coreNum_ = DEEPEP_LL_LAUNCH_CORES(core);
         recvCoreNum_ = coreNum_ / 2U;
         pipe_ = pipe;
         enableDedup_ = enableDedup;
         bs_ = bs;
         k_ = k;
         experts_ = experts;
-        localExperts_ = experts / uint32_t(args_->rankSize);
-        receiver_ = GetBlockIdx() - recvCoreNum_;
+        localExperts_ = experts / DEEPEP_LL_LAUNCH_WORLD(args_);
+        receiver_ = core.index - recvCoreNum_;
         // Both admitted 16-bit input families occupy two bytes per element.
         hiddenBytes_ = wireFp8_ ? h : h * 2U;
         data_ = DispatchServerDedupDataLayout(bs, h, k, experts, inputMode);
@@ -74,7 +76,8 @@ public:
 
         // 2. 按前缀定义的接收输出行均分任务，建立稳定槽位表和可压缩的 pending 表。
         // j 始终标识固定输出行/槽位；pending 下标只表示尚未消费的任务位置。
-        tasks_.Build(prefix, uint32_t(args_->rank), uint32_t(args_->rankSize), experts_, bs_, receiver_, pipe_, recvCoreNum_);
+        tasks_.Build(prefix, uint32_t(args_->rank), DEEPEP_LL_LAUNCH_WORLD(args_), experts_, bs_, receiver_, pipe_,
+                     recvCoreNum_);
         if (profile) {
             profile->Mark<31>();  // w31: receive_tasks_built
             profile->Value<37>(tasks_.Count());  // w37: receive_task_count
@@ -427,7 +430,7 @@ private:
             DataCopyPad(relayReadIndex_[uint64_t(row) * k_ * 2U], tail.ReadIndex(), {1U, k_ * 8U, 0U, 0U, 0U});
 
             const uint32_t sourceRank = tail.Header().GetValue(0U);
-            const uint32_t ranks = uint32_t(args_->rankSize);
+            const uint32_t ranks = DEEPEP_LL_LAUNCH_WORLD(args_);
             const uint32_t members = tail.ReadIndex().GetValue(0U);
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
             ++firstHopTokens_;
@@ -441,7 +444,8 @@ private:
 
                 LlTransport::Packet(args_, destinationRank,
                     DispatchServerDedupDispatchOffset(data_, sourceRank, destinationRank,
-                        expertId % localExperts_, q, ranks, localExperts_, bs_), wire, uint32_t(data_.tokenStride), lane);
+                        expertId % localExperts_, q, ranks, localExperts_, bs_), wire,
+                    uint32_t(data_.tokenStride), coreContext_, lane);
 
                 // SDK CQ polling uses MTE2_S. This lane's event was consumed at
                 // entry; other prefetched lanes (including 7) still own theirs.
@@ -470,6 +474,7 @@ public:
     __aicore__ inline LocalTensor<uint8_t> FinalScratch() { return prefixBuf_.Get<uint8_t>(); }
 private:
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
+    deepep::CoreContext coreContext_{};
     TPipe* pipe_ = nullptr;
     bool enableDedup_ = false, wireFp8_ = false;
     uint64_t windowOffset_ = 0;

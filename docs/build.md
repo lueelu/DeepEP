@@ -79,6 +79,13 @@ MegaMoE 构建及仓内 SDK 复用保持严格校验，SDK 必须与锁文件匹
 不同工具链、SDK、Python 环境和构建模式使用不同指纹目录；源码哈希仅用于标识产物，
 修改 Python、测试或单个 kernel 不切换整个构建目录。`DEEPEP_BUILD_MEGAMOE` 默认 OFF；
 ON 的构建与使用方式见 [MegaMoE 文档](../experiments/megamoe/README.md)。
+
+`DEEPEP_LL_JIT=ON` 启用 DeepJIT 运行时编译（默认 OFF）。ON 时构建需要
+`third-party/deep_jit`（`git submodule update --init -- third-party/deep_jit`）、
+C++20 Host 编译器和同环境 `torch`/`torch_npu`；`build_support.py` 记录
+`TORCH_NPU_PATH` 并把 `csrc` 头文件打包到安装目录的 `_kernel_src/`，供安装后离线编译。
+OFF 构建不包含 JIT 桥接、不链接 `torch_npu`，运行时不接受 JIT 选项。运行时 JIT 的
+缓存与设备侧限制见 [UBX 文档](ubx.md)。
 安装产物没有构建机绝对 RPATH。`deep_ep/.libs/` 携带 `libshmem.so`、`libshmem_utils.so`、
 `aclshmem_bootstrap_config_store.so` 和 `aclshmem_bootstrap_uid.so`，哈希记录在 `_build_info.json` 中。
 公开接口首次使用 native 时先校验这些文件，再按包内绝对路径加载；V1/V2 共用此入口。

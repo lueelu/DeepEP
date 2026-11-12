@@ -15,6 +15,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(DEEPEP_BUILD_EP_GMM_FUSED "Build Ascend950 communication/GMM experiment" OFF)
+option(DEEPEP_LL_JIT "Compile the LL dispatch/combine kernels at runtime through DeepJIT" OFF)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 include(cmake/Dependencies.cmake)
@@ -36,6 +37,35 @@ target_compile_options(_C PRIVATE "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
     "-ffile-prefix-map=${SHMEM_ROOT}=SHMEM_SDK" "-ffile-prefix-map=${ASCEND_HOME_PATH}=CANN_SDK")
 target_compile_definitions(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:_FORTIFY_SOURCE=2>")
 target_link_options(_C PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
+# DeepJIT compiles the LL entries at runtime. It needs C++20 and the torch_npu
+# stream types its kernel handle uses; the AOT build stays untouched.
+if(DEEPEP_LL_JIT)
+    if(NOT TORCH_NPU_PATH)
+        message(FATAL_ERROR "DEEPEP_LL_JIT requires -DTORCH_NPU_PATH (installed torch_npu directory)")
+    endif()
+    find_package(Torch REQUIRED)
+    target_sources(_C PRIVATE csrc/runtime/ll_jit.cpp)
+    set_target_properties(_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    # The JIT reproduces the device compile line from the AOT build, so the
+    # selected SDK root and doorbell mode travel with the Host module.
+    target_compile_definitions(_C PRIVATE DEEPEP_LL_JIT=1
+        "DEEPEP_JIT_SOURCE_ROOT=\"${CMAKE_SOURCE_DIR}/csrc\""
+        "DEEPEP_JIT_SHMEM_ROOT=\"${SHMEM_ROOT}\""
+        DEEPEP_JIT_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP})
+    if(DEEPEP_LL_REFERENCE_PROFILE)
+        target_compile_definitions(_C PRIVATE DEEPEP_JIT_REFERENCE_PROFILE=1)
+    endif()
+    if(DEEPEP_LL_COUNT_HISTOGRAM)
+        target_compile_definitions(_C PRIVATE DEEPEP_JIT_COUNT_HISTOGRAM=1)
+    endif()
+    # Third-party headers are not ours to keep warning-clean under -Werror.
+    target_include_directories(_C SYSTEM PRIVATE
+        "${CMAKE_SOURCE_DIR}/third-party/deep_jit/include"
+        "${TORCH_NPU_PATH}/include" "${TORCH_NPU_PATH}/include/third_party/acl/inc"
+        ${TORCH_INCLUDE_DIRS})
+    target_link_directories(_C PRIVATE "${TORCH_NPU_PATH}/lib" ${TORCH_LIBRARY_DIRS})
+    target_link_libraries(_C PRIVATE torch_npu)
+endif()
 # SDKs are external dependencies. Never embed checkout/toolkit absolute RPATHs.
 set_target_properties(_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS _C LIBRARY DESTINATION .)

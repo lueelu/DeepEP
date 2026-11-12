@@ -8,6 +8,7 @@
 #include <vector>
 #include "runtime/session.hpp"
 #include "runtime/ll_core_config.hpp"
+#include "runtime/ll_jit.hpp"
 #include "ubx/v2.hpp"
 #include "../kernels/dispatch/low_latency/common/ll_rdma_layout.h"
 #include "../kernels/dispatch/low_latency/common/ll_stage_timer_layout.h"
@@ -162,6 +163,47 @@ DispatchDedup::EpServerDedupTilingData dispatch_format_tiling(int world, const s
     data.expandXOutDtype = data.dtype;
     return data;
 }
+
+// The JIT identity comes from the same Host description as the tiling builder.
+// `capacity` is the per-rank token bound Python selected for this handle; the
+// dedup decision must match the value the device reads from that tiling.
+LlDispatchJitSpec dispatch_jit_spec(int world, int b, int h, int k, int e, const std::string& dtype, int capacity,
+                                   uint32_t cores)
+{
+    const auto format = dispatch_format_tiling(world, dtype);
+    LlDispatchJitSpec spec;
+    spec.bs = uint32_t(b);
+    spec.h = uint32_t(h);
+    spec.topK = uint32_t(k);
+    spec.experts = uint32_t(e);
+    spec.cores = cores;
+    spec.world = uint32_t(world);
+    spec.inputClass = DispatchDedup::LlDispatchInputClass(format.dtype, format.quantMode, format.expandXOutDtype,
+                                                          format.inputMode);
+    if (spec.inputClass == DispatchDedup::kLlDispatchInvalidVariant)
+        throw std::invalid_argument("Unsupported LL dispatch format");
+    spec.group = format.tilingKey;
+    spec.inputMode = format.inputMode;
+    spec.e4m3 = dtype == "float8_e4m3fn";
+    spec.dedup = DispatchDedup::EpServerDedupEnabled(uint32_t(capacity), uint32_t(b), uint32_t(world));
+    return spec;
+}
+
+LlCombineJitSpec combine_jit_spec(int world, int b, int h, int k, int e, const std::string& dtype, int capacity,
+                                 uint32_t cores)
+{
+    LlCombineJitSpec spec;
+    spec.bs = uint32_t(b);
+    spec.h = uint32_t(h);
+    spec.topK = uint32_t(k);
+    spec.experts = uint32_t(e);
+    spec.cores = cores;
+    spec.world = uint32_t(world);
+    spec.group = DispatchDedup::LlTilingKeyForWorld(uint32_t(world));
+    spec.bf16 = dtype == "bfloat16";
+    spec.dedup = DispatchDedup::EpServerDedupEnabled(uint32_t(capacity), uint32_t(b), uint32_t(world));
+    return spec;
+}
 }  // namespace
 
 void bind_low_latency(py::module_& module)
@@ -171,6 +213,40 @@ void bind_low_latency(py::module_& module)
     module.attr("low_latency_core_protocol") = DispatchDedup::kLlCoreProtocolVersion;
     module.attr("low_latency_roce_qps_per_peer") = 0; // actual active physical cores
     module.attr("low_latency_implementation") = "ndr-hns1825";
+#ifdef DEEPEP_LL_JIT
+    module.attr("low_latency_jit_enabled") = true;
+#else
+    module.attr("low_latency_jit_enabled") = false;
+#endif
+    module.def("low_latency_jit_available", &deepep::ll_jit_available);
+    module.def("low_latency_jit_prepare_dispatch",
+               [](Session& session, int b, int h, int k, int e, const std::string& dtype, int capacity) {
+                   dtype_code(dtype);
+                   layout(session.world(), b, h, k, e, dtype == "float8_e4m3fn");
+                   const uint32_t cores = pin_session_cores(session);
+                   ll_jit_prepare_dispatch(dispatch_jit_spec(session.world(), b, h, k, e, dtype, capacity, cores));
+               },
+               py::arg("session"), py::arg("tokens"), py::arg("hidden"), py::arg("topk"), py::arg("experts"),
+               py::arg("dtype"), py::arg("capacity"));
+    module.def("low_latency_jit_prepare_combine",
+               [](Session& session, int b, int h, int k, int e, const std::string& dtype, int capacity, bool rdma) {
+                   if (dtype != "bfloat16" && dtype != "float16")
+                       throw std::invalid_argument("LL combine supports BF16/FP16");
+                   if (rdma != session.ll_rdma())
+                       throw std::invalid_argument("LL combine JIT backend differs from the Session transport");
+                   uint32_t cores = 0;
+                   if (rdma) {
+                       cores = pin_session_cores(session);
+                   } else {
+                       CombineDedup::Layout plan{};
+                       if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan))
+                           throw std::invalid_argument("Invalid LL combine shape");
+                       cores = CombineDedup::kEpServerDedupCombineCoreNum;
+                   }
+                   ll_jit_prepare_combine(combine_jit_spec(session.world(), b, h, k, e, dtype, capacity, cores), rdma);
+               },
+               py::arg("session"), py::arg("tokens"), py::arg("hidden"), py::arg("topk"), py::arg("experts"),
+               py::arg("dtype"), py::arg("capacity"), py::arg("rdma"));
 #ifdef DEEPEP_LL_RDMA
     if (!deepep_ll_rdma_enabled()) throw std::runtime_error("LL Host/device RDMA build mismatch; rebuild complete wheel");
     module.attr("low_latency_rdma_enabled") = true;
@@ -287,7 +363,7 @@ void bind_low_latency(py::module_& module)
         data.numMaxTokensPerRank = num_max_tokens_per_rank;
         data.topK = k;
         data.moeExpertNum = e;
-        data.expertTokenNumsType = 1;
+        data.expertTokenNumsType = DispatchDedup::kLlExpertTokenNumsType;
         return bytes(data);
     });
     module.def("low_latency_combine_tiling",
@@ -312,7 +388,8 @@ void bind_low_latency(py::module_& module)
                py::arg("world"), py::arg("tokens"), py::arg("hidden"), py::arg("topk"), py::arg("experts"),
                py::arg("dtype"), py::arg("capacity"), py::arg("rdma") = false);
     module.def("dispatch_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int rows,
-                                          const std::string& dtype, uintptr_t stream_address) {
+                                          const std::string& dtype, uintptr_t stream_address, bool jit,
+                                          int capacity) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         dtype_code(dtype);
         const bool fp8 = dtype == "float8_e4m3fn";
@@ -357,10 +434,19 @@ void bind_low_latency(py::module_& module)
         session.workspace();  // Validate the owning context before launch.
         py::gil_scoped_release release;
         session.invalidate_dispatch_controls();
-        dispatch_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
-    });
+        if (jit) {
+            if (capacity <= 0) throw std::invalid_argument("LL JIT dispatch requires the per-rank capacity");
+            ll_jit_launch_dispatch(reinterpret_cast<void*>(stream_address), args,
+                                   dispatch_jit_spec(session.world(), b, h, k, e, dtype, capacity, args.coreNum));
+        } else {
+            dispatch_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
+        }
+    },
+               py::arg("session"), py::arg("tensors"), py::arg("b"), py::arg("h"), py::arg("k"), py::arg("e"),
+               py::arg("rows"), py::arg("dtype"), py::arg("stream"), py::arg("jit") = false,
+               py::arg("capacity") = 0);
     module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e,
-                                         const std::string& dtype, uintptr_t stream_address) {
+                                         const std::string& dtype, uintptr_t stream_address, bool jit, int capacity) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         CombineDedup::Layout plan{};
         if (!stream_address || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
@@ -407,14 +493,26 @@ void bind_low_latency(py::module_& module)
         session.workspace();
         py::gil_scoped_release release;
         session.invalidate_dispatch_controls();
+        if (jit && capacity <= 0) throw std::invalid_argument("LL JIT combine requires the per-rank capacity");
         if (session.ll_rdma()) {
             const ubx::CombineArgs rdma_args{args.commArgs,     args.expertOut, args.destinationIndex, args.sendCounts,
                                              args.expertScales, args.tokenType, args.relayReadIndex,   args.sourceMask,
                                              args.yOut,         args.tilingData, cores};
-            ubx_combine_launch(reinterpret_cast<void*>(stream_address), &rdma_args);
+            if (jit) {
+                ll_jit_launch_combine_ubx(reinterpret_cast<void*>(stream_address), rdma_args,
+                                          combine_jit_spec(session.world(), b, h, k, e, dtype, capacity, cores));
+            } else {
+                ubx_combine_launch(reinterpret_cast<void*>(stream_address), &rdma_args);
+            }
+        } else if (jit) {
+            ll_jit_launch_combine(reinterpret_cast<void*>(stream_address), args,
+                                  combine_jit_spec(session.world(), b, h, k, e, dtype, capacity,
+                                                   CombineDedup::kEpServerDedupCombineCoreNum));
         } else {
             combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
         }
-    });
+    },
+               py::arg("session"), py::arg("tensors"), py::arg("b"), py::arg("h"), py::arg("k"), py::arg("e"),
+               py::arg("dtype"), py::arg("stream"), py::arg("jit") = false, py::arg("capacity") = 0);
 }
 }  // namespace deepep

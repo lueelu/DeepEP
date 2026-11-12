@@ -68,7 +68,7 @@ def setup(monkeypatch):
         log.append(("tiling", args, kwargs))
         return bytes(16)
 
-    def launch(session, tensors, *args):
+    def launch(session, tensors, *args, **kwargs):
         assert active[0] is comm and args[-1] == comm.npu_stream
         log.append(("launch", tensors))
 
@@ -85,6 +85,7 @@ def setup(monkeypatch):
         stream=comm,
         native=object(),
         ll_backend="rdma",
+        low_latency_jit=False,
         closed=True,
         notify_lock=threading.Lock(),
         notify_failed=False,
@@ -206,7 +207,7 @@ def test_reject_wrong_owner_device_and_unexpanded_handle(setup):
 def test_launch_failure_retains_storage_and_prevents_reuse(setup):
     s = setup
 
-    def fail(*_):
+    def fail(*_, **__):
         raise RuntimeError("launch failure")
 
     s.native.combine_low_latency = fail

@@ -21,16 +21,18 @@ public:
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch,
                                 GM_ADDR expert, GM_ADDR table2, GM_ADDR table3, GM_ADDR types, uint32_t tokens,
                                 uint32_t bs, uint32_t h, uint32_t k, uint32_t experts, uint8_t dtype, uint64_t window,
-                                const EpCombineM45WorkspaceLayout& layout)
+                                const EpCombineM45WorkspaceLayout& layout, uint32_t world, uint32_t core)
     {
         args_ = args;
         pipe_ = pipe;
+        core_ = core;
+        world_ = world;
         scratch_ = scratch[layout.phaseOffset];
         tokens_ = tokens;
         bs_ = bs;
         h_ = h;
         k_ = k;
-        localExperts_ = experts / uint32_t(args->rankSize);
+        localExperts_ = experts / world;
         dtype_ = dtype;
         window_ = window;
         blocks_ = (h * 2U + 479U) / 480U;
@@ -70,7 +72,7 @@ public:
                              uint8_t(blocks_), 1U, 16U);
         }
         PipeBarrier<PIPE_V>();
-        const uint32_t servers = uint32_t(args_->rankSize) / 8U;
+        const uint32_t servers = world_ / 8U;
         const uint32_t ownServer = uint32_t(args_->rank) / 8U;
         uint32_t owner = 0U, completed = 0U;
         for (uint32_t step = 1U; step <= servers; ++step) {
@@ -119,7 +121,7 @@ private:
     __aicore__ inline uint32_t SelectServer(uint32_t server, uint32_t& owner, bool validateRanks)
     {
         uint32_t count = 0U;
-        const uint32_t localCore = GetBlockIdx() - kEpServerDedupCombineSendCoreNum;
+        const uint32_t localCore = core_ - kEpServerDedupCombineSendCoreNum;
         const uint32_t vectorBytes = EpCombineAlign(scanRows_ * 4U, 256U);
         const uint32_t maskBytes = EpCombineAlign((scanRows_ + 7U) / 8U, 32U);
         auto table = scan_.ReinterpretCast<int32_t>();
@@ -151,7 +153,7 @@ private:
             if (validateRanks) {
                 uint64_t typed = 0U, valid = 0U;
                 GatherMask(table, indices, typeMask.ReinterpretCast<uint32_t>(), true, span, {1U, 1U, 0U, 0U}, typed);
-                ServerDedupRankMask(mask, upper, ranks, 0, int32_t(args_->rankSize), span);
+                ServerDedupRankMask(mask, upper, ranks, 0, int32_t(world_), span);
                 And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(),
                     typeMask.ReinterpretCast<uint16_t>(), int32_t((span + 15U) / 16U));
                 PipeBarrier<PIPE_V>();
@@ -198,7 +200,7 @@ private:
             const uint32_t expert = packed & 0xffffU, q = packed >> 16U;
             const uint32_t memberRank = expert / localExperts_, localExpert = expert % localExperts_;
             const uint64_t slot =
-                (((uint64_t(source) + memberRank) % uint32_t(args_->rankSize)) * localExperts_ + localExpert) * bs_ + q;
+                (((uint64_t(source) + memberRank) % world_) * localExperts_ + localExpert) * bs_ + q;
             data.SetGlobalBuffer(
                 reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[memberRank] + stageBase_ + slot * stageStride_));
             DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U},
@@ -255,6 +257,7 @@ private:
 
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
     TPipe* pipe_ = nullptr;
+    uint32_t core_ = 0, world_ = 0;
     LocalTensor<uint8_t> scratch_, outputs_, scan_;
     LocalTensor<int32_t> rows_, table2Ub_;
     LocalTensor<uint32_t> table3Ub_;

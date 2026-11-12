@@ -529,8 +529,23 @@ class ElasticBuffer:
                     runtime.notify_inflight = retained
                     for value in retained:
                         value.record_stream(runtime.stream)
+                    jit = runtime.low_latency_jit
+                    if jit:
+                        native.low_latency_jit_prepare_dispatch(
+                            runtime.native, b, h, k, num_experts, dtype, capacity
+                        )
                     native.dispatch_low_latency(
-                        runtime.native, tensors, b, h, k, num_experts, output_rows, dtype, runtime.stream.npu_stream
+                        runtime.native,
+                        tensors,
+                        b,
+                        h,
+                        k,
+                        num_experts,
+                        output_rows,
+                        dtype,
+                        runtime.stream.npu_stream,
+                        jit=jit,
+                        capacity=capacity,
                     )
                     result = EPHandle(
                         True,
@@ -664,7 +679,24 @@ class ElasticBuffer:
                     value.record_stream(runtime.stream)
                 runtime.notify_inflight = retained
                 try:
-                    native.combine_low_latency(runtime.native, tensors, b, h, k, e, dtype, runtime.stream.npu_stream)
+                    jit = runtime.low_latency_jit
+                    capacity = handle.num_max_tokens_per_rank
+                    if jit:
+                        native.low_latency_jit_prepare_combine(
+                            runtime.native, b, h, k, e, dtype, capacity, False
+                        )
+                    native.combine_low_latency(
+                        runtime.native,
+                        tensors,
+                        b,
+                        h,
+                        k,
+                        e,
+                        dtype,
+                        runtime.stream.npu_stream,
+                        jit=jit,
+                        capacity=capacity,
+                    )
                     event = EventOverlap._from_resources(EventHandle(), retained)
                 except Exception:
                     runtime.notify_failed = True

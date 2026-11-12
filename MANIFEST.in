@@ -15,6 +15,7 @@ recursive-include benchmarks *.py *.json *.csv *.md
 include third-party/*.md third-party/*.LICENSE
 prune third-party/shmem
 prune third-party/catlass
+prune third-party/deep_jit
 prune deep_ep/.native-build
 prune deep_ep/.libs
 recursive-exclude deep_ep *.so *.so.*

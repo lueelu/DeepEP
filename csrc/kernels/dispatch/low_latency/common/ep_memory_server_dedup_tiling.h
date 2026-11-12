@@ -8,6 +8,9 @@
 #include <cstdint>
 
 namespace DispatchDedup {
+// Count output semantics shared by the Host tiling builder, the AOT entry and
+// the DeepJIT specialization. 1 selects per-expert counts.
+constexpr uint32_t kLlExpertTokenNumsType = 1U;
 // Shared Host/AICore wire layout. Host validates before narrowing.
 // Magic is persistent device state, not tiling or a Host launch value.
 struct EpServerDedupTilingData {

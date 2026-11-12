@@ -16,6 +16,7 @@
 #include "../common/ep_memory_server_dedup_protocol.h"
 #include "../common/ll_send_order.h"
 #include "../common/ll_fullmesh_first_hop.h"
+#include "../common/ll_jit_spec.h"
 #include "../common/ll_sender_route_plan.h"
 #include "../common/ll_sender_input_reuse.h"
 #include "../../../common/ep_packet_receive_layout.h"
@@ -34,15 +35,16 @@ public:
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, GM_ADDR x, GM_ADDR ids, GM_ADDR weights,
                                 GM_ADDR sourceMask, GM_ADDR sourceWeights, uint32_t bs, uint32_t h, uint32_t k,
                                 uint32_t experts, EpServerDedupInputMode inputMode, bool e4m3, TPipe* pipe,
-                                int64_t magic = 0, GM_ADDR inputScales = nullptr,
-                                bool enableDedup = true, uint32_t coreNum = 0U)
+                                deepep::CoreContext coreContext, int64_t magic = 0, GM_ADDR inputScales = nullptr,
+                                bool enableDedup = true)
     {
         args_ = args;
         prequantized_ = inputMode == EpServerDedupInputMode::PrequantizedFp8Packs;
         needQuantize_ = inputMode == EpServerDedupInputMode::Quantize16;
         e4m3_ = e4m3;
         inputRowBytes_ = uint32_t(prequantized_ ? h : h * sizeof(XType));
-        sendCores_ = (coreNum == 0U ? GetBlockNum() : coreNum) / 2U;
+        coreContext_ = coreContext;
+        sendCores_ = coreContext.count / 2U;
         pipe_ = pipe;
         enableDedup_ = enableDedup;
         fullMeshFirstHop_ = Group == kLlPhysicalRanksPerHost && LlTransport::Rdma(args);
@@ -50,8 +52,8 @@ public:
         h_ = h;
         k_ = k;
         experts_ = experts;
-        localExperts_ = experts / args->rankSize;
-        const uint32_t core = GetBlockIdx();
+        localExperts_ = experts / DEEPEP_LL_LAUNCH_WORLD(args);
+        const uint32_t core = coreContext.index;
         const uint32_t base = bs / sendCores_, remainder = bs % sendCores_;
         count_ = base + (core < remainder ? 1U : 0U);
         start_ = core * base + (core < remainder ? core : remainder);
@@ -79,15 +81,15 @@ public:
         if (profile && profile->Enabled()) {
             const uint32_t routes = bs_ * k_;
             const uint32_t assigned = enableDedup_ ? count_ * k_ :
-                routes / sendCores_ + (GetBlockIdx() < routes % sendCores_ ? 1U : 0U);
+                routes / sendCores_ + (coreContext_.index < routes % sendCores_ ? 1U : 0U);
             profile->Value<43>(assigned);  // w43: send_route_count
         }
         // 1. 无 token 分片的发送核直接返回；有任务的核复用 SendCnt 释放出的 scratch。
         // reservedBytes 对应仍可能被计数发送读取的 UB，不能当作可用空间覆盖。
-        if (!LlSenderHasWork(enableDedup_, count_, bs_ * k_, GetBlockIdx())) return;
+        if (!LlSenderHasWork(enableDedup_, count_, bs_ * k_, coreContext_.index)) return;
 
         if (LlTransport::Rdma(args_)) {
-            rdmaBatch_.Init(args_, uint32_t(data_.tokenStride));
+            rdmaBatch_.Init(args_, uint32_t(data_.tokenStride), coreContext_);
             rdmaBatch_.SetCountRetirement(retirement);
         }
 
@@ -129,9 +131,10 @@ public:
         Allocate(maskBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * 4U, 32U)));
         Allocate(directBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 16U, 32U)));
         // One uint32 state per server, including EP256's 16 host groups.
-        const uint32_t serverBytes = uint32_t(DispatchDedupAlign(uint64_t(args_->rankSize / Group) * 4U, 32U));
+        const uint32_t serverBytes =
+            uint32_t(DispatchDedupAlign(uint64_t(DEEPEP_LL_LAUNCH_WORLD(args_) / Group) * 4U, 32U));
         Allocate(serverBuf_, serverBytes < 64U ? 64U : serverBytes);
-        const uint32_t remoteServers = args_->rankSize / Group - 1U;
+        const uint32_t remoteServers = DEEPEP_LL_LAUNCH_WORLD(args_) / Group - 1U;
         const uint32_t maxGroups = remoteServers < k_ / 2U ? remoteServers : k_ / 2U;
         if (maxGroups != 0U) Allocate(firstHopBuf_, uint32_t(DispatchDedupAlign(maxGroups * 4U, 32U)));
 
@@ -215,7 +218,7 @@ public:
         // 由目标接收端继续转发。所有首跳优先发出，尽早启动远端 relay。
 
         const uint32_t rankInGroup = uint32_t(args_->rank) % Group;
-        const uint32_t sendCore = GetBlockIdx();
+        const uint32_t sendCore = coreContext_.index;
         for (uint32_t token = 0; token < count_; ++token) {
             uint32_t directMask = 0, firstHopCount = 0;
 
@@ -258,7 +261,7 @@ public:
         // Stable per-server scans retain the original q and token/k order.
         // Each core advances independently; the packet/lane sequence continues
         // across first hops and server boundaries without an added drain.
-        const uint32_t serverNum = args_->rankSize / Group;
+        const uint32_t serverNum = DEEPEP_LL_LAUNCH_WORLD(args_) / Group;
         const uint32_t expertsPerServer = localExperts_ * Group;
         const uint32_t ownServer = args_->rank / Group;
         LlBuildStableTaskGroups(directTasks_, directCount_, expertsPerServer, serverNum, serverState_);
@@ -279,12 +282,12 @@ public:
     __aicore__ inline void SendWithoutDedup(TQue<QuePosition::VECIN, 1>& input)
     {
         // Route ownership is independent of the token partition used to copy weights.
-        const uint32_t total = bs_ * k_, core = GetBlockIdx();
+        const uint32_t total = bs_ * k_, core = coreContext_.index;
         const uint32_t base = total / sendCores_;
         const uint32_t remainder = total % sendCores_;
         const uint32_t begin = core * base + (core < remainder ? core : remainder);
         const uint32_t count = base + (core < remainder ? 1U : 0U);
-        const uint32_t serverNum = args_->rankSize / Group;
+        const uint32_t serverNum = DEEPEP_LL_LAUNCH_WORLD(args_) / Group;
         if (serverNum < 16U) {
             for (uint32_t i = begin; i < begin + count; ++i) {
                 const uint32_t expert = uint32_t(routeIds_.GetValue(i));
@@ -550,13 +553,15 @@ private:
         if (LlTransport::RemoteWrite(args_, destination)) {
             rdmaBatch_.Enqueue(destination,
                 DispatchServerDedupDispatchOffset(data_, args_->rank, destination,
-                    expert % localExperts_, q, args_->rankSize, localExperts_, bs_), out, lanes_ > 1U);
+                    expert % localExperts_, q, DEEPEP_LL_LAUNCH_WORLD(args_), localExperts_, bs_), out,
+                lanes_ > 1U);
         } else
 #endif
         {
         LlTransport::Packet(args_, destination,
             DispatchServerDedupDispatchOffset(data_, args_->rank, destination,
-                expert % localExperts_, q, args_->rankSize, localExperts_, bs_), out, uint32_t(data_.tokenStride), 7U);
+                expert % localExperts_, q, DEEPEP_LL_LAUNCH_WORLD(args_), localExperts_, bs_), out,
+            uint32_t(data_.tokenStride), coreContext_, 7U);
         }
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
         if (packetProfile_) packetProfile_->GroupSubmitted();
@@ -567,6 +572,7 @@ private:
     }
 
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
+    deepep::CoreContext coreContext_{};
     TPipe* pipe_ = nullptr;
     LlTransport::DispatchRdmaBatch rdmaBatch_;
 #ifdef DEEPEP_LL_REFERENCE_PROFILE

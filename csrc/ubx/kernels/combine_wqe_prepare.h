@@ -16,12 +16,12 @@ class PreparedWrite {
 
 public:
     __aicore__ inline bool Prepare(uint32_t peer, GM_ADDR remote, GM_ADDR local, uint32_t bytes,
-                                   AscendC::LocalTensor<uint8_t> scratch)
+                                   AscendC::LocalTensor<uint8_t> scratch, deepep::CoreContext core)
     {
         static_assert(ACLSHMEMI_K_RDMA_BACKEND == aclshmemi_rdma_backend_t::HNS_1825,
                       "WQE preparation requires the native HNS-1825 SDK");
         auto* info = aclshmemi_qp_info_fetch();
-        const uint64_t index = uint64_t(peer) * info->qp_num + AscendC::GetBlockIdx();
+        const uint64_t index = uint64_t(peer) * info->qp_num + core.index;
         sq_ = reinterpret_cast<__gm__ aclshmemi_rdma_sq_ctx*>(info->sq_ptr + index * sizeof(*sq_));
         auto* cq =
             reinterpret_cast<__gm__ aclshmemi_rdma_cq_ctx*>(info->scq_ptr + index * sizeof(aclshmemi_rdma_cq_ctx));

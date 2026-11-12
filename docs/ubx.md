@@ -245,3 +245,51 @@ HCCL 仅用于初始化、配置与检查结果协调；精度测试不借启动
 每轮全部 rank 检查成功后打印 `Dispatch/FFN/Combine/reuse=PASS`；所有轮次通过且启动器
 退出码为 0 才表示该配置通过。rank 0 写入 `summary.jsonl`，各 rank 保留
 `rank-N/bs-B-round-R.json`。这是前向精度与生命周期检查，不覆盖训练反向或融合 FFN 性能。
+
+## DeepJIT 与 SuperKernel
+
+默认仍使用 Ahead-of-Time（AOT）设备库。设置 `DEEPEP_LL_JIT=ON` 并在同一环境构建扩展后，
+Dispatch 与 Combine 可以在首次启动时通过 DeepJIT 编译当前 shape/topology 的专用 kernel；
+AOT 路径保持不变，可随时回退。
+
+```bash
+export DEEPEP_LL_JIT=ON
+python -m pip install . --no-build-isolation --no-deps --force-reinstall
+export DEEPEP_LL_JIT=ON                    # 运行时选择 JIT 后端
+export DEEPEP_JIT_CACHE_DIR=$HOME/.dj      # 可选；DeepJIT 的唯一缓存变量
+```
+
+- 每个 `(B,H,K,E,world,核数,dtype,dedup)` 组合编译一次，写入 `DEEPEP_JIT_CACHE_DIR`
+  （默认 `$HOME/.dj`）。缓存键还包含编译器、SHMEM 头文件内容与门铃模式身份。
+- Dispatch、mesh Combine 和 UBX route-plan Combine 各生成独立 ELF；DeepJIT 加载器要求
+  单 kernel 入口，因此 JIT 产物只含普通入口，不含 SK 子入口和 AOT 启动包装。
+- Python 在启动前调用 `low_latency_jit_prepare_dispatch` / `low_latency_jit_prepare_combine`
+  完成编译与按 ACL 上下文加载；图捕获内不再编译。`Runtime` 会校验扩展确实以
+  `DEEPEP_LL_JIT=ON` 构建。
+- JIT 分支把 B/H/K/E、world、实际 AIV 数、wire 格式与 dedup 判定都作为编译期常量，
+  只在入口保留对 immutable 通信描述和 tiling 的兼容性检查。
+- Combine 的 dedup 判定需要每 rank 容量；Python 已把 `num_max_tokens_per_rank` 传给
+  原生绑定，JIT 用一个权威来源生成 spec、缓存键和设备校验。
+
+SuperKernel 入口只存在于 AOT 设备库，同一 body 由普通 global 和 `__sk__` 子入口共享：
+
+- 普通入口从 `AscendC::GetBlockIdx()/GetBlockNum()` 生成逻辑核上下文；
+- SK 子入口从 `SkSystemArgs::SkGetBlockIdx()/SkGetNumBlocks()` 生成，并把上下文传到
+  计数、发送、接收、RDMA 批处理、路由表和 Combine 的所有嵌套组件；
+- 每类入口的实参结构体按普通 global 的参数顺序逐字段定义，并静态对账尺寸/偏移；
+- SK 使用默认能力掩码（不 early-start、不关闭 DCCI），结束时显式
+  `DestroyWithoutPipeAll()`，业务 DMA 和传输退休仍在 `Process()` 内完成。
+
+固定地址的图捕获可使用 `deep_ep.backends.ubx.graph.LLGraph`：
+
+```python
+from deep_ep.backends.ubx.graph import LLGraph
+
+# dispatch_step / combine_step 为已准备、无分配、固定地址的启动函数。
+graph = LLGraph([dispatch_step, expert_step, combine_step], scope="ll_ep").capture()
+graph.replay()
+graph.reset()   # 所有 rank 在最后一次设备使用完成后调用
+```
+
+图内不编译、不分配 tiling 或回读计数；原地更新输入后连续 replay。SuperKernel 融合要求
+`npugraph_ex` 的 `super_kernel_optimize` 与静态 shape，scope 仅标记候选范围。

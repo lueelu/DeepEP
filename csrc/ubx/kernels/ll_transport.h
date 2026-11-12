@@ -3,6 +3,8 @@
 #pragma once
 #include "ll_rdma_layout.h"
 #include "ll_group_policy.h"
+#include "ubx_jit_spec.h"
+#include "../../kernels/common/core_context.h"
 #include "kernel_operator.h"
 #include "device/gm2gm/engine/shmem_device_rdma.h"
 namespace UbxTransport {
@@ -29,7 +31,7 @@ __aicore__ inline bool RemoteWrite(const __gm__ Args* a, uint32_t peer)
 }
 __aicore__ inline void Check(const __gm__ Args* a, uint32_t peer, uint64_t offset, uint64_t bytes)
 {
-    if (peer >= uint32_t(a->rankSize) || offset > a->peerMemBytes || bytes > a->peerMemBytes - offset) Trap();
+    if (peer >= DEEPEP_UBX_LAUNCH_WORLD(a) || offset > a->peerMemBytes || bytes > a->peerMemBytes - offset) Trap();
 }
 __aicore__ inline GM_ADDR RemoteAddress(const __gm__ Args* a, uint32_t peer, uint64_t offset)
 {
@@ -46,19 +48,22 @@ __aicore__ inline GlobalTensor<uint8_t> Tensor(GM_ADDR p, bool uncached = false)
     if (uncached) t.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
     return t;
 }
-__aicore__ inline GM_ADDR Stage(const __gm__ Args* a, uint32_t bytes)
+// QP id and staging slot are the logical core index, not the fused grid index
+// a SuperKernel sub-task would observe from AscendC::GetBlockIdx().
+__aicore__ inline GM_ADDR Stage(const __gm__ Args* a, uint32_t bytes, deepep::CoreContext core)
 {
-    if (GetBlockNum() != a->reservedConfig[1] || GetBlockIdx() >= a->reservedConfig[1] || bytes > UbxRdma::kCoreBytes)
+    if (core.count != a->reservedConfig[1] || core.index >= a->reservedConfig[1] || bytes > UbxRdma::kCoreBytes)
         Trap();
-    return a->reservedAddresses[1] + uint64_t(GetBlockIdx()) * UbxRdma::kCoreBytes;
+    return a->reservedAddresses[1] + uint64_t(core.index) * UbxRdma::kCoreBytes;
 }
 __aicore__ inline void Put(const __gm__ Args* a, uint32_t peer, GM_ADDR dst, GM_ADDR src, uint32_t bytes,
-                           LocalTensor<uint8_t> scratch, uint32_t syncId = 7U)
+                           LocalTensor<uint8_t> scratch, deepep::CoreContext core, uint32_t syncId = 7U)
 {
-    aclshmemx_roce_qp_put_nbi(dst, src, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), bytes, peer, GetBlockIdx(), syncId);
+    aclshmemx_roce_qp_put_nbi(dst, src, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), bytes, peer, core.index, syncId);
 }
-__aicore__ inline void Quiet(uint32_t peer, LocalTensor<uint8_t> scratch, uint32_t syncId = 7U)
+__aicore__ inline void Quiet(uint32_t peer, LocalTensor<uint8_t> scratch, deepep::CoreContext core,
+                             uint32_t syncId = 7U)
 {
-    aclshmemx_roce_qp_quiet(peer, GetBlockIdx(), (__ubuf__ uint8_t*)scratch.GetPhyAddr(), syncId);
+    aclshmemx_roce_qp_quiet(peer, core.index, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), syncId);
 }
 }  // namespace UbxTransport
