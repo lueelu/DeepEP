@@ -17,6 +17,7 @@ Modified by Joyce_An 2026
 | `elastic/test_dispatch.py` | HT Notify 元数据、BF16/FP8 payload、权重、fresh/cached 和路由 |
 | `elastic/test_combine.py` | HT dispatch → 专家输出 → BF16 combine、独立权重回传、重复调用及输出生命周期 |
 | `elastic/test_ep_low_latency.py` | LL 返回、精度、重复 combine，以及 profiler kernel 耗时 |
+| `ubx/test_combine.py`、`ubx/test_ffn.py` | RDMA V2 Combine 独立性能与 Dispatch→两层 FFN→Combine 前向精度；命令见 [UBX 文档](../docs/ubx.md) |
 | `elastic/test_low_latency_host.py`、`elastic/test_ll_st_contract.py` | LL Host 分支、计数通信、启动参数、测试参考及统计 |
 | `integration/` | CPU/NPU 测试适配器、安装检查和结果校验 |
 | `../experiments/megamoe/tests/` | MegaMoE 接口、Golden、主机协调、打包与计时解析；设备入口见 [MegaMoE 文档](../experiments/megamoe/README.md) |
@@ -273,4 +274,4 @@ python scripts/validate_ep.py --backend npu-stub --devices 0,1 \
 
 仅当选定场景的全部 rank、精度和退出检查成功，参考闭环才生成成功摘要。保留日志与 `rank-*.json/summary.json`；缺失、失败或 skip 不记为通过。完整 wheel/sdist 构建及安装验证见[构建指南](../docs/build.md)。
 
-UBX 的独立 Combine 性能入口为 `tests/ubx/test_combine.py`，构造 CPU 输入、先初始化 HCCL 再初始化 SHMEM；命令和统计口径见 [UBX 说明](../docs/ubx.md)。
+UBX 的独立 Combine 性能入口为 `tests/ubx/test_combine.py`，通过现有 Dispatch 创建真实 V2 handle，再单独测量 Combine。默认 ACL Event 计时、关闭 profiler；仅显式 `--timer profiler` 采集 kernel task/流水图。每轮前有 HCCL all_reduce，默认使用本地 Notify 门控，等 HCCL 依赖与 Combine 都入队后放行；仅显式 `--launch-gate none` 关闭。按每轮最慢 rank 汇总，不截尾；命令、精度检查和测量边界见 [UBX 说明](../docs/ubx.md)。

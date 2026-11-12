@@ -55,7 +55,7 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineRecvCoreCount(uint32_t core
 {
     return cores / 2U;
 }
-COMBINE_DEDUP_EP_COMBINE_CONSTEXPR bool EpCombineEarlyReduce(uint32_t bs)
+COMBINE_DEDUP_EP_COMBINE_CONSTEXPR bool EpCombineEarlyReduce(uint32_t)
 {
     return false;
 }
@@ -136,7 +136,7 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5WorkBytes(uint32_t h, uin
     // The intermediate B floats are reduced with full 256B vector loads.
     return EpCombineAlign(k * ((h * 2U + 479U) / 480U) * 4U, 256U);
 }
-COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5SnapshotBytes(uint32_t h, uint32_t k, uint32_t owned)
+COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5SnapshotBytes(uint32_t h, uint32_t k, uint32_t)
 {
     const uint32_t flags = EpCombineM5FlagBytes(h, k);
     return flags;

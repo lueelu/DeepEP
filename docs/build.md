@@ -27,7 +27,7 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
 
 全仓共用上述 SDK。1.8.0 含 IPv6 与 HNS_1825 全卡同步修复；UDMA shared-jetty 改由初始化属性配置。该 release 不含旧 dev 的稀疏 peer/QP 准入接口：有该符号时仍使用稀疏准入，否则完整建链，算子 QP 编号不变，但初始化资源和耗时需要在对应机型重新验证。
 
-UBX 的独立 Combine 构建与运行说明见 [UBX](ubx.md)。
+UBX RDMA V2 Combine 构建与运行说明见 [UBX](ubx.md)。
 
 ## 可选实验组件
 

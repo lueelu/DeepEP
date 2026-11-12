@@ -8,6 +8,7 @@
 #include <vector>
 #include "runtime/session.hpp"
 #include "runtime/ll_core_config.hpp"
+#include "ubx/v2.hpp"
 #include "../kernels/dispatch/low_latency/common/ll_rdma_layout.h"
 #include "../kernels/dispatch/low_latency/common/ll_stage_timer_layout.h"
 #include "../kernels/dispatch/low_latency/common/ll_reference_profile_layout.h"
@@ -290,7 +291,11 @@ void bind_low_latency(py::module_& module)
         return bytes(data);
     });
     module.def("low_latency_combine_tiling",
-               [](int p, int b, int h, int k, int e, const std::string& dtype, int num_max_tokens_per_rank) {
+               [](int p, int b, int h, int k, int e, const std::string& dtype, int num_max_tokens_per_rank, bool rdma) {
+                   if (rdma) {
+                       return bytes(ubx::v2_tiling(p, b, h, k, e, dtype_code(dtype), num_max_tokens_per_rank,
+                                                 query_ll_core_config().active, DispatchDedup::kLlPhysicalRanksPerHost));
+                   }
                    CombineDedup::Layout plan{};
                    if ((dtype != "bfloat16" && dtype != "float16") || !CombineDedup::BuildLayout(p, b, h, k, e, plan)) {
                        throw std::invalid_argument("LL combine exceeds dtype, topology, UB or workspace limits");
@@ -303,7 +308,9 @@ void bind_low_latency(py::module_& module)
                    data.moeExpertNum = e;
                    data.dtype = dtype_code(dtype);
                    return bytes(data);
-               });
+               },
+               py::arg("world"), py::arg("tokens"), py::arg("hidden"), py::arg("topk"), py::arg("experts"),
+               py::arg("dtype"), py::arg("capacity"), py::arg("rdma") = false);
     module.def("dispatch_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int rows,
                                           const std::string& dtype, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
@@ -357,12 +364,29 @@ void bind_low_latency(py::module_& module)
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         CombineDedup::Layout plan{};
         if (!stream_address || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
-            (dtype != "bfloat16" && dtype != "float16") ||
-            !CombineDedup::BuildLayout(session.world(), b, h, k, e, plan)) {
+            (dtype != "bfloat16" && dtype != "float16")) {
             throw std::invalid_argument("Invalid LL combine dtype, shape, workspace or stream");
         }
+        uint32_t cores = 0;
+        if (session.ll_rdma()) {
+            cores = pin_session_cores(session);
+            plan.capacityRows =
+                ubx::v2_capacity(session.world(), b, h, k, e, cores, DispatchDedup::kLlPhysicalRanksPerHost);
+        } else if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan)) {
+            throw std::invalid_argument("Invalid LL combine shape");
+        }
         const int64_t c = plan.capacityRows;
-        auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
+        int32_t device = -1;
+        if (session.ll_rdma() && aclrtGetDevice(&device) != 0)
+            throw std::runtime_error("LL Combine requires a current NPU");
+        auto get = [&](const char* name, Shape shape, const char* type) {
+            auto value = py::reinterpret_borrow<py::object>(tensors[name]);
+            auto* pointer = tensor(value, shape, type);
+            if (session.ll_rdma() && (value.attr("device").attr("type").cast<std::string>() != "npu" ||
+                                     value.attr("device").attr("index").cast<int>() != device))
+                throw std::invalid_argument("LL Combine tensors must be on the current NPU");
+            return pointer;
+        };
         deepep::EpServerDedupCombineKernelArgs args{};
         args.commArgs = get("comm_args", {sizeof(DispatchDedup::CommArgs)}, "uint8");
         // Python validates rows against the dispatch handle. The device selects
@@ -383,7 +407,14 @@ void bind_low_latency(py::module_& module)
         session.workspace();
         py::gil_scoped_release release;
         session.invalidate_dispatch_controls();
-        combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
+        if (session.ll_rdma()) {
+            const ubx::CombineArgs rdma_args{args.commArgs,     args.expertOut, args.destinationIndex, args.sendCounts,
+                                             args.expertScales, args.tokenType, args.relayReadIndex,   args.sourceMask,
+                                             args.yOut,         args.tilingData, cores};
+            ubx_combine_launch(reinterpret_cast<void*>(stream_address), &rdma_args);
+        } else {
+            combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
+        }
     });
 }
 }  // namespace deepep

@@ -250,10 +250,6 @@ def build_configuration(environment=None):
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
-    ubx_ranks = env.get("DEEPEP_UBX_RANKS_PER_HOST", "16")
-    if ubx_ranks not in {"4", "16"}:
-        raise RuntimeError("DEEPEP_UBX_RANKS_PER_HOST must be 4 or 16")
-    result["ubx_ranks_per_host"] = int(ubx_ranks)
     default_shmem = ROOT / "third-party/shmem/install/shmem"
 
     result["build_type"] = env.get("DEEPEP_BUILD_TYPE", "RelWithDebInfo" if lineinfo else "Release")
@@ -440,10 +436,8 @@ def publish_source_native(destination):
     names = [
         "_C" + suffix,
         "_clos_C" + suffix,
-        "_ubx_C" + suffix,
         "libdeepep_kernels.so",
         "libdeepep_clos_kernels.so",
-        "libdeepep_ubx_kernels.so",
         "_build_info.json",
     ]
     for name in names:
@@ -519,7 +513,6 @@ class CMakeBuild(build_ext):
             directory,
             f"-DCMAKE_BUILD_TYPE={configuration['build_type']}",
             f"-DDEEPEP_DEVICE_JOBS={jobs}",
-            f"-DDEEPEP_UBX_RANKS_PER_HOST={configuration['ubx_ranks_per_host']}",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",

@@ -362,7 +362,6 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
 
 def test_cache_survives_source_edits_but_not_toolchain_changes(build):
     configuration = {
-        "ubx_ranks_per_host": 16,
         "source_sha256": "before",
         "source_version": "1",
         "build_type": "Release",
@@ -408,8 +407,6 @@ def source_native(build, monkeypatch, tmp_path):
     names = [
         "_C.test.so",
         "_clos_C.test.so",
-        "_ubx_C.test.so",
-        "libdeepep_ubx_kernels.so",
         "libdeepep_kernels.so",
         "libdeepep_clos_kernels.so",
         "_build_info.json",
@@ -556,7 +553,6 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     monkeypatch.setitem(sys.modules, "pybind11", pybind11)
 
     configuration = {
-        "ubx_ranks_per_host": 16,
         "megamoe": {"enabled": beta, "timer": timer},
         "CATLASS_ROOT": "/private/catlass" if beta else "",
         "source_sha256": "current",

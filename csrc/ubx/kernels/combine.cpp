@@ -28,9 +28,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ubx_combine_
     kernel.Init(comm, expert, destination, counts, weights, types, relay, mask, output, td->bs, td->h, td->topK, \
                 td->moeExpertNum, td->dtype, magic, dedup);                                                      \
     kernel.Process()
-    if (td->tilingKey == 2U) {
-        UBX_COMBINE(2U);
-    } else if (td->tilingKey == 4U) {
+    if (td->tilingKey == 4U) {
         UBX_COMBINE(4U);
     } else {
         UBX_COMBINE(16U);
