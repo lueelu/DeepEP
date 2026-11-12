@@ -33,7 +33,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 9:
+    if getattr(extension, "api_protocol", None) != 10:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -79,6 +79,7 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
+        topk_weights_type: int = 0,
     ):
         import torch
         import torch.distributed as dist
@@ -101,6 +102,7 @@ class SymmBuffer:
             integer("world_size", size, 2, 128)
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
+            integer("topk_weights_type", topk_weights_type, 0, 1)
             h_align, i_align = (256, 256) if urma else (64, 128)
             if hidden % h_align or intermediate_hidden % i_align:
                 raise ValueError(f"hidden must be divisible by {h_align}; intermediate_hidden by {i_align}")
@@ -128,12 +130,13 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            topk_weights_type,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
         capacity = int(
             ext.buffer_size(
-                size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, backend=self._backend_name
+                size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, backend=self._backend_name, topk_weights_type=topk_weights_type
             )
         )
         self._lock = threading.Lock()
@@ -147,6 +150,7 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self.topk_weights_type = topk_weights_type
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -205,6 +209,7 @@ class SymmBuffer:
             address,
             runtime.native.capacity,
             backend=self._backend_name,
+            topk_weights_type=self.topk_weights_type,
         )
         self._plan_bs = bs
 
@@ -583,7 +588,7 @@ def fp8_fp4_mega_moe(
     Positional parameters follow DeepGEMM. Ascend-only keyword extensions:
     x is optional BF16 [BS,H] (quantized internally, NOT BF16 GEMM);
     timer is a fresh buffer.allocate_timer() for a separate diagnostic call.
-    Routed weights are applied after GMM2; see README numerical compatibility.
+    Routed weight placement follows sym_buffer.topk_weights_type; see README.
     """
     if recipe != (1, 1, 32) or activation != "swiglu" or fast_math is not True:
         raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, default math only")

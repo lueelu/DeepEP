@@ -67,7 +67,7 @@ namespace MegaMoeUrma {
 
 constexpr uint32_t kPackPipelineSlots = 6U;
 constexpr uint32_t kPackTokenCapacity = 8192U;
-constexpr uint32_t kPackScaleCapacity = kPackTokenCapacity / 32U;
+constexpr uint32_t kPackScaleCapacity = kPackTokenCapacity / 32U + 32U;
 constexpr uint32_t kPackSlotBytes = kPackTokenCapacity + kPackScaleCapacity;
 constexpr uint32_t kPackOrderRows = 1024U;
 constexpr uint32_t kPackOrderOffset = kPackPipelineSlots * kPackSlotBytes;
@@ -128,9 +128,12 @@ public:
         using namespace AscendC;
         const uint32_t h = args.config.hidden;
         const uint32_t scales = h / 32U;
+        const uint32_t wireScales = args.config.dispatchScaleStride;
         GlobalTensor<uint8_t> x, xScale, expandedX, expandedScale, selfX, selfScale;
         GlobalTensor<int32_t> routes;
         GlobalTensor<int64_t> inverse;
+        GlobalTensor<float> routeWeights;
+        routeWeights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
         x.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.x));
         xScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.xScale));
         expandedX.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.expandedX));
@@ -202,15 +205,21 @@ public:
                 WaitFlag<HardEvent::MTE3_MTE2>(event);
                 DataCopyPad(token, x[tokenRow * h], {1U, h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
                 DataCopyPad(scale, xScale[tokenRow * scales], {1U, scales, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+                if (args.config.topkWeightsType) {
+                    // Append the selected route's FP32 weight in a padded,
+                    // 32B-aligned block of the existing scale PUT payload.
+                    auto weight = scale[(scales + 31U) / 32U * 32U].ReinterpretCast<float>();
+                    DataCopyPad(weight, routeWeights[flat], {1U, 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0.0F});
+                }
                 SetFlag<HardEvent::MTE2_MTE3>(event);
                 WaitFlag<HardEvent::MTE2_MTE3>(event);
                 if (IsSelfExpandedRow(row, args.config)) {
                     const uint64_t receiveRow = SelfReceiveRow(row, args.config);
                     DataCopyPad(selfX[receiveRow * h], token, {1U, h, 0U, 0U, 0U});
-                    DataCopyPad(selfScale[receiveRow * scales], scale, {1U, scales, 0U, 0U, 0U});
+                    DataCopyPad(selfScale[receiveRow * wireScales], scale, {1U, wireScales, 0U, 0U, 0U});
                 } else {
                     DataCopyPad(expandedX[row * h], token, {1U, h, 0U, 0U, 0U});
-                    DataCopyPad(expandedScale[row * scales], scale, {1U, scales, 0U, 0U, 0U});
+                    DataCopyPad(expandedScale[row * wireScales], scale, {1U, wireScales, 0U, 0U, 0U});
                 }
                 // Byte-exact DMA avoids dirty Scalar cache-line writeback when
                 // different Pack owners update adjacent inverse entries.

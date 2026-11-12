@@ -65,6 +65,8 @@ public:
         float activationAlpha{1.0f};
         float activationBeta{1.0f};
         uint32_t ubOffsetBytes{0U};  // relocate the whole phase-private workspace
+        uint32_t topkWeightUbOffsetBytes{UINT32_MAX};
+        uint32_t topkWeightIndex{WEIGHT_INDEX};
         Arguments() = default;
     };
 
@@ -130,6 +132,7 @@ private:
     int64_t intermediateHiddenSize_;
     int64_t intermediateHiddenScaleElements_;
 
+    uint32_t topkWeightIndex_ = WEIGHT_INDEX;
     float clampLimit_{0.0f};
     uint8_t actMode_{static_cast<uint8_t>(ActMode::SWIGLU)};
     uint8_t actSubMode_{static_cast<uint8_t>(ActSubMode::DEFAULT)};
@@ -196,6 +199,7 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     yGmAddr_ = params.yGmAddr;
     yScaleGmAddr_ = params.yScaleGmAddr;
     clampLimit_ = params.clampLimit;
+    topkWeightIndex_ = params.topkWeightIndex;
     actMode_ = params.actMode;
     actSubMode_ = params.actSubMode;
     activationAlpha_ = params.activationAlpha;
@@ -220,7 +224,7 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 
     // weight UB: 放在 VECIN 区之后的安全区域，仅 mode=1 分配
     if constexpr (TopkWeightsPrefetch) {
-        weightUb_ = LocalTensor<float>(TPosition::VECCALC, ubBase + ubOffsets.topkWeightOffsetBytes,
+        weightUb_ = LocalTensor<float>(TPosition::VECCALC, ubBase + (params.topkWeightUbOffsetBytes == UINT32_MAX ? ubOffsets.topkWeightOffsetBytes : params.topkWeightUbOffsetBytes),
                                        ubOffsets.topkWeightElementCapacity);
     }
 }
@@ -342,14 +346,14 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
             Activation::RunSiTUGLU<DataTypeIn, TopkWeightsPrefetch, false>(gatedActivationContext, situGluParams);
         }
     } else if (actMode == ActMode::SWIGLU_STEP) {
-        const Activation::SwiGluParams swiGluParams{clampLimit_};
+        const Activation::SwiGluParams swiGluParams{clampLimit_, topkWeightIndex_};
         Activation::RunSwiGLU<DataTypeIn, TopkWeightsPrefetch, true, SeparateSwiGluSigmoid_>(gatedActivationContext,
                                                                                              swiGluParams);
     } else if (actMode == ActMode::SWIGLU_OAI) {
         const Activation::SwiGluOaiParams swiGluOaiParams{clampLimit_, activationAlpha_, activationBeta_};
         Activation::RunSwiGLUOAI<DataTypeIn, TopkWeightsPrefetch>(gatedActivationContext, swiGluOaiParams);
     } else {
-        const Activation::SwiGluParams swiGluParams{clampLimit_};
+        const Activation::SwiGluParams swiGluParams{clampLimit_, topkWeightIndex_};
         Activation::RunSwiGLU<DataTypeIn, TopkWeightsPrefetch, false, SeparateSwiGluSigmoid_>(gatedActivationContext,
                                                                                               swiGluParams);
     }

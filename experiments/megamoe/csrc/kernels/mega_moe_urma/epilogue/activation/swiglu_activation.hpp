@@ -18,6 +18,7 @@ namespace Activation {
 // SwiGLU 直接调用接口使用的最小参数集。
 struct SwiGluParams {
     float clampLimit = 0.0F;
+    uint32_t weightIndex = WEIGHT_INDEX;
 };
 
 template <typename InputType, bool FuseTopkWeight, bool IsStep, bool SeparateSigmoid = false>
@@ -57,7 +58,7 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
         for (uint16_t rowIndex = 0; rowIndex < rowLoopCount; rowIndex++) {
             if constexpr (FuseTopkWeight) {
                 AscendC::Reg::DataCopy<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(
-                    weightReg, context.topkWeights + rowIndex * INT32_PER_256B + WEIGHT_INDEX);
+                    weightReg, context.topkWeights + rowIndex * INT32_PER_256B + params.weightIndex);
             }
             for (uint16_t vectorIndex = 0; vectorIndex < fullVectorLoopCount; vectorIndex++) {
                 AscendC::Reg::AddrReg inputOffset = AscendC::Reg::CreateAddrReg<InputType>(

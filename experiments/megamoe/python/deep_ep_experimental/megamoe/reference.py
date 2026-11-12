@@ -82,13 +82,16 @@ def make_weights(experts, hidden, intermediate, seed):
     return tuple(result)
 
 
-def expert_forward(x, w1, w2, activation_clamp=None):
+def expert_forward(x, w1, w2, activation_clamp=None, route_weights=None):
     first = bf16(x @ w1.T)
     gate, up = np.split(first, 2, axis=-1)
     limit = normalize_clamp(activation_clamp)
     gate = np.minimum(gate, limit)
     up = np.clip(up, -limit, limit)
-    activated = bf16(gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up)
+    activated = gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up
+    if route_weights is not None:
+        activated = activated * np.asarray(route_weights, dtype=np.float32)[:, None]
+    activated = bf16(activated)
     quantized = dequantize_input(*quantize_input(activated))
     return bf16(quantized @ w2.T)
 

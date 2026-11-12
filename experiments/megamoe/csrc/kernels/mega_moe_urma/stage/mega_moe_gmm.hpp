@@ -333,18 +333,35 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     auto cursor = RuntimeSegments(args, fragment).MakeCursor();
     RowSegment segment{};
     while (cursor.Next(segment)) {
-        DataCopyPad(scratch[segment.tileRow * scaleStride], source[segment.receiveRow * scaleBytes],
-                    {static_cast<uint16_t>(segment.rows), scaleBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        DataCopyPad(scratch[segment.tileRow * scaleStride], source[segment.receiveRow * args.config.dispatchScaleStride],
+                    {static_cast<uint16_t>(segment.rows), scaleBytes, args.config.dispatchScaleStride - scaleBytes, 0U, 0U}, {false, 0U, 0U, 0U});
+    }
+    GlobalTensor<uint8_t> weights;
+    LocalTensor<uint8_t> weightScratch(TPosition::VECCALC, 192U * 1024U, kComputeTileM * 32U);
+    if (args.config.topkWeightsType) {
+        weights.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredRouteWeights));
+        auto weightCursor = RuntimeSegments(args, fragment).MakeCursor();
+        RowSegment part{};
+        while (weightCursor.Next(part)) {
+            DataCopyPad(weightScratch[part.tileRow * 32U],
+                        source[part.receiveRow * args.config.dispatchScaleStride + scaleStride],
+                        {static_cast<uint16_t>(part.rows), 4U, args.config.dispatchScaleStride - 4U, 0U, 0U},
+                        {false, 0U, 0U, 0U});
+        }
     }
     SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
     DataCopyPad(destination[fragment.rowBegin * scaleBytes], scratch,
                 {static_cast<uint16_t>(fragment.rows), scaleBytes, 0U, 0U, 0U});
+    if (args.config.topkWeightsType) {
+        DataCopyPad(weights[fragment.rowBegin * 32U], weightScratch,
+                    {1U, fragment.rows * 32U, 0U, 0U, 0U});
+    }
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WriteGmByPassDCache(ComputeFlag(args.inputScaleDone, index), 1);
     auto meta = FragmentTraceMeta(fragment, index);
-    meta.bytes = static_cast<uint64_t>(fragment.rows) * scaleBytes;
+    meta.bytes = static_cast<uint64_t>(fragment.rows) * (scaleBytes + (args.config.topkWeightsType ? 4U : 0U));
     timer.TraceEnd(TraceEvent::InputScaleGather, start, meta);
 }
 
@@ -523,6 +540,8 @@ namespace MegaMoeUrma {
 // until Run() returns (its final activation/scale MTE3 stores are complete).
 class UbRoutedActivation {
     using Op = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, false, true, true>;
+    using WeightedOp = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256U, 256U, true, true, true>;
+    static_assert(128U * 1024U + 256U * 32U <= kAiv1PersistentUbBase);
     static constexpr auto offsets =
         UrmaMegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, 256U, 256U, true>();
     static_assert(offsets.firstInputElementCapacity * sizeof(bfloat16_t) == 128U * 1024U);
@@ -532,6 +551,14 @@ public:
     static constexpr uint32_t kColumns = 128U;
     __aicore__ inline void Init(const Arguments& a)
     {
+        if (a.config.topkWeightsType) {
+            weighted_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
+                            .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
+                            .clampLimit = a.activationClamp, .ubOffsetBytes = 0U,
+                            .topkWeightUbOffsetBytes = 128U * 1024U, .topkWeightIndex = 0U});
+            weighted_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
+            return;
+        }
         op_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
                   .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
                   .clampLimit = a.activationClamp,
@@ -542,16 +569,33 @@ public:
     template <class TimerT>
     __aicore__ inline void Run(const Arguments& a, const Fragment& f, uint32_t group, uint32_t tile, TimerT& timer)
     {
+        if (a.config.topkWeightsType) RunImpl<true>(a, f, group, tile, timer, weighted_);
+        else RunImpl<false>(a, f, group, tile, timer, op_);
+    }
+
+private:
+    template <bool Early, class TimerT, class ActivationOp>
+    __aicore__ inline void RunImpl(const Arguments& a, const Fragment& f, uint32_t group,
+                                    uint32_t tile, TimerT& timer, ActivationOp& op)
+    {
         const uint32_t n = tile * kColumns;
         // I is256-aligned, so fused N128 task columns have no partial tail.
         // Only the M tail changes; each UB input row remains256 BF16 elements.
-        op_.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * a.config.intermediate),
+        op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * a.config.intermediate),
                               static_cast<int64_t>(f.rowBegin * (a.config.intermediate / 32U)), 0, 0, 0, 0});
         auto meta = ComputeTileTraceMeta(FragmentTraceMeta(f, group), 0U, n, f.rows, kColumns);
         timer.Begin(Phase::Activation);
         const auto start = timer.TraceBegin();
+        if constexpr (Early) {
+            AscendC::GlobalTensor<float> weights;
+            weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(a.gatheredRouteWeights));
+            auto ub = op.GetTopkWeightTensor();
+            AscendC::DataCopy(ub, weights[f.rowBegin * 8U], f.rows * 8U);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        }
         AscendC::SetCtrlSpr<60, 60>(0);
-        op_({f.rows, kColumns, 0, 0}, {n, n / 32U, 0, 0, 0, 0}, 0U);
+        op({f.rows, kColumns, 0, 0}, {n, n / 32U, 0, 0, 0, 0}, 0U);
         // operator() retains the existing SeparateSigmoid FP32 sequence,
         // BF16 rounding and MX groups. It drains both output DMA planes.
         AscendC::AtomicAdd(ComputeFlag(a.activationDone, group), 1);
@@ -561,5 +605,6 @@ public:
 
 private:
     Op op_;
+    WeightedOp weighted_;
 };
 }  // namespace MegaMoeUrma

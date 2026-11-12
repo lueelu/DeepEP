@@ -136,7 +136,7 @@ public:
             reinterpret_cast<__gm__ uint8_t*>(a_.expandedX + c.localRow * a_.config.hidden),
             static_cast<uint32_t>(m.bytes), peer_);
         timer_.TraceEnd(TraceEvent::DispatchPutX, start, m);
-        const uint32_t scales = a_.config.hidden / 32U;
+        const uint32_t scales = a_.config.dispatchScaleStride;
         m.bytes = uint64_t(rows) * scales;
         start = timer_.TraceBegin();
         Put(symmetric, a_.config.receiveScaleOffset + c.remoteRow * scales,

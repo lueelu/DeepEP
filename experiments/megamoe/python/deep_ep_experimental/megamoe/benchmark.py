@@ -25,7 +25,7 @@ def load_config(name, bs_values=None):
     required = {"schema_version", "model", "bs_values", "warmup", "iters", "seed"}
     if not required <= set(config) or set(config) - required - {"alignment"} or config["schema_version"] != 1:
         raise ValueError("Invalid config schema; see the packaged smoke.json")
-    if set(config["model"]) - {"shared_intermediate_hidden", "shared_output_rounding", "activation_clamp"} != {
+    if set(config["model"]) - {"shared_intermediate_hidden", "shared_output_rounding", "activation_clamp", "topk_weights_type"} != {
         "hidden",
         "intermediate_hidden",
         "num_experts",
@@ -33,6 +33,11 @@ def load_config(name, bs_values=None):
         "num_shared_experts",
     }:
         raise ValueError("Model must specify H, intermediate width, global experts, top-k and shared experts")
+    from .numerics import normalize_clamp
+    normalize_clamp(config["model"].get("activation_clamp"))
+    route_mode = config["model"].get("topk_weights_type", 0)
+    if type(route_mode) is not int or route_mode not in (0, 1):
+        raise ValueError("topk_weights_type must be 0 or 1")
     if bs_values is not None:
         config["bs_values"] = [int(part) for part in bs_values.split(",")]
     batches = config["bs_values"]
@@ -292,7 +297,7 @@ def run(args, config, group):
         backend=backend,
         device_communication="shmem_mte_udma" if urma else "shmem_mte",
         api="fp8_fp4_mega_moe",
-        numerical_contract="ascend_post_gmm2_route_weight_v1",
+        numerical_contract=("ascend_pre_quant_route_weight_v1" if config["model"].get("topk_weights_type", 0) else "ascend_post_gmm2_route_weight_v1"),
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )

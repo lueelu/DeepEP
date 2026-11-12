@@ -311,7 +311,7 @@ public:
         peer_ = peer;
         rows_ = rows;
         epoch_ = a.config.epoch;
-        bytes_ = uint64_t(rows) * (a.config.hidden + a.config.hidden / 32U);
+        bytes_ = uint64_t(rows) * (a.config.hidden + a.config.dispatchScaleStride);
         if (rows == 0U) {
             timer_->RecordDispatchReceive(peer, 0U, 0U, 0U);
             return;

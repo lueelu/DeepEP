@@ -175,6 +175,7 @@ public:
     {
         using namespace AscendC;
         firstToken_ = firstToken;
+        applyRouteWeight_ = args.config.topkWeightsType == 0U;
         returned_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.symmetric + args.config.returnYOffset));
         returned_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
         output_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.output));
@@ -224,7 +225,7 @@ public:
         const auto event = static_cast<TEventID>(slot);
         const uint32_t route = routes_.GetValue(slot);
         const uint32_t topk = route % Ub::topk;
-        const float weight = weights_.GetValue(route);
+        const float weight = applyRouteWeight_ ? weights_.GetValue(route) : 1.0F;
         LocalTensor<Element> input = inputs_[slot * Ub::hidden];
         LocalTensor<float> term = terms_[slot * Ub::hidden];
         WaitFlag<HardEvent::MTE2_V>(event);
@@ -275,6 +276,7 @@ public:
 private:
     using Ub = ReduceUbContract;
     uint64_t firstToken_ = 0U;
+    bool applyRouteWeight_ = true;
     uint32_t submitted_ = 0U;
     uint32_t consumed_ = 0U;
     AscendC::GlobalTensor<Element> returned_, output_;
@@ -479,6 +481,7 @@ public:
     {
         using namespace AscendC;
         firstToken_ = firstToken;
+        applyRouteWeight_ = args.config.topkWeightsType == 0U;
         stride_ = args.config.hidden;
         column_ = column;
         columns_ = columns;
@@ -533,7 +536,7 @@ public:
         const auto event = static_cast<TEventID>(slot);
         const uint32_t route = routes_.GetValue(slot);
         const uint32_t topk = route % TopK;
-        const float weight = weights_.GetValue(route);
+        const float weight = applyRouteWeight_ ? weights_.GetValue(route) : 1.0F;
         LocalTensor<Element> input = inputs_[slot * Ub::hidden];
         LocalTensor<float> term = terms_[slot * Ub::hidden];
         WaitFlag<HardEvent::MTE2_V>(event);
@@ -588,6 +591,7 @@ private:
     using Ub = ReduceUbContract;
     using Output = std::conditional_t<KeepFp32, float, Element>;
     uint64_t firstToken_ = 0U;
+    bool applyRouteWeight_ = true;
     uint32_t stride_ = 0, column_ = 0, columns_ = 0;
     uint32_t submitted_ = 0U;
     uint32_t consumed_ = 0U;

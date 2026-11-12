@@ -46,7 +46,7 @@ uint32_t DispatchCopyBytes(const MegaMoeTilingData& t)
 {
     const uint32_t token = AlignUp(t.h, uint32_t{256});
     const uint32_t scale = AlignUp(CeilDiv(t.h, uint32_t{32}), uint32_t{32});
-    return token + scale;
+    return token + scale + (t.topkWeightsPrefetch ? AlignUp(t.topK * 4U, 32U) : 0U);
 }
 
 MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t ub)
@@ -239,7 +239,7 @@ PlatformInfo GetPlatformInfo()
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, int64_t shared_experts,
-                             const PlatformInfo& p)
+                             const PlatformInfo& p, int64_t topk_weights_type)
 {
     MegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);
@@ -260,8 +260,13 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.topoType = MegaMoeImpl::TOPO_TYPE_MTE;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;
-    t.topkWeightsPrefetch = 0;
-    t.maxTilesPerExpert = 0;
+    t.topkWeightsPrefetch = topk_weights_type;
+    // Prefetch switches activation readiness to per-expert tile flags. Each
+    // token selects an expert at most once; reserve all EP source tokens and
+    // the full GMM1 N span (also covers fused small-BS scheduling).
+    t.maxTilesPerExpert = topk_weights_type
+        ? CeilDiv<uint32_t>(t.numMaxTokensPerRank * t.epWorldSize, 256U) * CeilDiv<uint32_t>(t.hiddenDim, 256U)
+        : 0U;
     t.actMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActMode::SWIGLU);
     t.actSubMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActSubMode::DEFAULT);
     t.activationAlpha = 1.0F;
@@ -301,7 +306,7 @@ uint64_t Align(uint64_t value, uint64_t alignment = kAlignment)
 }
 
 Config UrmaLayout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, int64_t max_recv_rows,
-                  int64_t cv_rows)
+                  int64_t cv_rows, int64_t topk_weights_type)
 {
     TORCH_CHECK((world == 4 || world == 8 || world == 16) && max_tokens > 0 &&
                     max_tokens <= MegaMoeUrma::kMaxTokensPerRank && topk >= 1 && topk <= 8 && hidden >= 256 &&
@@ -314,11 +319,13 @@ Config UrmaLayout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidde
     config.hidden = hidden;
     config.topk = topk;
     config.cvRows = cv_rows;
+    config.topkWeightsType = topk_weights_type;
+    config.dispatchScaleStride = topk_weights_type ? AlignUp<uint32_t>(hidden / 32, 32U) + 32U : hidden / 32;
     config.maxPeerChunks = (max_tokens * topk + cv_rows - 1) / cv_rows;
     config.sourceRowCapacity = static_cast<uint64_t>(max_tokens) * topk;
     config.receiveXOffset = 0;
     config.receiveScaleOffset = Align(static_cast<uint64_t>(max_recv_rows) * hidden);
-    config.returnYOffset = Align(config.receiveScaleOffset + static_cast<uint64_t>(max_recv_rows) * (hidden / 32));
+    config.returnYOffset = Align(config.receiveScaleOffset + static_cast<uint64_t>(max_recv_rows) * config.dispatchScaleStride);
     config.dispatchReadyOffset = Align(config.returnYOffset + static_cast<uint64_t>(max_tokens) * topk * hidden * 2);
     config.combineReadyOffset =
         Align(config.dispatchReadyOffset +
@@ -347,7 +354,7 @@ uint32_t SelectCv(int64_t world, int64_t bs)
 struct UrmaWorkspace {
     MegaMoeUrma::Arguments args_{};
     torch::Tensor expanded_x_, expanded_scale_, gmm1_, activation_, activation_scale_, gmm2_;
-    torch::Tensor gathered_input_scale_, input_scale_done_;
+    torch::Tensor gathered_input_scale_, input_scale_done_, gathered_route_weights_;
     torch::Tensor gmm_issued_, gmm2_contiguous_, peer_reorder_ranges_, peer_reorder_spans_;
     torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
     torch::Tensor segments_, compute_batches_, compute_tasks_, chunk_group_indices_;
@@ -360,10 +367,10 @@ struct UrmaWorkspace {
 
     UrmaWorkspace(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
                   int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address, int64_t shared_experts,
-                  int64_t shared_intermediate, int64_t num_experts, const PlatformInfo& platform)
+                  int64_t shared_intermediate, int64_t num_experts, const PlatformInfo& platform, int64_t topk_weights_type)
     {
         const int64_t max_recv_rows = world * max_tokens * topk;
-        args_.config = UrmaLayout(world, max_tokens, topk, example.size(1), max_recv_rows, cv_rows);
+        args_.config = UrmaLayout(world, max_tokens, topk, example.size(1), max_recv_rows, cv_rows, topk_weights_type);
         auto& config = args_.config;
         config.bs = example.size(0);
         config.intermediate = intermediate;
@@ -399,8 +406,9 @@ struct UrmaWorkspace {
             args_.sharedActivationDone = Address(shared_done_act_);
         }
         expanded_x_ = allocate(expanded_rows * config.hidden);
-        expanded_scale_ = allocate(expanded_rows * (config.hidden / 32));
+        expanded_scale_ = allocate(expanded_rows * config.dispatchScaleStride);
         gathered_input_scale_ = allocate(max_recv_rows * (config.hidden / 32));
+        gathered_route_weights_ = allocate(topk_weights_type ? max_recv_rows * 32U : 0U);
         gmm1_ = allocate(0);  // routed fused GMM1 writes to paired UB
         activation_ = allocate(max_recv_rows * intermediate);
         activation_scale_ = allocate(max_recv_rows * (intermediate / 32));
@@ -447,6 +455,7 @@ struct UrmaWorkspace {
         args_.expandedX = Address(expanded_x_);
         args_.expandedScale = Address(expanded_scale_);
         args_.gatheredInputScale = Address(gathered_input_scale_);
+        args_.gatheredRouteWeights = Address(gathered_route_weights_);
         args_.gmm1Output = Address(gmm1_);
         args_.activation = Address(activation_);
         args_.activationScale = Address(activation_scale_);
@@ -478,6 +487,7 @@ struct UrmaWorkspace {
         for (const auto* tensor : {&expanded_x_,
                                    &expanded_scale_,
                                    &gathered_input_scale_,
+                                   &gathered_route_weights_,
                                    &gmm1_,
                                    &activation_,
                                    &activation_scale_,
@@ -523,8 +533,9 @@ struct UrmaWorkspace {
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes, const std::string& backend)
+           uint64_t symmetric_address, int64_t symmetric_bytes, const std::string& backend, int64_t topk_weights_type)
     : backend_(backend == "mte" ? Backend::Mte : Backend::Urma),
+      topk_weights_type_(topk_weights_type),
       ffts_(ffts),
       example_(example),
       intermediate_(intermediate),
@@ -537,6 +548,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
       symmetric_address_(symmetric_address),
       symmetric_bytes_(symmetric_bytes)
 {
+    TORCH_CHECK(topk_weights_type == 0 || topk_weights_type == 1, "topk_weights_type must be 0 or 1");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     CheckTensor(example, 2, "plan input");
     TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens, "BS outside allocated capacity");
@@ -553,7 +565,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
         TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8 && (is_a8w4 || shared_experts == 0),
                     "Plan shared experts require W4A8, with count in [0,8]");
     }
-    const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1), backend);
+    const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1), backend, topk_weights_type);
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
@@ -583,7 +595,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     }
     if (!urma) {
         tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                             is_a8w4, shared_experts, platform_);
+                             is_a8w4, shared_experts, platform_, topk_weights_type);
         tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
         static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
         const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
@@ -731,7 +743,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
             urma_.reset();
             urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, SelectCv(world_, bs),
                                                     max_tokens_, aclshmem_my_pe(), ffts_, symmetric_address_,
-                                                    shared_experts_, shared_i, world_ * experts_, platform_);
+                                                    shared_experts_, shared_i, world_ * experts_, platform_, topk_weights_type_);
             shared_intermediate_ = shared_i;
         }
         urma_->args_.config.bs = bs;
@@ -835,15 +847,16 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend)
 }
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
-                    const std::string& backend)
+                    const std::string& backend, int64_t topk_weights_type)
 {
+    TORCH_CHECK(topk_weights_type == 0 || topk_weights_type == 1, "topk_weights_type must be 0 or 1");
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     if (backend == "urma") {
         TORCH_CHECK((world == 4 || world == 8 || world == 16) && tokens >= 1 &&
                         tokens <= MegaMoeUrma::kMaxTokensPerRank && topk >= 1 && topk <= 8,
                     "Invalid URMA EP, capacity or TopK");
         TORCH_CHECK(experts >= 1 && experts <= 128 && topk <= world * experts, "Invalid URMA expert count");
-        return UrmaLayout(world, tokens, topk, hidden, world * tokens * topk, 128).symmetricBytes;
+        return UrmaLayout(world, tokens, topk, hidden, world * tokens * topk, 128, topk_weights_type).symmetricBytes;
     }
     TORCH_CHECK(world >= 2 && world <= 128 && experts >= 1 && experts <= 128 && tokens >= 1 && tokens <= 65536 &&
                     topk >= 1 && topk <= 32 && topk <= world * experts && hidden >= 1024 && hidden <= 8192 &&
@@ -852,7 +865,7 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     // The buffer outlives BS/weight-mode changes. Reserve the decode rail/count
     // layout as well; prefill continues to bind its original device offsets.
     const MegaMoeImpl::PeermemSizeParams params{
-        tokens, topk, hidden, experts, world, 2, 1, false, false, MegaMoeImpl::TOPO_TYPE_MTE, true};
+        tokens, topk, hidden, experts, world, 2, 1, topk_weights_type == 1, false, MegaMoeImpl::TOPO_TYPE_MTE, true};
     return AlignUp<int64_t>(MegaMoeImpl::EXCEPTION_DUMP_REGION_SIZE + MegaMoeImpl::CalcPeermemLeastSize(params),
                             2LL << 20);
 }

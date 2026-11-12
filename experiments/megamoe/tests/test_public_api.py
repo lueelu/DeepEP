@@ -174,9 +174,11 @@ def backend(monkeypatch):
             address,
             capacity,
             backend="mte",
+            topk_weights_type=0,
         ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
             self.backend = backend
+            self.topk_weights_type = topk_weights_type
             self.local_experts = experts
             events.append(("prepare", self.bs))
             events.append(("plan_backend", backend))
@@ -225,7 +227,7 @@ def backend(monkeypatch):
                 timer.data[-1] = generation
             return output, Tensor(np.arange(self.local_experts) + 2, "int32")
 
-    def buffer_size(*args, backend="mte"):
+    def buffer_size(*args, backend="mte", topk_weights_type=0):
         events.append(("buffer_size", args, backend))
         return 2 << 20
 
@@ -649,3 +651,19 @@ def test_activation_clamp_reaches_native_forward(backend):
     assert ("activation_clamp", 0.25) in backend.events
     with pytest.raises(ValueError, match="activation_clamp"):
         api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=-1)
+
+
+@pytest.mark.parametrize("mode", [0, 1])
+def test_route_weight_mode_reaches_plan(backend, mode):
+    b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)
+    try:
+        b.prepare(17)
+        assert b._plan.topk_weights_type == mode
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("mode", [-1, 2, True, 1.0])
+def test_invalid_route_weight_mode(backend, mode):
+    with pytest.raises((ValueError, TypeError), match="topk_weights_type"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)

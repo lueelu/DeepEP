@@ -209,6 +209,7 @@ struct PackRound {
 };
 
 struct Config {
+    uint32_t topkWeightsType, dispatchScaleStride;
     uint32_t bs;
     uint32_t hidden;
     uint32_t intermediate;
@@ -263,6 +264,7 @@ struct Arguments {
     uint64_t expandedX;
     uint64_t expandedScale;
     uint64_t gatheredInputScale;
+    uint64_t gatheredRouteWeights;
     uint64_t gmm1Output;
     uint64_t activation;
     uint64_t activationScale;

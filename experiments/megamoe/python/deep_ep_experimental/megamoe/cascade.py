@@ -105,6 +105,9 @@ class CascadeReference:
         self.shared_experts = int(model["num_shared_experts"])
         self.shared_intermediate = int(model.get("shared_intermediate_hidden", self.intermediate))
         self.activation_clamp = normalize_clamp(model.get("activation_clamp"))
+        self.topk_weights_type = model.get("topk_weights_type", 0)
+        if type(self.topk_weights_type) is not int or self.topk_weights_type not in (0, 1):
+            raise ValueError("topk_weights_type must be 0 or 1")
         self.shared_output_rounding = model.get("shared_output_rounding", "single_cast")
         if self.experts <= 0 or self.experts % self.world:
             raise ValueError("Cascade requires global experts divisible by EP world size")
@@ -260,7 +263,7 @@ class CascadeReference:
             weight_dtype=self.fp4,
         )[0]
 
-    def _activation_quantize(self, first):
+    def _activation_quantize(self, first, route_weights=None):
         torch = self.torch
         if self.activation == "swiglu":
             gate, up = first.to(torch.float32).chunk(2, dim=-1)
@@ -277,12 +280,34 @@ class CascadeReference:
                 linear_beta=0.0 if self.linear_beta is None else self.linear_beta,
                 activate_left=True,
             )
+        if route_weights is not None:
+            activated = activated * route_weights[:, None]
         return self._quantize(activated.to(torch.bfloat16))
 
-    def _ffn(self, data, scale, counts, weights):
+    def _ffn(self, data, scale, counts, weights, route_weights=None):
         first = self._gmm(data, scale, counts, weights[0])
-        activated, activated_scale = self._activation_quantize(first)
+        activated, activated_scale = self._activation_quantize(first, route_weights)
         return self._gmm(activated, activated_scale, counts, weights[1])
+
+    def _expanded_route_weights(self, ids, weights, counts, rows):
+        # Route bit patterns with the same official operator used for X. This
+        # avoids assumptions about source-to-destination index flattening order.
+        torch = self.torch
+        width = ((4 * self.topk + 31) // 32) * 32
+        payload = torch.zeros((ids.shape[0], width), dtype=torch.bfloat16, device=ids.device)
+        payload[:, :2*self.topk] = weights.contiguous().view(torch.bfloat16)
+        payload[:, 2*self.topk:4*self.topk] = ids.contiguous().view(torch.bfloat16)
+        routed, _, _, _ = self._route(payload, ids)
+        active = int(counts.sum().item())
+        copied_weights = routed[:active, :2*self.topk].contiguous().view(torch.float32)
+        copied_ids = routed[:active, 2*self.topk:4*self.topk].contiguous().view(torch.int32)
+        owners = torch.repeat_interleave(torch.arange(self.first_expert, self.first_expert+self.local_experts, device=ids.device), counts)
+        matches = copied_ids == owners[:, None]
+        if not bool((matches.sum(dim=1) == 1).all().item()):
+            raise RuntimeError('Route weight reference requires one match per expanded row')
+        result = torch.zeros(rows, dtype=torch.float32, device=ids.device)
+        result[:active] = (copied_weights * matches).sum(dim=1)
+        return result
 
     def forward(self, x, ids, weights, *, input_kind, quantized=None):
         """Return (BF16 local output, int64 local expert receive counts).
@@ -323,13 +348,15 @@ class CascadeReference:
             global_weights = self._all_gather(weights)
             expanded, expanded_scale, row_idx, counts = self._dispatch(global_data, global_scale, global_ids)
             if int(counts.sum().item()):
-                second = self._ffn(expanded, expanded_scale, counts, self.weights)
+                route_weights = (self._expanded_route_weights(global_ids, global_weights, counts, expanded.shape[0])
+                                 if self.topk_weights_type else None)
+                second = self._ffn(expanded, expanded_scale, counts, self.weights, route_weights)
                 routed = self.npu.npu_moe_finalize_routing(
                     second.to(torch.float32),
                     skip1=None,
                     skip2=None,
                     bias=None,
-                    scales=global_weights,
+                    scales=torch.ones_like(global_weights) if self.topk_weights_type else global_weights,
                     expanded_src_to_dst_row=row_idx,
                     export_for_source_row=global_ids,
                     drop_pad_mode=2,

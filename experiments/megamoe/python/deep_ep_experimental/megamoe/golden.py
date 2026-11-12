@@ -49,7 +49,7 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
         input=input_kind,
         routing=routing,
         check_tokens=check_tokens,
-        numerical_contract="ascend_post_gmm2_route_weight_v1",
+        numerical_contract=("ascend_pre_quant_route_weight_v1" if config["model"].get("topk_weights_type", 0) else "ascend_post_gmm2_route_weight_v1"),
     )
 
 
@@ -178,8 +178,10 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
-            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2, model.get("activation_clamp"))
-        if route_weight is not None:
+            result[start:stop] = expert_forward(
+                x[token[start:stop]], w1, w2, model.get("activation_clamp"),
+                route_weight[start:stop] if route_weight is not None and model.get("topk_weights_type", 0) == 1 else None)
+        if route_weight is not None and model.get("topk_weights_type", 0) == 0:
             result *= route_weight[:, None]
         return token, result
 
