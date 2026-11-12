@@ -142,8 +142,9 @@ ASCEND_DEEPEP_SCHEDULE_FN uint64_t PeerMask(
     }
     return mask;
 }
-// Benchmark-only union for the existing peer schedules. Reserve both endpoint
-// mappings before SHMEM initialization; launches retain exclusive SQ ownership.
+// Union shared by automatic resources and benchmark sessions. Reserve both
+// endpoint mappings once; launches retain exclusive SQ ownership. Group size
+// is immutable for the lifetime of these resources.
 ASCEND_DEEPEP_SCHEDULE_FN uint64_t TuningPeerMask(
     uint32_t rank, uint32_t peer, uint32_t world, uint32_t ranks_per_group)
 {

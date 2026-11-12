@@ -17,7 +17,7 @@ __aicore__ inline uint32_t CombineWeightFirst(const CombineTilingData& td)
 
 __aicore__ inline bool CombineSimtWeightsEnabled(const CombineTilingData& td)
 {
-    return ASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS && td.has_topk_weights && td.num_topk &&
+    return ASCEND_DEEPEP_COMBINE_SIMT_WEIGHTS && td.udma_weight_mode != 1 && td.has_topk_weights && td.num_topk &&
            !td.udma_token_schedule && CombineWeightFirst(td) < td.block_dim;
 }
 

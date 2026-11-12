@@ -289,7 +289,9 @@ def check_idle(text, first_device, ep_size):
             raise RuntimeError(f"NPU {device} is busy, unhealthy or cannot be verified; no job started")
 
 
-def effective_udma_config(buffer, config=None, *, num_aiv=None):
+def effective_udma_config(
+    buffer, config=None, *, num_aiv=None, row_bytes=None, bf16=False, expanded=False, v2=True, combine_row_bytes=None
+):
     """Report resolved runtime values rather than caller defaults (V1 uses Config)."""
     result = {
         name: getattr(buffer, name)
@@ -307,7 +309,33 @@ def effective_udma_config(buffer, config=None, *, num_aiv=None):
     if policy is not None:
         if num_aiv is None:
             num_aiv = config.num_aiv if config is not None else 32
-        policy = policy.for_num_aiv(num_aiv)
+        if row_bytes is None:
+            policy = policy.for_num_aiv(num_aiv)
+            result["policy_scope"] = "buffer_default_only"
+        else:
+            plans = {
+                op: policy.for_launch(
+                    num_aiv,
+                    row_bytes if op == "dispatch" else (combine_row_bytes or row_bytes),
+                    op,
+                    bf16=bf16 if op == "dispatch" else True,
+                    expanded=expanded,
+                    v2=v2,
+                )
+                for op in ("dispatch", "combine", "weighted")
+            }
+            result["operation_plans"] = {op: asdict(plan) for op, plan in plans.items()}
+            policy = plans["dispatch"]
+            names = ("rank", "group", "group_staggered", "group_round_robin")
+            result.update(
+                policy_scope="dispatch; see operation_plans for combine",
+                udma_dispatch_peer_order=names[policy.peer_order],
+                udma_combine_peer_order=names[plans["combine"].peer_order],
+                udma_ranks_per_group=policy.ranks_per_group,
+                udma_peers_per_group_per_worker=policy.peers_per_worker if policy.peer_order == 3 else None,
+                udma_workers_per_peer=policy.workers_per_peer,
+                udma_qps_per_worker=policy.qps_per_worker,
+            )
     for name in ("udma_peers_per_worker", "udma_wqes_per_visit"):
         result[name] = (
             getattr(policy, name.removeprefix("udma_"))
@@ -401,11 +429,18 @@ def worker(args):
             transport="udma",
             use_1g_huge_pages=args.huge_pages,
         )
-        args.effective_udma_config = effective_udma_config(buffer, num_aiv=args.num_aiv)
+        args.effective_udma_config = effective_udma_config(
+            buffer,
+            num_aiv=args.num_aiv,
+            row_bytes=args.hidden * (1 if args.dtype == "fp8" else 2),
+            bf16=args.dtype == "bf16",
+            expanded=bool(args.expand),
+            combine_row_bytes=args.hidden * 2,
+        )
         if rank == 0:
             print("EFFECTIVE_UDMA_CONFIG", json.dumps(args.effective_udma_config, sort_keys=True), flush=True)
         if getattr(args, "udma_auto_policy", False):
-            args.resolved_udma_policy = asdict(buffer.udma_auto_policy.for_num_aiv(args.num_aiv))
+            args.resolved_udma_policy = args.effective_udma_config["operation_plans"]["dispatch"]
             if rank == 0:
                 print("AUTO_POLICY", json.dumps(args.resolved_udma_policy, sort_keys=True), flush=True)
         identity = loaded_identity()

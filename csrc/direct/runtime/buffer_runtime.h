@@ -32,7 +32,7 @@ public:
                   bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1);
+                  int64_t udma_qps_per_worker = 1, bool auto_resources = false);
 
     ~BufferRuntime() noexcept;
 
@@ -72,7 +72,7 @@ public:
                       int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy,
                       c10::optional<int64_t> allocation_stream_id = c10::nullopt,
                       c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt, int64_t udma_peers_per_worker = 4,
-                      int64_t udma_wqes_per_visit = 8);
+                      int64_t udma_wqes_per_visit = 8, const std::vector<int64_t>& launch_plan = {});
 
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
                std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -88,7 +88,8 @@ public:
                               c10::optional<int64_t> allocation_stream_id = c10::nullopt,
                               c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt,
                               int64_t udma_peers_per_worker = 4, int64_t udma_wqes_per_visit = 8,
-                              c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt);
+                              c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt,
+                              const std::vector<int64_t>& launch_plan = {});
 
     std::tuple<std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
                           c10::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
@@ -106,7 +107,7 @@ public:
                                 c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt,
                                 int64_t udma_peers_per_worker = 4, int64_t udma_wqes_per_visit = 8,
                                 c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt,
-                                bool defer_public_expert_prefix = false);
+                                bool defer_public_expert_prefix = false, const std::vector<int64_t>& launch_plan = {});
 
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>> IntranodeCombine(
         torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> bias_0,
@@ -115,7 +116,7 @@ public:
         int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
         c10::optional<int64_t> allocation_stream_id = c10::nullopt,
         c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt, int64_t udma_peers_per_worker = 4,
-        int64_t udma_wqes_per_visit = 8);
+        int64_t udma_wqes_per_visit = 8, const std::vector<int64_t>& launch_plan = {});
 
     c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BeginCombine(
         torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> bias_0,
@@ -127,7 +128,7 @@ public:
         int64_t udma_wqes_per_visit = 8, c10::optional<torch::Tensor> expanded_x = c10::nullopt,
         c10::optional<torch::Tensor> single_source_slots = c10::nullopt,
         c10::optional<torch::Tensor> early_aggregate_map = c10::nullopt, int64_t pipeline_chunk_tokens = 0,
-        int64_t reduce_num_aiv = 0);
+        int64_t reduce_num_aiv = 0, const std::vector<int64_t>& launch_plan = {});
 
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor,
                torch::Tensor>

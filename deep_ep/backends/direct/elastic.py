@@ -162,9 +162,11 @@ class ElasticBuffer:
             rank=rank,
         )
         if self._udma_auto_policy is not None:
+            self._udma_auto_policy = self._udma_auto_policy.bind_group(resolved_group)
             udma_schedule = "peer"
             udma_dispatch_peer_order = udma_combine_peer_order = "rank"
-            udma_ranks_per_group = udma_peers_per_group_per_worker = None
+            udma_ranks_per_group = self._udma_auto_policy.ranks_per_group
+            udma_peers_per_group_per_worker = None
             policy = self._udma_auto_policy
             udma_workers_per_peer, udma_qps_per_worker = policy.workers_per_peer, policy.qps_per_worker
             udma_peers_per_worker, udma_wqes_per_visit = policy.peers_per_worker, policy.wqes_per_visit
@@ -322,7 +324,9 @@ class ElasticBuffer:
                 bootstrap_key,
                 True,
                 udma_schedule == "token",
-                *peer_options,
+                # Keep the appended flag after all six native peer fields.
+                *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
+                self._udma_auto_policy is not None,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -764,7 +768,17 @@ class ElasticBuffer:
                 f"{self.num_bytes}"
             )
         _validate_num_sms(resolved_num_sms, self.num_device_aiv)
-        policy = self._udma_auto_policy.for_num_aiv(resolved_num_sms) if self._udma_auto_policy is not None else None
+        policy = (
+            self._udma_auto_policy.for_launch(
+                resolved_num_sms,
+                int(x_tensor.size(1)) * x_tensor.element_size(),
+                "dispatch",
+                bf16=str(x_tensor.dtype) == "torch.bfloat16",
+                expanded=do_expand,
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         _validate_bool("do_handle_copy", do_handle_copy)
         _validate_bool("do_cpu_sync", resolved_do_cpu_sync)
         if not cached_mode and self.num_max_tokens_per_rank == 0:
@@ -835,11 +849,15 @@ class ElasticBuffer:
                 handle._dispatch_plan if cached_mode else None,
             )
             if cached_mode:
-                result = self._native.intranode_dispatch_with_plan(*dispatch_args)
+                result = self._native.intranode_dispatch_with_plan(
+                    *dispatch_args, policy.native_plan() if policy else []
+                )
                 public_handle = None
             else:
                 # Expand writes the final expert prefix before this API returns.
-                result, public_handle = self._native.intranode_dispatch_with_handle(*dispatch_args, do_expand)
+                result, public_handle = self._native.intranode_dispatch_with_handle(
+                    *dispatch_args, do_expand, policy.native_plan() if policy else []
+                )
             (
                 recv_x,
                 recv_x_scales,
@@ -1028,7 +1046,17 @@ class ElasticBuffer:
             raise ValueError("independent combine/reduce core counts require UDMA")
         if comm_sms != handle.num_sms and handle.do_expand and self._aggregate_pipeline_chunk_tokens:
             raise ValueError("aggregate pipeline requires combine cores to match dispatch channels")
-        policy = self._udma_auto_policy.for_num_aiv(comm_sms) if self._udma_auto_policy is not None else None
+        policy = (
+            self._udma_auto_policy.for_launch(
+                comm_sms,
+                int(x.size(1)) * x.element_size(),
+                "weighted" if topk_weights is not None else "combine",
+                bf16=str(x.dtype) == "torch.bfloat16",
+                expanded=handle.do_expand,
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         bias_0, bias_1 = self._unpack_bias(bias)
         config = Config(
             num_aiv=comm_sms,
@@ -1106,6 +1134,7 @@ class ElasticBuffer:
                 early_aggregate_map,
                 pipeline_chunk,
                 reduce_sms,
+                policy.native_plan() if policy else [],
             )
             if previous_event_before_epilogue is not None:
                 previous_event_before_epilogue.current_stream_wait()

@@ -270,8 +270,12 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            bool use_udma, ShmemInstance& shmem, void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
            c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
            c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
-           bool defer_public_expert_prefix, void* dispatch_output_control)
+           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan)
 {
+    const auto udma_launch =
+        shmem.ResolveLaunch(launch_plan, false, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
+    udma_peers_per_worker = udma_launch.peers;
+    udma_wqes_per_visit = udma_launch.visit;
     StreamAllocator allocator(allocation_stream_id);
     TORCH_CHECK(!use_udma || dispatch_output_control != nullptr,
                 "UDMA dispatch requires its Buffer-owned output address control");
@@ -376,8 +380,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
     const int64_t num_channels = resolved_num_aiv;
-    if (shmem.DispatchPeerOrder() == ascend_deepep::udma::kGroupRoundRobinOrder)
-        udma_peers_per_worker = shmem.PeersPerGroupPerWorker();
+    if (udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder) udma_peers_per_worker = udma_launch.peers;
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
         TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
@@ -386,12 +389,12 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         TORCH_CHECK(udma_wqes_per_visit == 4 || udma_wqes_per_visit == 8 || udma_wqes_per_visit == 16 ||
                         udma_wqes_per_visit == 32,
                     "udma_wqes_per_visit must be 4, 8, 16 or 32");
-        const int64_t workers = shmem.TokenSchedule()
-                                    ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
-                                    : shmem.WorkersPerPeer() * ascend_deepep::udma::Workers(
-                                                                   world_size, udma_peers_per_worker,
-                                                                   shmem.DispatchPeerOrder(), shmem.RanksPerGroup());
-        TORCH_CHECK(workers <= resolved_num_aiv && workers * shmem.QpsPerWorker() <= ascend_deepep::udma::kQpCount,
+        const int64_t workers =
+            shmem.TokenSchedule()
+                ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
+                : udma_launch.workers * ascend_deepep::udma::Workers(world_size, udma_peers_per_worker,
+                                                                     udma_launch.order, udma_launch.group);
+        TORCH_CHECK(workers <= resolved_num_aiv && workers * udma_launch.qps <= ascend_deepep::udma::kQpCount,
                     "UDMA peer grouping exceeds the AIV or 32-QP pool budget");
     }
     const int64_t num_experts = num_tokens_per_expert.has_value() ? num_tokens_per_expert->numel() : 0;
@@ -555,10 +558,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.has_x_scales = x_scales.has_value() ? 1U : 0U;
     tiling.cached_mode = cached_mode ? 1U : 0U;
     tiling.num_channels = static_cast<uint32_t>(num_channels);
-    tiling.udma_peer_order = shmem.DispatchPeerOrder();
-    tiling.udma_ranks_per_group = shmem.RanksPerGroup();
-    tiling.udma_workers_per_peer = shmem.WorkersPerPeer();
-    tiling.udma_qps_per_worker = shmem.QpsPerWorker();
+    tiling.udma_peer_order = udma_launch.order;
+    tiling.udma_ranks_per_group = udma_launch.group;
+    tiling.udma_workers_per_peer = udma_launch.workers;
+    tiling.udma_qps_per_worker = udma_launch.qps;
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
@@ -610,9 +613,9 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         TORCH_CHECK(bytes <= CheckedMulInt64(recv_buffer_tokens, scale_row_bytes, "scale staging capacity"),
                     "Packed scales exceed symmetric scale capacity");
         tiling.packed_peer_scales = workspace_base + dispatch_workspace.x_scales_buffer_offset;
-        const uint32_t first = ascend_deepep::udma::MetadataFirst(world_size, udma_peers_per_worker, resolved_num_aiv,
-                                                                  shmem.DispatchPeerOrder(), shmem.RanksPerGroup(),
-                                                                  shmem.WorkersPerPeer());
+        const uint32_t first =
+            ascend_deepep::udma::MetadataFirst(world_size, udma_peers_per_worker, resolved_num_aiv, udma_launch.order,
+                                               udma_launch.group, udma_launch.workers);
         // Self scales go straight to owned output; their unused packed interval
         // holds one cache-isolated flag per AIV. Otherwise pack serially.
         const uint64_t self = tiling.packed_peer_scales + uint64_t(rank) * uint64_t(peer_bytes);

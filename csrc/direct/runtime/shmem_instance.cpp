@@ -92,7 +92,7 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker)
+                             int64_t udma_qps_per_worker, bool auto_resources)
     : rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -184,6 +184,9 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     if (data_op_engine_type_ <= 0 || (data_op_engine_type_ & ~kValidEngineMask) != 0) {
         throw std::invalid_argument("invalid CANN SHMEM data operation engine type");
     }
+    auto_resources_ = auto_resources;
+    if (auto_resources_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
+        throw std::invalid_argument("automatic launch plans require shared-Jetty peer resources and a fixed group");
     const char* tuning = std::getenv("DEEPEP_CLOS_TUNING_SESSION");
     tuning_session_ = tuning && std::strcmp(tuning, "1") == 0;
     if (tuning_session_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
@@ -193,7 +196,7 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
 std::vector<int64_t> ShmemInstance::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
                                                     int64_t workers, int64_t qps)
 {
-    if (!initialized_ || !tuning_session_ || g_runtime_refcount != 1)
+    if (!initialized_ || !tuning_session_ || auto_resources_ || g_runtime_refcount != 1)
         throw std::runtime_error("configure_tuning requires one active tuning-session Buffer per process");
     // Validate before any collective or mutation. The benchmark agrees the
     // complete plan across ranks before entering this private interface.
@@ -208,6 +211,42 @@ std::vector<int64_t> ShmemInstance::ConfigureTuning(int64_t dispatch_order, int6
     workers_per_peer_ = candidate.workers_per_peer_;
     qps_per_worker_ = candidate.qps_per_worker_;
     return {dispatch_peer_order_, combine_peer_order_, peers_per_group_per_worker_, workers_per_peer_, qps_per_worker_};
+}
+
+ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t>& values, bool combine, int64_t peers,
+                                                       int64_t visit, int64_t cores) const
+{
+    using namespace ascend_deepep::udma;
+    if (values.empty()) {
+        const auto order = combine ? combine_peer_order_ : dispatch_peer_order_;
+        return {order,
+                ranks_per_group_,
+                order == kGroupRoundRobinOrder ? peers_per_group_per_worker_ : uint32_t(peers),
+                workers_per_peer_,
+                qps_per_worker_,
+                uint32_t(visit),
+                -1,
+                0};
+    }
+    // Validate before narrowing or any kernel submission. P/W/Q changes are
+    // covered by the symmetric union reserved once in InitRuntime.
+    if (!auto_resources_ || values.size() != 9 || values[0] != 1)
+        throw std::invalid_argument("invalid or unreserved UDMA launch plan");
+    const auto order = values[1], group = values[2], p = values[3], w = values[4], q = values[5];
+    const auto v = values[6], copy = values[7], weight = values[8];
+    if (order < 0 || order > 3 || group != ranks_per_group_ || p < 1 || p > 8 || !ValidPeers(p) || (w != 1 && w != 2) ||
+        (q != 1 && q != 2) || w * q > 2 || v < 4 || v > 32 || !ValidVisit(v) || copy < 0 || copy > 2 || weight < 0 ||
+        weight > 2 || (!combine && (copy || weight)))
+        throw std::invalid_argument("UDMA launch plan is outside the reserved schedule set");
+    const auto owners = Workers(world_size_, p, order, group);
+    const auto aivs = cores == 0 ? 32 : cores;
+    if (cores < 0 || cores % 2 || owners * w > aivs || owners * w * q > kQpCount)
+        throw std::invalid_argument("UDMA launch plan exceeds communication AIV/QP budget");
+    if (order == kGroupRoundRobinOrder &&
+        (p > 4 || ((group + owners - 1) / owners) * (world_size_ / group) > kGroupPeerCapacity))
+        throw std::invalid_argument("UDMA launch plan exceeds the round-robin peer table");
+    return {uint32_t(order), uint32_t(group), uint32_t(p), uint32_t(w),
+            uint32_t(q),     uint32_t(v),     copy,        uint32_t(weight)};
 }
 
 ShmemInstance::~ShmemInstance()
@@ -389,7 +428,7 @@ void ShmemInstance::InitRuntime()
             if (shared_jetty_) {
                 std::vector<uint64_t> masks(world_size_);
                 for (int peer = 0; peer < world_size_; ++peer)
-                    masks[peer] = tuning_session_
+                    masks[peer] = (tuning_session_ || auto_resources_)
                                       ? ascend_deepep::udma::TuningPeerMask(rank_, peer, world_size_, ranks_per_group_)
                                   : token_schedule_
                                       ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
