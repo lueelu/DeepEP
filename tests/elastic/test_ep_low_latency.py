@@ -67,7 +67,8 @@ def validate_native_cases(native, cases, world):
             if native.low_latency_layout(*shape, dtype) is None:
                 raise ValueError("dispatch layout rejected")
             native.low_latency_combine_tiling(
-                *shape, "float16" if case.dtype == "fp16" else "bfloat16", validate_args(case, world)
+                *shape, "float16" if case.dtype == "fp16" else "bfloat16", validate_args(case, world),
+                **({"rdma": True} if os.environ.get("DEEPEP_LL_BACKEND") == "rdma" else {}),
             )
         except (ValueError, RuntimeError) as exc:
             raise ValueError(
@@ -628,13 +629,19 @@ def record_case_progress(args, rank, m, mode, phase, error=None):
         print("[LL ST] " + json.dumps(entry, ensure_ascii=False), flush=True)
 
 
+def kernel_name(operation):
+    if operation == "combine" and os.environ.get("DEEPEP_LL_BACKEND") == "rdma":
+        return "ubx_combine_route_plan"
+    return f"{operation}_server_dedup_kernel"
+
+
 def measure(invoke, args, operation, profile_dir, progress=None):
     """Measure exported device kernel tasks; never substitute Host wall time."""
     import torch
     import torch.distributed as dist
     import torch_npu
 
-    kernel = f"{operation}_server_dedup_kernel"
+    kernel = kernel_name(operation)
     if progress:
         progress(f"{operation}.warmup")
     for _ in range(args.warmup):
@@ -830,6 +837,9 @@ def run_case(buffer, args, rank, world, m, mode):
                 )
 
         agree_check(check_combine, args, rank)
+    if os.environ.get("DEEPEP_LL_BACKEND") == "rdma" and expected is not None:
+        progress("combine.async_reuse")
+        check_async_combine(buffer, expert_output, handle, expected, out, args, rank)
     result = {
         "case_id": args.case_id,
         "route": mode,
@@ -862,6 +872,40 @@ def run_case(buffer, args, rank, world, m, mode):
     completion_boundary(args)
     progress("complete")
     return result
+
+
+def check_async_combine(buffer, expert_output, handle, expected, previous_output, args, rank):
+    """Consume results on a third stream and cross both banks with changed input."""
+    import torch
+
+    producer, consumer = torch.npu.Stream(), torch.npu.Stream()
+    producer.wait_stream(torch.npu.current_stream())
+    snapshots = []
+    for sign in (-1, 1, -1):
+        with torch.npu.stream(producer):
+            changed = expert_output * sign
+            bias = torch.full_like(expected, 0.25, device=expert_output.device)
+            ready = buffer.capture()
+        output, weights, event = buffer.combine(
+            changed, handle, bias=(bias, bias), previous_event=ready,
+            previous_event_before_epilogue=ready,
+            allocate_on_comm_stream=True, async_with_compute_stream=True,
+        )
+        assert weights is None and event.event is not None
+        with torch.npu.stream(consumer):
+            event.current_stream_wait(release_handle=True)
+            snapshots.append((sign, output.clone()))
+            consumed = buffer.capture()
+        del changed, output, bias
+    consumed.current_stream_wait()
+
+    def check():
+        tolerance = dict(rtol=0.003, atol=0.004) if args.dtype == "fp16" else dict(rtol=0.01, atol=0.03125)
+        torch.testing.assert_close(previous_output.cpu(), expected, **tolerance)
+        for sign, snapshot in snapshots:
+            torch.testing.assert_close(snapshot.cpu(), (expected * sign + 0.25) + 0.25, **tolerance)
+
+    agree_check(check, args, rank)
 
 
 def worker(local_rank, args):

@@ -73,6 +73,17 @@ Mesh+Clos 与 Direct 的同步调用均先建立计算流依赖，再返回 `eve
 
 `ElasticBuffer(use_1g_huge_pages=True)` 默认为 SHMEM 工作区申请 1 GiB 大页；所有 rank 须使用相同设置。设置为 `False` 使用 SHMEM 常规分配。`num_bytes` 仍表示逻辑容量，实际分配包含页对齐和必要的保护区。
 
+## UBX RDMA V2 Combine
+
+`from deep_ep import ElasticBuffer` 同时提供 RDMA Dispatch 和 Combine。
+构造前设置 `DEEPEP_LL_BACKEND=rdma`，Combine 使用 Dispatch 返回的 `EPHandle` 和相同
+Runtime；不再使用独立 `ubx.Session/Combine.run()` 接口。`mte` 模式保留 POD 路径。
+公共 Combine 的参数名称、顺序、默认值及 `(out, out_weights, event)` 返回格式保持 V2。
+
+完整调用示例、每个参数的类型/含义、流与事件、LL 权重约束、资源生命周期和独立性能
+用例见 [UBX V2 接口说明](ubx.md#elasticbuffercombine)。这里的格式对齐不表示 LL 支持
+全部 HT/训练功能：独立权重回传仍不支持，不能重复对专家输出乘 Dispatch 的 gate 权重。
+
 ## 生命周期与失败处理
 
 一个进程同时只允许一个活跃 Session，不接管外部已初始化的 SHMEM。所有参与 rank 按相同顺序构造、调用和销毁；通信失败后应结束并重启整个分布式作业。

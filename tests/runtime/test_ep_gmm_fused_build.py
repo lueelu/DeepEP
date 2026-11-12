@@ -93,7 +93,6 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
     monkeypatch.setitem(sys.modules, "pybind11", pybind11)
 
     configuration = {
-        "ubx_ranks_per_host": 16,
         "source_sha256": "current",
         "source_version": "1",
         "cmake_path": "/tools/cmake",

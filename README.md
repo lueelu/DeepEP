@@ -316,4 +316,4 @@ MegaMoE 将 dispatch、专家计算、激活/量化及 combine 融合为 W4A8 �
 
 Lu Lu 持有权利的项目内容采用 [BSD 2-Clause 许可证](LICENSE)。其他来源代码保留各自的版权声明和许可证文本。
 
-UBX 机型另提供独立的 RDMA route-plan Combine，使用 CPU 元数据与 HCCL 算子前同步验证，见 [UBX 说明](docs/ubx.md)。
+UBX RDMA Dispatch/Combine 共用 V2 `ElasticBuffer`、设备 Tensor 和 EPHandle；Combine 保留独立性能用例，见 [UBX 说明](docs/ubx.md)。

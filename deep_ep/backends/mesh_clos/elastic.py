@@ -593,6 +593,22 @@ class ElasticBuffer:
 
         runtime = runtime_of(self)
         runtime.ensure_alive()
+        if runtime.ll_backend == "rdma":
+            from ..ubx.elastic import combine
+
+            return combine(
+                self,
+                x,
+                handle,
+                topk_weights,
+                bias,
+                num_compute_units,
+                num_qps,
+                previous_event,
+                previous_event_before_epilogue,
+                async_with_compute_stream,
+                allocate_on_comm_stream,
+            )
         if handle._buffer_token is not self._handle_token or handle.metadata_only:
             raise ValueError("LL handle must come from this buffer's payload dispatch")
         if topk_weights is not None or bias is not None:

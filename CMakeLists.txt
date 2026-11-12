@@ -21,7 +21,7 @@ include(cmake/Dependencies.cmake)
 option(DEEPEP_BUILD_MEGAMOE "Build the optional MegaMoE Beta" OFF)
 option(DEEPEP_MEGAMOE_TIMER "Compile MegaMoE device tracing" OFF)
 include(cmake/Device.cmake)
-pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp)
+pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp csrc/ubx/v2.cpp)
 target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
 find_path(DEEPEP_PLATFORM_INCLUDE tiling/platform/platform_ascendc.h
     HINTS "${ASCEND_HOME_PATH}/asc/include" "${ASCEND_HOME_PATH}/include/op_common"
@@ -40,7 +40,6 @@ target_link_options(_C PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 set_target_properties(_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS _C LIBRARY DESTINATION .)
 include(cmake/Direct.cmake)
-add_subdirectory(csrc/ubx)
 if(DEEPEP_BUILD_MEGAMOE)
     target_compile_definitions(_C PRIVATE DEEPEP_BUILD_MEGAMOE=1)
     add_subdirectory(experiments/megamoe)
@@ -61,8 +60,8 @@ file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/capabilities.json" CONTENT [=[
   "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"],
   "machine_backends": {
     "mesh_clos": {"module": "deep_ep._C", "device_library": "libdeepep_kernels.so"},
-    "ubx": {"module": "deep_ep._ubx_C", "device_library": "libdeepep_ubx_kernels.so",
-      "interfaces": ["Combine"], "transport": "mte+roce", "scheme": "route-plan"},
+    "ubx": {"module": "deep_ep._C", "device_library": "libdeepep_kernels.so",
+      "interfaces": ["ElasticBuffer"], "transport": "mte+roce", "scheme": "route-plan"},
     "mesh_pcie": {
       "module": "deep_ep._clos_C", "device_library": "libdeepep_clos_kernels.so",
       "interfaces": ["Buffer", "ElasticBuffer"], "transport": "mte", "topk_index_bits": 64

@@ -123,6 +123,15 @@ combine 接受与 handle 行数一致的连续 BF16/FP16 专家输出，返回 `
 
 LL handle 的 combine 沿用 LL 路径。设备用例见 [LL 系统测试](../tests/elastic/test_ep_low_latency.py)。
 
+### RDMA Combine 的 V2 接入
+
+`DEEPEP_LL_BACKEND=rdma` 时，同一 `ElasticBuffer.combine()` 使用 UBX route-plan kernel，
+直接消费现有 RDMA Dispatch 的设备 Tensor/handle。原 POD `mte` 分支不变。
+上述默认流限制对 RDMA Combine 有扩展：支持公共 `previous_event`、epilogue 依赖、
+异步完成事件、通信流分配和 Tensor bias；每个参数及限制见 [UBX V2 API](ubx.md#elasticbuffercombine)。
+不需要手工组装或从 CPU 上传 Combine 元数据，也不创建第二个 SHMEM Session。
+Dispatch 的接口与流选项不因本次 Combine 接入而变化。
+
 ## 工作区与输出所有权
 
 HT 的 `num_bytes` 包含 Notify/dispatch 和 combine 两个固定半区，按 2 MiB 对齐。size hint 的接收/gather 行预算为 `min(P,4)*T*K`，不是最坏路由上界。严重热点需要更大的显式容量；超过实际容量时在 payload 启动前报错，不自动扩容。

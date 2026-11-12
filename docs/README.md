@@ -12,7 +12,7 @@ Modified by Joyce_An 2026
 | 配置环境、构建和安装 wheel | [构建指南](build.md) |
 | 创建 Buffer、管理事件与资源、了解上游兼容范围 | [API 指南](api.md) |
 | 使用 dispatch/combine，核对 HT/LL 的输入、权重和容量约束 | [Elastic 接口](elastic.md) |
-| 验证 UBX RDMA route-plan Combine | [UBX 算子与独立性能用例](ubx.md) |
+| 验证 UBX RDMA route-plan Combine | [UBX V2 接口与独立 Combine 性能用例](ubx.md) |
 | 使用 AllToAllV → GMM 和 GMM → AllToAllV 融合算子 | [EpGmmFused](../experiments/ep_gmm_fused/README.md) |
 | 了解 MegaMoE 融合计算流程 | [MegaMoE](../experiments/megamoe/README.md) |
 | 定位 Python、Host、Device 调用链 | [架构说明](architecture.md) |
