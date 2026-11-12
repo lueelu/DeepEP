@@ -63,7 +63,7 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def("create_megamoe_runtime", &deepep::Session::create_megamoe, py::arg("rank"), py::arg("size"),
-               py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("backend") = "pod",
+               py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("backend") = "mte",
                py::call_guard<py::gil_scoped_release>());
     module.def("megamoe_workspace_address", &deepep::Session::workspace_address);
 #endif

@@ -20,7 +20,7 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
     monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "test-host")
     created = []
 
-    def create(*args, backend="pod"):
+    def create(*args, backend="mte"):
         created.append((*args, backend))
         return SimpleNamespace(close=lambda: None)
 
@@ -85,7 +85,7 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
         try:
             assert len(created) == 1
             assert created[0][:3] == (0, 2, 2 << 20)
-            assert created[0][-1] == "pod"
+            assert created[0][-1] == "mte"
         finally:
             runtime.close()
 
@@ -111,7 +111,7 @@ def unified_runtime_environment(monkeypatch):
         def barrier(self):
             pytest.fail("No device barrier before peer-access agreement")
 
-    def create(rank, size, capacity, address, timeout, backend="pod"):
+    def create(rank, size, capacity, address, timeout, backend="mte"):
         calls.append((rank, size, capacity, address, timeout, backend))
         events.append("create")
         return NativeSession()
@@ -158,7 +158,7 @@ def unified_runtime_environment(monkeypatch):
     return SimpleNamespace(group=group, state=state, calls=calls, events=events, aborted=aborted)
 
 
-@pytest.mark.parametrize("backend", ["pod", "urma"])
+@pytest.mark.parametrize("backend", ["mte", "urma"])
 def test_unified_factory_routes_backend_and_preserves_lifetime(unified_runtime_environment, backend):
     env = unified_runtime_environment
     runtime = _MegaRuntime(env.group, 2 << 20, backend=backend)
@@ -217,7 +217,7 @@ def test_backend_mismatch_fails_before_shmem(unified_runtime_environment):
 def test_backend_specific_capacity_limits(unified_runtime_environment):
     env = unified_runtime_environment
     with pytest.raises(ValueError, match="capacity"):
-        _MegaRuntime(env.group, 2 << 30, backend="pod")
+        _MegaRuntime(env.group, 2 << 30, backend="mte")
     assert env.calls == []
     runtime = _MegaRuntime(env.group, 2 << 30, backend="urma")
     assert env.calls[0][2] == 2 << 30

@@ -29,7 +29,7 @@ class _MegaMoEProfile(NamedTuple):
 
 
 _MEGAMOE_PROFILES = {
-    "pod": _MegaMoEProfile(1 << 30, False, False, None),
+    "mte": _MegaMoEProfile(1 << 30, False, False, None),
     "urma": _MegaMoEProfile(32 << 30, True, True, (4, 8, 16)),
 }
 
@@ -83,7 +83,7 @@ class Runtime:
     """One explicit collective lifetime per process; a live owner is retained."""
 
     _megamoe = False
-    _megamoe_backend = "pod"
+    _megamoe_backend = "mte"
 
     def __init__(
         self,
@@ -103,7 +103,7 @@ class Runtime:
         profile = None
         if self._megamoe:
             if self._megamoe_backend not in _MEGAMOE_PROFILES:
-                raise ValueError("MegaMoE backend must be pod or urma")
+                raise ValueError("MegaMoE backend must be mte or urma")
             profile = _MEGAMOE_PROFILES[self._megamoe_backend]
         native = require_native("Runtime.__init__")
         maximum_capacity = profile.maximum_capacity if profile else (1 << 63) - 1

@@ -279,17 +279,17 @@ int main(int argc, char** argv)
         assert(!deepep::Session::busy());
     } else if (mode == "megamoe") {
         fails([]() {
-            deepep::Session s(0, 256, 2 << 20, "tcp://127.0.0.1:19091", 30, false, deepep::RuntimeProfile::MegaMoEPod);
+            deepep::Session s(0, 256, 2 << 20, "tcp://127.0.0.1:19091", 30, false, deepep::RuntimeProfile::MegaMoEMte);
         });
         fails([]() {
-            deepep::Session s(0, 2, 2ULL << 30, "tcp://127.0.0.1:19091", 30, false, deepep::RuntimeProfile::MegaMoEPod);
+            deepep::Session s(0, 2, 2ULL << 30, "tcp://127.0.0.1:19091", 30, false, deepep::RuntimeProfile::MegaMoEMte);
         });
         fails([]() {
-            deepep::Session s(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true, deepep::RuntimeProfile::MegaMoEPod);
+            deepep::Session s(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true, deepep::RuntimeProfile::MegaMoEMte);
         });
         fails([]() { deepep::Session::create_megamoe(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, "unknown"); });
         assert(!deepep::Session::busy() && allocations == 0);
-        deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, false, deepep::RuntimeProfile::MegaMoEPod);
+        deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, false, deepep::RuntimeProfile::MegaMoEMte);
         assert(!session.udma() && qp_count == 0);
         assert(session.workspace_address() == reinterpret_cast<uintptr_t>(session.workspace()));
         assert(session.rank() == 0 && session.world() == 2);

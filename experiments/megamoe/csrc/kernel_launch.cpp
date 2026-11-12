@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 namespace deepep::megamoe {
-void launch_kernel(Backend backend, uint32_t block_dim, uint32_t ub_bytes, void* stream, const PodLaunchArgs& p,
+void launch_kernel(Backend backend, uint32_t block_dim, uint32_t ub_bytes, void* stream, const MteLaunchArgs& p,
                    const MegaMoeUrma::Arguments* urma)
 {
     if (backend == Backend::Urma) {

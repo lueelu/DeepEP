@@ -524,7 +524,7 @@ struct UrmaWorkspace {
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
            uint64_t symmetric_address, int64_t symmetric_bytes, const std::string& backend)
-    : backend_(backend == "pod" ? Backend::Pod : Backend::Urma),
+    : backend_(backend == "mte" ? Backend::Mte : Backend::Urma),
       ffts_(ffts),
       example_(example),
       intermediate_(intermediate),
@@ -537,7 +537,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
       symmetric_address_(symmetric_address),
       symmetric_bytes_(symmetric_bytes)
 {
-    TORCH_CHECK(backend == "pod" || backend == "urma", "MegaMoE backend must be pod or urma");
+    TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     CheckTensor(example, 2, "plan input");
     TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens, "BS outside allocated capacity");
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && world % ranks_per_node == 0),
@@ -569,7 +569,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     }
 
     // Both backends resolve peer mappings once during plan preparation.
-    // Only POD uploads this context; URMA passes the symmetric base in its ABI.
+    // Only MTE uploads this context; URMA passes the symmetric base in its ABI.
     Mc2Aclnn::Mc2MoeContext context{};
     const int rank = aclshmem_my_pe();
     TORCH_CHECK(rank >= 0 && rank < world && world <= Mc2Aclnn::HCCL_MAX_RANK_SIZE, "Invalid SHMEM rank/world: ", rank,
@@ -596,14 +596,14 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
             aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
     }
     // URMA workspace is prepared in forward once the shared tensor dimensions
-    // are available. POD keeps its existing eager allocation in prepare.
+    // are available. MTE keeps its existing eager allocation in prepare.
 }
 
 Plan::~Plan() = default;
 
 int64_t Plan::workspace_bytes() const
 {
-    if (backend_ == Backend::Pod) return workspace_.defined() ? workspace_.nbytes() : 0;
+    if (backend_ == Backend::Mte) return workspace_.defined() ? workspace_.nbytes() : 0;
     int64_t bytes = 0;
     if (urma_)
         urma_->for_each_tensor([&](const torch::Tensor& t) {
@@ -713,7 +713,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                         "Invalid URMA fine trace allocation");
             trace_capacity = trace_elements / row_elements - 1;
         } else
-            TORCH_CHECK(timer->numel() == AscendTimer::TOTAL_BUFFER_SIZE, "Invalid POD timer allocation");
+            TORCH_CHECK(timer->numel() == AscendTimer::TOTAL_BUFFER_SIZE, "Invalid MTE timer allocation");
     }
     torch::Tensor y = out ? *out : torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
     CheckTensor(y, 2, "out");
@@ -742,7 +742,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     // Common dispatch stage; only the device argument representation differs.
     auto ptr = [](const torch::Tensor& t) { return static_cast<uint8_t*>(t.data_ptr()); };
     auto opt = [&](const c10::optional<torch::Tensor>& t) { return t ? ptr(*t) : nullptr; };
-    PodLaunchArgs pod{};
+    MteLaunchArgs mte{};
     MegaMoeUrma::Arguments* urma_args = nullptr;
     if (urma) {
         auto& args = urma_->args_;
@@ -771,7 +771,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         }
         urma_args = &args;
     } else {
-        pod = {is_a8w4_,
+        mte = {is_a8w4_,
                ptr(context_),
                ptr(x),
                opt(x_scales),
@@ -792,7 +792,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                reinterpret_cast<const uint8_t*>(&tiling_),
                ffts_};
     }
-    launch_kernel(backend_, platform_.block_dim, platform_.ub, stream.stream(), pod, urma_args);
+    launch_kernel(backend_, platform_.block_dim, platform_.ub, stream.stream(), mte, urma_args);
     if (urma) last_generation_ = generation;
     // Shared lifetime handling for both backends. Input scopes and output ABI do
     // not depend on which private device parameter block was dispatched.
@@ -820,7 +820,7 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend)
     TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before allocating timer");
 #endif
     CheckTensor(example, 2, "timer example");
-    TORCH_CHECK(backend == "pod" || backend == "urma", "MegaMoE backend must be pod or urma");
+    TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     int64_t elements = AscendTimer::TOTAL_BUFFER_SIZE;
     if (backend == "urma") {
         elements = int64_t{MegaMoeUrma::kTimerCores} *
@@ -834,7 +834,7 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend)
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
                     const std::string& backend)
 {
-    TORCH_CHECK(backend == "pod" || backend == "urma", "MegaMoE backend must be pod or urma");
+    TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     if (backend == "urma") {
         TORCH_CHECK((world == 4 || world == 8 || world == 16) && tokens >= 1 &&
                         tokens <= MegaMoeUrma::kMaxTokensPerRank && topk >= 1 && topk <= 8,

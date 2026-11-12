@@ -16,9 +16,9 @@ namespace MegaMoeUrma {
 struct Arguments;
 }
 namespace deepep::megamoe {
-enum class Backend : uint8_t { Pod, Urma };
+enum class Backend : uint8_t { Mte, Urma };
 // Host-only launch description; the separate device ABIs remain unchanged.
-struct PodLaunchArgs {
+struct MteLaunchArgs {
     bool is_a8w4 = false;
     uint8_t *context = nullptr, *x = nullptr, *x_scales = nullptr, *topk_ids = nullptr, *topk_weights = nullptr;
     uint8_t *weight1 = nullptr, *weight2 = nullptr, *weight_scales1 = nullptr, *weight_scales2 = nullptr;
@@ -28,6 +28,6 @@ struct PodLaunchArgs {
     const uint8_t* tiling = nullptr;
     uint64_t ffts = 0;
 };
-void launch_kernel(Backend backend, uint32_t block_dim, uint32_t ub_bytes, void* stream, const PodLaunchArgs& pod,
+void launch_kernel(Backend backend, uint32_t block_dim, uint32_t ub_bytes, void* stream, const MteLaunchArgs& mte,
                    const MegaMoeUrma::Arguments* urma);
 }  // namespace deepep::megamoe

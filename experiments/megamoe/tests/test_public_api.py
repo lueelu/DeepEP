@@ -143,7 +143,7 @@ def backend(monkeypatch):
     monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096))
 
     class Runtime:
-        def __init__(self, group, capacity, timeout, *, backend="pod"):
+        def __init__(self, group, capacity, timeout, *, backend="mte"):
             self.device, self.stream, self.native = 0, stream, SimpleNamespace(capacity=capacity)
             self.backend = backend
             self.closed = False
@@ -173,7 +173,7 @@ def backend(monkeypatch):
             ffts,
             address,
             capacity,
-            backend="pod",
+            backend="mte",
         ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
             self.backend = backend
@@ -223,7 +223,7 @@ def backend(monkeypatch):
                 timer.data[-1] = generation
             return output, Tensor(np.arange(self.local_experts) + 2, "int32")
 
-    def buffer_size(*args, backend="pod"):
+    def buffer_size(*args, backend="mte"):
         events.append(("buffer_size", args, backend))
         return 2 << 20
 
@@ -233,7 +233,7 @@ def backend(monkeypatch):
         ffts_config=lambda: 123,
         timer_enabled=True,
         timer_numel=64,
-        allocate_timer=lambda example, backend="pod": Tensor(np.zeros(65536 if backend == "urma" else 64), "int64"),
+        allocate_timer=lambda example, backend="mte": Tensor(np.zeros(65536 if backend == "urma" else 64), "int64"),
         small_batch_max_tokens=256,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
@@ -511,7 +511,7 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan_bs == 17
 
 
-@pytest.mark.parametrize("board,expected", [(0x44, "urma"), (7, "pod"), (3, "pod"), (None, "pod"), (0x6C, "pod")])
+@pytest.mark.parametrize("board,expected", [(0x44, "urma"), (7, "mte"), (3, "mte"), (None, "mte"), (0x6C, "mte")])
 def test_megamoe_product_selection(monkeypatch, board, expected):
     from deep_ep_experimental.megamoe import backend as selector
     from deep_ep import _machine
@@ -559,7 +559,7 @@ def test_urma_uses_unified_plan_and_generation_survives_bs_changes(backend, monk
             assert api.fp8_fp4_mega_moe(y, w1, w2, b, cumulative_local_expert_recv_stats=stats) is None
             launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
             assert launch[-2] is y
-            assert launch[4] is w1.select(True)[0]  # URMA uses fused layout even above the POD threshold.
+            assert launch[4] is w1.select(True)[0]  # URMA uses fused layout even above the MTE threshold.
             assert isinstance(b._plan, backend.ext.Plan)
             assert b._plan.backend == "urma"
             generations.append(launch[-1])

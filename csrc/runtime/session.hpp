@@ -14,7 +14,7 @@
 #endif
 
 namespace deepep {
-enum class RuntimeProfile { General, MegaMoEPod, MegaMoEUrma };
+enum class RuntimeProfile { General, MegaMoEMte, MegaMoEUrma };
 // The framework owns ACL initialization, device and context. Only this workspace
 // and the SHMEM instance are owned here. Destruction is an explicit collective.
 class Session {
@@ -23,7 +23,7 @@ public:
             RuntimeProfile profile = RuntimeProfile::General, bool mpi = false, bool combine_only = false,
             bool use_1g_huge_pages = false);
     static std::unique_ptr<Session> create_megamoe(int rank, int size, uint64_t bytes, const std::string& endpoint,
-                                                   unsigned timeout, const std::string& backend = "pod");
+                                                   unsigned timeout, const std::string& backend = "mte");
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.

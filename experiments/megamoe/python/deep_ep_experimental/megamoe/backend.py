@@ -8,7 +8,7 @@ from .validation import collective_check
 
 def select_backend(group):
     # Product identity is distinct from fabric topology. Unknown products keep
-    # the POD entry; its existing shape/platform/peer checks still apply.
+    # the MTE entry; its existing shape/platform/peer checks still apply.
     try:
         from deep_ep._machine import board_id, physical_device
 
@@ -16,6 +16,6 @@ def select_backend(group):
     except Exception:
         product = None
     # Board 0x44 identifies the UBX product; its implementation uses URMA.
-    selected = "urma" if product == 0x44 else "pod"
+    selected = "urma" if product == 0x44 else "mte"
     collective_check(group, "MegaMoE product selection", None, selected)
     return selected

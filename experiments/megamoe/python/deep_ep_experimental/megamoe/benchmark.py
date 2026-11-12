@@ -253,7 +253,7 @@ def run(args, config, group):
         ),
     )
     if urma and args.input != "fp8":
-        raise ValueError("URMA currently supports --input fp8; BF16 input remains a POD capability")
+        raise ValueError("URMA currently supports --input fp8; BF16 input remains a MTE capability")
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
     if any(value >= world for value in timer_ranks):
         raise ValueError("timer rank exceeds EP world size")
@@ -310,7 +310,7 @@ def run(args, config, group):
         not urma
         and model.get("shared_intermediate_hidden", model["intermediate_hidden"]) != model["intermediate_hidden"]
     ):
-        raise ValueError("POD shared width must match routed width")
+        raise ValueError("MTE shared width must match routed width")
     if getattr(args, "dual_reference", False) and args.mode != "accuracy":
         raise ValueError("--dual-reference requires --mode accuracy")
     buffer = SymmBuffer(
@@ -396,7 +396,7 @@ def run(args, config, group):
 
         if urma:
             # Shared dimensions are inferred by native forward. Allocate its
-            # workspace before profiling, using the same public call as POD.
+            # workspace before profiling, using the same public call as MTE.
             call()
             torch.npu.synchronize()
         resources = dict(
@@ -547,7 +547,7 @@ def run(args, config, group):
 
                 export_diagnostics(group, timer, case, timer_ranks=timer_ranks)
             else:
-                _export_pod_timer(args.output_dir, bs, rank, group, timer)
+                _export_mte_timer(args.output_dir, bs, rank, group, timer)
             del timer
         del prefix
         group.barrier(f"case complete BS={bs}")
@@ -562,7 +562,7 @@ def run(args, config, group):
     group.close()
 
 
-def _export_pod_timer(output_dir, bs, rank, group, timer):
+def _export_mte_timer(output_dir, bs, rank, group, timer):
     timer_dir = output_dir / f"bs_{bs}" / "timer"
     breakdown = None
     if timer is not None:

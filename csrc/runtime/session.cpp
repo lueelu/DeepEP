@@ -41,7 +41,7 @@ SessionPolicy policy_for(RuntimeProfile profile)
     switch (profile) {
         case RuntimeProfile::General:
             return {false, false, (1ULL << 63) - 1U, 0U};
-        case RuntimeProfile::MegaMoEPod:
+        case RuntimeProfile::MegaMoEMte:
             return {true, false, 1ULL << 30, 0U};
         case RuntimeProfile::MegaMoEUrma:
             return {true, true, 32ULL << 30, ACLSHMEM_TRANSPORT_MTE | ACLSHMEM_TRANSPORT_UDMA};
@@ -91,12 +91,12 @@ std::unique_ptr<Session> Session::create_megamoe(int rank, int size, uint64_t by
                                                  unsigned timeout, const std::string& backend)
 {
     RuntimeProfile profile;
-    if (backend == "pod")
-        profile = RuntimeProfile::MegaMoEPod;
+    if (backend == "mte")
+        profile = RuntimeProfile::MegaMoEMte;
     else if (backend == "urma")
         profile = RuntimeProfile::MegaMoEUrma;
     else
-        throw std::invalid_argument("MegaMoE backend must be pod or urma");
+        throw std::invalid_argument("MegaMoE backend must be mte or urma");
     const auto policy = policy_for(profile);
     return std::make_unique<Session>(rank, size, bytes, endpoint, timeout, policy.dedicated_peer_qp, profile);
 }
