@@ -46,7 +46,7 @@ def public_runtime(monkeypatch):
     def bootstrap(*args, **kwargs):
         calls.append(("bootstrap", args[5]))
         if args[5] == "udma":
-            assert kwargs["udma_auto_options"][0] == "clos-v3"
+            assert kwargs["udma_auto_options"][0] == "clos-v4"
         return [], "test"
 
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)

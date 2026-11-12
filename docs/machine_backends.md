@@ -134,7 +134,7 @@ Mesh+Clos 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `sh
 ## 全 Clos 的默认调度与手动调优
 
 V1/V2 在 UDMA 下默认 `udma_auto_policy=True`。机型识别先选择通信实现，
-Clos 策略再选择发送参数。`clos-v3` 将初始化资源与逐次调用的策略分开：
+Clos 策略再选择发送参数。`clos-v4` 将初始化资源与逐次调用的策略分开：
 
 - Buffer 构造时在 EP group 内交换主机 boot ID。仅在各主机 rank 连续且数量相等时，
   将其识别为物理分组；不会默认每台 8 rank，也不使用 `LOCAL_WORLD_SIZE` 猜测。
@@ -148,9 +148,12 @@ Clos 策略再选择发送参数。`clos-v3` 将初始化资源与逐次调用�
 当前离线模板来自 EP4/8/16/32、AIV8/32、BF16、非展开随机路由测试，按不超过 4 KiB
 和较大行分档，覆盖测得的 2 KiB、5632 B、12 KiB 行。它是已有数据的保守拟合，
 不是所有 shape 的最优性能保证。模板还有实际分组约束：EP32 的 G=8 测量结果不会
-套用到 G=16。AIV20/64、未覆盖的 EP/行大小、FP8 dispatch、展开路径和 V1 保留保守策略。
-8 核非展开 BF16 combine 通常先提交远端再复制本卡；32 核无权重 combine 可由空余
-AIV 并行复制本卡。带权重 combine 独立选择 UDMA 或 SIMT，不因存在空余核就必选 SIMT。
+套用到 G=16。AIV20/48/64、未覆盖的 EP/行大小保留保守发送参数；FP8、展开路径和 V1
+保留原有策略。非展开 BF16 无权重 V2 combine 根据实际通信核数选择本卡复制方式：
+空余 AIV 数不少于 payload 发送 AIV 数时，使用空余 AIV 并行复制，否则先提交远端
+再复制本卡。该规则不限定总核数，QP 数不计作发送核数，reduce 核数不参与判断。
+这是资源启发式，不保证每个 shape 都有性能收益。带权重 combine 独立选择 UDMA 或
+SIMT，不因存在空余核就必选 SIMT。
 
 未命中模板时按核数增加 peers/worker，必要时改为轮转分组，检查发送核数、32-QP 预算
 及每 worker 64-peer 容量后才下发。例如 EP128/AIV8、G=16 可用轮转 P=2/W=1/Q=1；

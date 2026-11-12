@@ -466,6 +466,35 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
     """)
 
 
+def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        base = replace(resolve_udma_policy(True,4,'udma',None,None,None,None,None),
+                       ranks_per_group=4, topology_known=True)
+        for cores in (20,32,48,64):
+            plan = base.for_launch(cores,5632,'combine',bf16=True)
+            assert plan.send_workers == 6 and plan.self_copy == 1
+        assert base.for_launch(10,5632,'combine',bf16=True).self_copy == 2
+        assert base.for_launch(12,5632,'combine',bf16=True).self_copy == 1
+        for ep in (4,8,16,32,64,128):
+            policy = replace(base, world_size=ep, ranks_per_group=min(ep,16))
+            for cores in (8,20,32,48,64):
+                for row_bytes in (2048,5632,12288):
+                    plan = policy.for_launch(cores,row_bytes,'combine',bf16=True)
+                    expected = 1 if cores-plan.send_workers >= plan.send_workers else 2
+                    assert plan.self_copy == expected
+        # Two QPs still belong to one payload sender AIV.
+        q2 = replace(base, workers_per_peer=1, qps_per_worker=2)
+        plan = q2.for_launch(12,5632,'combine',bf16=True)
+        assert plan.send_workers == 3 and plan.self_copy == 1
+        # A large communication budget alone does not imply enough spare AIVs.
+        large = replace(base, world_size=128, ranks_per_group=16)
+        plan = large.for_launch(48,5632,'combine',bf16=True)
+        assert plan.send_workers == 32 and plan.self_copy == 2
+    """)
+
+
 def test_auto_topology_uses_ep_rank_order_and_collects_only_at_construction():
     run_host("""
         from deep_ep import _machine

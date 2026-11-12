@@ -77,7 +77,7 @@ class UdmaPolicy:
     workers_per_peer: int
     qps_per_worker: int
     wqes_per_visit: int
-    version: str = "clos-v3"
+    version: str = "clos-v4"
     ranks_per_group: int = 0
     topology_known: bool = False
     peer_order: int = 0
@@ -220,6 +220,12 @@ class UdmaPolicy:
                 )
             elif operation != "dispatch":
                 plan = replace(plan, self_copy=2)
+            if operation == "combine":
+                # Count payload AIVs, not QPs. Keep at least one spare copy
+                # AIV per sender; otherwise overlap self-copy after submission.
+                # Use this launch's communication budget, independent of reduce.
+                spare_aivs = cores - plan.send_workers
+                plan = replace(plan, self_copy=1 if spare_aivs >= plan.send_workers else 2)
             if operation == "weighted":
                 # Low-core weighted cases prefer payload QPs even with spare
                 # cores. A spare core alone is not a reason to enable SIMT.
