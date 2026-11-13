@@ -9,7 +9,7 @@ Modified by Joyce_An 2026
 
 简体中文 | [English](readme_en.md)
 
-**DeepEP 昇腾版本**（`Ascend/DeepEP`）是面向 Ascend NPU 混合专家模型（Mixture-of-Experts，MoE）推理的专家并行（Expert Parallelism，EP）通信库，提供高吞吐 **Prefill**、低时延 **Decode** 通信，以及实验性 **MegaMoE** 融合推理。
+**DeepEP 昇腾版本**（`Ascend/DeepEP`）是面向 Ascend NPU 混合专家模型（Mixture-of-Experts，MoE）推理与训练的专家并行（Expert Parallelism，EP）通信库，提供高吞吐 **Prefill**、低时延 **Decode** 通信，以及实验性的 **MegaMoE** 融合推理与融合训练。
 
 支持 Mesh+PCIe、Mesh+Clos 和 Global Clos 三种拓扑入口，共用 CANN SHMEM。
 自动识别、手动选择及使用方式见 [机型后端说明](docs/machine_backends.md)。
@@ -19,7 +19,7 @@ Modified by Joyce_An 2026
 
 ---
 
-**DeepEP V2 昇腾版。** Prefill 与 Decode 共用 `deep_ep.ElasticBuffer` 接口，通过 `dispatch()` 和 `combine()` 完成 token 分发与结果归并。
+**DeepEP V2 昇腾版。** Prefill 与 Decode 共用 `deep_ep.ElasticBuffer` 接口，通过 `dispatch()` 和 `combine()` 完成 token 分发与结果归并；另提供实验性的 MegaMoE BF16 融合训练。
 
 ### 新增特性
 
@@ -27,10 +27,11 @@ Modified by Joyce_An 2026
 - **低时延 Decode：** 通过同一 V2 接口提供小批量 dispatch/combine，覆盖 EP64/128。
 - **MegaMoE Prefill（实验性）：** W4A8 通信与专家计算融合，覆盖 EP32/64/128。
 - **MegaMoE Decode（实验性）：** 小批量 W4A8 融合推理，覆盖 EP64/128，与 Prefill 共用同一个 MegaMoE 前向入口。
+- **MegaMoE BF16 训练（实验性）：** 融合、通信与计算重叠的 BF16 MoE 训练算子，Ascend950 单节点，含 autograd 反向。
 
 ### 架构
 
-DeepEP 通过 V2 接口连接推理框架与昇腾通信算子；MegaMoE 将 token 通信、专家计算、激活和量化整合为融合前向流程。
+DeepEP 通过 V2 接口连接推理框架与昇腾通信算子；MegaMoE 将 token 通信、专家计算、激活和量化整合为融合前向流程，训练侧另提供 BF16 融合前反向（实验性）。
 
 <p align="center">
   <a href="figures/architecture.svg">
@@ -50,6 +51,7 @@ DeepEP/
 │   └── kernels/             # Ascend C 通信算子
 ├── experiments/
 │   ├── megamoe/             # MegaMoE 融合推理
+│   ├── megamoe_train/       # MegaMoE BF16 训练：融合前向与 autograd 反向
 │   └── ep_gmm_fused/        # 通信与矩阵乘融合算子
 ├── cmake/                   # 构建与安装
 ├── third-party/             # 依赖组件
@@ -61,7 +63,7 @@ DeepEP/
 └── figures/                 # 架构与性能图
 ```
 
-模块职责见[架构文档](docs/architecture.md)。
+模块职责见[架构文档](docs/architecture.md)；训练组件的接口与使用方式见[MegaMoE BF16 训练说明](experiments/megamoe_train/README.md)。
 
 ## 快速开始
 
@@ -77,7 +79,7 @@ DeepEP/
 | 驱动和固件 | 请配套使用华为发布的Q3 HDK版本，此版本包含达成极致性能所需的配置，该版本计划于10.15发布 |
 | 框架 | PyTorch 与 `torch_npu` |
 | 通信 | [dependencies.lock.json](dependencies.lock.json) 固定版本的 SHMEM；URMA 运行时 |
-| MegaMoE | CATLASS；依赖配置见 [MegaMoE 文档](experiments/megamoe/README.md) |
+| MegaMoE | CATLASS；推理依赖见 [MegaMoE 文档](experiments/megamoe/README.md)，训练依赖见[训练模块](experiments/megamoe_train/README.md) |
 
 ### 安装 SHMEM 依赖
 
@@ -98,7 +100,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
 ```
 
-贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，NPU 测试命令见[测试说明](tests/README.md)。
+贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，NPU 测试命令见[测试说明](tests/README.md)；训练组件的精度与性能入口见[训练测试说明](experiments/megamoe_train/README.md#测试)。
 
 ### 安装
 
@@ -122,6 +124,10 @@ bash experiments/megamoe/scripts/build.sh
 
 脚本准备依赖并构建、安装启用 MegaMoE 和 timer 的 wheel，日常重编复用已校验的 SHMEM。直接使用 `pip wheel` 时默认不构建 MegaMoE。多机配置和验证步骤见 [MegaMoE 使用说明](experiments/megamoe/README.md)；设备编译、精度与性能仍待验收。
 
+### 安装 MegaMoE Train
+
+训练组件与推理组件同源构建，构建时开启 `DEEPEP_BUILD_MEGAMOE_TRAIN=ON`（默认关闭）；构建命令、产物约束与首跑示例见[训练模块 README](experiments/megamoe_train/README.md#构建与安装)。
+
 ## 接口与示例
 
 ---
@@ -130,6 +136,7 @@ bash experiments/megamoe/scripts/build.sh
 | --- | --- |
 | DeepEP Prefill / Decode | `deep_ep.ElasticBuffer.dispatch()` / `combine()` |
 | MegaMoE Prefill / Decode（实验性） | `deep_ep_experimental.megamoe.fp8_fp4_mega_moe()` |
+| MegaMoE Train（实验性） | `deep_ep_experimental.megamoe_train.MegaMoeBF16Train` |
 
 ### Buffer 初始化
 
@@ -281,6 +288,24 @@ except BaseException as error:
 
 Tensor 布局、事件同步及 Buffer 生命周期见 [API 文档](docs/api.md)与 [Elastic 文档](docs/elastic.md)。
 
+### MegaMoE Train 示例
+
+用调用方已有的 EP 进程组构造算子：前向返回 `y` 与 `counts`，`backward()` 得到 `x`、`topk_weights`、`w1`、`w2` 的梯度，最后一次集体 `close()` 释放窗口。构造前需设置当前 NPU 与 `DEEPEP_SHMEM_ENDPOINT`。
+
+```python
+from deep_ep_experimental.megamoe_train import MegaMoeBF16Train
+
+op = MegaMoeBF16Train(ep_group, local_mem_size=1 << 30)  # 窗口字节数，各 rank 相同
+y, counts = op(
+    x, topk_ids, topk_weights, w1, w2, max_recv_tokens,
+    swiglu_limit=0.0, save_gmm1_output="bf16",
+)
+(y * grad_y).sum().backward()
+op.close()  # 集体释放，须在所有 backward 之后
+```
+
+对外接口、参数说明、使用示例与容量规划见[训练组件 README](experiments/megamoe_train/README.md)。
+
 ### 环境变量
 
 | 变量 | 用途 |
@@ -300,9 +325,13 @@ Tensor 布局、事件同步及 Buffer 生命周期见 [API 文档](docs/api.md)
 
 ---
 
-### MegaMoE
+### MegaMoE 推理
 
-MegaMoE 将 dispatch、专家计算、激活/量化及 combine 融合为 W4A8 推理流程，覆盖 Prefill 与 Decode。配置和使用方法见 [experiments/megamoe/](experiments/megamoe/README.md)。
+将 dispatch、专家计算、激活/量化及 combine 融合为 W4A8 推理流程，覆盖 Prefill 与 Decode。配置和使用方法见 [experiments/megamoe/](experiments/megamoe/README.md)。
+
+### MegaMoE BF16 训练
+
+Ascend950 上的 BF16 融合前反向，覆盖 EP MoE 训练的 dispatch、专家计算、激活与 combine。接口、构建与验收边界见 [experiments/megamoe_train/](experiments/megamoe_train/README.md)。
 
 ## 致谢
 

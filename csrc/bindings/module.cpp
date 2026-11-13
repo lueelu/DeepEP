@@ -59,6 +59,16 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("workspace_allocation_bytes", &deepep::Session::workspace_allocation_bytes)
         .def_property_readonly("sparse_qp_enabled", &deepep::Session::sparse_qp_enabled)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
+#ifdef DEEPEP_BUILD_MEGAMOE_TRAIN
+    module.def(
+        "create_megamoe_train_runtime",
+        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout) {
+            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, false, false, false, false,
+                                                     false, true);
+        },
+        py::call_guard<py::gil_scoped_release>());
+    module.def("megamoe_train_workspace_address", &deepep::Session::workspace_address);
+#endif
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def(
         "create_megamoe_runtime",

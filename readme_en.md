@@ -9,7 +9,7 @@ Modified by Joyce_An 2026
 
 [简体中文](README.md) | English
 
-**DeepEP on Ascend** (`Ascend/DeepEP`) is an expert-parallel (EP) communication library for mixture-of-experts (MoE) inference on Ascend NPUs. It provides high-throughput **prefill** and low-latency **decode** communication, together with experimental **MegaMoE** fused inference.
+**DeepEP on Ascend** (`Ascend/DeepEP`) is an expert-parallel (EP) communication library for mixture-of-experts (MoE) inference and training on Ascend NPUs. It provides high-throughput **prefill** and low-latency **decode** communication, together with experimental **MegaMoE** fused inference and fused training.
 
 ## Machine-specific backends
 
@@ -29,7 +29,7 @@ The HT/LL/MegaMoE descriptions below apply to the Mesh+Clos backend.
 
 ---
 
-**DeepEP V2 on Ascend.** Prefill and decode share the `deep_ep.ElasticBuffer` interface and its `dispatch()` / `combine()` operations.
+**DeepEP V2 on Ascend.** Prefill and decode share the `deep_ep.ElasticBuffer` interface and its `dispatch()` / `combine()` operations; an experimental MegaMoE BF16 fused training operator is provided alongside them.
 
 ### New features
 
@@ -37,10 +37,11 @@ The HT/LL/MegaMoE descriptions below apply to the Mesh+Clos backend.
 - **Low-latency decode:** small-batch dispatch and combine through the same V2 interface for EP64/128.
 - **MegaMoE prefill (experimental):** W4A8 fused communication and expert computation for EP32/64/128.
 - **MegaMoE decode (experimental):** small-batch W4A8 fused inference for EP64/128, using the same MegaMoE forward entry as prefill.
+- **MegaMoE BF16 training (experimental):** a fused, communication-compute-overlapping BF16 MoE training kernel for single-node Ascend950, with an autograd backward.
 
 ### Architecture
 
-DeepEP connects inference frameworks to Ascend communication kernels through V2. MegaMoE integrates token communication, expert computation, activation, and quantization into a fused forward workflow.
+DeepEP connects inference frameworks to Ascend communication kernels through V2. MegaMoE integrates token communication, expert computation, activation, and quantization into a fused forward workflow; the training side adds an experimental BF16 fused forward and autograd backward.
 
 <p align="center">
   <a href="figures/architecture_en.svg">
@@ -60,6 +61,7 @@ DeepEP/
 │   └── kernels/             # Ascend C communication kernels
 ├── experiments/
 │   ├── megamoe/             # MegaMoE fused inference
+│   ├── megamoe_train/       # MegaMoE BF16 training: fused forward and autograd backward
 │   └── ep_gmm_fused/        # Fused communication and grouped matmul
 ├── cmake/                   # Build and installation
 ├── third-party/             # Dependencies
@@ -71,7 +73,7 @@ DeepEP/
 └── figures/                 # Architecture and performance figures
 ```
 
-See the [architecture guide](docs/architecture.md) for module responsibilities.
+See the [architecture guide](docs/architecture.md) for module responsibilities, and the [MegaMoE BF16 training README (Chinese)](experiments/megamoe_train/README.md) for training interfaces and usage.
 
 ## Quick start
 
@@ -87,18 +89,20 @@ See the [architecture guide](docs/architecture.md) for module responsibilities.
 | Framework | PyTorch and `torch_npu` |
 | HDK and Firmware | Huawei's Q3 commercial HDK with a planned release date of October 15 2026 |
 | Communication | SHMEM pinned in [dependencies.lock.json](dependencies.lock.json); URMA runtime |
-| MegaMoE | CATLASS; dependency setup in the [MegaMoE guide](experiments/megamoe/README.md) |
+| MegaMoE | CATLASS; inference dependencies in the [MegaMoE guide](experiments/megamoe/README.md), training dependencies in the [training module](experiments/megamoe_train/README.md) |
 
 ### Install SHMEM dependency
 
-Prepare the SHMEM SDK using the [build guide](docs/build.md), then load the CANN and SHMEM environment:
+For source builds, prepare the SHMEM SDK using the [build guide](docs/build.md), then load CANN:
 
 ```bash
 source /path/to/ascend-toolkit/set_env.sh
 export SHMEM_ROOT=/path/to/shmem-sdk
-source "$SHMEM_ROOT/set_env.sh"
-export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 ```
+
+The wheel bundles the build SDK's SHMEM runtime libraries. After installation,
+load the matching CANN environment; `SHMEM_ROOT` and an external SHMEM library
+path are not required at run time. `SHMEM_ROOT` selects the SDK only when building.
 
 ### Development
 
@@ -107,7 +111,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and the [test guide](tests/README.md) for NPU test commands.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and the [test guide](tests/README.md) for NPU test commands; the training component's precision and performance entry is the [training test guide](experiments/megamoe_train/README.md#测试).
 
 ### Installation
 
@@ -131,6 +135,10 @@ bash experiments/megamoe/scripts/build.sh
 
 The script prepares dependencies and builds and installs a wheel with MegaMoE and timer support. Subsequent builds reuse the validated SHMEM SDK. Direct `pip wheel` builds keep MegaMoE disabled by default. See the [MegaMoE guide](experiments/megamoe/README.md) for multi-node configuration and validation. Device compilation, accuracy and performance qualification remain outstanding.
 
+### Install MegaMoE Train
+
+The training component is built from the same tree with `DEEPEP_BUILD_MEGAMOE_TRAIN=ON` (OFF by default); build commands, artifact constraints and a first run are in the [training module README](experiments/megamoe_train/README.md#构建与安装).
+
 ## Interfaces and examples
 
 ---
@@ -139,6 +147,7 @@ The script prepares dependencies and builds and installs a wheel with MegaMoE an
 | --- | --- |
 | DeepEP prefill / decode | `deep_ep.ElasticBuffer.dispatch()` / `combine()` |
 | MegaMoE prefill / decode (experimental) | `deep_ep_experimental.megamoe.fp8_fp4_mega_moe()` |
+| MegaMoE train (experimental) | `deep_ep_experimental.megamoe_train.MegaMoeBF16Train` |
 
 ### Buffer initialization
 
@@ -290,6 +299,24 @@ See [example.py](experiments/megamoe/python/deep_ep_experimental/megamoe/example
 
 Tensor layouts, event synchronization, and buffer lifecycle are described in the [API guide](docs/api.md) and [Elastic guide](docs/elastic.md).
 
+### MegaMoE Train example
+
+Construct the operator with the caller's existing EP process group: the forward returns `y` and `counts`, `backward()` yields gradients for `x`, `topk_weights`, `w1` and `w2`, and one collective `close()` releases the window. Set the current NPU and `DEEPEP_SHMEM_ENDPOINT` before construction.
+
+```python
+from deep_ep_experimental.megamoe_train import MegaMoeBF16Train
+
+op = MegaMoeBF16Train(ep_group, local_mem_size=1 << 30)  # window bytes, identical on every rank
+y, counts = op(
+    x, topk_ids, topk_weights, w1, w2, max_recv_tokens,
+    swiglu_limit=0.0, save_gmm1_output="bf16",
+)
+(y * grad_y).sum().backward()
+op.close()  # collective, after the last backward
+```
+
+Public interfaces, parameter descriptions, a usage example and capacity planning are in the [training component README (Chinese)](experiments/megamoe_train/README.md).
+
 ### Environment variables
 
 | Variable | Purpose |
@@ -309,9 +336,13 @@ Each EP group uses a shared SHMEM initialization endpoint and an explicit rank-t
 
 ---
 
-### MegaMoE
+### MegaMoE inference
 
-MegaMoE combines dispatch, expert computation, activation/quantization, and combine into W4A8 fused inference for prefill and decode. See [experiments/megamoe/](experiments/megamoe/README.md) for configuration and usage.
+Combines dispatch, expert computation, activation/quantization, and combine into W4A8 fused inference for prefill and decode. See [experiments/megamoe/](experiments/megamoe/README.md) for configuration and usage.
+
+### MegaMoE BF16 training
+
+BF16 fused forward and autograd backward for EP MoE training on Ascend950, covering dispatch, expert computation, activation and combine. See [experiments/megamoe_train/](experiments/megamoe_train/README.md) for interfaces, build and qualification boundaries.
 
 ## Acknowledgement
 
