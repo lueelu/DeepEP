@@ -46,8 +46,8 @@ namespace MegaMoeBF16ForwardCatlassImpl {
 
 using ArchTag = Catlass::Arch::Ascend950;
 using DispatchPolicy = Catlass::Gemm::MmadPingpong<ArchTag, true, false, 1, false, 2, 2, 2, 2>;
-using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
-using L0TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<64>>;
+using L1TileShape = tla::Shape<tla::Int<192>, tla::Int<256>, tla::Int<256>>;
+using L0TileShape = tla::Shape<tla::Int<192>, tla::Int<256>, tla::Int<64>>;
 using Gmm1L1TileShape = tla::Shape<tla::Int<MegaMoeBF16Training::ForwardDispatchTileReadyLayout::kComputeRows>,
                                    tla::Int<256>, tla::Int<256>>;
 using Gmm1L0TileShape = tla::Shape<tla::Int<MegaMoeBF16Training::ForwardDispatchTileReadyLayout::kComputeRows>,
@@ -55,7 +55,7 @@ using Gmm1L0TileShape = tla::Shape<tla::Int<MegaMoeBF16Training::ForwardDispatch
 using BlockScheduler = Catlass::Gemm::Block::GemmIdentityBlockSwizzle<3, 1>;
 using Gmm2BlockScheduler = BlockScheduler;
 
-constexpr uint32_t L1_TILE_M = 128;
+constexpr uint32_t L1_TILE_M = 192;
 constexpr uint32_t L1_TILE_N = 256;
 constexpr uint32_t L1_TILE_K = 256;
 constexpr uint32_t SWIGLU_N_HALF = MegaMoeBF16Training::kSwigluNHalf;
