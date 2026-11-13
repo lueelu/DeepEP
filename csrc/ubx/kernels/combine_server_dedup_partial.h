@@ -96,7 +96,7 @@ public:
         // future output slots. No payload DMA has started on this receive core.
 
         planned_ = plan_.Prepare(planScratch_, planScratchBytes_, rows_, types_, table2_, tokens_,
-                                 DEEPEP_UBX_LAUNCH_WORLD(args_), uint32_t(args_->rank),
+                                 DEEPEP_UBX_LAUNCH_WORLD(args_), uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)),
                                  CombineReceiveCoreIndex(coreContext_.index, coreContext_.count, recvCores_),
                                  recvCores_);
 
@@ -116,7 +116,7 @@ public:
         PipeBarrier<PIPE_V>();
 
         const uint32_t servers = DEEPEP_UBX_LAUNCH_WORLD(args_) / Group;
-        const uint32_t ownServer = uint32_t(args_->rank) / Group;
+        const uint32_t ownServer = uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)) / Group;
         uint32_t completed = 0U;
         completed = ProcessReadyTasks(servers, ownServer);
 
@@ -180,7 +180,7 @@ private:
             uint32_t mask = 0U;
             for (uint32_t member = 1; member <= n; ++member) {
                 const uint32_t rank = (table3Ub_.GetValue(member * 2U) & 0xffffU) / localExperts_;
-                if (rank / Group != uint32_t(args_->rank) / Group) {
+                if (rank / Group != uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)) / Group) {
                     Trap();
                     return 0U;
                 }
@@ -347,7 +347,7 @@ private:
             const uint64_t slot =
                 (((uint64_t(source) + memberRank) % DEEPEP_UBX_LAUNCH_WORLD(args_)) * localExperts_ + localExpert) * bs_ +
                 q;
-            if (memberRank / Group != uint32_t(args_->rank) / Group) {
+            if (memberRank / Group != uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)) / Group) {
                 Trap();
                 return;
             }

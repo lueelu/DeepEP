@@ -93,7 +93,7 @@ public:
         expert_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(expertOut));
         table_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(assistInfoForCombine));
         types_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tokenType));
-        stage_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[args_->rank] + stageBase_));
+        stage_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[DEEPEP_UBX_LAUNCH_RANK(args_)] + stageBase_));
 
         preparePublish_ = Allocate<float>(256U);
         prepareInput_ = Allocate<float>(kCombinePrepareRowBytes + 256U);
@@ -171,7 +171,7 @@ private:
         // M5, but owns its output events because M4 did not run on this launch.
         aggregate.InitDirectShared(
             arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes],
-            args_->peerMems[args_->rank] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET, weightsAddr_,
+            args_->peerMems[DEEPEP_UBX_LAUNCH_RANK(args_)] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET, weightsAddr_,
             outputAddr_, bs_, h_, topK_, dtype_, core_ - sendCores_, recvCores_, workspace_);
 
         aggregate.Process();
@@ -182,7 +182,7 @@ private:
     {
         ServerDedupSourceAggregate aggregate;
         aggregate.Init(arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes],
-                       args_->peerMems[args_->rank] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET,
+                       args_->peerMems[DEEPEP_UBX_LAUNCH_RANK(args_)] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET,
                        masksAddr_, weightsAddr_, outputAddr_, bs_, h_, topK_, dtype_, core_ - sendCores_, recvCores_,
                        workspace_, partialTasks_, enableDedup_);
 
@@ -273,7 +273,7 @@ private:
         Sync<HardEvent::V_S>();
         for (uint32_t j = 0; j < 8U; ++j) preparePublish_.SetValue(j * 8U, 1.0f);
         Sync<HardEvent::S_MTE3>();
-        auto done = Control(args_->rank, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET);
+        auto done = Control(DEEPEP_UBX_LAUNCH_RANK(args_), COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET);
         DataCopyPad(done[core_ * 8U], preparePublish_, {8U, 32U, 0U, kCombinePrepareRowBytes - 32U, 0U});
     }
     __aicore__ inline void CacheTableRows(uint32_t row, uint32_t start, uint32_t task, uint32_t count,
@@ -415,7 +415,7 @@ private:
 
         if (UbxTransport::Rdma(args_)) returnBatch_.Init(args_, resultStride_, coreContext_);
         const uint32_t servers = DEEPEP_UBX_LAUNCH_WORLD(args_) / Group;
-        const uint32_t ownServer = uint32_t(args_->rank) / Group;
+        const uint32_t ownServer = uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)) / Group;
         uint32_t owner = 0U, sendSequence = 0U;
         uint32_t activeLanes = lanes_;
 
@@ -542,7 +542,7 @@ private:
     }
     __aicore__ inline void NotifyServerCard()
     {
-        auto done = Control(args_->rank, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET +
+        auto done = Control(DEEPEP_UBX_LAUNCH_RANK(args_), COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET +
                                              uint64_t(core_ - notifyBegin_) * kCombinePrepareRowBytes);
         WaitFlags(done, prepareInput_, prepareWork_, prepareSum_, coreNum_, false);
 
@@ -556,7 +556,7 @@ private:
 
         // Eight notification cores cover all peers in the logical group.
         // Ready rows retain 512-byte capacity, independent of active group size.
-        const uint32_t groupBase = uint32_t(args_->rank) / Group * Group;
+        const uint32_t groupBase = uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)) / Group * Group;
         for (uint32_t local = core_ - notifyBegin_; local < Group; local += 8U) {
             // Keep publication, polling and clearing on the same default
             // L2 view. This ready table never crosses a physical host.
@@ -565,13 +565,13 @@ private:
                 return;
             }
             DataCopyPad(Control(groupBase + local, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET +
-                                                       (uint32_t(args_->rank) % Group) * 32U),
+                                                       (uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)) % Group) * 32U),
                         notifyUb_, {uint16_t(recvCores_), 32U, 0U, 480U, 0U});
         }
     }
     __aicore__ inline void WaitServerReady()
     {
-        auto ready = Control(args_->rank, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET +
+        auto ready = Control(DEEPEP_UBX_LAUNCH_RANK(args_), COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET +
                                               uint64_t(core_ - sendCores_) * 512U);
         WaitFlags(ready, readyInput_, readyWork_, readySum_, Group, true);
         const uint32_t resetBytes = 512U;

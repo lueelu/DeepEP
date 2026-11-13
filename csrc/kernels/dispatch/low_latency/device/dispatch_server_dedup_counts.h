@@ -40,7 +40,7 @@ public:
         profile_ = profile;
         coreContext_ = core;
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
-        epRankId_ = args_->rank;
+        epRankId_ = DEEPEP_LL_LAUNCH_RANK(args_);
         epWorldSize_ = DEEPEP_LL_LAUNCH_WORLD(args_);
         aivId_ = core.index;
         coreNum_ = DEEPEP_LL_LAUNCH_CORES(core);

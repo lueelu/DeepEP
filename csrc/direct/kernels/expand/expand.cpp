@@ -526,15 +526,3 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void expand_kerne
         AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
     }
 }
-
-extern "C" ASCEND_DEEPEP_EXPORT void expand_kernel_do(
-    uint32_t block_dim, void* stream, uint8_t* x, uint8_t* x_scales, uint8_t* topk_idx, uint8_t* topk_weights,
-    uint8_t* expanded_x, uint8_t* expanded_x_scales, uint8_t* expanded_topk_weights, uint8_t* expert_offsets,
-    uint8_t* actual_expert_counts, uint8_t* recv_to_expanded_idx, uint8_t* scratch_buffer, uint8_t* tiling_host,
-    uint64_t ffts_addr)
-{
-    auto* td = reinterpret_cast<ascend_deepep::ExpandTilingData*>(tiling_host);
-    expand_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kExpandUbBytes), stream>>>(
-        x, x_scales, topk_idx, topk_weights, expanded_x, expanded_x_scales, expanded_topk_weights, expert_offsets,
-        actual_expert_counts, recv_to_expanded_idx, scratch_buffer, *td, ffts_addr);
-}

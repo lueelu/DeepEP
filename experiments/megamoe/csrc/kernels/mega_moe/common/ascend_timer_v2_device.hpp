@@ -8,7 +8,7 @@
 
 class AscendTimerDevice {
 public:
-    __aicore__ inline void Init(GM_ADDR timerAddr)
+    __aicore__ inline void Init(GM_ADDR timerAddr, int32_t blockId = -1)
     {
 #ifdef DEEPEP_MEGAMOE_TIMER
         timerAddr_ = timerAddr;
@@ -25,7 +25,7 @@ public:
         activeType_ = activeIndex_ = waitType_ = waitIndex_ = -1;
         expert_ = -1;
         tileActive_ = false;
-        int blockId = AscendC::GetBlockIdx();
+        if (blockId < 0) blockId = static_cast<int32_t>(AscendC::GetBlockIdx());
         int taskRatio = AscendC::GetTaskRation();
         if (taskRatio <= 0) {
             coreId_ = -1;

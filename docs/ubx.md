@@ -3,7 +3,7 @@
 # UBX RDMA V2 Combine
 
 UBX Combine 与 RDMA Dispatch 使用同一套 `deep_ep.ElasticBuffer`、`EPHandle`、
-`deep_ep._C`、`libdeepep_kernels.so` 和 SHMEM Runtime。构造 Buffer **之前**设置
+`deep_ep._C`、共享 `libdeepep_jit.so` 和 SHMEM Runtime。构造 Buffer **之前**设置
 `DEEPEP_LL_BACKEND=rdma`，与现有 Dispatch 的选择方式一致；使用后不要修改该配置。
 机内走 MTE，跨机走 HNS_1825 RDMA。`mte` 模式继续使用原 POD Combine，其他机型的
 Direct 后端不变。不提供第二套 `ubx.Session`、CPU 字节串 `Combine` 或 `run()` 接口。
@@ -248,48 +248,29 @@ HCCL 仅用于初始化、配置与检查结果协调；精度测试不借启动
 
 ## DeepJIT 与 SuperKernel
 
-默认仍使用 Ahead-of-Time（AOT）设备库。设置 `DEEPEP_LL_JIT=ON` 并在同一环境构建扩展后，
-Dispatch 与 Combine 可以在首次启动时通过 DeepJIT 编译当前 shape/topology 的专用 kernel；
-AOT 路径保持不变，可随时回退。
+DeepJIT 是必选 Host 依赖（与 DeepEP-Ascend 相同），构建总是把它并入主扩展 `_C`，
+不再产生独立可选扩展；LL `dispatch`/`combine` 启动路径固定使用 JIT，没有 AOT/JIT
+运行时开关。
 
 ```bash
-export DEEPEP_LL_JIT=ON
 python -m pip install . --no-build-isolation --no-deps --force-reinstall
-export DEEPEP_LL_JIT=ON                    # 运行时选择 JIT 后端
 export DEEPEP_JIT_CACHE_DIR=$HOME/.dj      # 可选；DeepJIT 的唯一缓存变量
 ```
 
-- 每个 `(B,H,K,E,world,核数,dtype,dedup)` 组合编译一次，写入 `DEEPEP_JIT_CACHE_DIR`
-  （默认 `$HOME/.dj`）。缓存键还包含编译器、SHMEM 头文件内容与门铃模式身份。
-- Dispatch、mesh Combine 和 UBX route-plan Combine 各生成独立 ELF；DeepJIT 加载器要求
-  单 kernel 入口，因此 JIT 产物只含普通入口，不含 SK 子入口和 AOT 启动包装。
-- Python 在启动前调用 `low_latency_jit_prepare_dispatch` / `low_latency_jit_prepare_combine`
-  完成编译与按 ACL 上下文加载；图捕获内不再编译。`Runtime` 会校验扩展确实以
-  `DEEPEP_LL_JIT=ON` 构建。
-- JIT 分支把 B/H/K/E、world、实际 AIV 数、wire 格式与 dedup 判定都作为编译期常量，
-  只在入口保留对 immutable 通信描述和 tiling 的兼容性检查。
-- Combine 的 dedup 判定需要每 rank 容量；Python 已把 `num_max_tokens_per_rank` 传给
-  原生绑定，JIT 用一个权威来源生成 spec、缓存键和设备校验。
-
-SuperKernel 入口只存在于 AOT 设备库，同一 body 由普通 global 和 `__sk__` 子入口共享：
-
-- 普通入口从 `AscendC::GetBlockIdx()/GetBlockNum()` 生成逻辑核上下文；
-- SK 子入口从 `SkSystemArgs::SkGetBlockIdx()/SkGetNumBlocks()` 生成，并把上下文传到
-  计数、发送、接收、RDMA 批处理、路由表和 Combine 的所有嵌套组件；
-- 每类入口的实参结构体按普通 global 的参数顺序逐字段定义，并静态对账尺寸/偏移；
-- SK 使用默认能力掩码（不 early-start、不关闭 DCCI），结束时显式
-  `DestroyWithoutPipeAll()`，业务 DMA 和传输退休仍在 `Process()` 内完成。
-
-固定地址的图捕获可使用 `deep_ep.backends.ubx.graph.LLGraph`：
-
-```python
-from deep_ep.backends.ubx.graph import LLGraph
-
-# dispatch_step / combine_step 为已准备、无分配、固定地址的启动函数。
-graph = LLGraph([dispatch_step, expert_step, combine_step], scope="ll_ep").capture()
-graph.replay()
-graph.reset()   # 所有 rank 在最后一次设备使用完成后调用
-```
-
-图内不编译、不分配 tiling 或回读计数；原地更新输入后连续 replay。SuperKernel 融合要求
-`npugraph_ex` 的 `super_kernel_optimize` 与静态 shape，scope 仅标记候选范围。
+- JIT 产物与 AOT 使用同一份 entry 源码：每个 ELF 都包含一个普通入口、其逻辑等价的 `__sk__`
+  子入口和 `SK_BIND`。`__sk__` 子入口始终参与编译；外部调用方的 SuperKernel 调度决定是否使用它，
+  不需要 `DEEPEP_LL_SK` / `DEEPEP_UBX_SK` 或运行时环境变量。
+- 现有 `ElasticBuffer.dispatch` / `combine` 调用方式不变：JIT 编译、加载和提交都在既有
+  launcher 内部透明完成，不要求调用方使用 `prepare_dispatch` / `prepare_combine` 或计划对象，
+  也不新增 `jit.capture` 图 API。
+- 图捕获由调用方负责：使用 `torch.compile` / ACLGraph 捕获现有调用。本库只保证一次调用能通过
+  JIT 产物提交，不创建 NPUGraph、不调用 `super_kernel_optimize`，也不替调用方维护图、计划或
+  tensor 的固定地址生命周期。是否需要固定输出、预热编译或 `super_kernel_optimize` 由调用方的
+  ACLGraph 流程决定。
+- 缓存键由 DeepJIT 自己维护：源码字符串、编译选项和编译器版本；`DeepJIT` 的内存/磁盘缓存
+  负责复用。没有自定义 StaticSpec、include 闭包、toolkit 适配目录或模块 registry。
+  地址、payload、路由、权重、计数、窗口代际与完成标志不进入编译期常量。
+- 安装包携带 `_kernel_src` 设备头文件；JIT 直接从包内路径编译，不依赖构建机绝对路径。
+- 编译器不具备可用 `<format>` 时（例如 GCC 11），构建输出生成并编译/链接校验
+  `FMT_HEADER_ONLY` 的 fmt 适配头，同时编译锁定 DeepJIT 的真实格式化表达式；缺少 libdwfl
+  开发头时不阻断构建，异常回溯仍保留 dlsym 诊断路径。

@@ -7,6 +7,7 @@
 #include "kernel_operator.h"
 #include "../../dispatch/low_latency/common/comm_args.h"
 #include "../../dispatch/low_latency/common/dispatch_dedup_types.h"
+#include "../../dispatch/low_latency/common/ll_jit_spec.h"
 #include "ep_memory_server_dedup_buffer_layout.h"
 #include "ep_memory_server_dedup_combine_config.h"
 #include "combine_server_dedup_select.h"
@@ -73,7 +74,7 @@ public:
         }
         PipeBarrier<PIPE_V>();
         const uint32_t servers = world_ / 8U;
-        const uint32_t ownServer = uint32_t(args_->rank) / 8U;
+        const uint32_t ownServer = uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) / 8U;
         uint32_t owner = 0U, completed = 0U;
         for (uint32_t step = 1U; step <= servers; ++step) {
             const uint32_t count = SelectServer(ServerDedupHalfOrder(servers, ownServer, step - 1U), owner, step == 1U);

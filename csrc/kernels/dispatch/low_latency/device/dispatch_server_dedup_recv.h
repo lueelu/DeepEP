@@ -67,7 +67,7 @@ public:
         pipe_->InitBuffer(prefixBuf_, prefixBytes);
         GlobalTensor<int32_t> prefixGlobal;
         const auto counts = DispatchServerDedupCountLayout(experts_, coreNum_);
-        prefixGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(args_->peerMems[args_->rank] + windowOffset_ +
+        prefixGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(args_->peerMems[DEEPEP_LL_LAUNCH_RANK(args_)] + windowOffset_ +
                                                                        counts.cntOffset + counts.prefixOffset));
         auto prefix = prefixBuf_.Get<int32_t>();
         DataCopyPad(prefix, prefixGlobal, {1U, prefixBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0});
@@ -76,7 +76,7 @@ public:
 
         // 2. 按前缀定义的接收输出行均分任务，建立稳定槽位表和可压缩的 pending 表。
         // j 始终标识固定输出行/槽位；pending 下标只表示尚未消费的任务位置。
-        tasks_.Build(prefix, uint32_t(args_->rank), DEEPEP_LL_LAUNCH_WORLD(args_), experts_, bs_, receiver_, pipe_,
+        tasks_.Build(prefix, uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)), DEEPEP_LL_LAUNCH_WORLD(args_), experts_, bs_, receiver_, pipe_,
                      recvCoreNum_);
         if (profile) {
             profile->Mark<31>();  // w31: receive_tasks_built
@@ -307,7 +307,7 @@ private:
     // 摘要：将稳定任务编号 j 映射为本轮通信窗口中的实际 packet 槽地址。
     __aicore__ inline __gm__ uint8_t* Slot(uint32_t j)
     {
-        return args_->peerMems[args_->rank] + data_.dispatchOffset + uint64_t(tasks_.Position(j)) * data_.tokenStride;
+        return args_->peerMems[DEEPEP_LL_LAUNCH_RANK(args_)] + data_.dispatchOffset + uint64_t(tasks_.Position(j)) * data_.tokenStride;
     }
 
     // 摘要：保存最多 16 项 pending 任务快照，检查每个包全部块的标记，返回就绪位图。

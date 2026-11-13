@@ -198,13 +198,13 @@ void bind_dispatch(py::module_& module)
             session.remember_dispatch_controls(controls);
         }
         timing.mark(0, stream);
-        if (benchmark_entry_barrier) notify_dispatch_barrier_kernel_do(stream, 64U);
+        if (benchmark_entry_barrier) launch_notify_barrier(stream, 64U);
         timing.mark(1, stream);
         dispatch_kernel_do(stream, workspace, destinations, forward, counts, weights, scales,
                            reinterpret_cast<uint8_t*>(&config));
         timing.mark(2, stream);
         // The kernel joins incoming completion flags before its stream event.
-        if (benchmark_barriers) notify_dispatch_barrier_kernel_do(stream, 64U);
+        if (benchmark_barriers) launch_notify_barrier(stream, 64U);
         timing.mark(3, stream);
         return timing.finish(stream);
     });

@@ -88,13 +88,16 @@ __aicore__ inline void Run(const ArgsBlock& block, deepep::CoreContext core, boo
     constexpr uint32_t topK = DEEPEP_UBX_JIT_SPEC_TOPK;
     constexpr uint32_t experts = DEEPEP_UBX_JIT_SPEC_EXPERTS;
     constexpr uint32_t world = DEEPEP_UBX_JIT_SPEC_WORLD;
+    constexpr uint32_t rank = DEEPEP_UBX_JIT_SPEC_RANK;
     constexpr uint32_t cores = DEEPEP_UBX_JIT_SPEC_CORES;
+    constexpr uint32_t capacity = DEEPEP_UBX_JIT_SPEC_CAPACITY;
     constexpr uint8_t dtype = DEEPEP_UBX_JIT_SPEC_BF16 ? UbxDispatch::DISPATCH_DEDUP_DATA_TYPE_BFP16
                                                        : UbxDispatch::DISPATCH_DEDUP_DATA_TYPE_FP16;
     constexpr bool dedup = bool(DEEPEP_UBX_JIT_SPEC_DEDUP);
     const bool specDedup = UbxDispatch::EpServerDedupEnabled(td->numMaxTokensPerRank, td->bs, args->rankSize);
-    if (uint32_t(args->rankSize) != world || core.count != cores || td->bs != bs || td->h != h || td->topK != topK ||
-        td->moeExpertNum != experts || td->tilingKey != DEEPEP_UBX_JIT_SPEC_GROUP || td->dtype != dtype ||
+    if (uint32_t(args->rankSize) != world || uint32_t(args->rank) != rank || core.count != cores || td->bs != bs ||
+        td->h != h || td->topK != topK || td->moeExpertNum != experts || td->tilingKey != DEEPEP_UBX_JIT_SPEC_GROUP ||
+        td->dtype != dtype || uint32_t(td->numMaxTokensPerRank) != capacity ||
         (specDedup ? 1U : 0U) != (dedup ? 1U : 0U)) {
         AscendC::Trap();
         return;
@@ -134,16 +137,14 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ubx_combine_
     UbxCombineEntry::Run(block, deepep::OrdinaryCoreContext(), false);
 }
 
-#ifndef DEEPEP_UBX_JIT
 // Equivalent SuperKernel sub-entries. The template parameter only gives the
-// framework four distinct symbols; every instance runs the same body.
-//
-// DeepJIT builds one ordinary entry per specialization and its loader requires
-// exactly one kernel per ELF, so the JIT translation unit omits the SK symbols
-// and their bind record. SuperKernel fusion always uses the AOT device library.
+// framework four distinct symbols; every instance runs the same body. The JIT
+// ELF carries the same ordinary entry, SK sub-entries and bind record; the SK
+// capability is not coupled to the compilation route.
 template <uint32_t splitNum>
 __sk__ __vector__ void ubx_combine_route_plan_sk(const UbxCombineEntry::ArgsBlock* block, sk::SkSystemArgs* sysArgs)
 {
+    sysArgs->SkInit();
     deepep::CoreContext core{sysArgs->SkGetBlockIdx(), sysArgs->SkGetNumBlocks()};
     // Unpack the framework-provided argument block once, like the ordinary
     // entry's register arguments, instead of re-reading each field from GM
@@ -157,4 +158,3 @@ __sk__ __vector__ void ubx_combine_route_plan_sk(const UbxCombineEntry::ArgsBloc
 // end-of-kernel cache flush.
 SK_BIND(ubx_combine_route_plan, 0, ubx_combine_route_plan_sk<0>, ubx_combine_route_plan_sk<1>,
         ubx_combine_route_plan_sk<2>, ubx_combine_route_plan_sk<3>);
-#endif

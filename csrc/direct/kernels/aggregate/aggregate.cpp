@@ -35,13 +35,3 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void aggregate_ke
             x, topk_weights, expanded_values, recv_to_expanded_idx, aggregated_x, aggregated_values, tiling);
     }
 }
-
-extern "C" ASCEND_DEEPEP_EXPORT void aggregate_kernel_do(
-    uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* expanded_values,
-    uint8_t* recv_to_expanded_idx, uint8_t* aggregated_x, uint8_t* aggregated_values, uint8_t* tiling_host,
-    uint64_t ffts_addr)
-{
-    auto* td = reinterpret_cast<ascend_deepep::AggregateTilingData*>(tiling_host);
-    aggregate_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kAggregateUbBytes), stream>>>(
-        x, topk_weights, expanded_values, recv_to_expanded_idx, aggregated_x, aggregated_values, *td, ffts_addr);
-}

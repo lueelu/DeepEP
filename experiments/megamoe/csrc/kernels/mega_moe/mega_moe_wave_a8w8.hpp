@@ -18,6 +18,7 @@
 #define MEGA_MOE_WAVE_A8W8_H
 
 #include "kernel_operator.h"
+#include "kernels/common/core_context.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "shmem.h"
 #include "mc2_common/mc2_kernel_utils.hpp"
@@ -67,6 +68,14 @@ public:
     using QuantScaleOutType = typename std::conditional<(QuantMode >= E5M2_QUANT), fp8_e8m0_t, float>::type;
     using ActivationType = QuantOutType;
     __aicore__ inline MegaMoeA8W8Wave(){};
+    __aicore__ inline void SetCoreContext(const deepep::CoreContext& core)
+    {
+        const uint32_t ration = static_cast<uint32_t>(GetTaskRation());
+        blockAivNum_ = core.count;
+        blockNum_ = ration == 0U ? core.count : core.count / ration;
+        aivCoreIdx_ = core.index;
+        blockIdx_ = ration == 0U ? core.index : core.index / ration;
+    }
     __aicore__ inline void Init(GM_ADDR context, GM_ADDR x, GM_ADDR topkIds, GM_ADDR topkWeights, GM_ADDR weight1,
                                 GM_ADDR weight2, GM_ADDR xActiveMask, GM_ADDR weightScales1, GM_ADDR weightScales2,
                                 GM_ADDR scales, GM_ADDR sharedWeight1, GM_ADDR sharedWeight2,
@@ -285,7 +294,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Init(
 #if !defined(ASCEND_DEEPEP_DISABLE_MEGA_MOE_EXCEPTION_DUMP)
     gmmLoopCount_ =
         MegaMoeImpl::RegisterMegaMoeExceptionDump(exceptionDump_, dumpBase, tilingGM, tilingData, params_.peermemInfo,
-                                                  reinterpret_cast<GM_ADDR>(&mc2Context_->epRankId));
+                                                  reinterpret_cast<GM_ADDR>(&mc2Context_->epRankId), aivCoreIdx_, blockNum_);
 #else
     (void)dumpBase;
     (void)tilingGM;

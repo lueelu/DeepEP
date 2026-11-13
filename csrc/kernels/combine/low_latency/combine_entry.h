@@ -60,13 +60,16 @@ __aicore__ inline void Run(const ArgsBlock& block, deepep::CoreContext core, boo
     constexpr uint32_t topK = DEEPEP_LL_JIT_SPEC_TOPK;
     constexpr uint32_t experts = DEEPEP_LL_JIT_SPEC_EXPERTS;
     constexpr uint32_t world = DEEPEP_LL_JIT_SPEC_WORLD;
+    constexpr uint32_t rank = DEEPEP_LL_JIT_SPEC_RANK;
     constexpr uint32_t cores = DEEPEP_LL_JIT_SPEC_CORES;
+    constexpr uint32_t capacity = DEEPEP_LL_JIT_SPEC_CAPACITY;
     constexpr uint8_t dtype = DEEPEP_LL_JIT_SPEC_BF16 ? DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_BFP16
                                                      : DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP16;
     constexpr bool dedup = bool(DEEPEP_LL_JIT_SPEC_DEDUP);
-    if (uint32_t(args->rankSize) != world || core.count != cores ||
+    if (uint32_t(args->rankSize) != world || uint32_t(args->rank) != rank || core.count != cores ||
         td->bs != bs || td->h != h || td->topK != topK || td->moeExpertNum != experts || td->dtype != dtype ||
-        DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank) != dedup) {
+        uint32_t(td->numMaxTokensPerRank) != capacity ||
+        DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank, td->bs, uint32_t(args->rankSize)) != dedup) {
         AscendC::Trap();
         return;
     }
@@ -77,7 +80,7 @@ __aicore__ inline void Run(const ArgsBlock& block, deepep::CoreContext core, boo
     const uint32_t experts = td->moeExpertNum;
     const uint8_t dtype = td->dtype;
     const uint32_t world = uint32_t(args->rankSize);
-    const bool dedup = DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank);
+    const bool dedup = DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank, td->bs, world);
 #endif
 
     CombineDedup::CombineMemoryServerDedupKernel kernel;
@@ -100,14 +103,14 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_serv
     CombineDedupEntry::Run(block, deepep::OrdinaryCoreContext(), false);
 }
 
-#ifndef DEEPEP_LL_JIT
-// Equivalent SuperKernel sub-entries. The JIT translation unit omits them
-// because the DeepJIT loader requires exactly one kernel per ELF; fusion uses
-// the AOT device library.
+// Equivalent SuperKernel sub-entries. The JIT ELF carries the same ordinary
+// entry, SK sub-entries and bind record as the Ahead-of-Time device library;
+// the SK capability is independent of the compilation route.
 template <uint32_t splitNum>
 __sk__ __vector__ void combine_server_dedup_kernel_sk(const CombineDedupEntry::ArgsBlock* block,
                                                       sk::SkSystemArgs* sysArgs)
 {
+    sysArgs->SkInit();
     deepep::CoreContext core{sysArgs->SkGetBlockIdx(), sysArgs->SkGetNumBlocks()};
     const CombineDedupEntry::ArgsBlock local = *block;
     CombineDedupEntry::Run(local, core, true);
@@ -115,4 +118,3 @@ __sk__ __vector__ void combine_server_dedup_kernel_sk(const CombineDedupEntry::A
 
 SK_BIND(combine_server_dedup_kernel, 0, combine_server_dedup_kernel_sk<0>, combine_server_dedup_kernel_sk<1>,
         combine_server_dedup_kernel_sk<2>, combine_server_dedup_kernel_sk<3>);
-#endif

@@ -85,7 +85,6 @@ def setup(monkeypatch):
         stream=comm,
         native=object(),
         ll_backend="rdma",
-        low_latency_jit=False,
         closed=True,
         notify_lock=threading.Lock(),
         notify_failed=False,

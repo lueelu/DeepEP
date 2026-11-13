@@ -302,14 +302,6 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_reus
     util_set_ffts_config(0U);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
     Reuse(workspace, input, forward, counts, backward, offsets, mask, weights, weight_meta, tiling, window);
+
+}
 #endif
-}
-extern "C" ASCEND_DEEPEP_EXPORT void combine_reuse_kernel_do(void* stream, uint8_t* workspace, uint8_t* input,
-                                                             uint8_t* forward, uint8_t* counts, uint8_t* backward,
-                                                             uint8_t* offsets, uint8_t* mask, uint8_t* weights,
-                                                             uint8_t* weight_meta, uint8_t* tiling, uint32_t window)
-{
-    combine_reuse_kernel<<<64, ascend_deepep::combine_config::kLaunchUbBytes, stream>>>(
-        workspace, input, forward, counts, backward, offsets, mask, weights, weight_meta,
-        *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling), window);
-}

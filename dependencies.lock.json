@@ -26,6 +26,18 @@
     "wheel": "0.47.0",
     "pybind11": "3.0.4"
   },
+  "deepjit": {
+    "repository": "https://github.com/deepseek-ai/DeepJIT",
+    "revision": "65f513952b8771408a19202f65e36398522db6db",
+    "distribution": "pinned third-party/deep_jit build headers; the sdist carries include/ and the MIT notice in third-party/deepjit.LICENSE",
+    "license": "MIT",
+    "format_fallback": {
+      "library": "fmt",
+      "parameter": "DEEPEP_DEEPJIT_FMT_ROOT",
+      "required_when": "the Host standard library has no usable <format>",
+      "validation": "CMake compiles the generated <format> shim before the target is built"
+    }
+  },
   "target": "Ascend950",
   "device_kernels": [
     "full-notify-metadata",

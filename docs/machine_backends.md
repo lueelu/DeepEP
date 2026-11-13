@@ -42,9 +42,9 @@ combine 未指定核数时沿用 handle 中的核数，包括显式 64 核的 ha
 
 继续使用本仓的[编译安装流程](build.md)，同一 Python 环境需有匹配的 Torch/torch_npu。
 Mesh+Clos 和 Direct 共用一份 SHMEM SDK。
-构建产物包括 `_C`、`_clos_C` 和各自的 device library；二者加载同一 SDK 的 `libshmem.so`。
-`_clos_C` 和 `libdeepep_clos_kernels.so` 保留二进制名称，实际承载 Direct 的 MTE/UDMA
-两条路径；源码位于 `csrc/direct/`，构建定义位于 `cmake/Direct.cmake`。
+构建产物包括 `_C`、`_clos_C` 和共享的 `libdeepep_jit.so`；设备代码由 DeepJIT 运行时编译。
+`_clos_C` 保留二进制名称，实际承载 Direct 的 MTE/UDMA 两条路径；源码位于
+`csrc/direct/`，Host/JIT 定义位于 `cmake/Direct.cmake` 和 `csrc/direct/ops/jit_entries.cpp`。
 升级目录布局时应使用干净的构建暂存目录。安装会拒绝残留的旧 backend 实现，
 避免将两套 Python 模块同时打进 wheel；旧机型参数仍作为输入别名接受，
 识别结果、日志和新配置统一使用上表中的拓扑名称。

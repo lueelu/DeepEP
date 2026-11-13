@@ -278,7 +278,7 @@ void bind_combine(py::module_& module)
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         py::gil_scoped_release release;
         // All peers must finish the previous operator before reusing workspace.
-        notify_dispatch_barrier_kernel_do(stream, 64U);
+        launch_notify_barrier(stream, 64U);
         if (reuse) {
             if (t.with_weights &&
                 aclrtMemsetAsync(workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float), 0,
@@ -287,7 +287,7 @@ void bind_combine(py::module_& module)
             }
             combine_reuse_kernel_do(stream, workspace, input, forward, counts, reuse_backward, reuse_offsets, mask,
                                     weights, weight_meta, reinterpret_cast<uint8_t*>(&t), reuse);
-            notify_dispatch_barrier_kernel_do(stream, 64U);
+            launch_notify_barrier(stream, 64U);
             copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * hidden * 2U, stream);
             if (t.with_weights) {
                 copy(weight_output, workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float),
@@ -316,7 +316,7 @@ void bind_combine(py::module_& module)
             combine_kernel_do(stream, workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks,
                               weights, weight_meta, reinterpret_cast<uint8_t*>(&t));
         }
-        notify_dispatch_barrier_kernel_do(stream, 64U);
+        launch_notify_barrier(stream, 64U);
         copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * hidden * 2U, stream);
         if (t.with_weights) {
             copy(weight_output, workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float),

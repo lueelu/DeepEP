@@ -16,7 +16,7 @@ template<HardEvent E> __aicore__ inline void Sync(uint32_t id) {
 }
 __aicore__ inline bool Rdma(const __gm__ Args* a) { return a->reservedConfig[0] == LlRdma::kBackend; }
 __aicore__ inline bool SameHost(const __gm__ Args* a, uint32_t peer) {
-    return DispatchDedup::LlSameHost(uint32_t(a->rank), peer,
+    return DispatchDedup::LlSameHost(uint32_t(DEEPEP_LL_LAUNCH_RANK(a)), peer,
         a->reserved0 ? a->reserved0 : DispatchDedup::kLlPhysicalRanksPerHost);
 }
 __aicore__ inline bool RemoteWrite(const __gm__ Args* a, uint32_t peer) { return Rdma(a) && !SameHost(a, peer); }

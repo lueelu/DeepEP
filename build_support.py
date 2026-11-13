@@ -129,6 +129,21 @@ class CheckedInstallLib(install_lib):
                         f"Move {root} outside the build tree and rebuild; "
                         "use separate --build-lib paths for different component configurations."
                     )
+        build_root = Path(self.build_dir)
+        install_root = Path(self.install_dir)
+        build_info_path = build_root / "deep_ep" / "_build_info.json"
+        build_info = json.loads(build_info_path.read_text(encoding="utf-8")) if build_info_path.is_file() else None
+        if build_info is not None and install_root.resolve() != build_root.resolve():
+            # Remove the old optional extension and header tree from a reused
+            # install tree before copying the current build.
+            package = install_root / "deep_ep"
+            for path in package.glob("_jit_C*"):
+                path.unlink()
+            kernel_src = package / "_kernel_src"
+            if kernel_src.is_symlink():
+                kernel_src.unlink()
+            elif kernel_src.exists():
+                shutil.rmtree(kernel_src)
         return super().install()
 
 
@@ -160,6 +175,8 @@ def source_fingerprint():
         "benchmarks",
         "experiments/megamoe",
         "experiments/ep_gmm_fused",
+        "third-party/deep_jit/include",
+        "third-party/fmt/include",
     ):
         files.extend(
             path
@@ -176,6 +193,61 @@ def source_fingerprint():
 
 def checked_run(argv, **kwargs):
     subprocess.run([str(arg) for arg in argv], check=True, timeout=1800, **kwargs)
+
+
+def bundle_jit_shmem_headers(sdk, destination):
+    """Package the SHMEM Device headers needed by an offline JIT compile."""
+    source = Path(sdk)
+    target = Path(destination) / "shmem"
+    copied = 0
+    for tree in ("include", "src"):
+        root = source / tree
+        if not root.is_dir():
+            raise RuntimeError(f"SHMEM SDK is missing the JIT header tree: {root}")
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix not in {".h", ".hpp", ".inc"}:
+                continue
+            relative = path.relative_to(source)
+            output = target / relative
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, output)
+            copied += 1
+    if copied == 0:
+        raise RuntimeError(f"SHMEM SDK has no JIT headers under {source}")
+    manifest = source / "deepep-sdk.json"
+    if manifest.is_file():
+        shutil.copy2(manifest, target / manifest.name)
+    return target
+
+
+def bundle_megamoe_headers(destination, catlass_root=None):
+    """Copy experiment/CATLASS/Tensor API headers used by the JIT source."""
+    target = Path(destination) / "megamoe"
+    if target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True)
+    shutil.copytree(ROOT / "experiments/megamoe/csrc", target / "csrc")
+    catlass = Path(catlass_root or os.environ.get("CATLASS_ROOT", ROOT / "third-party/catlass"))
+    if (catlass / "include").is_dir():
+        shutil.copytree(catlass / "include", target / "catlass/include")
+    if (catlass / "examples/common").is_dir():
+        shutil.copytree(catlass / "examples/common", target / "catlass/examples/common")
+    common = os.environ.get("ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR", "")
+    candidates = [
+        common,
+        str(Path(os.environ.get("ASCEND_HOME_PATH", "")) / "opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common"),
+        str(Path(os.environ.get("ASCEND_HOME_PATH", "")) / "opp/built-in/op_impl/ai_core/tbe/impl/ops_nn/ascendc/common"),
+    ]
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "tensor_api").is_dir():
+            shutil.copytree(Path(candidate) / "tensor_api", target / "tensor_api")
+            break
+    else:
+        raise RuntimeError(
+            "MegaMoE JIT requires the CANN Tensor API headers; set "
+            "ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR to the common package root"
+        )
+    return target
 
 
 def validate_shmem_sdk(root, expected):
@@ -232,7 +304,7 @@ def find_host_compiler(env):
             continue
         return compiler, version
     prefix = "Explicit CXX is unusable" if explicit else "No runnable Host C++ compiler found"
-    raise RuntimeError(f"{prefix}. Set CXX to a C++17 compiler executable. Tried: " + "; ".join(failures))
+    raise RuntimeError(f"{prefix}. Set CXX to a C++20 compiler executable. Tried: " + "; ".join(failures))
 
 
 def build_configuration(environment=None):
@@ -249,7 +321,6 @@ def build_configuration(environment=None):
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
-    ll_jit = enabled("DEEPEP_LL_JIT", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
     default_shmem = ROOT / "third-party/shmem/install/shmem"
 
@@ -335,12 +406,33 @@ def build_configuration(environment=None):
         "torch_cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI),
         "topk_idx_bits": 64,
     }
-    result["ll_jit"] = {"enabled": ll_jit}
-    if ll_jit:
-        # DeepJIT loads kernels through torch_npu stream types, so the Host
-        # module compiles and links against that SDK when JIT is selected.
-        result["TORCH_NPU_PATH"] = str(Path(torch_npu.__file__).parent.resolve())
-        result["Torch_DIR"] = str(Path(torch.__file__).parent / "share/cmake/Torch")
+    result["ll_jit"] = {"enabled": True}
+    # DeepJIT is mandatory, like DeepEP-Ascend. The main _C module compiles and
+    # links against torch_npu and the pinned DeepJIT headers.
+    result["TORCH_NPU_PATH"] = str(Path(torch_npu.__file__).parent.resolve())
+    result["Torch_DIR"] = str(Path(torch.__file__).parent / "share/cmake/Torch")
+    deepjit = Path(env.get("DEEPJIT_ROOT", ROOT / "third-party/deep_jit")).resolve()
+    if not (deepjit / "include/deep_jit").is_dir():
+        raise RuntimeError(
+            "DEEPJIT_ROOT must contain include/deep_jit (run git submodule update --init --recursive "
+            "or unpack the sdist)"
+        )
+    result["DEEPJIT_ROOT"] = str(deepjit)
+    if (deepjit / ".git").exists():
+        try:
+            revision = subprocess.check_output(
+                ["git", "-C", str(deepjit), "rev-parse", "HEAD"], text=True, timeout=30
+            ).strip()
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("Cannot identify the locked DeepJIT checkout revision") from exc
+        if revision != lock["deepjit"]["revision"]:
+            raise RuntimeError("DeepJIT revision differs from dependencies.lock.json")
+    fmt_root = env.get("DEEPEP_DEEPJIT_FMT_ROOT", "")
+    if fmt_root:
+        fmt = Path(fmt_root).resolve()
+        if not (fmt / "fmt/format.h").is_file():
+            raise RuntimeError("DEEPEP_DEEPJIT_FMT_ROOT must contain fmt/format.h")
+        result["DEEPEP_DEEPJIT_FMT_ROOT"] = str(fmt)
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
@@ -443,17 +535,22 @@ def publish_source_native(destination):
     names = [
         "_C" + suffix,
         "_clos_C" + suffix,
-        "libdeepep_kernels.so",
-        "libdeepep_clos_kernels.so",
+        "libdeepep_jit.so",
         "_build_info.json",
+        "_kernel_src",
     ]
     for name in names:
-        if not (destination / name).is_file():
-            raise RuntimeError(f"Incomplete native build: {destination / name}")
+        path = destination / name
+        if name == "_kernel_src":
+            if not (path / "csrc").is_dir():
+                raise RuntimeError(f"Incomplete native build: {path}")
+        elif not path.is_file():
+            raise RuntimeError(f"Incomplete native build: {path}")
     for name in SHMEM_RUNTIME_LIBRARIES:
         if not (destination / ".libs" / name).is_file():
             raise RuntimeError(f"Incomplete native build: {destination / '.libs' / name}")
     names.append(".libs")
+    directory_names = {".libs", "_kernel_src"}
     anchor = package / ".native-build"
     storage = ROOT / "build" / "source-native"
     if anchor.exists() and not anchor.is_symlink():
@@ -471,7 +568,7 @@ def publish_source_native(destination):
     storage.mkdir(parents=True, exist_ok=True)
     snapshot = Path(tempfile.mkdtemp(prefix="build-", dir=storage)).resolve()
     for name in names:
-        if name == ".libs":
+        if name in directory_names:
             shutil.copytree(destination / name, snapshot / name)
         else:
             shutil.copy2(destination / name, snapshot / name)
@@ -479,7 +576,7 @@ def publish_source_native(destination):
     # the previous snapshot until the anchor is atomically replaced.
     for name in names:
         if name not in managed:
-            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name == ".libs")
+            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name in directory_names)
     pending = snapshot / "anchor"
     pending.symlink_to(os.path.relpath(snapshot, package), target_is_directory=True)
     os.replace(pending, anchor)
@@ -519,7 +616,6 @@ class CMakeBuild(build_ext):
             "-B",
             directory,
             f"-DCMAKE_BUILD_TYPE={configuration['build_type']}",
-            f"-DDEEPEP_DEVICE_JOBS={jobs}",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
@@ -529,16 +625,17 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
-            f"-DDEEPEP_LL_JIT={'ON' if configuration.get('ll_jit', {}).get('enabled', False) else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
         ]
-        if configuration.get("ll_jit", {}).get("enabled", False):
-            arguments.extend(
-                [
-                    f"-DTORCH_NPU_PATH={configuration['TORCH_NPU_PATH']}",
-                    f"-DTorch_DIR={configuration['Torch_DIR']}",
-                ]
-            )
+        arguments.extend(
+            [
+                f"-DTORCH_NPU_PATH={configuration['TORCH_NPU_PATH']}",
+                f"-DTorch_DIR={configuration['Torch_DIR']}",
+                f"-DDEEPJIT_ROOT={configuration['DEEPJIT_ROOT']}",
+            ]
+        )
+        if configuration.get("DEEPEP_DEEPJIT_FMT_ROOT"):
+            arguments.append(f"-DDEEPEP_DEEPJIT_FMT_ROOT={configuration['DEEPEP_DEEPJIT_FMT_ROOT']}")
         if ep_gmm_fused:
             arguments.extend(
                 [
@@ -549,13 +646,22 @@ class CMakeBuild(build_ext):
             )
         checked_run(arguments)
         checked_run([cmake, "--build", directory, "--parallel", jobs])
+        # A reused build_lib may still contain the old optional extension from
+        # an earlier wheel; JIT now lives in _C.
+        for path in destination.glob("_jit_C*"):
+            path.unlink()
         checked_run([cmake, "--install", directory])
-        if configuration.get("ll_jit", {}).get("enabled", False):
-            # DeepJIT compiles the LL entries on first launch, so the installed
-            # package carries the same device headers this build configured from.
-            kernel_src = destination / "_kernel_src"
-            shutil.rmtree(kernel_src, ignore_errors=True)
-            shutil.copytree(ROOT / "csrc", kernel_src / "csrc")
+        kernel_src = destination / "_kernel_src"
+        # DeepJIT compiles the LL entries on first launch, so the installed
+        # package carries the same device headers this build configured from.
+        if kernel_src.is_symlink():
+            kernel_src.unlink()
+        elif kernel_src.exists():
+            shutil.rmtree(kernel_src)
+        shutil.copytree(ROOT / "csrc", kernel_src / "csrc")
+        bundle_jit_shmem_headers(configuration["SHMEM_ROOT"], kernel_src)
+        if megamoe.get("enabled", False):
+            bundle_megamoe_headers(kernel_src, configuration.get("CATLASS_ROOT"))
         # A reused setuptools build_lib may still contain the former library.
         (destination / "libdeepep_notify.so").unlink(missing_ok=True)
         # Elastic implementation/layout modules now live under buffers/.
@@ -573,6 +679,8 @@ class CMakeBuild(build_ext):
                 "CATLASS_ROOT",
                 "TORCH_NPU_PATH",
                 "Torch_DIR",
+                "DEEPJIT_ROOT",
+                "DEEPEP_DEEPJIT_FMT_ROOT",
                 "compiler_path",
                 "ep_gmm_fused_paths",
                 "cmake_path",
@@ -582,6 +690,10 @@ class CMakeBuild(build_ext):
         }
         info["compiler"] = json.loads((directory / "compiler-info.json").read_text())
         info.update(json.loads((directory / "capabilities.json").read_text(encoding="utf-8")))
+        if "ll_jit" in info:
+            deepjit_info = directory / "deepjit-info.json"
+            if deepjit_info.is_file():
+                info["ll_jit"].update(json.loads(deepjit_info.read_text(encoding="utf-8")))
         info["shmem_runtime"] = bundle_shmem_runtime(configuration["SHMEM_ROOT"], destination)
         (destination / "_build_info.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"

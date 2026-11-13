@@ -19,7 +19,7 @@ deep_ep.ElasticBuffer
 Python Runtime → C++ Session → SHMEM / CANN
 ```
 
-`module.cpp` 集中注册运行时和算子入口。`csrc/ops` 校验 Host/Device 参数、组织 tiling 和 kernel 启动，不存在额外的 execution/plan 调用层。Host 扩展使用 C++17；Device 子工程用 Bisheng 编译为 `libdeepep_kernels.so`。构建和安装方式见[构建指南](build.md)。
+`module.cpp` 集中注册运行时和算子入口。`csrc/ops` 校验 Host/Device 参数、组织 tiling 和 kernel 启动，不存在额外的 execution/plan 调用层。Host 扩展使用 C++20；核心算子与 direct 设备入口由 DeepJIT 在首次调用时编译，共享 `libdeepep_jit.so`。构建和安装方式见[构建指南](build.md)。
 
 ## 模块职责
 

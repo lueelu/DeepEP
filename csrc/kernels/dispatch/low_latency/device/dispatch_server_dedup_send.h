@@ -217,7 +217,7 @@ public:
         // 其他成员的路由信息放入包尾，
         // 由目标接收端继续转发。所有首跳优先发出，尽早启动远端 relay。
 
-        const uint32_t rankInGroup = uint32_t(args_->rank) % Group;
+        const uint32_t rankInGroup = uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) % Group;
         const uint32_t sendCore = coreContext_.index;
         for (uint32_t token = 0; token < count_; ++token) {
             uint32_t directMask = 0, firstHopCount = 0;
@@ -263,7 +263,7 @@ public:
         // across first hops and server boundaries without an added drain.
         const uint32_t serverNum = DEEPEP_LL_LAUNCH_WORLD(args_) / Group;
         const uint32_t expertsPerServer = localExperts_ * Group;
-        const uint32_t ownServer = args_->rank / Group;
+        const uint32_t ownServer = DEEPEP_LL_LAUNCH_RANK(args_) / Group;
         LlBuildStableTaskGroups(directTasks_, directCount_, expertsPerServer, serverNum, serverState_);
         for (uint32_t step = 0; step < serverNum; ++step) {
             const uint32_t server = LlDirectGroupOrder(serverNum, ownServer, rankInGroup, sendCore, step);
@@ -298,7 +298,7 @@ public:
         // Keep the original route ownership and q slots. Only reorder this
         // core's sends by the same 256P+ server order used by dedup DIRECT.
         const uint32_t expertsPerServer = localExperts_ * Group;
-        const uint32_t ownServer = args_->rank / Group;
+        const uint32_t ownServer = DEEPEP_LL_LAUNCH_RANK(args_) / Group;
         for (uint32_t step = 0; step < serverNum; ++step) {
             const uint32_t server = EpServerOrder::ServerDedupDispatchDirectOrder(serverNum, ownServer, step);
             const uint32_t firstExpert = server * expertsPerServer;
@@ -336,7 +336,7 @@ private:
             const uint32_t destination = expert / localExperts_;
             const uint32_t server = destination / Group;
             const uint32_t bit = uint32_t(1) << k, serverBit = uint32_t(1) << server;
-            if (server == uint32_t(args_->rank) / Group) {
+            if (server == uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) / Group) {
                 directMask |= bit;
             } else if ((seen & serverBit) == 0U) {
                 seen |= serverBit;
@@ -395,7 +395,7 @@ private:
     __aicore__ inline void FillTail(LocalTensor<uint8_t> payload, uint32_t token, uint32_t firstK, uint32_t mask)
     {
         auto header = payload[data_.headerPayloadOffset].template ReinterpretCast<uint32_t>();
-        header.SetValue(0U, uint32_t(args_->rank));
+        header.SetValue(0U, uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)));
         header.SetValue(1U, token);
         header.SetValue(2U, firstK);
         auto index = payload[data_.readIndexPayloadOffset].template ReinterpretCast<uint32_t>();
@@ -512,7 +512,7 @@ private:
         const uint32_t destination = expert / localExperts_;
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
         if (packetProfile_) packetProfile_->SendBegin(LlTransport::RemoteWrite(args_, destination),
-            destination / Group == uint32_t(args_->rank) / Group, token, firstK, expert, destination);
+            destination / Group == uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) / Group, token, firstK, expert, destination);
 #endif
         SenderInputOperations inputOperations{*this, input};
         inputReuse_.Prepare(token, inputOperations);
@@ -552,14 +552,14 @@ private:
 #ifndef DEEPEP_LL_NO_COMM
         if (LlTransport::RemoteWrite(args_, destination)) {
             rdmaBatch_.Enqueue(destination,
-                DispatchServerDedupDispatchOffset(data_, args_->rank, destination,
+                DispatchServerDedupDispatchOffset(data_, DEEPEP_LL_LAUNCH_RANK(args_), destination,
                     expert % localExperts_, q, DEEPEP_LL_LAUNCH_WORLD(args_), localExperts_, bs_), out,
                 lanes_ > 1U);
         } else
 #endif
         {
         LlTransport::Packet(args_, destination,
-            DispatchServerDedupDispatchOffset(data_, args_->rank, destination,
+            DispatchServerDedupDispatchOffset(data_, DEEPEP_LL_LAUNCH_RANK(args_), destination,
                 expert % localExperts_, q, DEEPEP_LL_LAUNCH_WORLD(args_), localExperts_, bs_), out,
             uint32_t(data_.tokenStride), coreContext_, 7U);
         }

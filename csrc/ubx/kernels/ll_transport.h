@@ -22,7 +22,7 @@ __aicore__ inline bool Rdma(const __gm__ Args* a)
 }
 __aicore__ inline bool SameHost(const __gm__ Args* a, uint32_t peer)
 {
-    return UbxDispatch::LlSameHost(uint32_t(a->rank), peer,
+    return UbxDispatch::LlSameHost(uint32_t(DEEPEP_UBX_LAUNCH_RANK(a)), peer,
                                    a->reserved0 ? a->reserved0 : UbxDispatch::kLlPhysicalRanksPerHost);
 }
 __aicore__ inline bool RemoteWrite(const __gm__ Args* a, uint32_t peer)

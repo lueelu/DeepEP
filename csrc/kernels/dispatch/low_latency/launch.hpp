@@ -51,8 +51,6 @@ static_assert(offsetof(EpServerDedupKernelArgs, expertTimer) == 144, "expert tim
 
 // Single internal launch entry. The 152-byte argument structure and the
 // communication protocol are unchanged.
-extern "C" void dispatch_server_dedup_kernel_do(void* stream, const deepep::EpServerDedupKernelArgs* args);
-
 extern "C" uint32_t deepep_ll_core_protocol_version();
 extern "C" uint32_t deepep_ll_rdma_enabled();
 extern "C" uint32_t deepep_ll_ranks_per_group(uint32_t world);

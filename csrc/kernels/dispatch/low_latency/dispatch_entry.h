@@ -4,11 +4,16 @@
 // translation unit so the same source can be compiled ahead of time or through
 // a JIT backend without duplicating any logic. The input element class and the
 // group size are compile-time in every build; the JIT backend additionally
-// bakes B/H/K/E, the input mode, E4M3 and the dedup decision into the
-// translation unit (DEEPEP_LL_JIT_SPECIALIZED). The Ahead-of-Time build keeps
-// those as runtime tiling fields of the two instantiations it already has.
+// bakes B/H/K/E, per-rank capacity, world/rank, the active AIV count, the input
+// mode, E4M3 and the dedup decision into the translation unit
+// (DEEPEP_LL_JIT_SPECIALIZED). The Ahead-of-Time build keeps those as runtime
+// tiling/communication fields of the two instantiations it already has.
 //
-// The ordinary global entry and the SuperKernel sub-entry call the same body.
+// The ordinary global entry, the SuperKernel sub-entry and the bind record live
+// in this one source for both routes. The SK sub-entry is always compiled; the
+// external caller's SuperKernel schedule decides whether it is used, not a
+// compile-time switch or a runtime environment variable.
+//
 // The body receives its logical execution context instead of reading
 // AscendC::GetBlockIdx()/GetBlockNum() directly, because inside a fused
 // SuperKernel task those accessors describe the fused grid.
@@ -92,7 +97,7 @@ __aicore__ inline void RunGroup(const ArgsBlock& block, deepep::CoreContext core
     // business DMA and transfer retirement completed inside Process().
     if (skMode) pipe.DestroyWithoutPipeAll();
     const auto* commArgs = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(block.commArgs);
-    profile.Finish(uint32_t(commArgs->rank), DEEPEP_LL_LAUNCH_WORLD(commArgs), bs);
+    profile.Finish(uint32_t(DEEPEP_LL_LAUNCH_RANK(commArgs)), DEEPEP_LL_LAUNCH_WORLD(commArgs), bs);
 }
 
 __aicore__ inline void Run(const ArgsBlock& block, deepep::CoreContext core, bool skMode)
@@ -104,16 +109,22 @@ __aicore__ inline void Run(const ArgsBlock& block, deepep::CoreContext core, boo
     // communication description.
     (void)block.tilingData;
     constexpr uint32_t rankSize = DEEPEP_LL_JIT_SPEC_WORLD;
+    constexpr uint32_t rank = DEEPEP_LL_JIT_SPEC_RANK;
     constexpr uint32_t bs = DEEPEP_LL_JIT_SPEC_BS;
     constexpr uint32_t h = DEEPEP_LL_JIT_SPEC_H;
     constexpr uint32_t topK = DEEPEP_LL_JIT_SPEC_TOPK;
     constexpr uint32_t moeExpertNum = DEEPEP_LL_JIT_SPEC_EXPERTS;
+    constexpr uint32_t capacity = DEEPEP_LL_JIT_SPEC_CAPACITY;
+    static_assert(capacity > 0U, "JIT dispatch specialization needs the per-rank capacity");
     constexpr uint32_t expertTokenNumsType = DispatchDedup::kLlExpertTokenNumsType;
     constexpr auto inputMode = static_cast<DispatchDedup::EpServerDedupInputMode>(DEEPEP_LL_JIT_SPEC_INPUT_MODE);
     constexpr bool e4m3 = bool(DEEPEP_LL_JIT_SPEC_E4M3);
     constexpr bool enableDedup = bool(DEEPEP_LL_JIT_SPEC_DEDUP);
-    if (uint32_t(reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(block.commArgs)->rankSize) != rankSize ||
-        core.count != DEEPEP_LL_JIT_SPEC_CORES) {
+    const auto* commArgs = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(block.commArgs);
+    // The immutable communication description must agree with the compiled
+    // specialization. Capacity is a fixed part of that identity; it still does
+    // not make addresses, routing values or window state constant.
+    if (uint32_t(commArgs->rankSize) != rankSize || uint32_t(commArgs->rank) != rank || core.count != DEEPEP_LL_JIT_SPEC_CORES) {
         AscendC::Trap();
         return;
     }
@@ -183,17 +194,19 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ser
     DispatchDedupEntry::Run(block, deepep::OrdinaryCoreContext(), false);
 }
 
-#ifndef DEEPEP_LL_JIT
 // Equivalent SuperKernel sub-entries. The template parameter only gives the
 // framework four distinct symbols; every instance runs the same body.
 //
-// DeepJIT builds one ordinary entry per specialization and its loader requires
-// exactly one kernel per ELF, so the JIT translation unit omits the SK symbols
-// and their bind record. SuperKernel fusion always uses the AOT device library.
+// The SuperKernel capability is a property of this translation unit, not of
+// whether DeepJIT produced it: the Ahead-of-Time device library and the JIT ELF
+// both carry the ordinary entry, the SK sub-entries and their bind record. The
+// DeepJIT loader identifies ordinary entries from the ordinary kernel metadata;
+// the __sk__ functions are not independent starts.
 template <uint32_t splitNum>
 __sk__ __vector__ void dispatch_server_dedup_kernel_sk(const DispatchDedupEntry::ArgsBlock* block,
                                                        sk::SkSystemArgs* sysArgs)
 {
+    sysArgs->SkInit();
     deepep::CoreContext core{sysArgs->SkGetBlockIdx(), sysArgs->SkGetNumBlocks()};
     // Unpack the framework-provided argument block once, like the ordinary
     // entry's register arguments, instead of re-reading each field from GM.
@@ -206,5 +219,4 @@ __sk__ __vector__ void dispatch_server_dedup_kernel_sk(const DispatchDedupEntry:
 // end-of-kernel cache flush.
 SK_BIND(dispatch_server_dedup_kernel, 0, dispatch_server_dedup_kernel_sk<0>, dispatch_server_dedup_kernel_sk<1>,
         dispatch_server_dedup_kernel_sk<2>, dispatch_server_dedup_kernel_sk<3>);
-#endif
 #endif

@@ -572,17 +572,3 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_dispatch_
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, tiling, ffts_addr);
 }
-
-extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_kernel_do(
-    uint32_t block_dim, void* stream, uint8_t* x, uint8_t* x_scales, uint8_t* topk_idx, uint8_t* topk_weights,
-    uint8_t* num_tokens_per_rank, uint8_t* is_token_in_rank, uint8_t* num_tokens_per_expert, uint8_t* symmetric_buffer,
-    uint8_t* recv_x, uint8_t* recv_x_scales, uint8_t* recv_topk_idx, uint8_t* recv_topk_weights,
-    uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* recv_channel_prefix_matrix,
-    uint8_t* recv_src_idx, uint8_t* send_head, uint8_t* tiling_host, uint64_t ffts_addr)
-{
-    auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
-    v1_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
-        x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
-        symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
-        channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, *td, ffts_addr);
-}

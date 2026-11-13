@@ -8,4 +8,3 @@ struct CombineArgs {
     uint32_t cores;
 };
 }  // namespace deepep::ubx
-extern "C" void ubx_combine_launch(void* stream, const deepep::ubx::CombineArgs* args);

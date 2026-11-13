@@ -116,6 +116,10 @@ def _load_native():
     directory = Path(__file__).resolve().parent
     info = json.loads((directory / "_build_info.json").read_text(encoding="utf-8"))
     bundle = _load_bundled_shmem(directory, info)
+    # _C always links the mandatory DeepJIT bridge (and therefore torch_npu);
+    # import the Python framework first, like DeepEP-Ascend does.
+    import torch  # noqa: F401
+    import torch_npu  # noqa: F401
     try:
         module = importlib.import_module("deep_ep._C")
     except ImportError as exc:

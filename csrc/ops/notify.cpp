@@ -14,8 +14,13 @@
 #include "kernels/notify/profile.hpp"
 #include "kernels/dispatch/tiling.hpp"
 #include "runtime/session.hpp"
+#include "runtime/jit_runtime.hpp"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
+
+#ifndef DEEPEP_JIT_PI_ON_CHIP
+#define DEEPEP_JIT_PI_ON_CHIP 0
+#endif
 
 namespace py = pybind11;
 namespace deepep {
@@ -80,10 +85,63 @@ uint8_t* tensor_pointer(py::handle tensor, const Shape& shape, const std::string
     }
     return reinterpret_cast<uint8_t*>(obj.attr("data_ptr")().cast<uintptr_t>());
 }
+
+std::vector<std::string> jit_flags()
+{
+    return {
+        "-std=c++17",
+        "-DCATLASS_ARCH=3510",
+        "-DUSE_SIMT",
+        "-DL2_CACHE_HINT",
+        "-DDEEPEP_LL_RDMA=1",
+        "-DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1",
+        std::string("-DACLSHMEMI_HNS_1825_PI_ON_CHIP=") + std::to_string(DEEPEP_JIT_PI_ON_CHIP),
+        "--cce-auto-infer-kernel-type=false",
+    };
+}
+
+std::string notify_source(const char* file)
+{
+    return std::string("#include <kernels/notify/") + file + ">\n";
+}
+
+void launch_notify_full(void* stream, uint8_t* input, uint8_t* workspace, uint8_t* meta, uint8_t* hist,
+                        uint8_t* bases, uint8_t* prefix, uint8_t* counts, uint8_t* gateways, uint8_t* local_dst,
+                        uint8_t* mask, uint8_t* dst, uint8_t* forward, uint8_t* forward_counts, uint8_t* backward,
+                        uint8_t* backward_counts, uint8_t* ranges, uint8_t* masks, uint8_t* rank_rows,
+                        uint8_t* gather_rows, uint8_t* weight_return_meta, const ascend_deepep::NotifyTiling& t)
+{
+    const auto kernel = deepep::jit_compile("notify_full", notify_source("notify_full_kernel.cpp"), jit_flags());
+    const int ub = ascend_deepep::kNotifyDynamicUbBytes +
+                   (t.dispatch_plan.address ? ascend_deepep::kNotifyDispatchPlanUbBytes : 0);
+    deepep::jit_launch(kernel, stream, static_cast<int>(t.num_cores), ub, input, workspace, meta, hist, bases, prefix, counts,
+               gateways, local_dst, mask, dst, forward, forward_counts, backward, backward_counts, ranges, masks,
+               rank_rows, gather_rows, weight_return_meta, t);
+}
+
+void launch_notify_profile(void* stream, uint8_t* input, uint8_t* workspace, uint8_t* meta, uint8_t* hist,
+                           uint8_t* bases, uint8_t* prefix, uint8_t* counts, uint8_t* gateways, uint8_t* local_dst,
+                           uint8_t* mask, uint8_t* dst, uint8_t* forward, uint8_t* forward_counts, uint8_t* backward,
+                           uint8_t* backward_counts, uint8_t* ranges, uint8_t* masks, uint8_t* rank_rows,
+                           uint8_t* gather_rows, uint8_t* weight_return_meta, uint8_t* profile, uint64_t sample,
+                           const ascend_deepep::NotifyTiling& t)
+{
+    const auto kernel = deepep::jit_compile("notify_profile", notify_source("notify_profile_kernel.cpp"), jit_flags());
+    const int ub = ascend_deepep::kNotifyDynamicUbBytes + ascend_deepep::notify_diagnostics::kUbBytes +
+                   (t.dispatch_plan.address ? ascend_deepep::kNotifyDispatchPlanUbBytes : 0);
+    deepep::jit_launch(kernel, stream, static_cast<int>(t.num_cores), ub, input, workspace, meta, hist, bases, prefix, counts,
+               gateways, local_dst, mask, dst, forward, forward_counts, backward, backward_counts, ranges, masks,
+               rank_rows, gather_rows, weight_return_meta, profile, sample, t);
+}
 }  // namespace
 
-void bind_notify(py::module_& module)
+void launch_notify_barrier(void* stream, uint32_t num_cores)
 {
+    const auto kernel = deepep::jit_compile("notify_barrier", notify_source("notify_dispatch_barrier_kernel.cpp"), jit_flags());
+    deepep::jit_launch(kernel, stream, static_cast<int>(num_cores), 0);
+}
+
+void bind_notify(py::module_& module){
     module.def(
         "notify_profile_layout",
         [](uint32_t num_cores) {
@@ -160,20 +218,19 @@ void bind_notify(py::module_& module)
             timing.mark(0, stream);
             session.invalidate_dispatch_controls();
             if (profile) {
-                notify_profile_kernel_do(stream, input, workspace, ptr.at("meta"), ptr.at("hist"), ptr.at("bases"),
-                                         ptr.at("prefix"), ptr.at("counts"), ptr.at("gateways"), ptr.at("local_dst"),
-                                         ptr.at("server_mask"), ptr.at("dst"), ptr.at("forward_list"),
-                                         ptr.at("forward_counts"), ptr.at("backward_list"), ptr.at("backward_counts"),
-                                         ptr.at("chunk_ranges"), ptr.at("chunk_masks"), ptr.at("rank_rows"),
-                                         ptr.at("gather_rows"), ptr.at("weight_return_meta"), profile, sample,
-                                         reinterpret_cast<uint8_t*>(&t));
+                launch_notify_profile(stream, input, workspace, ptr.at("meta"), ptr.at("hist"), ptr.at("bases"),
+                                      ptr.at("prefix"), ptr.at("counts"), ptr.at("gateways"), ptr.at("local_dst"),
+                                      ptr.at("server_mask"), ptr.at("dst"), ptr.at("forward_list"),
+                                      ptr.at("forward_counts"), ptr.at("backward_list"), ptr.at("backward_counts"),
+                                      ptr.at("chunk_ranges"), ptr.at("chunk_masks"), ptr.at("rank_rows"),
+                                      ptr.at("gather_rows"), ptr.at("weight_return_meta"), profile, sample, t);
             } else {
-                notify_full_kernel_do(
+                launch_notify_full(
                     stream, input, workspace, ptr.at("meta"), ptr.at("hist"), ptr.at("bases"), ptr.at("prefix"),
                     ptr.at("counts"), ptr.at("gateways"), ptr.at("local_dst"), ptr.at("server_mask"), ptr.at("dst"),
                     ptr.at("forward_list"), ptr.at("forward_counts"), ptr.at("backward_list"),
                     ptr.at("backward_counts"), ptr.at("chunk_ranges"), ptr.at("chunk_masks"), ptr.at("rank_rows"),
-                    ptr.at("gather_rows"), ptr.at("weight_return_meta"), reinterpret_cast<uint8_t*>(&t));
+                    ptr.at("gather_rows"), ptr.at("weight_return_meta"), t);
             }
             timing.mark(1, stream);
             // Publication, Dispatch directory construction and totals export

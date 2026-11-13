@@ -12,4 +12,3 @@ struct EpServerDedupCombineKernelArgs {
 static_assert(std::is_standard_layout<EpServerDedupCombineKernelArgs>::value, "combine launch ABI");
 static_assert(sizeof(EpServerDedupCombineKernelArgs) == 80, "combine launch ABI");
 }  // namespace deepep
-extern "C" void combine_server_dedup_kernel_do(void* stream, const deepep::EpServerDedupCombineKernelArgs* args);

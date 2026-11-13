@@ -11,8 +11,8 @@ Modified by Joyce_An 2026
 - `dispatch/low_latency/`、`combine/low_latency/`：低时延设备实现、Host/Device 共用布局和启动声明。
 - `launch.hpp`：LL 的导出和启动宏；`common.hpp`：Notify/combine 的 rank 调度映射。
 
-Host 封装位于 `csrc/ops`，本目录的设备入口由 `cmake/device/CMakeLists.txt` 构建到同一个
-`libdeepep_kernels.so`。
+Host 封装位于 `csrc/ops`，本目录的设备入口由 DeepJIT 在运行时编译；核心
+`notify`/`dispatch`/`combine`/LL/UBX 不再生成 `libdeepep_kernels.so`。
 接口和测试命令见 [Elastic 文档](../../docs/elastic.md)。
 
 UBX 的 RDMA route-plan Combine 单独位于 [`csrc/ubx`](../ubx/)，编译为独立设备库；本目录原有机型实现不参与替换。

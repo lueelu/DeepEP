@@ -17,5 +17,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("get_shmem_unique_id", &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
     // Keep the Python dtype contract tied to the native V1 dispatch path.
-    m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<ascend_deepep::topk_idx_t>::value);
+    // Resolve through torch instead of pybind's ScalarType caster: torch_npu may
+    // not register every c10::ScalarType at import time.
+    auto torch = pybind11::module_::import("torch");
+    m.attr("topk_idx_t") = sizeof(ascend_deepep::topk_idx_t) == 8 ? torch.attr("int64") : torch.attr("int32");
 }
