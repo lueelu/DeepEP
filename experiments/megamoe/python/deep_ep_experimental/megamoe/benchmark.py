@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 from .timer.__main__ import parse_ranks
-from .performance import alignment_config, collect_profile, enqueue_batch, summarize_rounds
+from .performance import alignment_config, collect_profile, enqueue_batch, flush_l2_before_call, summarize_rounds
 
 
 def load_config(name, bs_values=None):
@@ -403,6 +403,8 @@ def run(args, config, group):
         if urma:
             # Shared dimensions are inferred by native forward. Allocate its
             # workspace before profiling, using the same public call as MTE.
+            if args.mode == "perf":
+                flush_l2_before_call()
             call()
             torch.npu.synchronize()
         resources = dict(
@@ -438,6 +440,8 @@ def run(args, config, group):
                 )
         if not (urma and args.mode == "perf"):
             for _ in range(config["warmup"]):
+                if args.mode == "perf":
+                    flush_l2_before_call()
                 call()
             torch.npu.synchronize()
             group.barrier(f"warmup BS={bs}")

@@ -23,11 +23,19 @@ def alignment_config(config):
     return value
 
 
+def flush_l2_before_call():
+    """Evict device L2 before one performance-sampled MegaMoE call."""
+    from deep_ep.utils.testing import flush_l2_cache
+
+    flush_l2_cache(True)
+
+
 def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None):
     """No host barriers, synchronize, or D2H between collective launches."""
     for _ in range(alignment["repeats"]):
         torch.exp(prefix, out=prefix)
     for iteration in range(iterations):
+        flush_l2_before_call()
         # 所有 rank 排入同样次数；只在最后一轮、选中的 rank 上打点。
         call(timer if iteration + 1 == iterations else None)
 
@@ -370,9 +378,11 @@ def measure_profiled_forward(forward, *, warmup, iters, guard, directory, fine_f
         guard.begin()
         for _ in range(warmup + iters):
             guard.before_forward()
+            flush_l2_before_call()
             forward()
         if fine_forward is not None:
             guard.before_forward()
+            flush_l2_before_call()
             fine_forward()
         guard.end()
         capture.step()
