@@ -2,6 +2,7 @@
 
 #include "kernel_operator.h"
 #include "shmem.h"
+#include "../../comm/tile/tile_udma_wqe.hpp"
 #include "simt_api/device_functions.h"
 #include "tiling.hpp"
 #include "launch.hpp"

@@ -46,11 +46,11 @@ __aicore__ inline void PublishClosSimtUbWqes(__ubuf__ uint8_t* wqes, uint32_t co
     view.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
     view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes);
     const uint64_t copy_start = DetailClock<Profile>(mode);
-    aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size),
+    deepep::comm::tile::CopyUdmaWqe(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size),
                                     view, first * ctx->wqe_size, EVENT_ID0);
     if (first != count) {
         view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes + first * ctx->wqe_size);
-        aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
+        deepep::comm::tile::CopyUdmaWqe(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
                                         (count - first) * ctx->wqe_size, EVENT_ID0);
     }
     // Both ring spans are complete before the original visit-sized DBs.

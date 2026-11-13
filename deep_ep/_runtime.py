@@ -114,7 +114,7 @@ class Runtime:
         if debug_collectives and group is None:
             raise ValueError("debug_collectives=True requires a ProcessGroup")
         self.debug_collectives = debug_collectives
-        dense_qps = os.environ.get("DEEPEP_SHMEM_DENSE_QPS", "0")
+        dense_qps = os.environ.get("DEEPEP_SHMEM_DENSE_QPS", "1")
         if dense_qps not in ("0", "1"):
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap

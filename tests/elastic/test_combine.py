@@ -763,10 +763,10 @@ def worker(local_rank, args):
         "elastic-combine-chunk-tuning-v1",
     }.issubset(info.get("capabilities", [])):
         raise RuntimeError("Rebuild/install all ranks for Combine profile v3 and peers v1 before profiling")
-    if "runtime-combine-sparse-qp-v1" not in info.get("capabilities", []) or (
+    if not {"runtime-combine-sparse-qp-v1", "runtime-combine-dense-qp-v1"}.intersection(info.get("capabilities", [])) or (
         args.profile_op and "elastic-combine-chunks-v2" not in info.get("capabilities", [])
     ):
-        raise RuntimeError("Rebuild/install all ranks for Combine sparse QPs and chunk diagnostics")
+        raise RuntimeError("Rebuild/install all ranks for Combine QP configuration and chunk diagnostics")
     torch.npu.set_device(local_rank)
     # Reuse the producer stream so allocator caches do not grow per iteration.
     args._producer_stream = torch.npu.Stream()
@@ -3487,7 +3487,7 @@ def test_session_one_buffer_for_grow_shrink_and_fail_fast(tmp_path, monkeypatch,
                 capabilities=[
                     "elastic-combine-expanded-v3",
                     "elastic-notify-metadata-v7",
-                    "runtime-combine-sparse-qp-v1",
+                    "runtime-combine-dense-qp-v1",
                 ]
             )
         )

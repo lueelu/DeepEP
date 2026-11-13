@@ -207,9 +207,9 @@ class ElasticBuffer:
 
         Explicit identities bootstrap SHMEM directly and only validate locally.
         bootstrap="mpi" uses MPI_COMM_WORLD under MPICH instead of Config Store.
-        combine_only=True omits Dispatch metadata and its QP admission pairs;
-        Dispatch and LL require combine_only=False. SDKs with peer-mask support
-        use sparse channels; DEEPEP_SHMEM_DENSE_QPS=1 forces dense admission.
+        combine_only=True omits Dispatch metadata; Dispatch and LL require
+        combine_only=False. SHMEM v1.8.0 creates dense peer/QP channels by default.
+        DEEPEP_SHMEM_DENSE_QPS=0 requires an SDK extension with peer-mask support.
         All ranks must agree on configuration and collective call order.
         debug_collectives=True requires a group and enables HT preflight collectives.
         Otherwise HT checks parameters locally; the caller handles job-wide failure.

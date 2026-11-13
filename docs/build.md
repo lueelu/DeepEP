@@ -20,10 +20,39 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
 - 同一构建 Python 环境安装匹配的 Torch/torch_npu；Clos Host 扩展需要其头文件和库，构建指纹记录框架版本及 C++ ABI。
 - 由本仓子模块构建或使用外部固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
-- 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` dev 提交，不直接跟随分支最新版本。
+- 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` v1.8.0 发布提交，不直接跟随分支最新版本。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
 - 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
 - wheel 构建不自动下载/编译外部 SDK。构建时将所选 SHMEM SDK 的运行库打入 wheel；驱动和 CANN 仍由部署环境提供。
+
+## 更新到 SHMEM v1.8.0
+
+更新主仓代码后，在仓库根目录同步锁定的子模块：
+
+```bash
+git submodule sync -- third-party/shmem
+git submodule update --init --recursive third-party/shmem
+git -C third-party/shmem rev-parse HEAD
+# ed07fa687d1ca30e636b5a86e1e6ceba82d88535
+```
+
+停止使用旧 SDK 的任务，加载 CANN 环境后重新构建：
+
+```bash
+python scripts/build_shmem.py --rebuild
+```
+
+随后按下文命令重编并安装 DeepEP wheel。独立分层 AllToAll 需重新执行自己的
+`experiments/hierarchical_alltoall/scripts/build.sh`，其 UDMA+RDMA SDK 构建选项见样例 README。
+不要直接修改旧 SDK 的 `deepep-sdk.json` 来冒充新版本；外部 SDK 也必须用该提交重编并重新登记。
+
+v1.8.0 的 shared-jetty 使用 `attr.runtime_config.udma_shared_jetty` 配置，保留头文件默认 ABI 版本。
+此版本没有旧 dev 的 `aclshmemx_set_udma_peer_qp_masks` 接口：Mesh+Clos 默认使用 dense 建链，
+Direct 也创建所有已配置的 peer/QP 通道。逻辑 worker/QP 分配不变，但通道数及初始化资源占用可能增加。
+`DEEPEP_SHMEM_DENSE_QPS=0` 仍是显式请求稀疏建链，仅扩展 SDK 提供相应接口时可用；官方 v1.8.0 会在初始化前报错。
+shared-jetty 仍要求匹配的 HCOMM 配置接口，不会静默退化为独立队列。
+Device 的原始远端 VA WQE 快速路径通过 `csrc/comm/tile/tile_udma_wqe.hpp` 适配新 SDK，
+保留已交换的远端输出地址，避免再次按本地对称地址转换。
 
 ## 可选实验组件
 

@@ -6,11 +6,12 @@
 
 | 目录 | 用途 | 固定提交 |
 | --- | --- | --- |
-| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7` |
+| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `ed07fa687d1ca30e636b5a86e1e6ceba82d88535` |
 | `catlass/` | MegaMoE 编译时使用的模板头文件，不单独编译动态库 | `2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1` |
 
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
-SHMEM 固定到 `cann/shmem` 的 dev 提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
+SHMEM 固定到 `cann/shmem` 的 v1.8.0 发布提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
+shared-jetty 改用初始化属性配置；官方 v1.8.0 不提供旧 dev 的稀疏 peer-QP 建链接口，默认建立全量通道。
 两个子仓库的许可证均为 CANN Open Software License Agreement Version 2.0，原文保留在各自的 `LICENSE` 中。
 全 Clos 后端导入的 Ascend DeepEP 实现采用 CANN Open Software License Agreement Version 2.0。
 该许可与 MegaMoE 使用的 CANN 许可文本相同，统一归档于 [cann.LICENSE](cann.LICENSE)，随 wheel 分发。

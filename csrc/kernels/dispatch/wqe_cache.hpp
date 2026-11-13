@@ -28,7 +28,7 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
         DetailAdd<Profile>(s.detail, 7U, build_start - load_start);
         const uint32_t slot = aclshmemi_udma_compute_slot(peer, static_cast<uint32_t>(-1));
         auto* header = reinterpret_cast<__ubuf__ uint64_t*>(scratch);
-        aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
+        deepep::comm::tile::FillUdmaRemoteSqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                          kUdmaDataRoNoCqeConfig>(
             reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header), reinterpret_cast<__gm__ uint8_t*>(target),
             aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, qp), 0U);
@@ -55,7 +55,7 @@ __aicore__ inline LocalTensor<uint64_t> PrepareClosBuiltWqes(DeepepSecondaryStat
     // are also part of the key; phase changes invalidate the row range below.
     if (!(s.wqe_cache_valid & bit) || tag[0] != key || header[5] != target) {
         const uint32_t slot = aclshmemi_udma_compute_slot(peer, static_cast<uint32_t>(-1));
-        aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
+        deepep::comm::tile::FillUdmaRemoteSqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                          kUdmaDataRoNoCqeConfig>(
             reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header), reinterpret_cast<__gm__ uint8_t*>(target),
             aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, qp), 0U);

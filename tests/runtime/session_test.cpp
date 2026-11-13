@@ -123,6 +123,7 @@ int aclshmemx_init_attr_with_buffers(int mode, aclshmemx_init_attr_t* attr, cons
     assert(mode == ACLSHMEMX_INIT_WITH_DEFAULT || mode == ACLSHMEMX_INIT_WITH_MPI);
     assert(attr->n_pes == expected_world && attr->local_mem_size == 0 && count == 1);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
+    assert(attr->runtime_config.udma_shared_jetty == ACLSHMEM_CONFIG_ENABLED);
     assert(descriptors->addr == source_address && descriptors->size == physical_bytes);
     assert(descriptors->optional_attr->mem_handle == &physical_token);
     assert(descriptors->optional_attr->fabric_handle == nullptr);
@@ -149,15 +150,12 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
+    assert(attr->runtime_config.udma_shared_jetty == (qp_count ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DEFAULT));
+    for (auto value : attr->runtime_config.reserved) assert(value == 0);
     if (init_status == 0) {
         initialized = 2;
     }
     return init_status;
-}
-int aclshmemx_set_shared_jetty(data_op_engine_type_t engine, bool enabled)
-{
-    assert(engine == ACLSHMEM_DATA_OP_UDMA && enabled);
-    return 0;
 }
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
@@ -198,8 +196,8 @@ void aclshmem_barrier_all()
 int main(int argc, char** argv)
 {
     assert(argc == 2);
-    // These SDK doubles intentionally exercise the explicit dense compatibility path.
-    setenv("DEEPEP_SHMEM_DENSE_QPS", "1", 1);
+    // These SDK doubles exercise the default v1.8.0 dense-channel path.
+    unsetenv("DEEPEP_SHMEM_DENSE_QPS"); // v1.8.0 defaults to dense channels.
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
     if (mode.rfind("huge-", 0) == 0) {
@@ -340,4 +338,5 @@ int main(int argc, char** argv)
         next.close();
         assert(frees == 2);
     }
+    return 0;
 }
