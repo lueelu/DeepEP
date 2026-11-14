@@ -1,3 +1,5 @@
+#pragma once
+
 // Copyright (c) 2026, Lu Lu
 
 #include "kernel_operator.h"
@@ -2924,63 +2926,3 @@ __aicore__ inline void Combine(GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_A
 }  // namespace
 // Session-level entry/exit barriers are separate from the arithmetic kernel.
 // All 64 AIVs participate, including empty experts and zero-token workers.
-#ifndef DEEPEP_COMBINE_EP8
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_prepare_kernel(
-    GM_ADDR workspace, ascend_deepep::PutCombineTiling tiling)
-{
-    util_set_ffts_config(0U);
-#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Prepare(workspace, tiling);
-#endif
-}
-#endif
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_kernel(
-    GM_ADDR workspace, GM_ADDR input, GM_ADDR forward, GM_ADDR counts, GM_ADDR backward, GM_ADDR backward_counts,
-    GM_ADDR mask, GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta,
-    ascend_deepep::PutCombineTiling tiling)
-{
-    util_set_ffts_config(0U);
-#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Combine<false>(workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr, weights,
-                   weight_meta, tiling);
-#endif
-}
-#ifndef DEEPEP_COMBINE_EP8
-extern "C" ASCEND_DEEPEP_EXPORT void combine_prepare_kernel_do(void* stream, uint8_t* workspace, uint8_t* tiling)
-{
-    combine_prepare_kernel<<<64, 0, stream>>>(workspace, *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
-}
-#endif
-extern "C" ASCEND_DEEPEP_EXPORT void combine_kernel_do(void* stream, uint8_t* workspace, uint8_t* input,
-                                                       uint8_t* forward, uint8_t* counts, uint8_t* backward,
-                                                       uint8_t* backward_counts, uint8_t* mask, uint8_t* ranges,
-                                                       uint8_t* masks, uint8_t* weights, uint8_t* weight_meta,
-                                                       uint8_t* tiling)
-{
-    combine_kernel<<<64, ascend_deepep::combine_config::kLaunchUbBytes, stream>>>(
-        workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, weights, weight_meta,
-        *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
-}
-
-// Same scheduler and arithmetic as combine_kernel, with fixed-size diagnostics.
-// Legacy V46 tracing stays disabled in both specializations.
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_profile_kernel(
-    GM_ADDR workspace, GM_ADDR input, GM_ADDR forward, GM_ADDR counts, GM_ADDR backward, GM_ADDR backward_counts,
-    GM_ADDR mask, GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta, GM_ADDR profile, uint64_t sample,
-    GM_ADDR chunk_profile, GM_ADDR peer_profile, ascend_deepep::PutCombineTiling tiling)
-{
-    util_set_ffts_config(0U);
-#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Combine<false, true>(workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr,
-                         weights, weight_meta, tiling, profile, sample, chunk_profile, peer_profile);
-#endif
-}
-extern "C" ASCEND_DEEPEP_EXPORT void combine_profile_kernel_do(
-    void* stream, uint8_t* workspace, uint8_t* input, uint8_t* forward, uint8_t* counts, uint8_t* backward,
-    uint8_t* backward_counts, uint8_t* mask, uint8_t* ranges, uint8_t* masks, uint8_t* weights, uint8_t* weight_meta,
-    uint8_t* profile, uint64_t sample, uint8_t* chunk_profile, uint8_t* peer_profile, uint8_t* tiling)
-{
-    combine_profile_kernel<<<64, ascend_deepep::combine_config::kLaunchUbBytes, stream>>>(
-        workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, weights, weight_meta,
-        profile, sample, chunk_profile, peer_profile, *reinterpret_cast<ascend_deepep::PutCombineTiling*>(tiling));
-}

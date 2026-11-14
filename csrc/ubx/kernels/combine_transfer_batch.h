@@ -11,6 +11,7 @@ namespace UbxCombine {
 class TransferBatch {
     static constexpr uint32_t kWords = (UbxDispatch::DISPATCH_DEDUP_MAX_RANK_SIZE + 31U) / 32U;
     const __gm__ UbxTransport::Args* args_ = nullptr;
+    deepep::CoreContext core_{};
     uint32_t bytes_ = 0U, count_ = 0U, capacity_ = 0U;
     uint32_t peers_[kWords]{};
     GM_ADDR stage_ = nullptr;
@@ -31,7 +32,7 @@ class TransferBatch {
                 if (mask & (1U << bit)) {
                     const uint32_t peer = word * 32U + bit;
 
-                    UbxTransport::Quiet(peer, scratch);
+                    UbxTransport::Quiet(peer, scratch, core_);
                 }
             peers_[word] = 0U;
         }
@@ -50,7 +51,8 @@ class TransferBatch {
         PreparedWrite write;
         bool prepared = false;
         if (partial_) {
-            prepared = write.Prepare(peer, UbxTransport::RemoteAddress(args_, peer, offset), src, bytes_, privateUb_);
+            prepared =
+                write.Prepare(peer, UbxTransport::RemoteAddress(args_, peer, offset), src, bytes_, privateUb_, core_);
         }
 
         WaitStage();
@@ -58,14 +60,15 @@ class TransferBatch {
         if (prepared)
             write.Publish();
         else
-            UbxTransport::Put(args_, peer, UbxTransport::RemoteAddress(args_, peer, offset), src, bytes_, scratch);
+            UbxTransport::Put(args_, peer, UbxTransport::RemoteAddress(args_, peer, offset), src, bytes_, scratch,
+                              core_);
 
         peers_[peer / 32U] |= 1U << (peer % 32U);
         if (++count_ == capacity_) Retire(scratch);
     }
 
 public:
-    __aicore__ inline void Init(const __gm__ UbxTransport::Args* args, uint32_t bytes)
+    __aicore__ inline void Init(const __gm__ UbxTransport::Args* args, uint32_t bytes, deepep::CoreContext core)
     {
         if (Pending() || !bytes || bytes % 512U || bytes > UbxRdma::kCoreBytes) {
             AscendC::Trap();
@@ -73,9 +76,10 @@ public:
         }
         args_ = args;
         bytes_ = bytes;
+        core_ = core;
         capacity_ = UbxRdma::kCoreBytes / bytes;
-        if (uint32_t(args->rankSize) > UbxDispatch::kLlPhysicalRanksPerHost)
-            stage_ = UbxTransport::Stage(args, capacity_ * bytes);
+        if (DEEPEP_UBX_LAUNCH_WORLD(args) > UbxDispatch::kLlPhysicalRanksPerHost)
+            stage_ = UbxTransport::Stage(args, capacity_ * bytes, core);
     }
     __aicore__ inline void SetPartialScratch(AscendC::LocalTensor<uint8_t> scratch)
     {

@@ -119,12 +119,13 @@ class KernelEventTimer:
         self.native.combine_low_latency = self.launch
         return self
 
-    def launch(self, *args):
+    def launch(self, *args, **kwargs):
         try:
-            if self.calls or args[-1] != self.target.value:
+            stream = kwargs["stream"] if "stream" in kwargs else args[-1]
+            if self.calls or stream != self.target.value:
                 raise RuntimeError("Expected exactly one Combine launch on the measured stream")
             LaunchGate.check(self.acl.aclrtRecordEvent(self.start, self.target), "record start Event")
-            result = self.original(*args)
+            result = self.original(*args, **kwargs)
             LaunchGate.check(self.acl.aclrtRecordEvent(self.end, self.target), "record end Event")
             self.calls = 1
             return result

@@ -21,15 +21,16 @@ public:
                                 GM_ADDR sendCountsOut, GM_ADDR tokenTypeOut, GM_ADDR destinationIndexOut,
                                 GM_ADDR relayReadIndexOut, GM_ADDR sourceMaskOut, GM_ADDR expertScalesOut, uint32_t bs,
                                 uint32_t h, uint32_t topK, uint32_t experts, uint32_t expertTokenNumsType,
-                                EpServerDedupInputMode inputMode, bool e4m3, TPipe* pipe,
+                                EpServerDedupInputMode inputMode, bool e4m3, TPipe* pipe, deepep::CoreContext core,
                                 GM_ADDR inputScales = nullptr, bool enableDedup = true,
                                 LlReferenceProfile::DeviceProfile* profile = nullptr)
     {
 
         profile_ = profile;
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
-        core_ = GetBlockIdx();
-        sendCores_ = GetBlockNum() / 2U;
+        coreContext_ = core;
+        core_ = core.index;
+        sendCores_ = DEEPEP_LL_LAUNCH_CORES(core) / 2U;
         pipe_ = pipe;
 
         if (profile_) profile_->Mark<2>();  // w2: magic_begin
@@ -37,15 +38,15 @@ public:
         if (profile_) profile_->Mark<3>();  // w3: magic_end
 
         counts_.Init(commArgs, expertIds, expertTokenNumsOut, sendCountsOut, bs, topK, experts, expertTokenNumsType,
-                     magic, pipe, profile_);
+                     magic, pipe, core, profile_);
         if (profile_) profile_->Mark<4>();  // w4: counts_init_end
 
         if (core_ < sendCores_)
             sender_.Init(args_, x, expertIds, expertScales, sourceMaskOut, expertScalesOut, bs, h, topK, experts,
-                         inputMode, e4m3, pipe, magic, inputScales, enableDedup);
+                         inputMode, e4m3, pipe, core, magic, inputScales, enableDedup);
         else
             receiver_.Init(args_, expandXOut, dynamicScalesOut, tokenTypeOut, destinationIndexOut, relayReadIndexOut,
-                           bs, h, topK, experts, inputMode, pipe, magic, enableDedup);
+                           bs, h, topK, experts, inputMode, pipe, core, magic, enableDedup);
         if (profile_) profile_->Mark<5>();  // w5: role_init_end
     }
 
@@ -115,6 +116,7 @@ private:
     ServerDedupSender<XType, Group> sender_;
     ServerDedupReceiver receiver_;
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
+    deepep::CoreContext coreContext_{};
     TPipe* pipe_ = nullptr;
     uint32_t core_ = 0, sendCores_ = 0;
 };

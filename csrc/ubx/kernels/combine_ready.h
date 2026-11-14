@@ -61,7 +61,7 @@ public:
         // Includes delayed, unused peers. Never clear before their write arrived.
         AscendC::Duplicate(indices_, uint32_t(0), 128U);
         Sync<AscendC::HardEvent::V_MTE3>();
-        auto dest = Tensor(uint32_t(args_->rank),
+        auto dest = Tensor(uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)),
                            COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET + (core_ - send_) * 512U);
         AscendC::DataCopyPad(dest, indices_, {1U, 512U, 0U, 0U, 0U});
     }
@@ -87,7 +87,7 @@ private:
     __aicore__ inline uint64_t ReadMask(uint64_t offset, uint32_t count, uint32_t expected)
     {
         Sync<AscendC::HardEvent::V_MTE2>();
-        AscendC::DataCopyPad(input_, Tensor(uint32_t(args_->rank), offset), {1U, count * 32U, 0U, 0U, 0U},
+        AscendC::DataCopyPad(input_, Tensor(uint32_t(DEEPEP_UBX_LAUNCH_RANK(args_)), offset), {1U, count * 32U, 0U, 0U, 0U},
                              {false, 0U, 0U, uint32_t(0)});
         Sync<AscendC::HardEvent::MTE2_V>();
 

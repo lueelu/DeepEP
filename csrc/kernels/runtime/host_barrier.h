@@ -1,4 +1,4 @@
-// DeepEP-owned NDR Host barrier. Compiled into libdeepep_kernels, never SHMEM.
+// DeepEP-owned NDR Host barrier. JIT-compiled with the device source, never SHMEM.
 // Uses the locked SDK's existing transport APIs without modifying the SDK.
 // Host callers must serialize this collective with communication kernels.
 ACLSHMEM_DEVICE void deepep_barrier_store(__gm__ int32_t* address, int32_t value)

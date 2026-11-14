@@ -79,6 +79,16 @@ MegaMoE 构建及仓内 SDK 复用保持严格校验，SDK 必须与锁文件匹
 不同工具链、SDK、Python 环境和构建模式使用不同指纹目录；源码哈希仅用于标识产物，
 修改 Python、测试或单个 kernel 不切换整个构建目录。`DEEPEP_BUILD_MEGAMOE` 默认 OFF；
 ON 的构建与使用方式见 [MegaMoE 文档](../experiments/megamoe/README.md)。
+
+DeepJIT 是必选 Host 依赖（与 DeepEP-Ascend 相同），构建总是把 JIT
+编译、加载、绑定并入主扩展 `_C`，不再产生独立 `_jit_C`。`_C` 使用 C++20，并链接
+`torch`/`torch_npu`；DeepJIT 头文件来自锁定的 `third-party/deep_jit/include`（源码 checkout 用
+`git submodule update --init -- third-party/deep_jit`；sdist 已携带头文件与 MIT 声明）。
+`build_support.py` 把 `csrc` 头文件、SHMEM Device 头文件打包到安装目录的 `_kernel_src/`，
+安装后直接做离线编译，不再依赖 manifest 二次校验；LL 启动路径固定使用 JIT。
+Host 标准库没有可用 `<format>` 时（如 GCC 11）由 CMake 生成并以 `FMT_HEADER_ONLY` 编译/链接校验
+fmt 适配头，同时编译锁定 DeepJIT 的真实格式化表达式；`DEEPEP_DEEPJIT_FMT_ROOT` 必须显式指向
+包含 `fmt/format.h` 的目录。缺少 libdwfl 开发头时使用构建输出声明，不阻断 wheel。
 安装产物没有构建机绝对 RPATH。`deep_ep/.libs/` 携带 `libshmem.so`、`libshmem_utils.so`、
 `aclshmem_bootstrap_config_store.so` 和 `aclshmem_bootstrap_uid.so`，哈希记录在 `_build_info.json` 中。
 公开接口首次使用 native 时先校验这些文件，再按包内绝对路径加载；V1/V2 共用此入口。
@@ -93,7 +103,7 @@ Host 编译器优先使用 `CXX` 指定的可执行文件；未设置时依次�
 `c++`、`g++`、`clang++`、`bisheng++`、`bisheng`，再查找 CANN 的
 `tools/bisheng_compiler/bin`。自动探测会跳过无法执行 `--version` 的候选；
 显式指定的 `CXX` 无效则报错。保留 `c++ -> ccache` 等符号链接的调用名称，
-不要把 `CXX` 设成裸 `ccache`。编译器是否满足 C++17 和链接要求仍由 CMake/实际构建验证。
+不要把 `CXX` 设成裸 `ccache`。编译器是否满足 C++20 和链接要求仍由 CMake/实际构建验证。
 日志会输出选中的 Host 编译器路径，Device kernel 继续使用 CANN Bisheng。
 
 单机编译并安装仍使用：
@@ -143,15 +153,16 @@ export DEEPEP_BUILD_TYPE=RelWithDebInfo  # Release / RelWithDebInfo / Debug
 
 - `build_support.py`：环境校验、工具链缓存、调用 CMake、写入 `_build_info.json`。
 - 根 `CMakeLists.txt`：Host 封装、Python 扩展 `_C.so`、能力声明、链接及安装。
-- `cmake/Device.cmake`：每次进入独立 Device 构建，由子工程判断是否需要重新编译。
-- `cmake/device/CMakeLists.txt`：Bisheng 源文件列表及编译选项，生成 `libdeepep_kernels.so`。
+- 根 `CMakeLists.txt`：Host 封装、Python 扩展 `_C.so` / `_clos_C.so`、共享 `libdeepep_jit.so`。
+- 核心 notify/dispatch/combine/LL/UBX 与 direct 的设备代码由 DeepJIT 在首次调用时编译；
+  `_kernel_src` 提供源码/头文件，`cmake/DeepJIT.cmake` 提供 fmt 适配。
 - `cmake/Dependencies.cmake`：Host/Device 共用的 CANN 和 SHMEM 库定位。
 
 新增算子涉及的源码注册和检查项见[开发指南](development.md)。
 编译器依赖信息负责追踪公共头文件；无改动、仅改 Python/测试时，不重新编译原生目标。
 修改一个 kernel 时仅编译受影响的对象并重新链接，修改公共头文件时重编依赖它的对象。
 
-wheel 中 `_C.so` 和 `libdeepep_kernels.so` 放在同一目录，通过 `$ORIGIN` 查找。
+wheel 中 `_C.so`、`_clos_C.so` 和 `libdeepep_jit.so` 放在同一安装目录，通过 `$ORIGIN` 查找。
 安装阶段会清除 setuptools 构建目录里遗留的旧 `libdeepep_notify.so`；包校验拒绝混入旧库。
 CPU 构建预检和打包回归位于 `tests/runtime/test_build.py`，检查配置、缓存键、构建命令与产物要求；
 这些测试不执行真实 Bisheng 编译，也不替代 Device 增量构建和设备验收。

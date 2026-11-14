@@ -13,6 +13,7 @@
 #endif
 #include "../common/ll_count_frame_layout.h"
 #include "../common/ll_count_assignment.h"
+#include "../common/ll_jit_spec.h"
 #include "../common/ll_reference_profile_device.h"
 #include "adv_api/reduce/sum.h"
 #include "../common/ep_memory_server_dedup_count_layout.h"
@@ -32,15 +33,17 @@ public:
     // 摘要：绑定路由与计数输出，选择本轮控制区；保存并调整 CTRL[60]，供整数位模式的 FP32 归约使用。
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertIds, GM_ADDR expertTokenNumsOut, GM_ADDR sendCountsOut,
                                 uint32_t bs, uint32_t topK, uint32_t experts, uint32_t expertTokenNumsType,
-                                int64_t magic, TPipe* pipe, LlReferenceProfile::DeviceProfile* profile = nullptr)
+                                int64_t magic, TPipe* pipe, deepep::CoreContext core,
+                                LlReferenceProfile::DeviceProfile* profile = nullptr)
     {
         tpipe_ = pipe;
         profile_ = profile;
+        coreContext_ = core;
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
-        epRankId_ = args_->rank;
-        epWorldSize_ = args_->rankSize;
-        aivId_ = GetBlockIdx();
-        coreNum_ = GetBlockNum();
+        epRankId_ = DEEPEP_LL_LAUNCH_RANK(args_);
+        epWorldSize_ = DEEPEP_LL_LAUNCH_WORLD(args_);
+        aivId_ = core.index;
+        coreNum_ = DEEPEP_LL_LAUNCH_CORES(core);
         aivUsedAllToAll_ = aivUsedCumSum_ = coreNum_ / 2U;
         axisBS_ = bs;
         axisK_ = topK;
@@ -52,7 +55,7 @@ public:
         packedFrames_ = LlTransport::Rdma(args_) && epWorldSize_ > 16U;
         directRanks_ = LlTransport::Rdma(args_) && epWorldSize_ > kLlPhysicalRanksPerHost;
         countWindow_ = DispatchServerDedupWindowOffset(magic);
-        retirement_.Init(args_);
+        retirement_.Init(args_, core);
         layout_ = DispatchServerDedupCountLayout(experts, coreNum_);
         stateOffset_ = DispatchServerDedupWindowOffset(magic) + layout_.cntOffset;
         GM_ADDR localState = args_->peerMems[epRankId_] + stateOffset_;
@@ -153,6 +156,7 @@ private:
     __aicore__ inline void WaitCumSumFlag();
 
     TPipe* tpipe_ = nullptr;
+    deepep::CoreContext coreContext_{};
     LlReferenceProfile::DeviceProfile* profile_ = nullptr;
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
     EpServerDedupCountLayout layout_{};
@@ -232,7 +236,8 @@ __aicore__ inline void ServerDedupCounts::SendCnt()
             const auto frame = CountFrame(rscvStatusNum_, epWorldSize_, cores,
                                           destination, epRankId_, 0U, true);
             LlTransport::DirectCountFrame(args_, destination, stateOffset_ + frame.frameOffset,
-                remoteFrame.ReinterpretCast<uint8_t>(), moeExpertNumPerRank_, dstExpBuf_.Get<uint8_t>(), countWindow_);
+                remoteFrame.ReinterpretCast<uint8_t>(), moeExpertNumPerRank_, dstExpBuf_.Get<uint8_t>(), coreContext_,
+                countWindow_);
             retirement_.Posted(task);
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
             if (profile_) {
@@ -358,13 +363,14 @@ __aicore__ inline void ServerDedupCounts::SendExpertCntRange(uint32_t start, uin
                 useAllCoreCount_ ? coreNum_ : aivUsedCumSum_, dst, epRankId_, localExpert, directRanks_);
             if (frame.firstExpert != localExpert || frame.records != count) { Trap(); return; }
             LlTransport::CountFrame(args_, dst, stateOffset_ + frame.frameOffset, stateOffset_ + frame.commitOffset,
-                statusTensor_[(expert - start) * UB_ALIGN_DATA_COUNT].ReinterpretCast<uint8_t>(), count, workBuf_.Get<uint8_t>());
+                statusTensor_[(expert - start) * UB_ALIGN_DATA_COUNT].ReinterpretCast<uint8_t>(), count,
+                workBuf_.Get<uint8_t>(), coreContext_);
             expert += count;
             continue;
         }
         LlTransport::Records(args_, dst, stateOffset_ + offset,
             statusTensor_[(expert - start) * UB_ALIGN_DATA_COUNT].ReinterpretCast<uint8_t>(),
-            count, epWorldSize_ * kEpServerDedupCountGmStride, true, workBuf_.Get<uint8_t>());
+            count, epWorldSize_ * kEpServerDedupCountGmStride, true, workBuf_.Get<uint8_t>(), coreContext_);
         expert += count;
     }
 }

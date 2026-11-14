@@ -1,34 +1,4 @@
-#include <cstdint>
-
-#include "kernels/common/ub_workspace.h"
-#include "kernel_operator.h"
-#include "shmem.h"
-
-#include "kernels/notify/notify_recv_prefix.h"
-#include "kernels/notify/notify_dispatch_plan.h"
-#include "kernels/common/v2_handle.h"
-#include "common/launch.h"
-#include "common/types.h"
-
-using namespace AscendC;
-
-namespace {
-
-constexpr int32_t kNotifyInt32Bytes = 4;
-constexpr int32_t kNotifyInt32AlignElems = 8;
-constexpr int32_t kNotifyDispatchUbBytes = static_cast<int32_t>(ascend_deepep::platform::kKernelUbBytes);
-constexpr int32_t kMaxVectorTileElems = 16 * 1024;
-constexpr int32_t kRouteRowUbOffset = 2 * kMaxVectorTileElems * kNotifyInt32Bytes;
-constexpr int32_t kRouteHalfUbOffset = kRouteRowUbOffset + kMaxVectorTileElems * sizeof(uint8_t);
-constexpr int32_t kRouteHalfUbEnd = kRouteHalfUbOffset + kMaxVectorTileElems * sizeof(half);
-static_assert(kRouteHalfUbEnd <= kNotifyDispatchUbBytes);
-
-__aicore__ inline int32_t NotifyIntMin(int32_t lhs, int32_t rhs)
-{
-    return lhs < rhs ? lhs : rhs;
-}
-
-} // namespace
+#include "notify_dispatch_common.hpp"
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispatch_kernel(
     GM_ADDR num_tokens_per_rank, GM_ADDR num_tokens_per_expert, GM_ADDR is_token_in_rank, GM_ADDR symmetric_buffer,
@@ -389,48 +359,4 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispa
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
     }
-}
-
-extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
-    uint32_t block_dim, void* stream, uint8_t* num_tokens_per_rank, uint8_t* num_tokens_per_expert,
-    uint8_t* is_token_in_rank, uint8_t* symmetric_buffer, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix,
-    uint8_t* recv_channel_prefix_matrix, uint8_t* num_recv_tokens, uint8_t* num_recv_tokens_per_expert,
-    uint8_t* dispatch_plan, uint8_t* send_head, uint8_t* tiling_host, uint64_t ffts_addr)
-{
-    auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
-    notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kNotifyDispatchUbBytes), stream>>>(
-        num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank, symmetric_buffer, rank_prefix_matrix,
-        channel_prefix_matrix, recv_channel_prefix_matrix, num_recv_tokens, num_recv_tokens_per_expert,
-        dispatch_plan, send_head, *td, ffts_addr);
-}
-
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr)
-{
-    util_set_ffts_config(ffts_addr);
-    aclshmemi_sync_npu_v4<true>(0);
-}
-
-extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
-    uint32_t block_dim, void* stream, uint64_t ffts_addr)
-{
-    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr);
-}
-
-// Legacy six-tensor handles have no private plan. Rebuild locally on the same
-// stream after cached notify's collective, without touching cached SHMEM data.
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void cached_dispatch_plan_kernel(
-    GM_ADDR routes, GM_ADDR plan, GM_ADDR head, ascend_deepep::DispatchTilingData td, uint64_t ffts_addr)
-{
-    util_set_ffts_config(ffts_addr);
-    if ASCEND_IS_AIC { return; }
-    ascend_deepep::UbWorkspace resource;
-    const uint32_t channel = get_block_idx() * get_subblockdim() + get_subblockid();
-    ascend_deepep::BuildDispatchPlan(resource, routes, plan, head, td, channel);
-}
-extern "C" ASCEND_DEEPEP_EXPORT void cached_dispatch_plan_kernel_do(
-    uint32_t block_dim, void* stream, uint8_t* routes, uint8_t* plan, uint8_t* head, uint8_t* tiling_host, uint64_t ffts_addr)
-{
-    auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
-    cached_dispatch_plan_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kNotifyDispatchUbBytes), stream>>>(
-        routes, plan, head, *td, ffts_addr);
 }

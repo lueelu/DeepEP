@@ -73,7 +73,7 @@ def inspect_wheel(path):
                 "deep_ep_experimental/megamoe/api.py",
                 "deep_ep_experimental/megamoe/benchmark.py",
                 "deep_ep_experimental/megamoe/configs/smoke.json",
-                "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
+                "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_common.hpp",
             }
             extensions = [
                 n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_C.") and n.endswith(".so")
@@ -113,16 +113,6 @@ def inspect_wheel(path):
         elif any(n.startswith(component) for n in names):
             raise RuntimeError("Core wheel contains disabled EP_GMM_FUSED artifacts")
 
-        kernel_capabilities = {
-            "elastic-low-latency-ndr-hns1825-v8",
-            "elastic-notify-metadata-v6",
-            "elastic-notify-metadata-v7",
-            "elastic-dispatch-expanded-v1",
-            "elastic-combine-expanded-v3",
-        }
-        if kernel_capabilities.intersection(info.get("capabilities", [])):
-            if "deep_ep/libdeepep_kernels.so" not in names:
-                raise RuntimeError("Kernel capabilities require their packaged Device library")
         if "deep_ep/libdeepep_notify.so" in names:
             raise RuntimeError("Wheel contains a stale libdeepep_notify.so; rebuild the package")
         operations = info.get("communication_operations")

@@ -22,8 +22,11 @@ pybind11_add_module(_clos_C NO_EXTRAS
     "${_direct_root}/ops/launcher.cpp" "${_direct_root}/runtime/shmem_instance.cpp"
     "${_direct_root}/runtime/buffer_runtime.cpp"
     "${_direct_root}/ops/aggregate.cpp" "${_direct_root}/ops/combine.cpp"
-    "${_direct_root}/ops/dispatch.cpp" "${_direct_root}/ops/expand.cpp")
-target_include_directories(_clos_C PRIVATE "${_direct_root}"
+    "${_direct_root}/ops/dispatch.cpp" "${_direct_root}/ops/expand.cpp"
+    "${_direct_root}/ops/jit_entries.cpp")
+set_target_properties(_clos_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+deepep_apply_deepjit(_clos_C)
+target_include_directories(_clos_C PRIVATE "${_direct_root}" "${CMAKE_SOURCE_DIR}/csrc"
     ${TORCH_INCLUDE_DIRS} "${_torch_npu_root}/include" "${_torch_npu_root}/.."
     "${ASCEND_HOME_PATH}/include" "${ASCEND_HOME_PATH}/include/experiment/runtime"
     "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src")
@@ -31,6 +34,6 @@ target_compile_definitions(_clos_C PRIVATE TORCH_EXTENSION_NAME=_clos_C
     _GLIBCXX_USE_CXX11_ABI=${_torch_abi} ASCEND_DEEPEP_ARCH=3510 EP_NUM_TOPK_IDX_BITS=64)
 target_compile_options(_clos_C PRIVATE -O2)
 target_link_libraries(_clos_C PRIVATE ${TORCH_LIBRARIES} "${_torch_python}" "${_torch_npu}"
-    ascendcl ascend_runtime shmem deepep_clos_device "${_tiling}" "${_platform}" ${CMAKE_DL_LIBS})
+    ascendcl ascend_runtime shmem deepep_jit "${_tiling}" "${_platform}" ${CMAKE_DL_LIBS})
 set_target_properties(_clos_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS _clos_C LIBRARY DESTINATION .)

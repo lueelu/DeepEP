@@ -1,5 +1,6 @@
 #pragma once
 #include "kernel_operator.h"
+#include "../../../common/core_context.h"
 #include "ll_reference_profile_layout.h"
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
 #include "shmem.h"
@@ -22,11 +23,11 @@ public:
         return 0U;
 #endif
     }
-    __aicore__ inline void Init(GM_ADDR address)
+    __aicore__ inline void Init(GM_ADDR address, deepep::CoreContext core)
     {
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
-        record_ = address ? reinterpret_cast<__gm__ uint64_t*>(address) +
-                            AscendC::GetBlockIdx() * kWordsPerCore : nullptr;
+        core_ = core;
+        record_ = address ? reinterpret_cast<__gm__ uint64_t*>(address) + core.index * kWordsPerCore : nullptr;
         valid_ = 0U;
         for (uint32_t i = 0; i < 32U; ++i) send_[i] = 0U;
         sendRemote_ = sendGroup_ = false;
@@ -127,9 +128,9 @@ public:
         send_[0] = 1U;
         for (uint32_t i = 0; i < 32U; ++i) record_[64U + i] = send_[i];
         record_[50] = rank;                         // w50: rank (metadata, not a clock)
-        record_[51] = AscendC::GetBlockIdx();        // w51: AIV_core
+        record_[51] = core_.index;                  // w51: AIV_core
         record_[52] = world;                        // w52: EP
-        record_[53] = AscendC::GetBlockNum();        // w53: active_aiv
+        record_[53] = core_.count;                  // w53: active_aiv
         record_[54] = bs;                           // w54: BS
         record_[55] = kSchema;                      // w55: schema
         record_[56] = 1U;                           // w56: operation, dispatch only
@@ -148,6 +149,7 @@ public:
     }
 private:
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
+    deepep::CoreContext core_{};
     __gm__ uint64_t* record_ = nullptr;
     uint64_t valid_ = 0U;
     uint64_t send_[32]{};

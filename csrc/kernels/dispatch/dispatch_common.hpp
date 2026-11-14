@@ -1,3 +1,5 @@
+#pragma once
+
 // Copyright (c) 2026, Lu Lu
 
 #include "kernel_operator.h"
@@ -590,39 +592,3 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
 }
 #endif
 }  // namespace
-
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_kernel(GM_ADDR workspace,
-                                                                                    GM_ADDR destinations,
-                                                                                    GM_ADDR forward, GM_ADDR counts,
-                                                                                    GM_ADDR weights, GM_ADDR scales,
-                                                                                    ascend_deepep::DispatchTiling t)
-{
-    util_set_ffts_config(0U);
-#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Dispatch<false>(workspace, destinations, forward, counts, weights, scales, t);
-#endif
-}
-
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_profile_kernel(
-    GM_ADDR workspace, GM_ADDR destinations, GM_ADDR forward, GM_ADDR counts, GM_ADDR weights, GM_ADDR scales,
-    ascend_deepep::DispatchTiling t)
-{
-    util_set_ffts_config(0U);
-#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Dispatch<true>(workspace, destinations, forward, counts, weights, scales, t);
-#endif
-}
-
-extern "C" ASCEND_DEEPEP_EXPORT void dispatch_kernel_do(void* stream, uint8_t* workspace, uint8_t* destinations,
-                                                        uint8_t* forward, uint8_t* counts, uint8_t* weights,
-                                                        uint8_t* scales, uint8_t* tiling)
-{
-    const auto t = *reinterpret_cast<ascend_deepep::DispatchTiling*>(tiling);
-    if (t.profile) {
-        dispatch_profile_kernel<<<64, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(192 * 1024), stream>>>(
-            workspace, destinations, forward, counts, weights, scales, t);
-        return;
-    }
-    dispatch_kernel<<<64, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(192 * 1024), stream>>>(workspace, destinations, forward,
-                                                                                counts, weights, scales, t);
-}

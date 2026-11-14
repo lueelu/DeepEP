@@ -106,7 +106,18 @@ def combine(
                     if not isinstance(value, torch.Tensor):
                         raise ValueError("LL handle is missing a required tensor")
                     value.record_stream(runtime.stream)
-                native.combine_low_latency(runtime.native, tensors, b, h, k, e, dtype, runtime.stream.npu_stream)
+                capacity = handle.num_max_tokens_per_rank
+                native.combine_low_latency(
+                    runtime.native,
+                    tensors,
+                    b,
+                    h,
+                    k,
+                    e,
+                    dtype,
+                    runtime.stream.npu_stream,
+                    capacity=capacity,
+                )
                 for value in biases:
                     output.add_(value)
                 event = EventOverlap._from_resources(EventHandle(), retained)

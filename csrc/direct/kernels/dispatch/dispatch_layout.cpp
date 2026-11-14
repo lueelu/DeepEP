@@ -231,12 +231,3 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_lay
         }
     }
 }
-
-extern "C" ASCEND_DEEPEP_EXPORT void dispatch_layout_kernel_do(
-    uint32_t block_dim, void* stream, uint8_t* topk_idx, uint8_t* scratch_buffer, uint8_t* num_tokens_per_rank,
-    uint8_t* num_tokens_per_expert, uint8_t* is_token_in_rank, uint8_t* tiling_host, uint64_t ffts_addr)
-{
-    auto* td = reinterpret_cast<ascend_deepep::DispatchLayoutTilingData*>(tiling_host);
-    dispatch_layout_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchLayoutUbBytes), stream>>>(
-        topk_idx, scratch_buffer, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank, *td, ffts_addr);
-}

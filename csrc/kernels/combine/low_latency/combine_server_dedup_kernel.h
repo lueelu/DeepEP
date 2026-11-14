@@ -5,8 +5,10 @@
 #define COMBINE_DEDUP_EP_COMBINE_MEMORY_SERVER_DEDUP_KERNEL_H
 
 #include "kernel_operator.h"
+#include "../../common/core_context.h"
 #include "../../dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h"
 #include "../../dispatch/low_latency/common/comm_args.h"
+#include "../../dispatch/low_latency/common/ll_jit_spec.h"
 #include "ep_memory_server_dedup_buffer_layout.h"
 #include "ep_memory_server_dedup_combine_config.h"
 #include "combine_server_dedup_partial.h"
@@ -24,10 +26,13 @@ public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
                                 GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK, uint32_t experts, uint8_t dtype,
-                                uint8_t quantMode, int64_t magic, bool enableDedup = true)
+                                uint8_t quantMode, int64_t magic, uint32_t world, deepep::CoreContext core,
+                                bool enableDedup = true)
     {
         (void)quantMode;
-        core_ = GetBlockIdx();
+        coreContext_ = core;
+        core_ = core.index;
+        world_ = world;
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
         enableDedup_ = enableDedup;
         h_ = h;
@@ -54,9 +59,9 @@ public:
         DataCopyPad(tokenCount, prefix[experts - 1U], {1U, 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0});
         Sync<HardEvent::MTE2_S>();
         const int32_t tokens = tokenCount.GetValue(0U);
-        const uint32_t localExperts = experts / uint32_t(args_->rankSize);
+        const uint32_t localExperts = experts / world_;
         const uint32_t copies = topK < localExperts ? topK : localExperts;
-        const uint64_t capacity = uint64_t(args_->rankSize) * bs * copies;
+        const uint64_t capacity = uint64_t(world_) * bs * copies;
         if (tokens < 0 || uint32_t(tokens) > kEpServerDedupCombineMaxTokenNum || uint64_t(tokens) > capacity) {
             Trap();  // Invalid device data must not become a truncated successful launch.
             return;
@@ -79,7 +84,7 @@ public:
         expert_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(expertOut));
         table_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(assistInfoForCombine));
         types_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tokenType));
-        stage_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[args_->rank] + stageBase_));
+        stage_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[DEEPEP_LL_LAUNCH_RANK(args_)] + stageBase_));
         preparePublish_ = Allocate<float>(256U);
         prepareInput_ = Allocate<float>(2304U);
         prepareWork_ = Allocate<float>(512U);
@@ -125,6 +130,11 @@ public:
         PipeBarrier<PIPE_ALL>();
     }
 
+    // SuperKernel sub-task boundary. Retires the member TPipe without the
+    // implicit whole-pipe barrier; all business DMA and output retirement has
+    // already completed in Process().
+    __aicore__ inline void Destroy() { pipe_.DestroyWithoutPipeAll(); }
+
 private:
     __aicore__ inline void AggregateSourceTokensM6()
     {
@@ -133,7 +143,7 @@ private:
         // M5, but owns its output events because M4 did not run on this launch.
         aggregate.InitDirectShared(
             arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes],
-            args_->peerMems[args_->rank] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET, weightsAddr_,
+            args_->peerMems[DEEPEP_LL_LAUNCH_RANK(args_)] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET, weightsAddr_,
             outputAddr_, bs_, h_, topK_, dtype_, core_ - kEpServerDedupCombineSendCoreNum,
             kEpServerDedupCombineRecvCoreNum, workspace_);
         aggregate.Process();
@@ -143,7 +153,7 @@ private:
     {
         ServerDedupSourceAggregate aggregate;
         aggregate.Init(arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes],
-                       args_->peerMems[args_->rank] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET,
+                       args_->peerMems[DEEPEP_LL_LAUNCH_RANK(args_)] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET,
                        masksAddr_, weightsAddr_, outputAddr_, bs_, h_, topK_, dtype_,
                        core_ - kEpServerDedupCombineSendCoreNum, kEpServerDedupCombineRecvCoreNum, workspace_,
                        partialTasks_, enableDedup_);
@@ -218,7 +228,7 @@ private:
         Sync<HardEvent::V_S>();
         for (uint32_t j = 0; j < 8U; ++j) preparePublish_.SetValue(j * 8U, 1.0f);
         Sync<HardEvent::S_MTE3>();
-        auto done = Control(args_->rank, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET);
+        auto done = Control(DEEPEP_LL_LAUNCH_RANK(args_), COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET);
         DataCopyPad(done[core_ * 8U], preparePublish_, {8U, 32U, 0U, 2016U, 0U});
     }
     __aicore__ inline void CacheTableRows(uint32_t row, uint32_t start, uint32_t task, uint32_t count,
@@ -281,7 +291,7 @@ private:
             Muls(typeUb_, indexUb_, int32_t(1), tokens_);
         }
         Sync<HardEvent::V_S>();
-        ServerDedupRankMask(maskUb_, tableUb_.ReinterpretCast<uint8_t>(), typeUb_, 0, int32_t(args_->rankSize),
+        ServerDedupRankMask(maskUb_, tableUb_.ReinterpretCast<uint8_t>(), typeUb_, 0, int32_t(world_),
                             uint32_t(selected_));
         uint64_t valid = 0U;
         GatherMask(indexUb_, packedUb_, maskUb_.ReinterpretCast<uint32_t>(), true, uint32_t(selected_),
@@ -303,8 +313,8 @@ private:
     {
         PrepareDirectRows();
         if (selected_ == 0U) return;
-        const uint32_t servers = uint32_t(args_->rankSize) / 8U;
-        const uint32_t ownServer = uint32_t(args_->rank) / 8U;
+        const uint32_t servers = world_ / 8U;
+        const uint32_t ownServer = uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) / 8U;
         uint32_t owner = 0U, sendSequence = 0U;
         uint64_t flagMask[2] = {0xffU, 0U};
         for (uint32_t lane = 0; lane < lanes_; ++lane) {
@@ -373,7 +383,7 @@ private:
         ServerDedupPartial partial;
         partial.Init(args_, &pipe_, arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes], expertAddr_,
                      tableAddr_, relayAddr_, typesAddr_, tokens_, bs_, h_, topK_, experts_, dtype_, window_,
-                     workspace_);
+                     workspace_, world_, core_);
         partialTasks_ = partial.Process();
         // Retire only input and Vector users before scalar metadata reuse.
         // M4 output slots and MTE3_V events stay live for M5's per-slot waits.
@@ -395,7 +405,7 @@ private:
     }
     __aicore__ inline void NotifyServerCard()
     {
-        auto done = Control(args_->rank,
+        auto done = Control(DEEPEP_LL_LAUNCH_RANK(args_),
                             COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET + uint64_t(core_ - 56U) * 2048U);
         WaitFlags(done, prepareInput_, prepareWork_, prepareSum_, 64U);
         Duplicate<float>(prepareZero_, 0.0f, 512U);
@@ -405,14 +415,14 @@ private:
         Sync<HardEvent::V_MTE3>();
         Sync<HardEvent::S_MTE3>();
         DataCopyPad(done, prepareZero_, {1U, 2048U, 0U, 0U, 0U});
-        const uint32_t target = uint32_t(args_->rank) / 8U * 8U + core_ - 56U;
+        const uint32_t target = uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) / 8U * 8U + core_ - 56U;
         auto ready = Control(target, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET);
-        DataCopyPad(ready[(uint32_t(args_->rank) % 8U) * 8U], notifyUb_,
+        DataCopyPad(ready[(uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) % 8U) * 8U], notifyUb_,
                     {uint16_t(kEpServerDedupCombineRecvCoreNum), 32U, 0U, 480U, 0U});
     }
     __aicore__ inline void WaitServerReady()
     {
-        auto ready = Control(args_->rank, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET +
+        auto ready = Control(DEEPEP_LL_LAUNCH_RANK(args_), COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SERVER_READY_OFFSET +
                                               uint64_t(core_ - kEpServerDedupCombineSendCoreNum) * 512U);
         WaitFlags(ready, readyInput_, readyWork_, readySum_, 8U);
         Duplicate<float>(readyZero_, 0.0f, 128U);
@@ -432,8 +442,9 @@ private:
     GM_ADDR weightsAddr_ = nullptr;
     GM_ADDR masksAddr_ = nullptr;
     GM_ADDR outputAddr_ = nullptr;
+    deepep::CoreContext coreContext_{};
     bool enableDedup_ = false;
-    uint32_t bs_ = 0, experts_ = 0;
+    uint32_t bs_ = 0, experts_ = 0, world_ = 0;
     uint8_t dtype_ = 0;
     uint32_t core_ = 0, h_ = 0, topK_ = 0, blocks_ = 0, resultStride_ = 0, tokens_ = 0, lanes_ = 0, laneBytes_ = 0,
              usedBytes_ = 0;

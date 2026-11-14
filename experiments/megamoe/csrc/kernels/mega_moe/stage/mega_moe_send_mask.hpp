@@ -229,7 +229,7 @@ __aicore__ inline void GatherAndSendExpertCompactRoutesDirect(const AivJobContex
     }
     __gm__ int32_t* launchCountSlot =
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.rankSyncInWorldPtr + RANK_SYNC_COUNTER_OFFSET_BYTES +
-                                          static_cast<uint64_t>(GetBlockIdx()) * RANK_SYNC_COUNTER_SLOT_BYTES);
+                                          static_cast<uint64_t>(jobIndex) * RANK_SYNC_COUNTER_SLOT_BYTES);
     // 本 launch epoch = 计数槽值+1(跨卡同步在本阶段之后执行,槽值仍为上一 launch)。
     int32_t arrivalEpoch = ((ReadGmByPassDCache(launchCountSlot) + 1) & 0x7F) | 0x80;
     PublishExpertCounts(common, winRankAddr, config, scratch, ownedExpertBegin, ownedExpertNum, arrivalEpoch);

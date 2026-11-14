@@ -8,3 +8,9 @@
 [submodule "third-party/catlass"]
 	path = third-party/catlass
 	url = https://gitcode.com/cann/catlass.git
+[submodule "third-party/deep_jit"]
+	path = third-party/deep_jit
+	url = https://github.com/deepseek-ai/DeepJIT.git
+[submodule "third-party/fmt"]
+	path = third-party/fmt
+	url = https://github.com/fmtlib/fmt.git
