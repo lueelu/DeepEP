@@ -36,7 +36,7 @@ __aicore__ inline void IssueFmRows(DeepepSecondaryState& s, uint32_t peer, __ubu
             trap();
             return;
         }
-        aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
+        deepep::comm::tile::FillUdmaRemoteSqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                          kUdmaDataRoNoCqeConfig>(
             reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header), target,
             aclshmemi_udma_get_mem_info(info, slot, 0U), 0U);

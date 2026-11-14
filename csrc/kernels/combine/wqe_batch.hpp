@@ -53,7 +53,7 @@ __aicore__ inline void CacheCombinePutHeader(__ubuf__ uint64_t* header, GM_ADDR 
     auto* info = aclshmemi_udma_qp_info_fetch();
     const uint32_t slot = aclshmemi_udma_compute_slot(peer, static_cast<uint32_t>(-1));
     auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(workspace, peer));
-    aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
+    deepep::comm::tile::FillUdmaRemoteSqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, __ubuf__ aclshmemi_sqe_ctx_t*,
                                      kPayloadRoNoCqeConfig>(reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(header),
                                                             remote, aclshmemi_udma_get_mem_info(info, slot, qp), 0U);
     header[7] = reinterpret_cast<uint64_t>(remote);
@@ -105,11 +105,11 @@ struct LocalPutBatch {
         auto* destination = reinterpret_cast<__gm__ uint8_t*>(rows[(row_count - 1U) * 4U + 1U]);
         auto* memory = aclshmemi_udma_get_mem_info(aclshmemi_udma_qp_info_fetch(), slot, 0U);
         if (strong_tail) {
-            aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE,
+            deepep::comm::tile::FillUdmaRemoteSqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE,
                                              __ubuf__ aclshmemi_sqe_ctx_t*, kCompletionSoConfig>(
                 reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(tail_header), destination, memory, row_count - 1U);
         } else {
-            aclshmemi_udma_fill_sqe_base_ctx<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE,
+            deepep::comm::tile::FillUdmaRemoteSqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE,
                                              __ubuf__ aclshmemi_sqe_ctx_t*, kPayloadRoConfig>(
                 reinterpret_cast<__ubuf__ aclshmemi_sqe_ctx_t*>(tail_header), destination, memory, row_count - 1U);
         }

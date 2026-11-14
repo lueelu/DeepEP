@@ -42,7 +42,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         throw std::invalid_argument("1 GiB huge pages require the Elastic UDMA runtime");
     use_1g_huge_pages_ = use_1g_huge_pages;
     const char* dense_env = std::getenv("DEEPEP_SHMEM_DENSE_QPS");
-    const std::string dense = dense_env == nullptr ? "0" : dense_env;
+    const std::string dense = dense_env == nullptr ? "1" : dense_env;
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
@@ -92,7 +92,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
     if (udma && dense != "1" && !set_masks) {
         throw std::runtime_error(
-            "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
+            "SHMEM v1.8.0 does not provide aclshmemx_set_udma_peer_qp_masks; unset DEEPEP_SHMEM_DENSE_QPS "
             "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
     }
     // A failed initialization can leave SDK state behind. Keep the process
@@ -107,7 +107,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
                   "aclshmemx_set_qp_num");
-            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");
+            attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_ENABLED;
             std::vector<uint64_t> masks;
             if (dense != "1") {
                 masks.resize(size);

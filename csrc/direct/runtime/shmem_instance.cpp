@@ -41,19 +41,17 @@ void FillInitAttributes(int rank, int world_size, uint64_t local_mem_size, const
     if (attributes == nullptr) {
         throw std::invalid_argument("attributes must not be null");
     }
-    std::memset(attributes, 0, sizeof(*attributes));
+    // Preserve v1.8.0's format-2 ABI version and optional/runtime defaults.
+    *attributes = aclshmemx_init_attr_t{};
 
     const std::size_t ip_len = std::min(ip_port.size(), static_cast<std::size_t>(ACLSHMEM_MAX_IP_PORT_LEN - 1));
     std::copy_n(ip_port.data(), ip_len, attributes->ip_port);
     attributes->ip_port[ip_len] = '\0';
 
-    const int attr_version = (1 << 16) + static_cast<int>(sizeof(aclshmemx_init_attr_t));
-
     attributes->my_pe = rank;
     attributes->n_pes = world_size;
     attributes->local_mem_size = local_mem_size;
-    attributes->option_attr = {attr_version, static_cast<data_op_engine_type_t>(data_op_engine_type), DEFAULT_TIMEOUT,
-                               DEFAULT_TIMEOUT, DEFAULT_TIMEOUT};
+    attributes->option_attr.data_op_engine_type = static_cast<data_op_engine_type_t>(data_op_engine_type);
     attributes->comm_args = reinterpret_cast<void*>(&g_default_flag_uid);
 }
 
@@ -359,23 +357,13 @@ void ShmemInstance::InitRuntime()
             }
             ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_qp_num(
                 ACLSHMEM_DATA_OP_UDMA, shared_jetty_ ? ascend_deepep::udma::kQpCount : kUdmaQpCount));
-            ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, shared_jetty_));
-            if (shared_jetty_) {
-                std::vector<uint64_t> masks(world_size_);
-                for (int peer = 0; peer < world_size_; ++peer)
-                    masks[peer] = token_schedule_
-                                      ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
-                                      : ascend_deepep::udma::PeerMask(rank_, peer, world_size_, dispatch_peer_order_,
-                                                                      combine_peer_order_, ranks_per_group_,
-                                                                      peers_per_group_per_worker_,
-                                                                      workers_per_peer_ * qps_per_worker_);
-                ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(masks.data(), masks.size()));
-            } else {
-                ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(nullptr, 0));
-            }
+            // v1.8.0 creates all configured peer/QP channels. Logical worker/QP
+            // ownership is unchanged; the old sparse channel-creation API is absent.
         }
         aclshmemx_init_attr_t attributes{};
         FillInitAttributes(rank_, world_size_, local_mem_size_, ip_port_, data_op_engine_type_, &attributes);
+        attributes.runtime_config.udma_shared_jetty =
+            shared_jetty_ ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DISABLED;
         // Keep an aligned, rank-local copy alive throughout both initialization paths.
         aclshmemx_uniqueid_t uid{};
         auto init_flags = ACLSHMEMX_INIT_WITH_DEFAULT;

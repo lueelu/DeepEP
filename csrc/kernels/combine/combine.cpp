@@ -2,6 +2,7 @@
 
 #include "kernel_operator.h"
 #include "shmem.h"
+#include "../../comm/tile/tile_udma_wqe.hpp"
 #include "simt_api/device_functions.h"
 #include "tiling.hpp"
 #include "launch.hpp"
@@ -1740,11 +1741,11 @@ struct CrossPutBatch {
         LocalTensor<uint8_t> ub;
         ub.address_.logicPos = static_cast<uint8_t>(TPosition::VECOUT);
         ub.address_.bufferAddr = reinterpret_cast<uint64_t>(scratch + lane * kWqeBatchScratchBytes);
-        aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(slot) * kWqeBytes),
+        deepep::comm::tile::CopyUdmaWqe(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(slot) * kWqeBytes),
                                         ub, first * kWqeBytes, EVENT_ID0);
         if (first != count) {
             ub.address_.bufferAddr += first * kWqeBytes;
-            aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), ub,
+            deepep::comm::tile::CopyUdmaWqe(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), ub,
                                             (count - first) * kWqeBytes, EVENT_ID0);
         }
         // Both wrap segments are visible before the one SQ doorbell update.
