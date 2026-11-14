@@ -95,13 +95,16 @@ def backend(monkeypatch):
     events = []
 
     class Group:
+        def __init__(self, size=2):
+            self._size = size
+
         def size(self):
-            return 2
+            return self._size
 
     def gather(output, value, **kwargs):
-        output[:] = [value] * 2
+        output[:] = [value] * len(output)
 
-    dist = SimpleNamespace(ProcessGroup=Group, get_world_size=lambda _: 2, all_gather_object=gather)
+    dist = SimpleNamespace(ProcessGroup=Group, get_world_size=lambda group: group.size(), all_gather_object=gather)
     torch = SimpleNamespace(
         **{name: name for name in DTYPES},
         device=Device,
@@ -130,7 +133,9 @@ def backend(monkeypatch):
             get_npu_format=lambda t: t.npu_format, npu_format_cast=format_cast, float4_e2m1fn_x2="float4_e2m1fn_x2"
         ),
     )
-    stream = SimpleNamespace(wait_stream=lambda _: events.append("wait"))
+    stream = SimpleNamespace(
+        wait_stream=lambda _: events.append("wait"), synchronize=lambda: events.append("synchronize")
+    )
     npu = SimpleNamespace(
         current_device=lambda: 0, current_stream=lambda _: stream, stream=lambda _: contextlib.nullcontext()
     )
@@ -138,8 +143,9 @@ def backend(monkeypatch):
     monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096))
 
     class Runtime:
-        def __init__(self, group, capacity, timeout):
+        def __init__(self, group, capacity, timeout, *, backend="mte"):
             self.device, self.stream, self.native = 0, stream, SimpleNamespace(capacity=capacity)
+            self.backend = backend
             self.closed = False
 
         def ensure_alive(self):
@@ -153,29 +159,92 @@ def backend(monkeypatch):
     monkeypatch.setattr(api, "_MegaRuntime", Runtime)
 
     class Plan:
-        def __init__(self, example, *args):
+        def __init__(
+            self,
+            example,
+            intermediate,
+            topk,
+            experts,
+            world,
+            max_tokens,
+            is_a8w4,
+            shared_experts,
+            ranks_per_node,
+            ffts,
+            address,
+            capacity,
+            backend="mte",
+            topk_weights_type=0,
+        ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
+            self.backend = backend
+            self.topk_weights_type = topk_weights_type
+            self.local_experts = experts
             events.append(("prepare", self.bs))
+            events.append(("plan_backend", backend))
 
-        def forward(self, *args):
+        def forward(
+            self,
+            x,
+            scales,
+            ids,
+            route_weights,
+            w1,
+            w2,
+            s1,
+            s2,
+            timer,
+            shared_w1,
+            shared_w2,
+            shared_s1,
+            shared_s2,
+            out,
+            generation=0,
+            activation_clamp=None,
+        ):
+            args = (
+                x,
+                scales,
+                ids,
+                route_weights,
+                w1,
+                w2,
+                s1,
+                s2,
+                timer,
+                shared_w1,
+                shared_w2,
+                shared_s1,
+                shared_s2,
+                out,
+                generation,
+            )
             events.append(("launch", args))
-            output = args[-1]
+            events.append(("activation_clamp", activation_clamp))
+            output = out if out is not None else Tensor(np.zeros(x.shape), "bfloat16")
             output.data.fill(3)
-            return output, Tensor([2, 3], "int32")
+            if self.backend == "urma" and timer is not None:
+                timer.data[-1] = generation
+            return output, Tensor(np.arange(self.local_experts) + 2, "int32")
+
+    def buffer_size(*args, backend="mte", topk_weights_type=0):
+        events.append(("buffer_size", args, backend))
+        return 2 << 20
 
     ext = SimpleNamespace(
-        buffer_size=lambda *args: 2 << 20,
+        buffer_size=buffer_size,
         Plan=Plan,
         ffts_config=lambda: 123,
         timer_enabled=True,
         timer_numel=64,
+        allocate_timer=lambda example, backend="mte": Tensor(np.zeros(65536 if backend == "urma" else 64), "int64"),
         small_batch_max_tokens=256,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
     buffer.topk_idx.data[:] = [0, 1]
     buffer.topk_weights.data[:] = [0.4, 0.6]
-    yield SimpleNamespace(buffer=buffer, events=events, ext=ext, dist=dist)
+    yield SimpleNamespace(buffer=buffer, events=events, ext=ext, dist=dist, group_type=Group)
     buffer.destroy()
 
 
@@ -210,7 +279,7 @@ def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16)
     launches = [event[1] for event in backend.events if isinstance(event, tuple) and event[0] == "launch"]
     assert launches[0][8] is None and launches[1][8] is timer
     assert (launches[0][1] is None) == bf16
-    assert launches[0][-1] is y and launches[1][-1] is y
+    assert launches[0][-2] is y and launches[1][-2] is y
     assert (
         sum(event == ("prepare", 17) for event in backend.events if isinstance(event, tuple) and event[0] == "prepare")
         == 1
@@ -413,6 +482,7 @@ def test_store_group_public_configuration_and_prepare_without_process_group(back
     buffer.prepare(17)
     buffer.destroy()
     assert stages == [
+        "check:MegaMoE product selection",
         "check:configuration",
         "check:input allocation",
         "check:input preflight",
@@ -433,7 +503,7 @@ def test_non_finite_route_weights_and_bad_capacity_fail_before_launch(backend):
 def test_plan_allocation_failure_is_collective_and_retryable(backend):
     plan_type = backend.ext.Plan
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("workspace allocation failed")
 
     backend.ext.Plan = fail
@@ -443,3 +513,157 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     backend.ext.Plan = plan_type
     backend.buffer.prepare(17)
     assert backend.buffer._plan_bs == 17
+
+
+@pytest.mark.parametrize("board,expected", [(0x44, "urma"), (7, "mte"), (3, "mte"), (None, "mte"), (0x6C, "mte")])
+def test_megamoe_product_selection(monkeypatch, board, expected):
+    from deep_ep_experimental.megamoe import backend as selector
+    from deep_ep import _machine
+
+    calls = []
+    monkeypatch.setattr(_machine, "physical_device", lambda: 17)
+    monkeypatch.setattr(_machine, "board_id", lambda physical: board)
+    monkeypatch.setattr(selector, "collective_check", lambda group, stage, error, value: calls.append(value))
+    assert selector.select_backend(object()) == expected
+    assert calls == [expected]
+
+
+def urma_buffer(backend, monkeypatch, *, shared=0):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    # Also cover a module-level imported selector without coupling the test to
+    # whether api.py imports the helper locally or at module initialization.
+    monkeypatch.setattr(api, "select_backend", lambda group: "urma", raising=False)
+    b = api.SymmBuffer(backend.group_type(16), 32, 2048, 2, 256, 256, num_shared_experts=shared)
+    b.topk_idx.data[:] = [0, 1]
+    b.topk_weights.data[:] = [0.4, 0.6]
+    raw = (
+        (Tensor(np.zeros((2, 512, 128)), "uint8"), Tensor(np.full((2, 512, 4, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((2, 256, 128)), "uint8"), Tensor(np.full((2, 256, 4, 2), 127), "float8_e8m0fnu")),
+    )
+    return b, api.transform_weights_for_mega_moe(*raw)
+
+
+def test_urma_uses_unified_plan_and_generation_survives_bs_changes(backend, monkeypatch):
+    b, (w1, w2) = urma_buffer(backend, monkeypatch)
+
+    def forbidden_readback(*args, **kwargs):
+        pytest.fail("Normal forward must not read routing tensors on Host")
+
+    monkeypatch.setattr(Tensor, "cpu", forbidden_readback)
+    stats = Tensor([7, 11], "int32")
+    generations = []
+    plans = []
+    casts_before = sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
+    try:
+        assert not hasattr(b, "_urma")
+        for bs in (17, 1024, 1025, 2048, 17):
+            y = Tensor(np.zeros((bs, 256)), "bfloat16")
+            assert api.fp8_fp4_mega_moe(y, w1, w2, b, cumulative_local_expert_recv_stats=stats) is None
+            launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+            assert launch[-2] is y
+            assert launch[4] is w1.select(True)[0]  # URMA uses fused layout even above the MTE threshold.
+            assert isinstance(b._plan, backend.ext.Plan)
+            assert b._plan.backend == "urma"
+            generations.append(launch[-1])
+            plans.append(b._plan)
+            np.testing.assert_array_equal(y.data, 3)
+        assert generations == [1, 2, 3, 4, 5]
+        assert len({id(plan) for plan in plans}) > 1  # generation belongs to the owner, not a replaced plan.
+        np.testing.assert_array_equal(stats.data, [17, 26])
+        assert stats.streams == [b._runtime.stream] * 5
+        assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts_before
+    finally:
+        b.destroy()
+
+
+def test_urma_shared_shapes_reach_same_forward_without_extra_host_interface(backend, monkeypatch):
+    import inspect
+
+    b, weights = urma_buffer(backend, monkeypatch, shared=1)
+    # Independent shared I=512; routed I=256. Native Plan is responsible for
+    # inferring and preparing shared resources from these existing operands.
+    sw1 = Tensor(np.zeros((1, 1024, 256)), "float8_e4m3fn")
+    ss1 = Tensor(np.full((1, 1024, 4, 2), 127), "float8_e8m0fnu")
+    sw2 = Tensor(np.zeros((1, 256, 512)), "float8_e4m3fn")
+    ss2 = Tensor(np.full((1, 256, 8, 2), 127), "float8_e8m0fnu")
+    y = Tensor(np.zeros((17, 256)), "bfloat16")
+    try:
+        assert "shared_intermediate_hidden" not in inspect.signature(api.SymmBuffer).parameters
+        api.fp8_fp4_mega_moe(y, *weights, b, shared_l1_weights=(sw1, ss1), shared_l2_weights=(sw2, ss2))
+        launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+        assert launch[9:13] == (sw1, sw2, ss1, ss2)
+        assert b._plan.backend == "urma"
+        assert b._plan.workspace_bytes == b.workspace_bytes
+    finally:
+        b.destroy()
+
+
+def test_urma_timer_uses_unified_forward_and_plan_diagnostics(backend, monkeypatch):
+    b, weights = urma_buffer(backend, monkeypatch)
+    try:
+        timer = b.allocate_timer()
+        assert timer.data.size > backend.ext.timer_numel
+        y = Tensor(np.zeros((17, 256)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, *weights, b, timer=timer)
+        launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+        assert launch[8] is timer
+        assert timer.data[-1] == launch[-1]
+        assert not hasattr(b._plan, "diagnostic_timer")
+        assert not hasattr(b._plan, "cv_rows")
+        assert not hasattr(b, "_urma")
+    finally:
+        b.destroy()
+
+
+def test_urma_plan_allocation_failure_poisoned_without_caching_shape(backend, monkeypatch):
+    b, weights = urma_buffer(backend, monkeypatch)
+    original_plan = backend.ext.Plan
+    attempts = []
+
+    def fail(*args, **kwargs):
+        attempts.append((args, kwargs))
+        raise RuntimeError("URMA workspace allocation failed")
+
+    backend.ext.Plan = fail
+    y = Tensor(np.zeros((17, 256)), "bfloat16")
+    try:
+        with pytest.raises(RuntimeError, match="URMA workspace allocation failed"):
+            api.fp8_fp4_mega_moe(y, *weights, b)
+        assert b._failure == "URMA workspace allocation failed"
+        assert b._plan is None and b._plan_bs is None
+        assert len(attempts) == 1
+        backend.ext.Plan = original_plan
+        with pytest.raises(RuntimeError, match="buffer failed.*restart"):
+            api.fp8_fp4_mega_moe(y, *weights, b)
+        assert b._plan is None and b._plan_bs is None
+        assert len(attempts) == 1
+        assert not any(isinstance(e, tuple) and e[0] == "launch" for e in backend.events)
+    finally:
+        backend.ext.Plan = original_plan
+        b.destroy()
+
+
+def test_activation_clamp_reaches_native_forward(backend):
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=0.25)
+    assert ("activation_clamp", 0.25) in backend.events
+    with pytest.raises(ValueError, match="activation_clamp"):
+        api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=-1)
+
+
+@pytest.mark.parametrize("mode", [0, 1])
+def test_route_weight_mode_reaches_plan(backend, mode):
+    b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)
+    try:
+        b.prepare(17)
+        assert b._plan.topk_weights_type == mode
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("mode", [-1, 2, True, 1.0])
+def test_invalid_route_weight_mode(backend, mode):
+    with pytest.raises((ValueError, TypeError), match="topk_weights_type"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)

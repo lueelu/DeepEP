@@ -228,8 +228,8 @@ int main(int argc, char** argv)
         if (fault == "finalize") finalize_status = -1;
         const uint64_t logical_bytes = fault == "ll-guard" ? 8ULL << 30 : expected_bytes;
         auto create_huge = [&]() {
-            return deepep::Session(0, 2, logical_bytes, "tcp://127.0.0.1:19091", 30, true, false, fault == "mpi", true,
-                                   true);
+            return deepep::Session(0, 2, logical_bytes, "tcp://127.0.0.1:19091", 30, true, false, fault == "mpi",
+                                   true, true);
         };
         const std::vector<std::string> setup{"allocate", "reserve", "map", "access", "register", "translate"};
         if (fault == "normal" || fault == "rounded" || fault == "exact" || fault == "ll-guard" || fault == "mpi" ||
@@ -292,13 +292,10 @@ int main(int argc, char** argv)
     } else if (mode == "udma-sparse-default" || mode == "udma-sparse-disabled") {
         if (mode == "udma-sparse-default") unsetenv("DEEPEP_SHMEM_DENSE_QPS");
         else setenv("DEEPEP_SHMEM_DENSE_QPS", "0", 1);
-        try {
-            deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
-            assert(false);
-        } catch (const std::runtime_error& error) {
-            assert(std::string(error.what()).find("DEEPEP_SHMEM_DENSE_QPS=1") != std::string::npos);
-        }
-        assert(!deepep::Session::busy() && initialized == 0 && qp_count == 0 && allocations == 0);
+        deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
+        assert(session.udma());
+        session.close();
+        assert(!deepep::Session::busy());
     } else if (mode == "udma") {
         deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
         assert(session.udma() && qp_count == 32 && !session.sparse_qp_enabled());

@@ -12,7 +12,7 @@
 #ifndef MEGA_MOE_CATLASS_BLOCK_PROLOGUE_A8W4_HPP
 #define MEGA_MOE_CATLASS_BLOCK_PROLOGUE_A8W4_HPP
 
-#include "resource.hpp"
+#include "kernels/mega_moe_common/catlass_gmm/resource.hpp"
 #include "a8w4_k_plan.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"

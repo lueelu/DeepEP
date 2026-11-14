@@ -10,10 +10,12 @@ import importlib
 import threading
 from typing import TYPE_CHECKING
 
-from deep_ep._runtime import Runtime, integer, warn_unclosed
+from deep_ep._runtime import integer, warn_unclosed
+from ._runtime import _MegaRuntime
 from deep_ep._native import npu_api, require_native
 from deep_ep._store import StoreGroup
 from .validation import check_routing, collective_check
+from .numerics import normalize_clamp
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -31,13 +33,9 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 4:
+    if getattr(extension, "api_protocol", None) != 10:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
-
-
-class _MegaRuntime(Runtime):
-    _megamoe = True
 
 
 def _pair(value, name):
@@ -81,6 +79,7 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
+        topk_weights_type: int = 0,
     ):
         import torch
         import torch.distributed as dist
@@ -88,19 +87,27 @@ class SymmBuffer:
         if not isinstance(group, (StoreGroup, dist.ProcessGroup)):
             raise TypeError("Pass a StoreGroup or an initialized ProcessGroup explicitly")
         size = group.size() if isinstance(group, StoreGroup) else dist.get_world_size(group)
+        from .backend import select_backend
+
+        self._backend_name = select_backend(group)
+        urma = self._backend_name == "urma"
         error = None
         try:
             integer("num_experts", num_experts, 1, 16384)
-            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 65536)
-            integer("num_topk", num_topk, 1, min(32, num_experts))
-            integer("hidden", hidden, 1024, 8192)
-            integer("intermediate_hidden", intermediate_hidden, 256, 4096)
-            integer("num_shared_experts", num_shared_experts, 0, 8)
+            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384 if urma else 65536)
+            integer("num_topk", num_topk, 1, min(8 if urma else 32, num_experts))
+            integer("hidden", hidden, 256 if urma else 1024, 8192)
+            integer("intermediate_hidden", intermediate_hidden, 256, 16384 if urma else 4096)
+            integer("num_shared_experts", num_shared_experts, 0, 1 if urma else 8)
             integer("world_size", size, 2, 128)
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
-            if hidden % 64 or intermediate_hidden % 128:
-                raise ValueError("hidden must be divisible by 64; intermediate_hidden by 128")
+            integer("topk_weights_type", topk_weights_type, 0, 1)
+            h_align, i_align = (256, 256) if urma else (64, 128)
+            if hidden % h_align or intermediate_hidden % i_align:
+                raise ValueError(f"hidden must be divisible by {h_align}; intermediate_hidden by {i_align}")
+            if urma and (size not in (4, 8, 16) or mma_type != "fp8xfp4"):
+                raise ValueError("URMA supports EP4/EP8/EP16 and routed FP8xFP4")
             if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
                 raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8 is implemented; no BF16xBF16")
             if mma_type != "fp8xfp4" and num_shared_experts:
@@ -123,18 +130,27 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            topk_weights_type,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
-        capacity = int(ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden))
+        capacity = int(
+            ext.buffer_size(
+                size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, backend=self._backend_name, topk_weights_type=topk_weights_type
+            )
+        )
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._plan = self._plan_bs = None
+        self._generation = 0
+        self._failure = None
+        self._world_size = size
         self.group, self.num_experts = group, num_experts
         self.num_max_tokens_per_rank, self.num_topk = num_max_tokens_per_rank, num_topk
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self.topk_weights_type = topk_weights_type
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -143,7 +159,7 @@ class SymmBuffer:
             error = str(failure)
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
-        self._runtime = _MegaRuntime(group, capacity, timeout)
+        self._runtime = _MegaRuntime(group, capacity, timeout, backend=self._backend_name)
 
     def allocate_inputs(self):
         """Legacy idempotent helper. Inputs are already allocated by the constructor."""
@@ -169,7 +185,12 @@ class SymmBuffer:
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
         if self._plan_bs == bs:
             return
-        # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
+        if self._backend_name == "urma":
+            # Resource changes retire prior network sources before reusing the
+            # fixed control regions. Exchange shape metadata, never route data.
+            self._runtime.stream.synchronize()
+            collective_check(self.group, "plan configuration", None, (bs, self._backend_name))
+        # Keep only the current shape's plan; owner generation survives rebuilds.
         self._plan = self._plan_bs = None
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
@@ -178,8 +199,8 @@ class SymmBuffer:
             self.x[:bs],
             self.intermediate_hidden,
             self.num_topk,
-            self.num_experts // self.group.size(),
-            self.group.size(),
+            self.num_experts // self._world_size,
+            self._world_size,
             self.num_max_tokens_per_rank,
             self.mma_type == "fp8xfp4",
             self.num_shared_experts,
@@ -187,6 +208,8 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
+            backend=self._backend_name,
+            topk_weights_type=self.topk_weights_type,
         )
         self._plan_bs = bs
 
@@ -225,12 +248,10 @@ class SymmBuffer:
 
     def allocate_timer(self) -> Tensor:
         """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""
-        import torch
-
         self._runtime.ensure_alive()
         if not self.timer_enabled:
             raise RuntimeError("W4A8 timer requires DEEPEP_MEGAMOE_TIMER=ON")
-        return torch.zeros(_extension().timer_numel, dtype=torch.int64, device=self._device)
+        return _extension().allocate_timer(self.x, backend=self._backend_name)
 
     def validate_inputs(self, bs: int, *, x: Tensor | None = None) -> None:
         """Collective, synchronizing routing scan. Run after filling inputs, outside timing."""
@@ -391,6 +412,7 @@ def mega_moe(
     shared_l2_weights=None,
     out=None,
     timer=None,
+    activation_clamp=None,
 ):
     """Explicit-input convenience API; prefer fp8_fp4_mega_moe for DeepGEMM-style use.
 
@@ -410,6 +432,7 @@ def mega_moe(
         shared_l2_weights=shared_l2_weights,
         out=out,
         timer=timer,
+        activation_clamp=activation_clamp,
     )
 
 
@@ -426,6 +449,7 @@ def _run(
     out=None,
     timer=None,
     cumulative_stats=None,
+    activation_clamp=None,
 ):
     import torch
 
@@ -441,7 +465,11 @@ def _run(
         sw1, ss1 = _pair(shared_l1_weights, "shared_l1_weights")
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
         shared = (sw1, sw2, ss1, ss2)
+    clamp = normalize_clamp(activation_clamp)
     b = sym_buffer
+    urma = b._backend_name == "urma"
+    if urma and scales is None:
+        raise TypeError("URMA input requires (FP8 E4M3, E8M0 scales)")
     if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
         raise ValueError("x must be nonempty [BS,H] within the buffer capacity")
     if data.device != b._device:
@@ -456,11 +484,11 @@ def _run(
         raise TypeError("Weight dtype differs from buffer mma_type")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
-        fused = data.shape[0] <= _extension().small_batch_max_tokens
+        fused = urma or data.shape[0] <= _extension().small_batch_max_tokens
         if isinstance(l1_weights, _RoutedWeightPair):
             prepared_inputs = (*l1_weights, *l1_weights._planar)
             w1, s1 = l1_weights.select(fused)
-        elif not fused:
+        elif urma or not fused:
             raise ValueError(
                 "Prefill requires both prepared GMM1 layouts; call transform_weights_for_mega_moe "
                 "on raw ND weights and keep its returned l1 pair intact"
@@ -483,7 +511,17 @@ def _run(
             ("shared_l2_weights", shared[1]),
         ):
             if weight is not None:
-                _check_fp4_weight_format(weight, name)
+                if urma and name.startswith("shared_"):
+                    import torch_npu
+
+                    if (
+                        weight.dtype != torch.float8_e4m3fn
+                        or not weight.is_contiguous()
+                        or torch_npu.get_npu_format(weight) != 2
+                    ):
+                        raise ValueError("URMA shared weights require contiguous ND FP8 E4M3")
+                else:
+                    _check_fp4_weight_format(weight, name)
     if cumulative_stats is not None:
         stats = cumulative_stats
         if (
@@ -502,12 +540,24 @@ def _run(
     runtime = b._runtime
     with b._lock:
         runtime.ensure_alive()
+        if b._failure is not None:
+            raise RuntimeError(f"MegaMoE buffer failed; restart the distributed job: {b._failure}")
         caller = npu_api().current_stream(runtime.device)
         runtime.stream.wait_stream(caller)
         # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。
         with npu_api().stream(runtime.stream):
-            b._prepare(data.shape[0])
-            result = b._plan.forward(data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out)
+            try:
+                b._prepare(data.shape[0])
+                b._generation += 1
+                result = b._plan.forward(
+                    data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out, b._generation, clamp
+                )
+            except Exception as error:
+                if urma:
+                    b._failure = str(error)
+                    if isinstance(b.group, StoreGroup):
+                        b.group.abort(b._failure)
+                raise
             if cumulative_stats is not None:
                 cumulative_stats.add_(result[1])
                 cumulative_stats.record_stream(runtime.stream)
@@ -538,10 +588,10 @@ def fp8_fp4_mega_moe(
     Positional parameters follow DeepGEMM. Ascend-only keyword extensions:
     x is optional BF16 [BS,H] (quantized internally, NOT BF16 GEMM);
     timer is a fresh buffer.allocate_timer() for a separate diagnostic call.
-    Routed weights are applied after GMM2; see README numerical compatibility.
+    Routed weight placement follows sym_buffer.topk_weights_type; see README.
     """
-    if recipe != (1, 1, 32) or activation != "swiglu" or activation_clamp is not None or fast_math is not True:
-        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, no clamp, default math only")
+    if recipe != (1, 1, 32) or activation != "swiglu" or fast_math is not True:
+        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, default math only")
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
     import torch
@@ -564,4 +614,5 @@ def fp8_fp4_mega_moe(
         out=y,
         timer=timer,
         cumulative_stats=cumulative_local_expert_recv_stats,
+        activation_clamp=activation_clamp,
     )

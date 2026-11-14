@@ -8,6 +8,7 @@ are modeled; this is not a bitwise emulator of Cube accumulation or exp.
 """
 
 import numpy as np
+from .numerics import normalize_clamp
 
 FP4 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 _code = np.arange(127)
@@ -81,10 +82,16 @@ def make_weights(experts, hidden, intermediate, seed):
     return tuple(result)
 
 
-def expert_forward(x, w1, w2):
+def expert_forward(x, w1, w2, activation_clamp=None, route_weights=None):
     first = bf16(x @ w1.T)
     gate, up = np.split(first, 2, axis=-1)
-    activated = bf16(gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up)
+    limit = normalize_clamp(activation_clamp)
+    gate = np.minimum(gate, limit)
+    up = np.clip(up, -limit, limit)
+    activated = gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up
+    if route_weights is not None:
+        activated = activated * np.asarray(route_weights, dtype=np.float32)[:, None]
+    activated = bf16(activated)
     quantized = dequantize_input(*quantize_input(activated))
     return bf16(quantized @ w2.T)
 
@@ -112,3 +119,17 @@ def error_metrics(actual, expected):
         "relative_rmse": float(np.sqrt(np.mean(diff**2))) / denominator,
         "max_abs": float(np.abs(diff).max(initial=0)),
     }
+
+
+def expand_fp4_to_fp8(pair):
+    """Exact offline E2M1 -> E4M3 conversion, preserving MX scale bytes.
+
+    This is used only for benchmark fixture preparation, never in forward.
+    The native shared API accepts arbitrary finite FP8 E4M3 values.
+    """
+    packed, scales = pair
+    packed = np.asarray(packed, dtype=np.uint8)
+    lut = fp8_encode(FP4)
+    codes = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.uint8)
+    codes[..., ::2], codes[..., 1::2] = lut[packed & 15], lut[packed >> 4]
+    return codes, np.asarray(scales, dtype=np.uint8).copy()

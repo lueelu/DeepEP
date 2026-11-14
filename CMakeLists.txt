@@ -21,7 +21,8 @@ include(cmake/Dependencies.cmake)
 option(DEEPEP_BUILD_MEGAMOE "Build the optional MegaMoE Beta" OFF)
 option(DEEPEP_MEGAMOE_TIMER "Compile MegaMoE device tracing" OFF)
 include(cmake/Device.cmake)
-pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp csrc/ubx/v2.cpp)
+pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp
+    csrc/ops/combine.cpp csrc/ops/low_latency.cpp csrc/ubx/v2.cpp)
 target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
 find_path(DEEPEP_PLATFORM_INCLUDE tiling/platform/platform_ascendc.h
     HINTS "${ASCEND_HOME_PATH}/asc/include" "${ASCEND_HOME_PATH}/include/op_common"
@@ -42,6 +43,8 @@ install(TARGETS _C LIBRARY DESTINATION .)
 include(cmake/Direct.cmake)
 if(DEEPEP_BUILD_MEGAMOE)
     target_compile_definitions(_C PRIVATE DEEPEP_BUILD_MEGAMOE=1)
+    target_include_directories(_C PRIVATE experiments/megamoe/csrc)
+    target_sources(_C PRIVATE experiments/megamoe/csrc/runtime/megamoe_session.cpp)
     add_subdirectory(experiments/megamoe)
 elseif(DEEPEP_MEGAMOE_TIMER)
     message(FATAL_ERROR "DEEPEP_MEGAMOE_TIMER requires DEEPEP_BUILD_MEGAMOE")

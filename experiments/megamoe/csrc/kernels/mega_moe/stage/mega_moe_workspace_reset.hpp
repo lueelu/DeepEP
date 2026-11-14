@@ -12,7 +12,7 @@
 #ifndef MEGA_MOE_WORKSPACE_RESET_H
 #define MEGA_MOE_WORKSPACE_RESET_H
 
-#include "../common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 
 namespace MegaMoeImpl {
 

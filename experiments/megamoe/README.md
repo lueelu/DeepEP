@@ -37,7 +37,11 @@ def fp8_fp4_mega_moe(
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
 
-`recipe/activation/activation_clamp/fast_math` 当前仅支持签名中的默认值。所有张量在 buffer 所在 NPU 上。
+`recipe/activation/fast_math` 当前仅支持签名中的默认值。
+`activation_clamp` 支持非负 FP32 上限；`None` 或正无穷等价于 FLT_MAX。
+MTE/URMA 均在 SwiGLU 前将 gate 上截断至 limit，up 截断至 [-limit, limit]，路由和共享专家均适用。
+例如 `fp8_fp4_mega_moe(y, w1, w2, buffer, activation_clamp=7.0)`。
+CPU Golden 和级联参考同步应用该限制。MTE SwiGLU 使用与级联参考一致的 FP32 sigmoid 后乘 gate 顺序，随后才进行 BF16 舍入/MX 量化。所有张量在 buffer 所在 NPU 上。
 FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示打包，不是重新量化。
 
 权重在测试/推理前转换一次，转换过程不计入性能测量：
@@ -108,6 +112,44 @@ CATLASS GMM 的布局和同步机制见 [GMM 说明](csrc/kernels/mega_moe/catla
 
 验证边界建议覆盖 B=255/256/257/512、S=0/1/2，以及同一 buffer 下反复切换
 `256 → 257 → 256` 和 epoch 回绕。CPU 协议测试不能替代 CANN 编译和 NPU 精度/性能验证。
+
+## 路由权重位置与 ProcessGroup
+
+通信实现称为 **MTE** 和 **URMA**，产品识别仍自动选择实现。
+`SymmBuffer(..., topk_weights_type=0)` 的参数与 ops-transformer 一致：
+
+| 值 | 路由专家计算顺序 |
+| --- | --- |
+| 0（默认） | GMM1 → clamp → SwiGLU → BF16/MX 量化 → GMM2 → 乘路由权重 → reduce |
+| 1 | GMM1 → clamp → SwiGLU → 乘路由权重 → BF16/MX 量化 → GMM2 → reduce |
+
+共享专家不乘路由权重。两种模式因量化位置不同不保证数值相同。
+所有 rank 必须选择相同模式；它影响通信内存布局，buffer 创建后不要修改。
+URMA 的提前模式把每条路由的 FP32 权重附在 Scale PUT 中，保持两次 data PUT，增加元数据传输与 Gather；默认模式不传路由权重。
+CPU Golden 与 NPU cascade 均按同一模式及 clamp 生成参考结果。benchmark 配置 JSON 的 `model` 支持 `topk_weights_type` 和 `activation_clamp`。
+
+```python
+import torch
+import torch_npu
+import torch.distributed as dist
+from deep_ep_experimental.megamoe import SymmBuffer, fp8_fp4_mega_moe
+
+torch.npu.set_device(local_rank)
+dist.init_process_group("hccl")
+group = dist.group.WORLD
+buffer = SymmBuffer(
+    group, num_experts=384, num_max_tokens_per_rank=1024,
+    num_topk=8, hidden=3584, intermediate_hidden=1280,
+    num_shared_experts=0, ranks_per_node=group.size(), topk_weights_type=1,
+)
+# 填入 buffer.x/x_sf/topk_idx/topk_weights，并提前转换 w1/w2。
+buffer.prepare(bs)
+fp8_fp4_mega_moe(y, w1, w2, buffer, activation_clamp=7.0)
+buffer.destroy()
+dist.destroy_process_group()
+```
+
+接口语义参考 [ops-transformer MegaMoE](https://gitcode.com/cann/ops-transformer/blob/master/mc2/mega_moe/docs/torchapi_mega_moe.md)。
 
 ## 2. 编译安装
 
