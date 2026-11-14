@@ -23,17 +23,17 @@
 #else
 #include "kernel_operator.h"
 #endif
-#include "../common/mega_moe_constants.hpp"
-#include "../common/mega_moe_utils.hpp"
-#include "activation/activation_common.hpp"
-#include "activation/situglu_activation.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/epilogue/activation/activation_common.hpp"
+#include "kernels/mega_moe_common/epilogue/activation/situglu_activation.hpp"
 #include "activation/swiglu_activation.hpp"
-#include "activation/swigluoai_activation.hpp"
-#include "block_epilogue_ub_layout.hpp"
-#include "quant/mx_quant_common.hpp"
-#include "quant/mx_quant_compute_scale.hpp"
-#include "quant/mxfp4_quant.hpp"
-#include "quant/mxfp8_quant.hpp"
+#include "kernels/mega_moe_common/epilogue/activation/swigluoai_activation.hpp"
+#include "kernels/mega_moe_common/epilogue/block_epilogue_ub_layout.hpp"
+#include "kernels/mega_moe_common/epilogue/quant/mx_quant_common.hpp"
+#include "kernels/mega_moe_common/epilogue/quant/mx_quant_compute_scale.hpp"
+#include "kernels/mega_moe_common/epilogue/quant/mxfp4_quant.hpp"
+#include "kernels/mega_moe_common/epilogue/quant/mxfp8_quant.hpp"
 
 namespace ActivationQuantMsg {
 using ActMode = MegaMoeImpl::MegaMoeActMode;

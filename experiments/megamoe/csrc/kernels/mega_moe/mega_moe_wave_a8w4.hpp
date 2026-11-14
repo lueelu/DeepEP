@@ -9,7 +9,7 @@
 #ifndef MEGA_MOE_WAVE_A8W4_H
 #define MEGA_MOE_WAVE_A8W4_H
 
-#include "common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 #include "mega_moe_arch35.hpp"
 
 namespace MegaMoeImpl {

@@ -74,6 +74,7 @@ def inspect_wheel(path):
                 "deep_ep_experimental/megamoe/benchmark.py",
                 "deep_ep_experimental/megamoe/configs/smoke.json",
                 "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
+                "deep_ep_experimental/megamoe/libmegamoe_urma_kernel.so",
             }
             extensions = [
                 n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_C.") and n.endswith(".so")
