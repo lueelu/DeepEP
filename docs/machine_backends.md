@@ -241,10 +241,12 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 32 --nnodes 2 --node-rank
 V1/V2 带宽脚本在每轮预热和 profiling 调用后等待本卡 NPU 执行完成，再提交下一轮，
 避免未完成输出和分配持续积压。该 Host 等待位于采样结束标记之外，不计入 kernel
 带宽分母；报告通过 `sampling.host_sync_each_iteration=true` 记录此测量方式。
-Combine 的预热、profiling（含边界保护轮次）及独立 Event 计时还会在每次调用前，
-先等待本卡 NPU 完成，再通过 Buffer 的 Host SHMEM barrier 对齐所有 rank。
-V1 使用 `buffer.barrier()`，V2 使用 `buffer.runtime.barrier()`；该对齐位于采样标记、
-Event 起点及可选缓存清理之前，不计入耗时，也不改变算子内部同步。
+V2 的 fresh/cached dispatch、无权重/带权重 combine 在每轮预热、profiling（含边界
+保护轮次）和独立 Event 计时前，先执行可选 L2 清理，再等待本卡 NPU 完成，最后通过
+`buffer.runtime.barrier()` 对齐当前通信组的所有 rank，之后才开始计时并调用算子。
+L2 清理与外层同步均不计入耗时；报告通过 `all_rank_sync_each_iteration=true` 标识
+这一采样方式，旧报告仍按其原有顺序解析。V1 保留原行为，仅 combine 通过
+`buffer.barrier()` 在可选缓存清理之前对齐 rank。上述调整不改变算子内部同步。
 SHMEM Host barrier 内部的设备 barrier kernel 仅在采样区间之外排除，原始 profiler 仍保留它。
 它减少 rank 间的启动偏差，但不保证 kernel 同时启动；不同对齐条件下的性能需区分比较。
 

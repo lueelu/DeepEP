@@ -398,6 +398,7 @@ def worker(args):
     args.profile_warmup, args.profile_iters = args.warmup, args.iterations
     args.profile_sample_markers = True
     args.combine_notify = True
+    args.all_rank_sync_each_iteration = True
     # Precision and caller-stream timing exercise the ordinary library path.
     os.environ[COMBINE_NOTIFY_ENV] = "0"
     device = args.first_device + local_rank
@@ -609,15 +610,19 @@ def worker(args):
             combine_weighted=lambda: combine(True),
         )
 
-        def align_combine_ranks():
-            # Host SHMEM rendezvous after local device completion; outside all timers.
+        def before_iteration():
+            # Evict first, then align every rank immediately before the sample.
+            # Both eviction and the blocking rendezvous stay outside all timers.
+            flush_cache()
             torch.npu.synchronize()
             buffer.runtime.barrier()
 
         for op, fn in functions.items():
             dist.barrier()
-            before_iteration = align_combine_ranks if op.startswith("combine") else None
-            print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
+            print(
+                f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True all_rank_sync_each_iteration=True",
+                flush=True,
+            )
             args.profile_dir = str(destination / op / "profiler")
             try:
                 with profile_combine_notify(op.startswith("combine")):
@@ -625,7 +630,7 @@ def worker(args):
                         rank,
                         args,
                         op,
-                        flush_cache.wrap(fn),
+                        fn,
                         sample_callback=ProfileSamples(torch),
                         guard_iters=PROFILE_GUARD_ITERS,
                         synchronize_each_iteration=True,
@@ -645,24 +650,21 @@ def worker(args):
                 flush_l2_cache=args.flush_l2_cache,
                 sample_markers=True,
                 require_combine_notify=True,
+                all_rank_sync_each_iteration=True,
             )
             # Independent caller-stream samples; do not subtract from profiler kernel times.
             profile["sampling"]["host_sync_each_iteration"] = True
             profile["sampling"]["combine_notify_profile_only"] = op.startswith("combine")
             dist.barrier()
             for _ in range(args.warmup):
-                if before_iteration is not None:
-                    before_iteration()
-                flush_cache()
+                before_iteration()
                 wait(fn())
                 torch.npu.synchronize()
             torch.npu.synchronize()
             caller = []
             for _ in range(args.iterations):
                 start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-                if before_iteration is not None:
-                    before_iteration()
-                flush_cache()
+                before_iteration()
                 start.record()
                 result = wait(fn())
                 end.record()
@@ -814,6 +816,7 @@ def report(root):
                 ("combine_bias", "two"),
                 ("profile_sample_markers", False),
                 ("combine_notify", False),
+                ("all_rank_sync_each_iteration", False),
             ):
                 if config.get(key, default) != plan["arguments"].get(key, default):
                     raise ValueError(f"peer order configuration mismatch: {key}")
@@ -885,6 +888,7 @@ def report(root):
                     flush_l2_cache=config.get("flush_l2_cache", False),
                     sample_markers=config.get("profile_sample_markers", False),
                     require_combine_notify=config.get("combine_notify", False),
+                    all_rank_sync_each_iteration=config.get("all_rank_sync_each_iteration", False),
                 )
                 import_size = plan["topk_idx_bytes"]
                 expected = byte_ledger(
@@ -945,6 +949,7 @@ def report(root):
             completed=completed,
             limits=limits,
             profile_sample_markers=plan["arguments"].get("profile_sample_markers", False),
+            all_rank_sync_each_iteration=plan["arguments"].get("all_rank_sync_each_iteration", False),
             flush_l2_cache=plan["arguments"].get("flush_l2_cache", False),
             l2_flush_bytes=L2_CACHE_FLUSH_BYTES if plan["arguments"].get("flush_l2_cache", False) else 0,
             combine_bias=plan["arguments"].get("combine_bias", "two"),
@@ -1137,6 +1142,7 @@ def launch(args, *, entrypoint=None):
     api = getattr(args, "api", "v2")
     args.profile_sample_markers = True
     args.combine_notify = True
+    args.all_rank_sync_each_iteration = api == "v2"
     plan = dict(
         format_version=2,
         api=api,
