@@ -31,15 +31,15 @@ def streams(monkeypatch):
 
 
 def test_v1_v2_share_stream_but_devices_and_processes_do_not(streams):
-    first = buffer._create_communication_stream()
-    assert elastic._create_communication_stream() is first
+    first = buffer.get_global_comm_stream()
+    assert elastic.get_global_comm_stream() is first
     streams.device = 1
-    second = elastic._create_communication_stream()
+    second = elastic.get_global_comm_stream()
     assert second is not first and second.device == 1
     streams.device = 0
-    assert buffer._create_communication_stream() is first
+    assert buffer.get_global_comm_stream() is first
     streams.pid += 1
-    assert buffer._create_communication_stream() is not first
+    assert buffer.get_global_comm_stream() is not first
     assert len(streams.created) == 3
 
 
@@ -49,7 +49,7 @@ def test_simultaneous_first_access_creates_one_stream(streams):
     def access(index):
         ready.wait(timeout=10)
         module = buffer if index % 2 else elastic
-        return module._create_communication_stream()
+        return module.get_global_comm_stream()
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(access, range(8)))
@@ -60,8 +60,8 @@ def test_simultaneous_first_access_creates_one_stream(streams):
 def test_creation_failure_does_not_publish_a_stream(streams):
     streams.fail = True
     with pytest.raises(RuntimeError, match="stream creation failed"):
-        buffer._create_communication_stream()
+        buffer.get_global_comm_stream()
     assert buffer._COMMUNICATION_STREAMS == {}
     streams.fail = False
-    assert buffer._create_communication_stream() is elastic._create_communication_stream()
+    assert buffer.get_global_comm_stream() is elastic.get_global_comm_stream()
     assert len(streams.created) == 1

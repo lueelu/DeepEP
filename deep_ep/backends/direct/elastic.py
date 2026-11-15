@@ -11,7 +11,7 @@ from ._native import get_native_class
 from .buffer import (
     _BOOTSTRAP_LOCK,
     _compact_extra_tensors,
-    _create_communication_stream,
+    get_global_comm_stream,
     _get_allocation_stream_id,
     _normalize_transport,
     _prepare_shmem_bootstrap,
@@ -335,7 +335,7 @@ class ElasticBuffer:
         if self.num_device_aiv < 2:
             raise RuntimeError("V2 elastic communication requires at least 2 AIVs")
         self.runtime = self._native
-        self._communication_stream = _create_communication_stream()
+        self._communication_stream = get_global_comm_stream()
 
         # Match the V2 initialization visibility contract on the communication
         # stream. The native barrier kernel is reused from the V1 resource layer.

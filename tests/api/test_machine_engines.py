@@ -53,7 +53,7 @@ def public_runtime(monkeypatch):
     for module in (source_v1, source_v2):
         monkeypatch.setattr(module, "get_native_class", lambda _: Native)
         monkeypatch.setattr(module, "_prepare_shmem_bootstrap", bootstrap)
-        monkeypatch.setattr(module, "_create_communication_stream", lambda: SimpleNamespace(synchronize=lambda: None))
+        monkeypatch.setattr(module, "get_global_comm_stream", lambda: SimpleNamespace(synchronize=lambda: None))
     monkeypatch.setattr(source_v2, "_validate_group_consensus", lambda *args: None)
     monkeypatch.setattr(source_v2.ElasticBuffer, "barrier", lambda *args, **kw: calls.append(("barrier",)))
     return deep_ep, group, calls

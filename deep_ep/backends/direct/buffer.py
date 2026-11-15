@@ -241,7 +241,7 @@ class Buffer:
         # Slot/generation tracks one future layout -> dispatch -> combine
         # session. The native runtime owns the symmetric workspace itself.
         self._slot = Slot(0, owner=self, native_resources=self._native)
-        self._communication_stream = _create_communication_stream()
+        self._communication_stream = get_global_comm_stream()
 
     @property
     def udma_auto_policy(self):
@@ -1359,7 +1359,7 @@ def _resolve_group_or_comm(group: Any, comm: Optional[Any]) -> Tuple[int, int, A
         raise TypeError("group must be a valid torch.distributed process group") from exc
 
 
-def _create_communication_stream() -> Any:
+def get_global_comm_stream() -> Any:
     """Return the process/device communication stream shared by V1 and V2.
 
     Keep it alive independently of any Buffer. Callers must submit collective
