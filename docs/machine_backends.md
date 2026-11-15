@@ -168,7 +168,8 @@ peer 数；只有新计划留下超过 2 个辅助核且满足容量约束时才
 非展开 BF16 无权重 V2 combine 根据实际通信核数选择本卡复制方式：
 空余 AIV 数不少于 payload 发送 AIV 数时，使用空余 AIV 并行复制，否则先提交远端
 再复制本卡。该规则不限定总核数，QP 数不计作发送核数，reduce 核数不参与判断。
-这是资源启发式，不保证每个 shape 都有性能收益。非展开 BF16 带权重 V2 combine
+这是资源启发式，不保证每个 shape 都有性能收益；下述 EP128 配置保留其完整本卡复制方式。
+非展开 BF16 带权重 V2 combine
 按 payload 行字节数选择远端权重的传输方式。每行不超过 7168 B 且有空余 AIV 时使用
 SIMT。超过 7168 B 时默认使用 UDMA。已识别为 EP64/G16、实际通信核数不少于 32 时，
 8192 B（BF16 H4096）和 12288 B（BF16 H6144）也优先使用 SIMT。发送核占满时
@@ -179,9 +180,24 @@ combine 使用同一发送配置：`group_round_robin/P1/W1/Q1/visit8`，先提�
 或 reduce 核数，也不向其他 EP 及中间行大小外推。EP64 的 32 核以上扩展保持原发送
 计划，避免增核时意外切回 UDMA；它不代表已验证更大核数的性能。
 
+EP128/G16、32 个通信 AIV、BF16 H2816（5632 B/行）、非展开 V2 使用以下默认配置：
+
+| 操作 | 发送顺序及参数 | 本卡复制 | 权重传输 |
+| --- | --- | --- | --- |
+| dispatch | group_round_robin/P2/W1/Q1/visit16，8 个发送 AIV | 保持 dispatch 原有方式 | 保持 dispatch 原有方式 |
+| 无权重 combine | group_round_robin/P2/W1/Q1/visit16，8 个发送 AIV | 先提交远端再复制 | 无 |
+| 带权重 combine | rank/P8/W1/Q1/visit8，16 个发送 AIV | default：各 AIV 先复制本卡再发送 | SIMT |
+
+这些配置来自 T8192/K8/E512、1 GiB 大页开启、不清理 L2 的单轮 8 样本粗筛，
+尚未完成精度校验及正反序确认。dispatch 的测量对象是 cached dispatch；fresh dispatch
+共用该 payload 策略，但其完整性能未由此验证。策略选择不读取 token 数、路由或专家计数，
+也不会自动开启大页；其他 token/top-k/专家数仍会采用该配置，但不保证相同收益。
+通信核数 0 按现有 API 规则解析为实际核数后匹配，不使用 reduce 核数进行匹配。
+其他行大小、核数、拓扑、FP8、展开路径、V1 及手动模式保留原行为。
+
 未命中模板时按核数增加 peers/worker，必要时改为轮转分组，检查发送核数、32-QP 预算
 及每 worker 64-peer 容量后才下发。例如 EP128/AIV8、G=16 可用轮转 P=2/W=1/Q=1；
-这表示资源上可执行，不代表已验证 EP128 的性能。资源仍放不下时在下发前报错。
+这表示资源上可执行，不代表已验证 EP128/AIV8 的性能。资源仍放不下时在下发前报错。
 
 策略不增加用户指定的通信核数。V1 通过 `Config(num_sms=...)` 指定；未传 Config
 沿用 `set_num_sms`，默认 32。V2 fresh dispatch 的 `num_sms=0` 默认 32；cached dispatch

@@ -268,6 +268,33 @@ class UdmaPolicy:
                     row_bytes <= _SIMT_WEIGHT_MAX_ROW_BYTES or (measured_weight_fit and self.world_size == 64)
                 ) and plan.send_workers < cores
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
+            if (
+                self.world_size == 128
+                and self.topology_known
+                and self.ranks_per_group == 16
+                and cores == 32
+                and row_bytes == 5632
+            ):
+                # EP128/G16 BF16 H2816 coarse sweep, not a precision or
+                # performance guarantee. Preserve each complete candidate,
+                # including its copy mode, after the generic resource rules.
+                # Fresh and cached dispatch share the payload launch policy;
+                # only cached dispatch was measured in this sweep.
+                order, peers, visit, copy, weight = {
+                    "dispatch": (3, 2, 16, 0, 0),
+                    "combine": (3, 2, 16, 2, 0),
+                    "weighted": (0, 8, 8, 0, 2),
+                }[operation]
+                plan = replace(
+                    plan,
+                    peer_order=order,
+                    peers_per_worker=peers,
+                    workers_per_peer=1,
+                    qps_per_worker=1,
+                    wqes_per_visit=visit,
+                    self_copy=copy,
+                    weight_mode=weight,
+                )
         plan.validate_num_aiv(num_aiv)
         if not plan.valid_group_capacity():
             raise ValueError("automatic UDMA plan exceeds the per-worker peer table")
