@@ -162,7 +162,11 @@ Clos 策略再选择发送参数。`clos-v4` 将初始化资源与逐次调用�
 按 payload 行字节数选择远端权重的传输方式。每行不超过 7168 B 且有空余 AIV 时使用
 SIMT。超过 7168 B 时默认使用 UDMA。已识别为 EP64/G16、实际通信核数为 32 时，
 8192 B（BF16 H4096）和 12288 B（BF16 H6144）也优先使用 SIMT。发送核占满时
-使用 UDMA。
+使用 UDMA。对于这两种行大小、32 个通信核，EP32/G8 和 EP64/G16 的带权重
+combine 使用完整的已测配置：`group_round_robin/P1/W1/Q1/visit8`，先提交远端再
+复制本卡；EP32/G8 使用 UDMA 发权重，EP64/G16 使用空余 AIV 通过 SIMT 发权重。
+这两个覆盖项仅用于已识别的对应拓扑和精确行大小，不改变 dispatch、无权重 combine
+或 reduce 核数，也不向其他 EP、核数及中间行大小外推。
 
 未命中模板时按核数增加 peers/worker，必要时改为轮转分组，检查发送核数、32-QP 预算
 及每 worker 64-peer 容量后才下发。例如 EP128/AIV8、G=16 可用轮转 P=2/W=1/Q=1；
