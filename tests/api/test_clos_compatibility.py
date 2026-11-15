@@ -499,9 +499,26 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
         for known, group in ((True,16), (False,8)):
             policy = replace(base, ranks_per_group=group, topology_known=known)
             assert policy.for_launch(32,5632,'combine',bf16=True).peer_order == 0
-        # Weighted low-core cases must not opportunistically take the SIMT path.
-        low = replace(base, world_size=8, ranks_per_group=8, topology_known=True)
-        assert low.for_launch(8,5632,'weighted',bf16=True).weight_mode == 1
+    """)
+
+
+def test_weighted_combine_uses_row_bytes_and_spare_aivs():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+
+        for ep, group, cores in ((4,2,8), (8,8,20), (16,8,20), (32,8,32), (64,8,48), (128,16,64)):
+            base = resolve_udma_policy(True,ep,'udma',None,None,None,None,None)
+            policy = replace(base, ranks_per_group=group, topology_known=True)
+            for row_bytes, mode in ((5632,2), (7168,2), (7170,1), (8192,1), (12288,1)):
+                plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
+                assert plan.send_workers < cores, (ep, cores, plan)
+                assert plan.weight_mode == mode, (ep, cores, row_bytes, plan)
+        # At EP8/G8/AIV8 the fitted plan uses every AIV for payload.
+        base = resolve_udma_policy(True,8,'udma',None,None,None,None,None)
+        policy = replace(base, ranks_per_group=8, topology_known=True)
+        plan = policy.for_launch(8,7168,'weighted',bf16=True)
+        assert plan.send_workers == 8 and plan.weight_mode == 1
     """)
 
 

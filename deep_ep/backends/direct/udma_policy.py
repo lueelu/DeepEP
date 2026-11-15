@@ -6,6 +6,8 @@ from functools import lru_cache
 
 from .config import Config, _MAX_NUM_AIV
 
+_SIMT_WEIGHT_MAX_ROW_BYTES = 7168
+
 
 @lru_cache(maxsize=128)
 def _warn_ignored(name, supplied, effective):
@@ -227,9 +229,9 @@ class UdmaPolicy:
                 spare_aivs = cores - plan.send_workers
                 plan = replace(plan, self_copy=1 if spare_aivs >= plan.send_workers else 2)
             if operation == "weighted":
-                # Low-core weighted cases prefer payload QPs even with spare
-                # cores. A spare core alone is not a reason to enable SIMT.
-                plan = replace(plan, weight_mode=2 if cores >= 32 and plan.send_workers < cores else 1)
+                # SIMT needs an AIV outside the payload sending plan.
+                use_simt_weights = row_bytes <= _SIMT_WEIGHT_MAX_ROW_BYTES and plan.send_workers < cores
+                plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
         plan.validate_num_aiv(num_aiv)
         if not plan.valid_group_capacity():
             raise ValueError("automatic UDMA plan exceeds the per-worker peer table")
