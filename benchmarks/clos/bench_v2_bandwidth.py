@@ -68,15 +68,15 @@ def arguments(argv=None, *, description=None):
         default="none",
         help="bias inputs for weighted combine only (default: none; two reproduces older benchmarks)",
     )
-    p.add_argument("--ep-size", type=int, choices=(2, 4, 8, 16, 32, 64), default=8)
+    p.add_argument("--ep-size", type=int, choices=(2, 4, 8, 16, 32, 64, 128, 256), default=8)
     p.add_argument(
         "--nnodes",
         type=int,
-        choices=(1, 2, 4, 8),
+        choices=(1, 2, 4, 8, 16, 32),
         default=None,
         help="equal local rank count on each node; at most 16 devices per node",
     )
-    p.add_argument("--node-rank", type=int, choices=range(8), default=0)
+    p.add_argument("--node-rank", type=int, choices=range(32), default=0)
     p.add_argument("--master-addr", help="node 0 reachable IPv4 address/hostname; required for multi-node execution")
     p.add_argument("--master-port", type=int, default=29500, help="node coordination port; torchrun uses the next port")
     p.add_argument("--run-id", help="same unique suite name on all nodes; required for multi-node execution")

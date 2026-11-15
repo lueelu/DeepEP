@@ -218,7 +218,9 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 8 --output clos_v2_ep8
 V2 通信带宽分母仅为通信 kernel 耗时，notify/reduce 单列；V1 的 fused combine
 保留融合耗时，不能将其当作独立通信耗时。
 
-EP32 默认两机、每机 16 rank；每机只有 8 卡时显式设置 `--nnodes 4`。所有节点
+带宽脚本接受 EP128 和 EP256。EP256 默认 16 台、每台 16 rank；每台 8 rank 时用
+`--nnodes 32`，各节点的 `--node-rank` 为 0 到 31。EP32 默认两机、每机 16 rank；
+每机只有 8 卡时显式设置 `--nnodes 4`。所有节点
 使用相同的 `--ep-size`、`--nnodes`、`--master-addr` 和 `--run-id`，分别设置
 `--node-rank`。例如两机时在 node0/node1 分别执行以下命令并替换 node-rank：
 
