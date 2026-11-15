@@ -91,12 +91,14 @@ V1 路由 handle 和 V2 `EPHandle` 会保留所属 Buffer 的引用；替换外�
 
 不同 Buffer 的通信可使用独立 Host 线程和 NPU stream；每个线程须选择正确设备并维护输入/输出事件依赖。创建和销毁仍应由框架统一按 rank 一致的顺序组织，不应与同一 Buffer 的在途调用并发执行。MPI bootstrap、MegaMoE 与 fused 实验入口保留独占运行时约束。
 
+同一设备上重叠执行的跨 rank 通信需要按设备可用 AIV 总数分配核数。单次 launch 只校验当前调用的核数。多个通信 kernel 各自占核并等待对端时，总请求超过设备容量可能导致不同 rank 互等。V1 通过 `Config(num_aiv=...)` 指定核数，V2 通过 `num_sms` 指定。实测 56 AIV 的设备上，EP4 两个 Buffer 各用 24 AIV 时通过双流回归，各用 32 AIV 时首次并发 dispatch 超时。需要每个 Buffer 使用 32 AIV 时，可以在所有 rank 上按相同顺序串行执行两个 Buffer 的通信。
+
 本分支以 Global Clos 高吞吐路径为实机验证范围。测试覆盖容量共存、旧输出与 handle 保留、cached dispatch/combine、双 Host 线程/双 stream，以及销毁后重建：
 
 ```bash
 python tests/clos/source/test_multi_buffer.py \
     --api v2 --ep-size 8 --num-tokens 129 --small-tokens 17 \
-    --hidden 6144 --cycles 20 --allocate-on-comm-stream
+    --hidden 6144 --num-aiv 24 --cycles 20 --allocate-on-comm-stream
 ```
 
 `--api v1` 验证 V1；V2 可加 `--expand` 覆盖专家展开与 aggregate/combine，`--dtype fp8` 覆盖量化 payload 和 scale。每项会逐 rank 输出 `MULTI_BUFFER_PASSED`，同时要求整个命令退出码为 0。
@@ -109,7 +111,7 @@ python tests/clos/source/test_multi_buffer.py \
 python tests/clos/source/test_multi_buffer.py \
     --api v2 --ep-size 64 --nnodes 8 --node-rank "$NODE_RANK" \
     --dist-init-method "tcp://$MASTER_ADDR:$MASTER_PORT" \
-    --num-tokens 129 --small-tokens 17 --hidden 6144 --cycles 5 \
+    --num-tokens 129 --small-tokens 17 --hidden 6144 --num-aiv 24 --cycles 5 \
     --allocate-on-comm-stream --expand
 ```
 

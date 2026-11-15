@@ -16,6 +16,7 @@ from pathlib import Path
 import sys
 from threading import Barrier
 from time import monotonic
+import traceback
 import weakref
 
 import torch
@@ -180,7 +181,7 @@ def run_rank(local_rank, args):
     ready = Barrier(2)
     torch.npu.synchronize()
 
-    def worker(name, owner, shape, offset, after=None):
+    def run_worker(name, owner, shape, offset, after):
         torch.npu.set_device(device)
         stream = torch.npu.Stream(device=device)
 
@@ -217,6 +218,17 @@ def run_rank(local_rank, args):
             stream.synchronize()
             trace("stream_sync_done", "final")
         return stream.npu_stream
+
+    def worker(name, owner, shape, offset, after=None):
+        try:
+            return run_worker(name, owner, shape, offset, after)
+        except Exception:
+            print(
+                f"MULTI_BUFFER_WORKER_ERROR rank={rank} buffer={name}\n{traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
 
     print(
         f"MULTI_BUFFER_STAGE rank={rank} stage={'serialized' if args.serialize_streams else 'concurrent'} "
