@@ -434,7 +434,7 @@ def worker(args):
             num_aiv=args.num_aiv,
             row_bytes=args.hidden * (1 if args.dtype == "fp8" else 2),
             bf16=args.dtype == "bf16",
-            expanded=bool(args.expand),
+            expanded=expanded,
             combine_row_bytes=args.hidden * 2,
         )
         if rank == 0:

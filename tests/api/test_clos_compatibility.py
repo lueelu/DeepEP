@@ -564,6 +564,66 @@ def test_benchmark_reports_separate_launch_plans():
     """)
 
 
+@pytest.mark.parametrize("expand", [0, 1])
+def test_benchmark_worker_reports_the_expand_mode_passed_to_dispatch(expand):
+    run_host(
+        f"expand = {expand}\n"
+        + textwrap.dedent("""
+        import os
+        from dataclasses import asdict, replace
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from unittest.mock import Mock
+        from deep_ep.backends import global_clos
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        sys.path.insert(0, 'benchmarks/clos')
+        import bench_v2_bandwidth as bench
+
+        class DispatchReached(Exception):
+            pass
+
+        policy = replace(resolve_udma_policy(True,32,'udma',None,None,None,None,None),
+                         ranks_per_group=8, topology_known=True)
+        buffer = Mock(udma_auto_policy=policy)
+        for name in ('schedule', 'dispatch_peer_order', 'combine_peer_order', 'ranks_per_group',
+                     'peers_per_group_per_worker', 'workers_per_peer', 'qps_per_worker'):
+            setattr(buffer, 'udma_' + name, None)
+        buffer.dispatch.side_effect = DispatchReached
+        global_clos.ElasticBuffer = Mock(return_value=buffer)
+        dist = Mock(group=SimpleNamespace(WORLD=object()))
+        dist.all_gather_object.side_effect = lambda items, value: items.__setitem__(slice(None), [value]*len(items))
+        sys.modules.update({'torch.distributed': dist, 'torch_npu': Mock(), 'common': Mock(), 'profiling': Mock()})
+        torch.distributed, torch.npu, torch.set_num_threads = dist, Mock(), Mock()
+        bench.route_counts = bench.route_statistics = Mock(return_value={})
+        bench.loaded_identity = bench.library_identity = Mock(return_value={})
+        bench.byte_ledger = Mock(return_value={'official_logical_bytes_per_row': 0})
+        tensor = Mock(**{'numel.return_value': 0, 'element_size.return_value': 2})
+        tensor.to.return_value = tensor
+        tensor.tolist.return_value = []
+        golden = sys.modules['common']
+        golden._make_topk_idx.return_value = tensor
+        golden._make_weights.return_value = tensor
+        golden._to_npu.return_value = tensor
+        os.environ.update(RANK='0', WORLD_SIZE='32', LOCAL_RANK='0', LOCAL_WORLD_SIZE='8')
+        with TemporaryDirectory() as output:
+            args = bench.arguments(['--ep-size','32','--nnodes','4','--node-rank','0',
+                                    '--master-addr','192.0.2.1','--run-id','expand-test','--hidden','2816','--aiv','32',
+                                    '--dtypes','bf16','--expand',str(expand),'--output',str(Path(output))])
+            try:
+                bench.worker(args)
+            except DispatchReached:
+                actual = buffer.dispatch.call_args.kwargs['do_expand']
+                assert actual is bool(expand)
+                assert args.effective_udma_config['operation_plans'] == {
+                    op: asdict(policy.for_launch(32,5632,op,bf16=True,expanded=actual))
+                    for op in ('dispatch','combine','weighted')
+                }
+            else:
+                raise AssertionError('worker never called dispatch')
+    """)
+    )
+
+
 def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
     import shutil
 
