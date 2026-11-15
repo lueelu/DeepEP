@@ -11,6 +11,7 @@ uint32_t deepep_next_instance();
 uint32_t deepep_reserve_instance(const char* configuration);
 void deepep_release_instance(uint32_t id);
 bool deepep_has_instances();
+bool deepep_is_only_instance(uint32_t id);
 }
 
 namespace deepep {

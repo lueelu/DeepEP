@@ -1,6 +1,7 @@
 // Copyright (c) 2026, DeepEP contributors
 #include "instances.hpp"
 #include <acl/acl.h>
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,13 @@ extern "C" bool deepep_has_instances()
         if (used) return true;
     return false;
 }
+
+extern "C" bool deepep_is_only_instance(uint32_t id)
+{
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return id < occupied.size() && occupied[id] && std::count(occupied.begin(), occupied.end(), true) == 1;
+}
+
 extern "C" uint32_t deepep_next_instance()
 {
     std::lock_guard<std::recursive_mutex> lock(mutex);

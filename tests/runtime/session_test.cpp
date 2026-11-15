@@ -251,6 +251,7 @@ int main(int argc, char** argv)
         auto a = create();
         void* original = a.workspace();
         assert(a.instance_id() == 0);
+        assert(deepep_is_only_instance(0) && !deepep_is_only_instance(1));
         if (mode == "multi-config") {
             fails([&]() { deepep::Session b(0, 4, expected_bytes, "tcp://127.0.0.1:19100", 30); });
             assert(deepep_next_instance() == 1 && a.workspace() == original && finalized == 0);
@@ -272,10 +273,12 @@ int main(int argc, char** argv)
             expected_bytes = 4 << 20;
             deepep::Session b(0, 2, expected_bytes, "tcp://127.0.0.1:19100", 30);
             assert(b.instance_id() == 1 && b.workspace() != original && a.workspace() == original);
+            assert(!deepep_is_only_instance(0) && !deepep_is_only_instance(1));
             a.barrier();
             b.barrier();
             a.close();
             assert(!b.closed());
+            assert(!deepep_is_only_instance(0) && deepep_is_only_instance(1));
             b.barrier();
             expected_bytes = 2 << 20;
             auto c = create();
@@ -283,6 +286,7 @@ int main(int argc, char** argv)
             c.close();
             b.close();
             assert(!deepep_has_instances() && frees == 3 && finalized == 3);
+            assert(!deepep_is_only_instance(1));
             return 0;
         }
         a.close();

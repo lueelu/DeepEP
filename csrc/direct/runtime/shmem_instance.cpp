@@ -189,7 +189,8 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
 std::vector<int64_t> ShmemInstance::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
                                                     int64_t workers, int64_t qps)
 {
-    if (!initialized_ || !tuning_session_ || auto_resources_ || g_runtime_refcount != 1)
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    if (!initialized_ || !tuning_session_ || auto_resources_ || !deepep_is_only_instance(instance_id_))
         throw std::runtime_error("configure_tuning requires one active tuning-session Buffer per process");
     // Validate before any collective or mutation. The benchmark agrees the
     // complete plan across ranks before entering this private interface.
