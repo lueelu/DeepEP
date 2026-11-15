@@ -254,6 +254,7 @@ struct PutCombineTiling {
     uint32_t first_chunk_splits;  // 1 disables startup splitting.
     uint32_t weight_topk, weight_rows, with_weights;
     uint64_t weight_recv_offset_bytes, weight_local_done_offset_bytes, weight_done_offset_bytes;
+    uint32_t instance_id = 0;
 };
 
 // For a fixed owner each peer emits one SO per lane at every logical window

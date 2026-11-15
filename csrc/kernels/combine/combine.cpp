@@ -2,6 +2,7 @@
 
 #include "kernel_operator.h"
 #include "shmem.h"
+#include "device_simt/shmem_device_simt_instance.h"
 #include "simt_api/device_functions.h"
 #include "tiling.hpp"
 #include "launch.hpp"
@@ -2170,18 +2171,22 @@ constexpr uint32_t kWeightThreads = 128;
 __simt_vf__ __launch_bounds__(kWeightThreads) inline void ScatterWeights(__gm__ float* weights,
                                                                          __gm__ int32_t* metadata,
                                                                          __gm__ float* receive, uint32_t begin,
-                                                                         uint32_t end, uint32_t values_per_rank)
+                                                                         uint32_t end, uint32_t values_per_rank,
+                                                                         uint32_t instance_id)
 {
+    simt::aclshmemx_instance_ctx_set(instance_id);
     for (uint32_t row = begin + threadIdx.x; row < end; row += kWeightThreads) {
         const uint32_t id = uint32_t(metadata[row]);
-        ::simt::aclshmem_float_p(receive + id % values_per_rank, weights[row], int32_t(id / values_per_rank));
+        simt::aclshmem_float_p(receive + id % values_per_rank, weights[row], int32_t(id / values_per_rank));
     }
     asc_threadfence();
 }
-__simt_vf__ __launch_bounds__(64) inline void NotifyWeightRanks(__gm__ uint64_t* done, uint32_t world)
+__simt_vf__ __launch_bounds__(64) inline void NotifyWeightRanks(__gm__ uint64_t* done, uint32_t world,
+                                                                uint32_t instance_id)
 {
+    simt::aclshmemx_instance_ctx_set(instance_id);
     for (uint32_t peer = threadIdx.x; peer < world; peer += 64U) {
-        ::simt::aclshmem_uint64_p(done, uint64_t(1), int32_t(peer));
+        simt::aclshmem_uint64_p(done, uint64_t(1), int32_t(peer));
     }
     asc_threadfence();
 }
@@ -2198,7 +2203,7 @@ __aicore__ inline void SendWeights(GM_ADDR workspace, GM_ADDR weights, GM_ADDR m
         asc_vf_call<ScatterWeights>(dim3(kWeightThreads), reinterpret_cast<__gm__ float*>(weights),
                                     reinterpret_cast<__gm__ int32_t*>(metadata),
                                     reinterpret_cast<__gm__ float*>(workspace + tiling.weight_recv_offset_bytes), begin,
-                                    end, tiling.token_num * tiling.weight_topk);
+                                    end, tiling.token_num * tiling.weight_topk, tiling.instance_id);
         // SIMT remote-store visibility before MTE publication needs validation on the target CANN.
         PipeBarrier<PIPE_ALL>();
     }
@@ -2211,7 +2216,7 @@ __aicore__ inline void PublishWeightDone(GM_ADDR workspace, const CombineTiling&
         }
     }
     asc_vf_call<NotifyWeightRanks>(dim3(64), WeightFlag(workspace, tiling.weight_done_offset_bytes, tiling.rank_id),
-                                   tiling.rank_num);
+                                   tiling.rank_num, tiling.instance_id);
     PipeBarrier<PIPE_ALL>();
 }
 
@@ -2926,6 +2931,7 @@ __aicore__ inline void Combine(GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_A
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_prepare_kernel(
     GM_ADDR workspace, ascend_deepep::PutCombineTiling tiling)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(0U);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
     Prepare(workspace, tiling);
@@ -2937,6 +2943,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_kern
     GM_ADDR mask, GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta,
     ascend_deepep::PutCombineTiling tiling)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(0U);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
     Combine<false>(workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr, weights,
@@ -2967,6 +2974,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_prof
     GM_ADDR mask, GM_ADDR ranges, GM_ADDR masks, GM_ADDR weights, GM_ADDR weight_meta, GM_ADDR profile, uint64_t sample,
     GM_ADDR chunk_profile, GM_ADDR peer_profile, ascend_deepep::PutCombineTiling tiling)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(0U);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
     Combine<false, true>(workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks, nullptr,

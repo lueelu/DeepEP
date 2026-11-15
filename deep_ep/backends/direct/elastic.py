@@ -955,6 +955,7 @@ class ElasticBuffer:
             )
             _record_recv_outputs_on_current_stream(*public_handle)
             handle._buffer_token = self._handle_token
+            handle._buffer_owner = self
             handle._udma_policy = policy
             handle._dispatch_layout = dispatch_layout
             handle._dispatch_plan = dispatch_plan

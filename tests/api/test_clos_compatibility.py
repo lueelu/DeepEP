@@ -28,6 +28,45 @@ def run_host(code, *, dtypes=True):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_multi_buffer_bootstrap_uses_fresh_uid_and_capacity_independent_identity():
+    run_host("""
+        from deep_ep.backends.direct import buffer
+        keys, uids = [], []
+        def state(key):
+            keys.append(key)
+            return len(keys) - 1, []
+        def unique():
+            uids.append([len(uids) + 1])
+            return uids[-1]
+        buffer.load_native_module = lambda: SimpleNamespace(
+            get_shmem_bootstrap=state, get_shmem_unique_id=unique)
+        buffer._bootstrap_all_gather = lambda group, comm, size, value: [value] * size
+        group = object()
+        first = buffer._prepare_shmem_bootstrap(group, None, 0, 2, 64 << 20, 'udma', False, None, 17)
+        second = buffer._prepare_shmem_bootstrap(group, None, 0, 2, 128 << 20, 'udma', False, None, 129)
+        assert first[0] != second[0] and first[1] == second[1]
+        assert keys[0] == keys[1] and len(uids) == 2
+    """)
+
+
+@pytest.mark.parametrize("peer_state", [-1, 7])
+def test_multi_buffer_bootstrap_rejects_incompatible_or_divergent_ids_before_uid(peer_state):
+    run_host(f"""
+        from deep_ep.backends.direct import buffer
+        def forbidden():
+            raise AssertionError('must reject before opening a UID listener')
+        buffer.load_native_module = lambda: SimpleNamespace(
+            get_shmem_bootstrap=lambda key: (1, []), get_shmem_unique_id=forbidden)
+        buffer._bootstrap_all_gather = lambda group, comm, size, value: [value, (value[0], {peer_state}, [])]
+        try:
+            buffer._prepare_shmem_bootstrap(object(), None, 0, 2, 64 << 20, 'udma', False, None)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('rank disagreement accepted')
+    """)
+
+
 def test_topology_entries_share_direct_implementation_without_native_loading():
     run_host("""
         import deep_ep

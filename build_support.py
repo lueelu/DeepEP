@@ -433,7 +433,14 @@ def publish_source_native(destination):
     """
     package = ROOT / "deep_ep"
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
-    names = ["_C" + suffix, "_clos_C" + suffix, "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    names = [
+        "_C" + suffix,
+        "_clos_C" + suffix,
+        "libdeepep_kernels.so",
+        "libdeepep_clos_kernels.so",
+        "libdeepep_instances.so",
+        "_build_info.json",
+    ]
     for name in names:
         if not (destination / name).is_file():
             raise RuntimeError(f"Incomplete native build: {destination / name}")

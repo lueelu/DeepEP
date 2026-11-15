@@ -538,6 +538,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                           allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
+    tiling.instance_id = shmem.InstanceId();
     if (public_handle != nullptr) {
         tiling.v2_rank_prefix = reinterpret_cast<uint64_t>((*public_handle)[0].data_ptr());
         if (!defer_public_expert_prefix) {

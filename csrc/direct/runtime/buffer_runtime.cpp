@@ -8,6 +8,7 @@
  */
 
 #include "runtime/buffer_runtime.h"
+#include "runtime/instances.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -25,7 +26,7 @@
 #include "shmem.h"
 #include "tiling/platform/platform_ascendc.h"
 
-extern "C" uint64_t v1_token_schedule_abi_3();
+extern "C" uint64_t v1_multi_instance_abi_4();
 
 namespace ascend_deepep::runtime {
 namespace {
@@ -143,7 +144,7 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
           v1_token_schedule, udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
           udma_peers_per_group_per_worker, udma_workers_per_peer, udma_qps_per_worker, auto_resources))
 {
-    TORCH_CHECK(v1_token_schedule_abi_3() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
+    TORCH_CHECK(v1_multi_instance_abi_4() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
                                               uint64_t(sizeof(ascend_deepep::CombineTilingData))),
                 "Kernel/native tiling ABI mismatch; rebuild and install with scripts/build.sh");
 
@@ -211,6 +212,8 @@ void BufferRuntime::AbortInitialization()
 
 std::vector<std::string> BufferRuntime::MteMappingErrors() const
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     RequireShmem();
     TORCH_CHECK(data_op_engine_type_ == ACLSHMEM_DATA_OP_MTE, "mapping preflight requires MTE-only transport");
     std::vector<std::string> errors;
@@ -504,11 +507,13 @@ void BufferRuntime::ElasticBarrier(int64_t num_aiv)
     // It is also valid for the shared-Jetty V1 backend of ElasticBuffer.
     TORCH_CHECK(num_aiv > 0 && num_aiv <= num_device_aiv_, "elastic barrier num_aiv must be in (0, ", num_device_aiv_,
                 "]");
-    LaunchElasticBarrierKernel(num_aiv, RequireShmem().FftsAddr());
+    LaunchElasticBarrierKernel(num_aiv, RequireShmem().FftsAddr(), RequireShmem().InstanceId());
 }
 
 void BufferRuntime::AllocateCommMeta()
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     comm_meta_ptr_ = aclshmem_malloc(kCommMetaBytes);
     if (comm_meta_ptr_ == nullptr) {
         throw std::runtime_error("aclshmem_malloc failed for the 2 MiB communication metadata slot");
@@ -524,6 +529,8 @@ void BufferRuntime::AllocateCommMeta()
 
 void BufferRuntime::AllocateWorkspace()
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     if (num_bytes_ == 0) {
         return;
     }
@@ -538,8 +545,10 @@ void BufferRuntime::AllocateWorkspace()
     }
 }
 
-void BufferRuntime::FreeResources() noexcept
+void BufferRuntime::FreeResources()
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     if (workspace_ptr_ != nullptr) {
         if (!use_1g_huge_pages_) {
             aclshmem_free(workspace_ptr_);

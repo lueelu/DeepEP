@@ -403,7 +403,14 @@ def source_native(build, monkeypatch, tmp_path):
     monkeypatch.setattr(build.sysconfig, "get_config_var", lambda key: ".test.so")
     destination = tmp_path / "temporary-staging"
     destination.mkdir()
-    names = ["_C.test.so", "_clos_C.test.so", "libdeepep_kernels.so", "libdeepep_clos_kernels.so", "_build_info.json"]
+    names = [
+        "_C.test.so",
+        "_clos_C.test.so",
+        "libdeepep_kernels.so",
+        "libdeepep_clos_kernels.so",
+        "libdeepep_instances.so",
+        "_build_info.json",
+    ]
     for name in names:
         (destination / name).write_bytes(("first:" + name).encode())
     (destination / ".libs").mkdir()

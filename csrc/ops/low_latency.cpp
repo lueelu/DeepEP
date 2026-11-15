@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include "runtime/session.hpp"
+#include "runtime/instances.hpp"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
 #include "host/data_plane/shmem_host_p2p_sync.h"
@@ -24,6 +25,8 @@ using Shape = std::vector<int64_t>;
 constexpr uint64_t kRankBaseBiasBytes = 1024U;
 uint8_t* peer_buffer_base(Session& session, int peer)
 {
+    InstanceLock lock(instance_mutex());
+    select_instance(session.instance_id());
     if (peer < 0 || peer >= session.world()) throw std::invalid_argument("Invalid LL peer");
     auto* original = static_cast<uint8_t*>(aclshmem_ptr(session.workspace(), peer));
     if (original == nullptr) throw std::invalid_argument("Invalid LL peer mapping");
@@ -153,6 +156,7 @@ void bind_low_latency(py::module_& module)
         }
         auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
         deepep::EpServerDedupKernelArgs args{};
+        args.instance_id = session.instance_id();
         args.commArgs = get("comm_args", {sizeof(DispatchDedup::CommArgs)}, "uint8");
         args.x = get("input", {b, h}, dtype.c_str());
         args.expertIds = get("indices", {b, k}, "int32");
@@ -194,6 +198,7 @@ void bind_low_latency(py::module_& module)
         const int64_t c = plan.capacityRows;
         auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
         deepep::EpServerDedupCombineKernelArgs args{};
+        args.instance_id = session.instance_id();
         args.commArgs = get("comm_args", {sizeof(DispatchDedup::CommArgs)}, "uint8");
         // Python validates rows against the dispatch handle. The device selects
         // rows below the actual receive count; C_B sizes metadata, not expert storage.

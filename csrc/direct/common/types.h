@@ -101,6 +101,7 @@ struct alignas(8) DispatchTilingData {
     uint64_t packed_scale_ready = 0;
     // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
     uint64_t notify_host_counts = 0;
+    uint32_t instance_id = 0;
 };
 
 struct alignas(8) CombineTilingData {
@@ -142,6 +143,7 @@ struct alignas(8) CombineTilingData {
     uint32_t udma_self_copy_first_aiv = 0;
     uint32_t udma_self_copy_after_submit = 0;
     uint32_t udma_weight_mode = 0;  // 0 legacy, 1 UDMA, 2 SIMT if spare AIVs exist.
+    uint32_t instance_id = 0;
 };
 
 struct alignas(8) ExpandTilingData {

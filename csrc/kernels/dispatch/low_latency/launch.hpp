@@ -24,9 +24,10 @@ struct EpServerDedupKernelArgs {
     uint8_t* tilingData;    // Per-launch device tiling, read from GM by the kernel.
     int64_t reservedMagic;  // Must be zero; device owns the persistent bank selector.
     uint8_t* inputScales;   // ABI: complete INT32 packed E8M0 input rows.
+    uint32_t instance_id = 0;
 };
 static_assert(std::is_standard_layout<EpServerDedupKernelArgs>::value, "launch arguments must be standard layout");
-static_assert(sizeof(EpServerDedupKernelArgs) == 128, "launch ABI has fifteen addresses and a reserved slot");
+static_assert(sizeof(EpServerDedupKernelArgs) == 136, "launch ABI has fifteen addresses and a reserved slot");
 static_assert(offsetof(EpServerDedupKernelArgs, dynamicScalesOut) == 40, "quant scale address");
 static_assert(offsetof(EpServerDedupKernelArgs, tokenTypeOut) == 64, "token type address");
 static_assert(offsetof(EpServerDedupKernelArgs, destinationIndexOut) == 72, "destination index address");

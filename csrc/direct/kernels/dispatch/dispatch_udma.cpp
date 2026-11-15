@@ -128,7 +128,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         ascend_deepep::udma::PrepareDispatchOutput(resource, tiling.udma_output_control, rank, world_size,
             recv_x, recv_x_scales, tiling.num_output_tokens,
             static_cast<uint32_t>(rank_prefix_gm.GetValue((world_size - 1) * world_size + rank)),
-            hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0);
+            hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0, tiling.instance_id);
     }
     // Clears incoming payload markers and publishes this invocation's output
     // addresses/top-k initialization before remote writes. Every AIV participates.
@@ -366,6 +366,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR recv_channel_prefix_matrix, GM_ADDR recv_src_idx, GM_ADDR send_head, GM_ADDR dispatch_plan,
     ascend_deepep::DispatchTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     V1DispatchUdmaKernelImpl(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
@@ -386,7 +387,7 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, *td, ffts_addr);
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT uint64_t v1_token_schedule_abi_3() {
+extern "C" ASCEND_DEEPEP_EXPORT uint64_t v1_multi_instance_abi_4() {
     return (uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
            uint64_t(sizeof(ascend_deepep::CombineTilingData));
 }

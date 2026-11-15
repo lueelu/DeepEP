@@ -179,6 +179,7 @@ struct NotifyTiling {
     // routing/Combine tables and symmetric workspace offsets are unchanged.
     NotifyDispatchPlan dispatch_plan;
     uint64_t expert_totals_output = 0;
+    uint32_t instance_id = 0;
 };
 
 // 主机在检查 shape 和乘法上界后调用。设备直接消费偏移，不重新布局。

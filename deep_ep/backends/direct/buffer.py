@@ -1286,7 +1286,7 @@ def _prepare_shmem_bootstrap(
         options += (udma_auto_options,)
     # This key is compared only within this process. Buffer retains group, so
     # its identity cannot be recycled while the associated runtime is alive.
-    key = repr((id(group), options))
+    key = repr((id(group) if comm is None else id(comm), transport, udma_schedule, udma_peer_options))
     state, uid = native.get_shmem_bootstrap(key)
     peers = _bootstrap_all_gather(group, comm, size, (options, state, uid))
     if any(peer[0] != options for peer in peers):
@@ -1294,9 +1294,9 @@ def _prepare_shmem_bootstrap(
     if any(peer[1] < 0 for peer in peers):
         raise RuntimeError("CANN SHMEM already has an active Buffer for a different group or configuration")
     if any(peer[1] != state or peer[2] != uid for peer in peers):
-        raise RuntimeError("inconsistent active SHMEM sessions across EP ranks")
-    if state or ip_port is not None:
-        return uid, key
+        raise RuntimeError("EP ranks disagree on the next Buffer instance ID")
+    if ip_port is not None:
+        return [], key
 
     # Only EP rank 0 reserves an endpoint. Other ranks receive its opaque UID,
     # never create their own endpoint or interpret a peer's socket descriptor.

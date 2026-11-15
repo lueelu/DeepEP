@@ -57,4 +57,4 @@ void LaunchAggregateKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
                            torch::Tensor aggregated_x, const c10::optional<torch::Tensor>& aggregated_values,
                            const ascend_deepep::AggregateTilingData& tiling, uint64_t ffts_addr);
 
-void LaunchElasticBarrierKernel(int64_t block_dim, uint64_t ffts_addr);
+void LaunchElasticBarrierKernel(int64_t block_dim, uint64_t ffts_addr, uint32_t instance_id);

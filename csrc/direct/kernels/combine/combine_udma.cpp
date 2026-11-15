@@ -263,6 +263,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
         return;
@@ -295,6 +296,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
         return;
@@ -327,6 +329,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_u
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
         return;
@@ -359,6 +362,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
         return;
@@ -392,6 +396,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
         return;
@@ -425,6 +430,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
     if ASCEND_IS_AIC {
         return;

@@ -1,4 +1,5 @@
 #pragma once
+#include "device_simt/shmem_device_simt_instance.h"
 
 #include "kernels/common/udma_shared_sender.h"
 #include "common/types.h"
@@ -10,8 +11,9 @@ constexpr uint32_t kDispatchMetadataSimtThreads = 128;
 // Notify already chose the stable ordinal. Metadata workers only publish it.
 __simt_vf__ __launch_bounds__(kDispatchMetadataSimtThreads) inline void DispatchSourceIndicesVf(
     const __gm__ int32_t* plan, const __gm__ int32_t* ranks, const __gm__ int32_t* channels, __gm__ uint8_t* workspace,
-    uint64_t src_offset, uint32_t rank, uint32_t world, uint32_t channel_count, uint32_t channel, uint32_t stride)
+    uint64_t src_offset, uint32_t rank, uint32_t world, uint32_t channel_count, uint32_t channel, uint32_t stride, uint32_t instance_id)
 {
+    simt::aclshmemx_instance_ctx_set(instance_id);
     constexpr uint32_t lanes = 16;
     for (uint32_t peer = threadIdx.x / lanes; peer < world; peer += kDispatchMetadataSimtThreads / lanes) {
         const int32_t previous = channel ? channels[uint64_t(peer) * channel_count + channel - 1] : 0;
@@ -33,8 +35,9 @@ __simt_vf__ __launch_bounds__(kDispatchMetadataSimtThreads) inline void Dispatch
     const __gm__ int32_t* send_head, const __gm__ int32_t* rank_prefix, const __gm__ int32_t* channel_prefix,
     int32_t rank, int32_t num_channels, int32_t channel, int32_t token_begin, int32_t tile_tokens, int32_t num_topk,
     int32_t world_size, int32_t experts_per_rank, uint64_t topk_idx_buffer_offset, uint64_t topk_weights_buffer_offset,
-    uint32_t topk_idx_row_stride, uint32_t topk_weights_row_stride, uint32_t scatter_topk_weights)
+    uint32_t topk_idx_row_stride, uint32_t topk_weights_row_stride, uint32_t scatter_topk_weights, uint32_t instance_id)
 {
+    simt::aclshmemx_instance_ctx_set(instance_id);
     const uint32_t thread_index = static_cast<uint32_t>(threadIdx.x);
     const uint64_t route_count = static_cast<uint64_t>(tile_tokens) * num_topk;
     for (uint64_t route = thread_index; route < route_count; route += kDispatchMetadataSimtThreads) {
@@ -167,7 +170,7 @@ __aicore__ inline void DispatchMetadata(
         if (build_handle) {
             asc_vf_call<DispatchSourceIndicesVf>(
                 dim3(kDispatchMetadataSimtThreads), reinterpret_cast<__gm__ int32_t*>(plan), rank_ptr, channel_ptr,
-                workspace, td.src_idx_buffer_offset, td.rank, world, td.num_channels, ch, plan_stride);
+                workspace, td.src_idx_buffer_offset, td.rank, world, td.num_channels, ch, plan_stride, td.instance_id);
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         }
@@ -178,7 +181,7 @@ __aicore__ inline void DispatchMetadata(
                 rank_ptr, channel_ptr, int32_t(td.rank), int32_t(td.num_channels), int32_t(ch), int32_t(begin),
                 int32_t(end - begin), int32_t(td.num_topk), int32_t(world), int32_t(experts_per_rank),
                 td.topk_idx_buffer_offset, td.topk_weights_buffer_offset, td.num_topk * uint32_t(sizeof(topk_idx_t)),
-                td.num_topk * uint32_t(sizeof(float)), td.has_topk_weights);
+                td.num_topk * uint32_t(sizeof(float)), td.has_topk_weights, td.instance_id);
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         }

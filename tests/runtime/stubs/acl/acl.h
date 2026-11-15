@@ -39,3 +39,9 @@ int aclrtFreePhysical(aclrtDrvMemHandle);
 int aclrtGetCurrentContext(aclrtContext*);
 const char* aclrtGetSocName();
 int aclrtMemset(void*, size_t, int, size_t);
+
+using aclrtStream = void*;
+constexpr int ACL_SUCCESS = 0;
+int aclrtCreateStream(aclrtStream*);
+int aclrtSynchronizeStream(aclrtStream);
+int aclrtDestroyStream(aclrtStream);

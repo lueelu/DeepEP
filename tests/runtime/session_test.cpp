@@ -2,6 +2,9 @@
 
 // Link-time SDK doubles test ownership decisions, never ABI/device support.
 #include "runtime/session.hpp"
+#include "runtime/instances.hpp"
+#include <array>
+#include <memory>
 #include "host/init/shmem_host_init.h"
 #include <cassert>
 #include <cstdlib>
@@ -16,7 +19,9 @@ bool allocation_failure = false;
 int qp_count = 0;
 int expected_world = 2;
 uint64_t expected_bytes = 2 << 20;
-int storage = 0, context_token = 0, another_context = 0;
+int storage[128]{}, context_token = 0, another_context = 0;
+uint32_t current_id = 0;
+std::array<int, 128> states{};
 void* current_context = &context_token;
 void* source_address = reinterpret_cast<void*>(0x100000000ULL);
 void* symmetric_address = reinterpret_cast<void*>(0x200000000ULL);
@@ -49,7 +54,7 @@ const char* aclrtGetSocName()
 }
 int aclrtMemset(void* destination, size_t maximum, int value, size_t count)
 {
-    assert(destination == (huge_registered ? symmetric_address : &storage));
+    assert(destination == (huge_registered ? symmetric_address : &storage[current_id]));
     assert(maximum == expected_bytes && count == expected_bytes && value == 0);
     ++memsets;
     return memset_status;
@@ -121,6 +126,7 @@ int aclshmemx_init_attr_with_buffers(int mode, aclshmemx_init_attr_t* attr, cons
                                      size_t count)
 {
     assert(mode == ACLSHMEMX_INIT_WITH_DEFAULT || mode == ACLSHMEMX_INIT_WITH_MPI);
+    aclshmemx_instance_ctx_set(attr->instance_id);
     assert(attr->n_pes == expected_world && attr->local_mem_size == 0 && count == 1);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
     assert(descriptors->addr == source_address && descriptors->size == physical_bytes);
@@ -147,6 +153,7 @@ int aclshmemx_init_status()
 }
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
+    aclshmemx_instance_ctx_set(attr->instance_id);
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
     if (init_status == 0) {
@@ -178,7 +185,7 @@ void* aclshmem_malloc(size_t bytes)
 {
     assert(bytes == expected_bytes);
     ++allocations;
-    return allocation_failure ? nullptr : &storage;
+    return allocation_failure ? nullptr : &storage[current_id];
 }
 // Match the aligned allocation API used by Session; reuse the existing fault-injection stub.
 void* aclshmem_align(size_t, size_t bytes)
@@ -187,11 +194,49 @@ void* aclshmem_align(size_t, size_t bytes)
 }
 void aclshmem_free(void* value)
 {
-    assert(value == &storage);
+    assert(value == &storage[current_id]);
     ++frees;
 }
 void aclshmem_barrier_all()
 {
+    ++barriers;
+}
+
+int aclshmemx_instance_ctx_set(uint64_t id)
+{
+    assert(id < states.size());
+    states[current_id] = initialized;
+    current_id = static_cast<uint32_t>(id);
+    initialized = states[current_id];
+    return 0;
+}
+int aclshmemx_finalize(uint64_t id)
+{
+    aclshmemx_instance_ctx_set(id);
+    const auto rc = aclshmem_finalize();
+    if (id != 0 && rc == 0) aclshmemx_instance_ctx_set(0);
+    return rc;
+}
+uint64_t shmemx_get_ffts_config()
+{
+    return 0;
+}
+int aclrtCreateStream(aclrtStream* stream)
+{
+    *stream = &storage[0];
+    return 0;
+}
+int aclrtSynchronizeStream(aclrtStream)
+{
+    return 0;
+}
+int aclrtDestroyStream(aclrtStream)
+{
+    return 0;
+}
+extern "C" void deepep_instance_sync_do(void*, uint32_t id, uint64_t, bool)
+{
+    assert((id == current_id ? initialized : states[id]) == 2);
     ++barriers;
 }
 
@@ -202,7 +247,47 @@ int main(int argc, char** argv)
     setenv("DEEPEP_SHMEM_DENSE_QPS", "1", 1);
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
-    if (mode.rfind("huge-", 0) == 0) {
+    if (mode.rfind("multi-", 0) == 0 || mode == "instance-limit") {
+        auto a = create();
+        void* original = a.workspace();
+        assert(a.instance_id() == 0);
+        if (mode == "multi-config") {
+            fails([&]() { deepep::Session b(0, 4, expected_bytes, "tcp://127.0.0.1:19100", 30); });
+            assert(deepep_next_instance() == 1 && a.workspace() == original && finalized == 0);
+        } else if (mode == "multi-init-fault") {
+            init_status = -1;
+            fails(create);
+            init_status = 0;
+            assert(deepep_next_instance() == 1 && a.workspace() == original && finalized == 0);
+            a.barrier();
+        } else if (mode == "instance-limit") {
+            std::vector<std::unique_ptr<deepep::Session>> sessions;
+            for (uint32_t id = 1; id < 128; ++id) {
+                sessions.emplace_back(new deepep::Session(0, 2, expected_bytes, "tcp://127.0.0.1:19100", 30));
+                assert(sessions.back()->instance_id() == id);
+            }
+            fails(create);
+            for (auto& session : sessions) session->close();
+        } else {
+            expected_bytes = 4 << 20;
+            deepep::Session b(0, 2, expected_bytes, "tcp://127.0.0.1:19100", 30);
+            assert(b.instance_id() == 1 && b.workspace() != original && a.workspace() == original);
+            a.barrier();
+            b.barrier();
+            a.close();
+            assert(!b.closed());
+            b.barrier();
+            expected_bytes = 2 << 20;
+            auto c = create();
+            assert(c.instance_id() == 0 && c.workspace() != b.workspace());
+            c.close();
+            b.close();
+            assert(!deepep_has_instances() && frees == 3 && finalized == 3);
+            return 0;
+        }
+        a.close();
+        assert(!deepep_has_instances());
+    } else if (mode.rfind("huge-", 0) == 0) {
         fault = mode.substr(5);
         if (fault == "rounded") expected_bytes = (1ULL << 30) + (2 << 20);
         if (fault == "exact") expected_bytes = 4ULL << 30;
@@ -231,7 +316,7 @@ int main(int argc, char** argv)
                 const auto calls = physical_calls;
                 fails([&]() { session.close(); });
                 fails([&]() { session.barrier(); });
-                assert(deepep::Session::busy() && !session.closed() && calls == physical_calls);
+                assert(deepep_has_instances() && !session.closed() && calls == physical_calls);
                 assert(physical_calls.back() == fault && finalized == 1 && frees == 0);
                 return 0;
             }
@@ -242,14 +327,16 @@ int main(int argc, char** argv)
             assert(physical_calls == expected && frees == 0 && finalized == 1 && !deepep::Session::busy());
         } else {
             fails(create_huge);
-            assert(frees == 0 && allocations == 0 && deepep::Session::busy() == (fault == "init"));
+            assert(frees == 0 && allocations == 0 && !deepep::Session::busy());
             std::vector<std::string> expected;
             if (fault == "allocate") expected = {"allocate"};
             if (fault == "reserve") expected = {"allocate", "reserve", "free-physical"};
             if (fault == "map") expected = {"allocate", "reserve", "map", "release-address", "free-physical"};
             if (fault == "access")
                 expected = {"allocate", "reserve", "map", "access", "unmap", "release-address", "free-physical"};
-            if (fault == "init") expected = {"allocate", "reserve", "map", "access", "register"};
+            if (fault == "init")
+                expected = {"allocate", "reserve",         "map",          "access", "register",
+                            "unmap",    "release-address", "free-physical"};
             if (fault == "translate" || fault == "unaligned" || fault == "memset") {
                 expected = setup;
                 expected.insert(expected.end(), {"finalize", "unmap", "release-address", "free-physical"});
@@ -264,7 +351,7 @@ int main(int argc, char** argv)
         // ownership and logical capacity independently of the EP size.
         deepep::Session session(expected_world - 1, expected_world, logical_bytes, "tcp://xxx.xxx.xxx.xxx:xxxxx", 30,
                                 true);
-        assert(session.capacity() == logical_bytes && session.workspace() == &storage && memsets == 1);
+        assert(session.capacity() == logical_bytes && session.workspace() == &storage[current_id] && memsets == 1);
         assert(session.workspace_allocation_bytes() == expected_bytes);
         assert(uint64_t(expected_world - 1) * 1024U < expected_bytes - logical_bytes);
         session.close();
@@ -298,7 +385,7 @@ int main(int argc, char** argv)
     } else if (mode == "init-fault") {
         init_status = -1;
         fails(create);
-        assert(deepep::Session::busy() && finalized == 0);
+        assert(!deepep_has_instances() && finalized == 0);
     } else if (mode == "allocation-fault" || mode == "memset-fault") {
         allocation_failure = mode == "allocation-fault";
         memset_status = mode == "memset-fault" ? -1 : 0;
@@ -314,10 +401,9 @@ int main(int argc, char** argv)
             auto session = create();
             assert(!session.closed());
         }
-        assert(deepep::Session::busy() && finalized == 0 && frees == 0);
+        assert(deepep_has_instances() && finalized == 0 && frees == 0);
     } else {
         auto session = create();
-        fails(create);
         current_context = &another_context;
         fails([&]() { session.close(); });
         assert(finalized == 0 && frees == 0);
@@ -325,7 +411,7 @@ int main(int argc, char** argv)
         if (mode == "close-fault") {
             finalize_status = -1;
             fails([&]() { session.close(); });
-            assert(!session.closed() && deepep::Session::busy() && frees == 1);
+            assert(!session.closed() && deepep_has_instances() && frees == 1);
             fails([&]() { session.close(); });
             fails([&]() { session.barrier(); });
             assert(finalized == 1 && frees == 1);

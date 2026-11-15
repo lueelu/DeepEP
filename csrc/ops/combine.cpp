@@ -199,6 +199,7 @@ void bind_combine(py::module_& module)
                              int local_rows, int chunk, uintptr_t stream_address) {
         const int hidden = tensors["input"].attr("size")(1).cast<int>();
         auto t = layout(session.rank(), session.world(), tokens, topk, rows, gathered, chunk, hidden);
+        t.instance_id = session.instance_id();
         const uint32_t reuse = tensors.contains("reuse_tokens") ? tensors["reuse_tokens"].cast<uint32_t>() : 0U;
         if (reuse) {
             if (reuse > uint32_t(tokens)) throw std::invalid_argument("Invalid Combine reuse window");
@@ -278,7 +279,7 @@ void bind_combine(py::module_& module)
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         py::gil_scoped_release release;
         // All peers must finish the previous operator before reusing workspace.
-        notify_dispatch_barrier_kernel_do(stream, 64U);
+        notify_dispatch_barrier_kernel_do(stream, 64U, session.instance_id());
         if (reuse) {
             if (t.with_weights &&
                 aclrtMemsetAsync(workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float), 0,
@@ -287,7 +288,7 @@ void bind_combine(py::module_& module)
             }
             combine_reuse_kernel_do(stream, workspace, input, forward, counts, reuse_backward, reuse_offsets, mask,
                                     weights, weight_meta, reinterpret_cast<uint8_t*>(&t), reuse);
-            notify_dispatch_barrier_kernel_do(stream, 64U);
+            notify_dispatch_barrier_kernel_do(stream, 64U, session.instance_id());
             copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * hidden * 2U, stream);
             if (t.with_weights) {
                 copy(weight_output, workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float),
@@ -316,7 +317,7 @@ void bind_combine(py::module_& module)
             combine_kernel_do(stream, workspace, input, forward, counts, backward, backward_counts, mask, ranges, masks,
                               weights, weight_meta, reinterpret_cast<uint8_t*>(&t));
         }
-        notify_dispatch_barrier_kernel_do(stream, 64U);
+        notify_dispatch_barrier_kernel_do(stream, 64U, session.instance_id());
         copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * hidden * 2U, stream);
         if (t.with_weights) {
             copy(weight_output, workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float),

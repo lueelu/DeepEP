@@ -56,7 +56,7 @@ ASCEND_DEEPEP_EXPORT void cached_dispatch_plan_kernel_do(
 ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
     uint32_t block_dim,
     void* stream,
-    uint64_t ffts_addr);
+    uint64_t ffts_addr, uint32_t instance_id);
 
 ASCEND_DEEPEP_EXPORT void v1_dispatch_kernel_do(
     uint32_t block_dim,
@@ -108,7 +108,7 @@ ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
 ASCEND_DEEPEP_EXPORT void cached_notify_combine_kernel_do(
     uint32_t block_dim,
     void* stream,
-    uint64_t ffts_addr);
+    uint64_t ffts_addr, uint32_t instance_id);
 
 ASCEND_DEEPEP_EXPORT void v1_combine_kernel_do(
     uint32_t block_dim,

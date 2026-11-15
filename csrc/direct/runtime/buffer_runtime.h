@@ -153,7 +153,7 @@ public:
 private:
     void AllocateCommMeta();
     void AllocateWorkspace();
-    void FreeResources() noexcept;
+    void FreeResources();
     void ReleaseResources(bool synchronize);
     void DestroyNoThrow() noexcept;
     ShmemInstance& RequireShmem() const;

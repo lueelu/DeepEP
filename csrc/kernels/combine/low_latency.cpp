@@ -16,8 +16,10 @@
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_server_dedup_kernel(
     GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR destinationIndex, GM_ADDR sendCounts, GM_ADDR expertScales,
-    GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask, GM_ADDR yOut, GM_ADDR tilingData)
+    GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask, GM_ADDR yOut, GM_ADDR tilingData,
+    uint32_t instance_id)
 {
+    aclshmemx_instance_ctx_set(instance_id);
     const auto* args = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
     util_set_ffts_config(args->fftsVal);
     uint32_t magic;
@@ -38,6 +40,6 @@ extern "C" DEEPEP_EXPORT void combine_server_dedup_kernel_do(void* stream,
     const auto& a = *args;
     combine_server_dedup_kernel<<<64, DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(
         a.commArgs, a.expertOut, a.destinationIndex, a.sendCounts, a.expertScales, a.tokenType, a.relayReadIndex,
-        a.sourceMask, a.yOut, a.tilingData);
+        a.sourceMask, a.yOut, a.tilingData, a.instance_id);
 }
 #endif

@@ -48,6 +48,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     GM_ADDR num_recv_tokens_per_expert, GM_ADDR dispatch_plan, GM_ADDR send_head,
     ascend_deepep::DispatchTilingData tiling, uint64_t ffts_addr)
 {
+    aclshmemx_instance_ctx_set(tiling.instance_id);
     util_set_ffts_config(ffts_addr);
 
     if ASCEND_IS_AIC {
@@ -439,16 +440,17 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
         dispatch_plan, send_head, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr)
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr, uint32_t instance_id)
 {
+    aclshmemx_instance_ctx_set(instance_id);
     util_set_ffts_config(ffts_addr);
     aclshmemi_sync_npu_v4<true>(0);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
-    uint32_t block_dim, void* stream, uint64_t ffts_addr)
+    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id)
 {
-    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr);
+    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, instance_id);
 }
 
 // Legacy six-tensor handles have no private plan. Rebuild locally on the same

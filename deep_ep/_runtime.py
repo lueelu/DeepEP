@@ -16,7 +16,7 @@ from ._store import StoreGroup
 
 from ._backend_lock import LOCK as _LOCK
 
-_OWNER = None
+_OWNERS = set()
 
 
 def integer(name, value, minimum, maximum):
@@ -65,7 +65,7 @@ def rank_and_world(group, rank=None, world_size=None):
 
 
 class Runtime:
-    """One explicit collective lifetime per process; a live owner is retained."""
+    """One explicit collective lifetime per Buffer; live owners are retained."""
 
     _megamoe = False
 
@@ -83,7 +83,7 @@ class Runtime:
         use_1g_huge_pages=False,
         debug_collectives=False,
     ):
-        global _OWNER
+        global _OWNERS
         native = require_native("Runtime.__init__")
         integer("capacity", capacity, 2 << 20, (1 << 30) if self._megamoe else (1 << 63) - 1)
         if capacity % (2 << 20):
@@ -151,7 +151,16 @@ class Runtime:
         self.low_latency_comm_args = None
         self.closed = False
         with _LOCK:
-            busy = _OWNER is not None or native.runtime_busy()
+            busy = native.runtime_busy() or any(
+                owner.group is not group
+                or owner.device != self.device
+                or self._megamoe
+                or owner._megamoe
+                or bootstrap == "mpi"
+                or owner.bootstrap == "mpi"
+                for owner in _OWNERS
+            )
+            instance_id = native.next_instance_id()
 
             if group is None:
                 if busy:
@@ -172,7 +181,8 @@ class Runtime:
                         ]
                     )
                 local_values.append(
-                    int(udma)
+                    128 * instance_id
+                    + int(udma)
                     + 2 * int(combine_only)
                     + 4 * int(dense_qps)
                     + 8 * int(use_1g_huge_pages)
@@ -217,6 +227,19 @@ class Runtime:
                                 f"{peer_rank} use local device {value[6]} on the same Linux host"
                             )
                         devices[key] = peer_rank
+            uid = []
+            if group is not None and not self._megamoe:
+                result = None
+                if rank == 0:
+                    try:
+                        result = (native.instance_unique_id(), None)
+                    except Exception as exc:
+                        result = (None, str(exc))
+                gathered = [None] * size
+                dist.all_gather_object(gathered, result, group=group)
+                uid, error = gathered[0]
+                if error:
+                    raise RuntimeError(f"SHMEM UID creation failed: {error}")
             self.rank, self.world_size = rank, size
             self.capacity = capacity
             self.notify_lock = threading.RLock()
@@ -225,18 +248,18 @@ class Runtime:
             self.stream = npu.Stream(device=self.device)
             self.native = (
                 native.create_combine_runtime(
-                    rank, size, capacity, address, timeout, bootstrap == "mpi", use_1g_huge_pages
+                    rank, size, capacity, address, timeout, bootstrap == "mpi", use_1g_huge_pages, uid
                 )
                 if combine_only
                 else native.create_mpi_runtime(rank, size, capacity, timeout, use_1g_huge_pages)
                 if bootstrap == "mpi"
                 else (
-                    native.Runtime(rank, size, capacity, address, timeout, udma, use_1g_huge_pages)
-                    if udma
+                    native.Runtime(rank, size, capacity, address, timeout, udma, use_1g_huge_pages, uid)
+                    if not self._megamoe
                     else factory(rank, size, capacity, address, timeout)
                 )
             )
-            _OWNER = self
+            _OWNERS.add(self)
             if capacity == 8 << 30 and 16 <= size <= 256:
                 # LL peers must finish initialization before any payload writes.
                 self.native.barrier()
@@ -248,7 +271,7 @@ class Runtime:
             raise RuntimeError("Use Buffer on its creating NPU device")
 
     def close(self):
-        global _OWNER
+        global _OWNERS
         with getattr(self, "notify_lock", nullcontext()), _LOCK:
             if self.closed:
                 return
@@ -258,7 +281,7 @@ class Runtime:
             self.notify_inflight = None
             self.low_latency_comm_args = None
             self.closed = True
-            _OWNER = None
+            _OWNERS.discard(self)
 
     def barrier(self):
         self.ensure_alive()

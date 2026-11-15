@@ -83,8 +83,9 @@ void bind_dispatch(py::module_& module)
                               int local_rows, bool fp8, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("Dispatch requires combine_only=False");
         const int hidden = tensors["input"].attr("size")(1).cast<int>();
-        const auto t = layout(session.rank(), session.world(), tokens, topk, experts, rows, fp8,
-                              !tensors["weights"].is_none(), hidden);
+        auto t = layout(session.rank(), session.world(), tokens, topk, experts, rows, fp8,
+                        !tensors["weights"].is_none(), hidden);
+        t.instance_id = session.instance_id();
         auto* workspace = static_cast<uint8_t*>(session.workspace());
         if (!session.udma() || t.workspace_bytes > session.capacity() / 2U || stream_address == 0 || local_rows < 0 ||
             local_rows > rows) {
@@ -198,13 +199,13 @@ void bind_dispatch(py::module_& module)
             session.remember_dispatch_controls(controls);
         }
         timing.mark(0, stream);
-        if (benchmark_entry_barrier) notify_dispatch_barrier_kernel_do(stream, 64U);
+        if (benchmark_entry_barrier) notify_dispatch_barrier_kernel_do(stream, 64U, session.instance_id());
         timing.mark(1, stream);
         dispatch_kernel_do(stream, workspace, destinations, forward, counts, weights, scales,
                            reinterpret_cast<uint8_t*>(&config));
         timing.mark(2, stream);
         // The kernel joins incoming completion flags before its stream event.
-        if (benchmark_barriers) notify_dispatch_barrier_kernel_do(stream, 64U);
+        if (benchmark_barriers) notify_dispatch_barrier_kernel_do(stream, 64U, session.instance_id());
         timing.mark(3, stream);
         return timing.finish(stream);
     });
