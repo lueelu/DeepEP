@@ -1,13 +1,14 @@
 #pragma once
 
 #include "kernels/dispatch/udma_dispatch_sender.h"
+#include "common/platform.h"
 #include "common/types.h"
 #include "simt_api/device_sync_functions.h"
 
 namespace ascend_deepep::udma {
 // Separate list windows from the sender's in-flight WQE staging region.
 constexpr uint32_t kListsOffset = kDispatchSenderBytes;
-static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
+static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
 // Each producer owns one 512-byte local flag slot. Before Begin, zero is
@@ -54,7 +55,7 @@ __aicore__ inline void DispatchRemoteImpl(
     GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
 {
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + kOutputRecordBytes) + 32;
-    static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= 216 * 1024);
+    static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto lists = resource.template GetBufferByByte<int32_t>(sender_bytes);
     DispatchSenderT<Capacity, Qps> sender(td, core, wq, workspace, x, scales);

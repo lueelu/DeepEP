@@ -2,6 +2,7 @@
 
 #include "kernels/combine/udma_combine_sender.h"
 #include "kernels/combine/udma_combine_self_copy.h"
+#include "common/platform.h"
 #include "common/types.h"
 #include "kernels/aggregate/aggregate_pipeline.h"
 #include "kernels/combine/udma_combine_weights.h"
@@ -14,7 +15,7 @@ __aicore__ inline void CombineRemoteImpl(
     GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
 {
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
-    static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= 216 * 1024);
+    static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto indices = resource.template GetBufferByByte<int32_t>(sender_bytes);
     const bool simt_weights = Phase == 0 && CombineSimtWeightsEnabled(td);

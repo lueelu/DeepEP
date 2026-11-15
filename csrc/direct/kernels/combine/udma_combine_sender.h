@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernels/common/udma_shared_sender.h"
+#include "common/platform.h"
 #include "common/types.h"
 #include "utils/debug/asc_assert.h"
 
@@ -10,7 +11,7 @@ namespace ascend_deepep::udma {
 inline constexpr uint32_t kCombineBasesOffset = kSenderScratchBytes;
 inline constexpr uint32_t kCombineSenderBytes = kCombineBasesOffset + kMaxPeers * sizeof(uint64_t);
 static_assert(kCombineSenderBytes % 32 == 0);
-static_assert(kCombineSenderBytes + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
+static_assert(kCombineSenderBytes + kMaxPeers * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(

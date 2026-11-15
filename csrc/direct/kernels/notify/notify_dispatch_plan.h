@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/platform.h"
 #include "common/types.h"
 #include "simt_api/device_sync_functions.h"
 
@@ -9,7 +10,7 @@ constexpr uint32_t kPlanRouteBytes = 65536;
 constexpr uint32_t kPlanChunkTokens = 8;
 constexpr uint32_t kPlanChunksOffset = kPlanCountBytes + kPlanRouteBytes;
 constexpr uint32_t kPlanMaxChunks = kPlanRouteBytes / kPlanChunkTokens + kPlanCountBytes / sizeof(int32_t);
-static_assert(kPlanChunksOffset + kPlanMaxChunks * sizeof(int32_t) <= 216 * 1024);
+static_assert(kPlanChunksOffset + kPlanMaxChunks * sizeof(int32_t) <= platform::kKernelUbBytes);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 // Small independent token chunks expose parallelism even for EP2/4/8. Three
