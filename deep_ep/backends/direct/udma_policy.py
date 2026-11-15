@@ -203,7 +203,10 @@ class UdmaPolicy:
         plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
         if v2 and not expanded and bf16:
             bucket = "small" if row_bytes <= 4096 else "large"
-            entry = _PROFILES.get((self.world_size, cores, bucket, operation))
+            # Extra auxiliary AIVs must not discard the EP32 dispatch profile.
+            # Combine profiles have different evidence and are not inherited.
+            profile_cores = min(cores, 32) if self.world_size == 32 and operation == "dispatch" else cores
+            entry = _PROFILES.get((self.world_size, profile_cores, bucket, operation))
             if (
                 entry is not None
                 and 2048 <= row_bytes <= 12288
@@ -222,6 +225,16 @@ class UdmaPolicy:
                 )
             elif operation != "dispatch":
                 plan = replace(plan, self_copy=2)
+            if operation in ("dispatch", "weighted") and cores >= 16 and 0 < cores - plan.send_workers <= 2:
+                # Avoid assigning all metadata/weights to just one or two AIVs.
+                # First remove duplicate payload workers, then grow peer ownership
+                # only as needed. No fixed sender/helper ratio or low-core change.
+                candidate = replace(plan, workers_per_peer=1)
+                max_peers = 4 if candidate.peer_order == 3 else 8
+                while 0 < cores - candidate.send_workers <= 2 and candidate.peers_per_worker < max_peers:
+                    candidate = replace(candidate, peers_per_worker=candidate.peers_per_worker * 2)
+                if cores - candidate.send_workers > 2 and candidate.valid_group_capacity():
+                    plan = candidate
             if operation == "combine":
                 # Count payload AIVs, not QPs. Keep at least one spare copy
                 # AIV per sender; otherwise overlap self-copy after submission.
@@ -231,12 +244,13 @@ class UdmaPolicy:
             if operation == "weighted":
                 # Keep the complete measured plan together: the weight-path
                 # comparison used RR/1/1/1/visit8 and after-submit self-copy.
-                # Its winner differs between EP32/G8 and EP64/G16; do not
-                # extrapolate to other core budgets, topologies or row sizes.
+                # Its winner differs between EP32/G8 and EP64/G16.
+                # Keep the EP64 plan with larger core budgets too: additional
+                # auxiliary AIVs must not silently switch weights back to UDMA.
                 measured_weight_fit = (
                     self.topology_known
                     and (self.world_size, self.ranks_per_group) in ((32, 8), (64, 16))
-                    and cores == 32
+                    and (cores == 32 or (self.world_size == 64 and cores > 32))
                     and row_bytes in (8192, 12288)
                 )
                 if measured_weight_fit:

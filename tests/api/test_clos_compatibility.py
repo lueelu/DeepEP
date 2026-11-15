@@ -525,7 +525,7 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
             policy = replace(base, ranks_per_group=group, topology_known=known)
             for row_bytes in (8192, 9216, 12288):
                 plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
-                use_fit = (group, known, cores) == (16, True, 32) and row_bytes in (8192, 12288)
+                use_fit = group == 16 and known and cores >= 32 and row_bytes in (8192, 12288)
                 assert plan.weight_mode == (2 if use_fit else 1)
     """)
 
@@ -541,7 +541,7 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                            ranks_per_group=group, topology_known=True)
             before = base.signature()
-            for cores in (0,32):
+            for cores in ((0,32) if ep == 32 else (0,32,34,48,64)):
                 for row_bytes in (8192,12288):
                     plan = base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     assert plan.native_plan() == [1,3,group,1,1,1,8,2,mode]
@@ -558,11 +558,11 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
             for op in ('dispatch','combine'):
                 assert base.for_launch(32,8192,op,bf16=True) == base.for_launch(32,5632,op,bf16=True)
                 assert base.for_launch(32,12288,op,bf16=True) == base.for_launch(32,5632,op,bf16=True)
-            # No new fit for unmeasured widths, cores or topology identities.
+            # Width/topology scopes remain unchanged; EP32 combine is not inherited.
             for size in (7168,7170,8190,8194,12286,12290):
                 p = base.for_launch(32,size,'weighted',bf16=True)
                 assert p.peer_order == (2 if ep == 32 and size <= 12288 else 0)
-            for cores in (8,20,48,64):
+            for cores in ((8,20,48,64) if ep == 32 else (8,20)):
                 p = base.for_launch(cores,8192,'weighted',bf16=True)
                 assert p.peer_order == 0 and p.weight_mode == 1
             for other in (replace(base,topology_known=False), replace(base,ranks_per_group=24-group)):
@@ -572,6 +572,86 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
                 p = base.for_launch(32,8192,'weighted',**{'bf16':True,**opts})
                 assert p.native_plan()[1:] == [0,group,4,1,1,32,0,0]
             assert base.signature() == before
+    """)
+
+
+def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+
+        for ep, group, p, senders in ((8,2,1,7), (16,4,2,8)):
+            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=group,topology_known=True)
+            before = base.signature()
+            for size in (2048,5632,12288,14336):
+                for op in ('dispatch','weighted'):
+                    plan = base.for_launch(16,size,op,bf16=True)
+                    assert plan.native_plan()[:7] == [1,0,group,p,1,1,32]
+                    assert plan.send_workers == senders
+                    assert plan.valid_group_capacity()
+                    assert plan is base.for_launch(16,size,op,bf16=True)
+                    if op == 'weighted':
+                        assert plan.self_copy == 2
+                        assert plan.weight_mode == (2 if size <= 7168 else 1)
+                    # A different API/dtype/expansion still uses the old baseline.
+                    for options in ({'expanded':True}, {'v2':False}, {'bf16':False}):
+                        old = base.for_launch(16,size,op,**{'bf16':True,**options})
+                        assert old.send_workers == (14 if ep == 8 else 15)
+                unweighted = base.for_launch(16,size,'combine',bf16=True)
+                assert unweighted.send_workers == (14 if ep == 8 else 15)
+                assert unweighted.self_copy == 2
+            assert base.signature() == before
+            assert base.config(16).num_aiv == 16
+
+        # Actual four-node topologies: keep all AIV8 launch plans unchanged.
+        for ep, group, order, p, w in ((4,1,0,1,2), (8,2,0,2,2), (16,4,0,2,1),
+                                      (32,8,0,4,1), (64,16,0,8,1), (128,16,3,2,1)):
+            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=group,topology_known=True)
+            for op in ('dispatch','combine','weighted'):
+                for size in (2048,5632,12288,14336):
+                    plan = base.for_launch(8,size,op,bf16=True)
+                    mode = (2 if ep == 4 and size <= 7168 else 1) if op == 'weighted' else 0
+                    assert plan.native_plan() == [1,order,group,p,w,1,32,0 if op == 'dispatch' else 2,mode]
+
+        # No fixed half-core split, and no change to the all-senders fallback.
+        base = replace(resolve_udma_policy(True,64,'udma',None,None,None,None,None),
+                       ranks_per_group=16,topology_known=True)
+        assert base.for_launch(16,5632,'dispatch',bf16=True).send_workers == 16
+        assert base.for_launch(18,5632,'dispatch',bf16=True).send_workers == 8
+        assert base.for_launch(20,5632,'dispatch',bf16=True).send_workers == 16
+    """)
+
+
+def test_ep32_dispatch_profile_survives_extra_cores_without_changing_combine():
+    run_host("""
+        from dataclasses import replace, asdict
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        sys.path.insert(0, 'benchmarks/clos')
+        from bench_v2_bandwidth import effective_udma_config
+        base = replace(resolve_udma_policy(True,32,'udma',None,None,None,None,None),
+                       ranks_per_group=8,topology_known=True)
+        buffer = SimpleNamespace(udma_auto_policy=base, udma_schedule='peer',
+            udma_dispatch_peer_order='rank',udma_combine_peer_order='rank',
+            udma_ranks_per_group=8,udma_peers_per_group_per_worker=None,
+            udma_workers_per_peer=1,udma_qps_per_worker=1)
+        for cores in (32,34,48,64):
+            assert base.config(cores).num_aiv == cores
+            for size in (5632,8192,12288):
+                plan = base.for_launch(cores,size,'dispatch',bf16=True)
+                assert plan.native_plan() == [1,1,8,4,1,1,32,0,0]
+                report = effective_udma_config(buffer,num_aiv=cores,row_bytes=size,bf16=True)
+                assert report['operation_plans']['dispatch'] == asdict(plan)
+            for size in (1024,2048,4096,14336):
+                assert base.for_launch(cores,size,'dispatch',bf16=True).peer_order == 0
+            for other in (replace(base,topology_known=False),replace(base,ranks_per_group=16)):
+                assert other.for_launch(cores,5632,'dispatch',bf16=True).peer_order == 0
+            for options in ({'expanded':True}, {'v2':False}, {'bf16':False}):
+                assert base.for_launch(cores,5632,'dispatch',**{'bf16':True,**options}).peer_order == 0
+            if cores > 32:
+                for op in ('combine','weighted'):
+                    assert base.for_launch(cores,12288,op,bf16=True).peer_order == 0
     """)
 
 
@@ -747,7 +827,7 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
         using namespace ascend_deepep::udma;
         int main() {
             for (unsigned ep : {4U,8U,16U,32U,64U,128U})
-              for (unsigned g : {4U,8U,16U}) {
+              for (unsigned g : {1U,2U,4U,8U,16U}) {
                 if (g > ep) continue;
                 for (unsigned rank=0; rank<ep; ++rank)
                   for (unsigned order=0; order<=3; ++order)
