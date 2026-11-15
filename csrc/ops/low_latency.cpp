@@ -197,8 +197,9 @@ LlJitSignature dispatch_static_spec(int world, int rank, bool rdma, int b, int h
 LlJitSignature combine_static_spec(int world, int rank, bool rdma, int b, int h, int k, int e, const std::string& dtype,
                                    int capacity, uint32_t cores)
 {
+    (void)rdma;
     LlJitSignature signature;
-    signature.operation = rdma ? LlJitOperation::UbxCombine : LlJitOperation::MeshCombine;
+    signature.operation = LlJitOperation::Combine;
     signature.bs = uint32_t(b);
     signature.hidden = uint32_t(h);
     signature.topK = uint32_t(k);

@@ -34,6 +34,8 @@ struct ArgsBlock {
 };
 static_assert(sizeof(ArgsBlock) == 10U * sizeof(GM_ADDR), "SuperKernel argument view must match the global ABI");
 
+template <uint32_t BS, uint32_t H, uint32_t TopK, uint32_t Experts, uint32_t World, uint32_t Rank, uint32_t Cores,
+          uint32_t Capacity, bool Bf16, bool Dedup>
 __aicore__ inline void Run(const ArgsBlock& block, deepep::CoreContext core, bool skMode)
 {
     const auto* args = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(block.commArgs);
@@ -42,79 +44,27 @@ __aicore__ inline void Run(const ArgsBlock& block, deepep::CoreContext core, boo
     {
         AscendC::TPipe pipe;
         magic = DispatchDedup::RotateDispatchServerDedupMagic(args, core.index, &pipe);
-        // A SuperKernel sub-task is an ordinary function to the compiler, so the
-        // implicit destructor no longer guarantees the pipeline barrier.
         if (skMode) pipe.DestroyWithoutPipeAll();
     }
     if (skMode) AscendC::PipeBarrier<PIPE_ALL>();
 
     const auto* td =
         reinterpret_cast<const volatile __gm__ CombineDedup::EpServerDedupCombineTilingData*>(block.tilingData);
-
-#ifdef DEEPEP_LL_JIT_SPECIALIZED
-    // The JIT unit bakes the launch identity. Tiling is rechecked rather than
-    // trusted, and no Host-controllable field selects a different kernel.
-    (void)td;
-    constexpr uint32_t bs = DEEPEP_LL_JIT_SPEC_BS;
-    constexpr uint32_t h = DEEPEP_LL_JIT_SPEC_H;
-    constexpr uint32_t topK = DEEPEP_LL_JIT_SPEC_TOPK;
-    constexpr uint32_t experts = DEEPEP_LL_JIT_SPEC_EXPERTS;
-    constexpr uint32_t world = DEEPEP_LL_JIT_SPEC_WORLD;
-    constexpr uint32_t rank = DEEPEP_LL_JIT_SPEC_RANK;
-    constexpr uint32_t cores = DEEPEP_LL_JIT_SPEC_CORES;
-    constexpr uint32_t capacity = DEEPEP_LL_JIT_SPEC_CAPACITY;
-    constexpr uint8_t dtype = DEEPEP_LL_JIT_SPEC_BF16 ? DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_BFP16
-                                                     : DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP16;
-    constexpr bool dedup = bool(DEEPEP_LL_JIT_SPEC_DEDUP);
-    if (uint32_t(args->rankSize) != world || uint32_t(args->rank) != rank || core.count != cores ||
-        td->bs != bs || td->h != h || td->topK != topK || td->moeExpertNum != experts || td->dtype != dtype ||
-        uint32_t(td->numMaxTokensPerRank) != capacity ||
-        DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank, td->bs, uint32_t(args->rankSize)) != dedup) {
+    constexpr uint8_t dtype = Bf16 ? DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_BFP16
+                                   : DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP16;
+    if (uint32_t(args->rankSize) != World || uint32_t(args->rank) != Rank || core.count != Cores || td->bs != BS ||
+        td->h != H || td->topK != TopK || td->moeExpertNum != Experts || td->dtype != dtype ||
+        uint32_t(td->numMaxTokensPerRank) != Capacity ||
+        DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank, td->bs, uint32_t(args->rankSize)) != Dedup) {
         AscendC::Trap();
         return;
     }
-#else
-    const uint32_t bs = td->bs;
-    const uint32_t h = td->h;
-    const uint32_t topK = td->topK;
-    const uint32_t experts = td->moeExpertNum;
-    const uint8_t dtype = td->dtype;
-    const uint32_t world = uint32_t(args->rankSize);
-    const bool dedup = DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank, td->bs, world);
-#endif
-
     CombineDedup::CombineMemoryServerDedupKernel kernel;
     kernel.Init(block.commArgs, block.expertOut, block.destinationIndex, block.sendCounts, block.expertScales,
-                block.tokenType, block.relayReadIndex, block.sourceMask, block.yOut, bs, h, topK, experts, dtype, 0,
-                magic, world, core, dedup);
+                block.tokenType, block.relayReadIndex, block.sourceMask, block.yOut, BS, H, TopK, Experts, dtype, 0,
+                magic, World, core, Dedup);
     kernel.Process();
-    // Member TPipe boundary: business DMA and output retirement already
-    // completed inside Process().
     if (skMode) kernel.Destroy();
 }
 }  // namespace CombineDedupEntry
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_server_dedup_kernel(
-    GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR destinationIndex, GM_ADDR sendCounts, GM_ADDR expertScales,
-    GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask, GM_ADDR yOut, GM_ADDR tilingData)
-{
-    const CombineDedupEntry::ArgsBlock block{commArgs, expertOut, destinationIndex, sendCounts, expertScales,
-                                             tokenType, relayReadIndex, sourceMask, yOut, tilingData};
-    CombineDedupEntry::Run(block, deepep::OrdinaryCoreContext(), false);
-}
-
-// Equivalent SuperKernel sub-entries. The JIT ELF carries the same ordinary
-// entry, SK sub-entries and bind record as the Ahead-of-Time device library;
-// the SK capability is independent of the compilation route.
-template <uint32_t splitNum>
-__sk__ __vector__ void combine_server_dedup_kernel_sk(const CombineDedupEntry::ArgsBlock* block,
-                                                      sk::SkSystemArgs* sysArgs)
-{
-    sysArgs->SkInit();
-    deepep::CoreContext core{sysArgs->SkGetBlockIdx(), sysArgs->SkGetNumBlocks()};
-    const CombineDedupEntry::ArgsBlock local = *block;
-    CombineDedupEntry::Run(local, core, true);
-}
-
-SK_BIND(combine_server_dedup_kernel, 0, combine_server_dedup_kernel_sk<0>, combine_server_dedup_kernel_sk<1>,
-        combine_server_dedup_kernel_sk<2>, combine_server_dedup_kernel_sk<3>);

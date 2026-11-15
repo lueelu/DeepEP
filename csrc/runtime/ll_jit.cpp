@@ -12,7 +12,6 @@
 #include "jit_runtime.hpp"
 #include "../kernels/combine/low_latency/launch.hpp"
 #include "../kernels/dispatch/low_latency/launch.hpp"
-#include "../ubx/launch.hpp"
 
 #ifndef DEEPEP_JIT_PI_ON_CHIP
 #define DEEPEP_JIT_PI_ON_CHIP 0
@@ -21,74 +20,87 @@
 namespace deepep {
 namespace {
 
-const char* entry_header(LlJitOperation operation)
+std::string dispatch_source(const LlJitSignature& s)
 {
-    switch (operation) {
-        case LlJitOperation::Dispatch:
-            return "kernels/dispatch/low_latency/dispatch_entry.h";
-        case LlJitOperation::MeshCombine:
-            return "kernels/combine/low_latency/combine_entry.h";
-        case LlJitOperation::UbxCombine:
-            return "ubx/kernels/combine_entry.h";
+    std::ostringstream args;
+    args << s.world << ", " << s.rank << ", " << s.bs << ", " << s.hidden << ", " << s.topK << ", " << s.experts << ", "
+         << s.capacity << ", " << s.cores << ", " << s.inputClass << ", " << s.group << ", " << s.inputMode << ", "
+         << s.e4m3 << ", " << s.dedup;
+    const std::string shape = args.str();
+    std::ostringstream text;
+    text << "#include <kernels/dispatch/low_latency/dispatch_entry.h>\n"
+         << "extern \"C\" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void "
+            "dispatch_server_dedup_kernel_jit(DispatchDedupEntry::ArgsBlock block)\n"
+         << "{\n"
+         << "    DispatchDedupEntry::Run<" << shape
+         << ">(block, deepep::OrdinaryCoreContext(), false);\n"
+         << "}\n"
+         << "static void __instantiate_kernel()\n"
+         << "{\n"
+         << "    auto ptr = reinterpret_cast<void*>(&dispatch_server_dedup_kernel_jit);\n"
+         << "    (void)ptr;\n"
+         << "}\n";
+    for (uint32_t i = 0; i < 4U; ++i) {
+        text << "__sk__ __vector__ void dispatch_server_dedup_kernel_sk" << i
+             << "(const DispatchDedupEntry::ArgsBlock* block, sk::SkSystemArgs* sysArgs)\n"
+             << "{\n"
+             << "    sysArgs->SkInit();\n"
+             << "    const deepep::CoreContext core{sysArgs->SkGetBlockIdx(), sysArgs->SkGetNumBlocks()};\n"
+             << "    const DispatchDedupEntry::ArgsBlock local = *block;\n"
+             << "    DispatchDedupEntry::Run<" << shape << ">(local, core, true);\n"
+             << "}\n";
     }
-    throw std::invalid_argument("Invalid LL JIT operation");
+    text << "SK_BIND(dispatch_server_dedup_kernel_jit, 0, dispatch_server_dedup_kernel_sk0, "
+            "dispatch_server_dedup_kernel_sk1, dispatch_server_dedup_kernel_sk2, "
+            "dispatch_server_dedup_kernel_sk3);\n";
+    return text.str();
 }
 
-std::string source(LlJitOperation operation)
+std::string combine_source(const LlJitSignature& s)
 {
-    return std::string("\n#include <") + entry_header(operation) + ">\n";
-}
-
-std::string dispatch_source(const LlJitSignature& signature)
-{
+    std::ostringstream args;
+    args << s.bs << ", " << s.hidden << ", " << s.topK << ", " << s.experts << ", " << s.world << ", " << s.rank << ", "
+         << s.cores << ", " << s.capacity << ", " << s.bf16 << ", " << s.dedup;
+    const std::string shape = args.str();
     std::ostringstream text;
-    text << "#define DEEPEP_LL_JIT_SPECIALIZED 1\n"
-         << "#define DEEPEP_LL_JIT_SPEC_BS " << signature.bs << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_H " << signature.hidden << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_TOPK " << signature.topK << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_EXPERTS " << signature.experts << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_CAPACITY " << signature.capacity << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_CORES " << signature.cores << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_WORLD " << signature.world << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_RANK " << signature.rank << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_INPUT_CLASS " << signature.inputClass << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_GROUP " << signature.group << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_INPUT_MODE " << signature.inputMode << "U\n"
-         << "#define DEEPEP_LL_JIT_SPEC_E4M3 " << signature.e4m3 << "\n"
-         << "#define DEEPEP_LL_JIT_SPEC_DEDUP " << signature.dedup << "\n";
-    return text.str() + source(LlJitOperation::Dispatch);
-}
-
-std::string combine_source(const LlJitSignature& signature)
-{
-    const bool ubx = signature.operation == LlJitOperation::UbxCombine;
-    const char* prefix = ubx ? "DEEPEP_UBX_JIT" : "DEEPEP_LL_JIT";
-    std::ostringstream text;
-    text << "#define " << prefix << "_SPECIALIZED 1\n"
-         << "#define " << prefix << "_SPEC_BS " << signature.bs << "U\n"
-         << "#define " << prefix << "_SPEC_H " << signature.hidden << "U\n"
-         << "#define " << prefix << "_SPEC_TOPK " << signature.topK << "U\n"
-         << "#define " << prefix << "_SPEC_EXPERTS " << signature.experts << "U\n"
-         << "#define " << prefix << "_SPEC_CAPACITY " << signature.capacity << "U\n"
-         << "#define " << prefix << "_SPEC_CORES " << signature.cores << "U\n"
-         << "#define " << prefix << "_SPEC_WORLD " << signature.world << "U\n"
-         << "#define " << prefix << "_SPEC_RANK " << signature.rank << "U\n"
-         << "#define " << prefix << "_SPEC_BF16 " << signature.bf16 << "\n"
-         << "#define " << prefix << "_SPEC_DEDUP " << signature.dedup << "\n";
-    if (ubx) text << "#define DEEPEP_UBX_JIT_SPEC_GROUP " << signature.group << "U\n";
-    return text.str() + source(signature.operation);
+    text << "#include <kernels/combine/low_latency/combine_entry.h>\n"
+         << "extern \"C\" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void "
+            "combine_server_dedup_kernel_jit(CombineDedupEntry::ArgsBlock block)\n"
+         << "{\n"
+         << "    CombineDedupEntry::Run<" << shape
+         << ">(block, deepep::OrdinaryCoreContext(), false);\n"
+         << "}\n"
+         << "static void __instantiate_kernel()\n"
+         << "{\n"
+         << "    auto ptr = reinterpret_cast<void*>(&combine_server_dedup_kernel_jit);\n"
+         << "    (void)ptr;\n"
+         << "}\n";
+    for (uint32_t i = 0; i < 4U; ++i) {
+        text << "__sk__ __vector__ void combine_server_dedup_kernel_sk" << i
+             << "(const CombineDedupEntry::ArgsBlock* block, sk::SkSystemArgs* sysArgs)\n"
+             << "{\n"
+             << "    sysArgs->SkInit();\n"
+             << "    const deepep::CoreContext core{sysArgs->SkGetBlockIdx(), sysArgs->SkGetNumBlocks()};\n"
+             << "    const CombineDedupEntry::ArgsBlock local = *block;\n"
+             << "    CombineDedupEntry::Run<" << shape << ">(local, core, true);\n"
+             << "}\n";
+    }
+    text << "SK_BIND(combine_server_dedup_kernel_jit, 0, combine_server_dedup_kernel_sk0, "
+            "combine_server_dedup_kernel_sk1, combine_server_dedup_kernel_sk2, "
+            "combine_server_dedup_kernel_sk3);\n";
+    return text.str();
 }
 
 std::vector<std::string> flags(const LlJitSignature& signature)
 {
-    const bool ubx = signature.operation == LlJitOperation::UbxCombine;
+    (void)signature;
     std::vector<std::string> values = {
         "-std=c++17",
         "-DCATLASS_ARCH=3510",
         "-DUSE_SIMT",
         "-DL2_CACHE_HINT",
         "-DDEEPEP_LL_RDMA=1",
-        ubx ? "-DDEEPEP_UBX_JIT_TU=1" : "-DDEEPEP_LL_JIT_TU=1",
+        "-DDEEPEP_LL_JIT_TU=1",
         "-DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1",
         std::string("-DACLSHMEMI_HNS_1825_PI_ON_CHIP=") + std::to_string(DEEPEP_JIT_PI_ON_CHIP),
         "--cce-auto-infer-kernel-type=false",
@@ -114,17 +126,10 @@ void launch_dispatch(const LlJitSignature& signature, const EpServerDedupKernelA
 
 void launch_combine(const LlJitSignature& signature, const EpServerDedupCombineKernelArgs& args, void* stream)
 {
-    const auto kernel = jit_compile("mesh_combine", combine_source(signature), flags(signature));
+    const auto kernel = jit_compile("combine", combine_source(signature), flags(signature));
     jit_launch(kernel, stream, static_cast<int>(signature.cores), 0, args.commArgs, args.expertOut,
                args.destinationIndex, args.sendCounts, args.expertScales, args.tokenType, args.relayReadIndex,
                args.sourceMask, args.yOut, args.tilingData);
-}
-
-void launch_ubx_combine(const LlJitSignature& signature, const ubx::CombineArgs& args, void* stream)
-{
-    const auto kernel = jit_compile("ubx_combine", combine_source(signature), flags(signature));
-    jit_launch(kernel, stream, static_cast<int>(signature.cores), 0, args.comm, args.expert, args.destination,
-               args.counts, args.weights, args.types, args.relay, args.mask, args.output, args.tiling);
 }
 
 }  // namespace
@@ -137,14 +142,10 @@ void ll_jit_launch(const LlJitSignature& signature, const void* arguments, std::
                 throw std::invalid_argument("Dispatch launch argument size mismatch");
             launch_dispatch(signature, *static_cast<const EpServerDedupKernelArgs*>(arguments), stream);
             break;
-        case LlJitOperation::MeshCombine:
+        case LlJitOperation::Combine:
             if (bytes != sizeof(EpServerDedupCombineKernelArgs))
-                throw std::invalid_argument("Mesh combine launch argument size mismatch");
+                throw std::invalid_argument("Combine launch argument size mismatch");
             launch_combine(signature, *static_cast<const EpServerDedupCombineKernelArgs*>(arguments), stream);
-            break;
-        case LlJitOperation::UbxCombine:
-            if (bytes != sizeof(ubx::CombineArgs)) throw std::invalid_argument("UBX combine argument size mismatch");
-            launch_ubx_combine(signature, *static_cast<const ubx::CombineArgs*>(arguments), stream);
             break;
     }
 }
