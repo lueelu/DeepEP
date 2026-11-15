@@ -230,7 +230,17 @@ class UdmaPolicy:
                 plan = replace(plan, self_copy=1 if spare_aivs >= plan.send_workers else 2)
             if operation == "weighted":
                 # SIMT needs an AIV outside the payload sending plan.
-                use_simt_weights = row_bytes <= _SIMT_WEIGHT_MAX_ROW_BYTES and plan.send_workers < cores
+                # EP64/G16/AIV32 matched tests also favored SIMT at H4096 and H6144.
+                ep64_simt_fit = (
+                    self.world_size == 64
+                    and self.topology_known
+                    and self.ranks_per_group == 16
+                    and cores == 32
+                    and row_bytes in (8192, 12288)
+                )
+                use_simt_weights = (
+                    row_bytes <= _SIMT_WEIGHT_MAX_ROW_BYTES or ep64_simt_fit
+                ) and plan.send_workers < cores
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
         plan.validate_num_aiv(num_aiv)
         if not plan.valid_group_capacity():

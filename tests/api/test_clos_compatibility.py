@@ -519,6 +519,14 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
         policy = replace(base, ranks_per_group=8, topology_known=True)
         plan = policy.for_launch(8,7168,'weighted',bf16=True)
         assert plan.send_workers == 8 and plan.weight_mode == 1
+
+        base = resolve_udma_policy(True,64,'udma',None,None,None,None,None)
+        for group, known, cores in ((16,True,32), (8,True,32), (16,False,32), (16,True,48)):
+            policy = replace(base, ranks_per_group=group, topology_known=known)
+            for row_bytes in (8192, 9216, 12288):
+                plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
+                use_fit = (group, known, cores) == (16, True, 32) and row_bytes in (8192, 12288)
+                assert plan.weight_mode == (2 if use_fit else 1)
     """)
 
 
