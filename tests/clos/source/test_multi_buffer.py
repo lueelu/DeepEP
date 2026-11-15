@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 from threading import Barrier
+from time import monotonic
 import weakref
 
 import torch
@@ -179,27 +180,52 @@ def run_rank(local_rank, args):
     ready = Barrier(2)
     torch.npu.synchronize()
 
-    def worker(owner, shape, offset):
+    def worker(name, owner, shape, offset, after=None):
         torch.npu.set_device(device)
         stream = torch.npu.Stream(device=device)
+
+        def trace(stage, cycle):
+            if args.trace_workers:
+                print(
+                    f"MULTI_BUFFER_WORKER rank={rank} buffer={name} stream={stream.npu_stream} "
+                    f"cycle={cycle} stage={stage} monotonic={monotonic():.6f}",
+                    flush=True,
+                )
+
         with torch.npu.stream(stream):
             ready.wait(timeout=60)
+            if after is not None:
+                after.result()
+            trace("dispatch_enter", "fresh")
             first = dispatch(owner, shape, rank, offset)
+            trace("dispatch_returned", "fresh")
             check_dispatch(first, shape, rank, offset)
+            trace("combine_enter", "fresh")
             combine(owner, first, shape, rank, offset)
+            trace("combine_checked", "fresh")
             for cycle in range(args.cycles):
                 delta = offset + cycle + 1
+                trace("dispatch_enter", cycle)
                 current = dispatch(owner, shape, rank, delta, first[3])
+                trace("dispatch_returned", cycle)
                 check_dispatch(current, shape, rank, delta, cached=True)
+                trace("combine_enter", cycle)
                 combine(owner, current, shape, rank, delta)
+                trace("combine_checked", cycle)
                 check_dispatch(first, shape, rank, offset)
+            trace("stream_sync_enter", "final")
             stream.synchronize()
+            trace("stream_sync_done", "final")
         return stream.npu_stream
 
-    print(f"MULTI_BUFFER_STAGE rank={rank} stage=concurrent", flush=True)
+    print(
+        f"MULTI_BUFFER_STAGE rank={rank} stage={'serialized' if args.serialize_streams else 'concurrent'} "
+        f"requested_aiv={args.num_aiv} device_aiv={buffer._native.num_device_aiv()}",
+        flush=True,
+    )
     with ThreadPoolExecutor(max_workers=2) as pool:
-        a = pool.submit(worker, cached_buffer, small, 16.0)
-        b = pool.submit(worker, buffer, args, 32.0)
+        a = pool.submit(worker, "old", cached_buffer, small, 16.0)
+        b = pool.submit(worker, "new", buffer, args, 32.0, a if args.serialize_streams else None)
         stream_ids = [a.result(), b.result()]
     assert stream_ids[0] != stream_ids[1]
     check_dispatch(pending, small, rank)
@@ -235,6 +261,8 @@ def run_rank(local_rank, args):
                 rank=rank,
                 api=args.api,
                 cycles=args.cycles,
+                num_aiv=args.num_aiv,
+                serialized_streams=args.serialize_streams,
                 tokens=[small.num_tokens, args.num_tokens],
                 hidden=args.hidden,
                 dtype=args.dtype,
@@ -267,6 +295,10 @@ def main():
     p.add_argument("--seed", type=int, default=20260823)
     p.add_argument("--dist-init-method", default="tcp://127.0.0.1:29780")
     p.add_argument("--allocate-on-comm-stream", action="store_true")
+    p.add_argument("--trace-workers", action="store_true", help="Log worker phases without adding device waits")
+    p.add_argument(
+        "--serialize-streams", action="store_true", help="Run old then new Buffer workers as a sequential control"
+    )
     p.add_argument("--inject-error", action="store_true")
     p.add_argument("--expand", action="store_true", help="V2 expert-expanded dispatch and aggregate/combine")
     args = p.parse_args()
