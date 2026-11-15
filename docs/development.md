@@ -11,7 +11,7 @@ Modified by Joyce_An 2026
 
 从 `deep_ep/buffers/elastic.py` 的公开方法进入，经 `csrc/bindings/module.cpp` 定位 `csrc/ops` Host 封装和 `csrc/kernels` 实现。资源由 Python Runtime 与 `csrc/runtime/session` 管理，事件位于 `deep_ep/utils/event.py`。
 
-新增或修改算子时，同步检查 Python 参数、Host 校验、tiling/工作区、kernel 参数、绑定、构建清单及能力声明。核心 EP 的 Device 源文件登记在 `cmake/device/CMakeLists.txt`，Host 源文件和绑定由根工程编译；不需要为每个算子建立独立 Python 构建器。
+新增或修改算子时，同步检查 Python 参数、Host 校验、tiling/工作区、kernel 参数、JIT 源码入口及能力声明。核心 EP 与 direct 的设备入口通过 DeepJIT 源码编译，Host 源文件和绑定由根工程编译；不需要为每个算子建立独立 Python 构建器。
 
 单算子的辅助实现放在邻接目录；同族共享代码放在算法族内，只有存在共同调用方和契约时才提取跨算子组件。沿用现有模块和头文件约定，不为目录完整性建立空模块。公共参数使用通信域、数据和资源含义命名，具体硬件机制留在后端实现中。
 

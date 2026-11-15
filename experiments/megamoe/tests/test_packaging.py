@@ -53,8 +53,9 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         "test.dist-info/licenses/deepseek-deepep.LICENSE": b"fixture",
     }
     if payload:
-        for name in ("api.py", "benchmark.py", "configs/smoke.json", "libmegamoe_kernel.so", "_C.fake.so"):
+        for name in ("api.py", "benchmark.py", "configs/smoke.json", "_C.fake.so"):
             entries["deep_ep_experimental/megamoe/" + name] = b"fixture"
+        entries["deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_common.hpp"] = b"fixture"
         entries["test.dist-info/licenses/cann.LICENSE"] = b"fixture"
     if ep_gmm_fused:
         prefix = "deep_ep_experimental/ep_gmm_fused/"

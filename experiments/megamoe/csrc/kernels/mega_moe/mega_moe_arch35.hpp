@@ -18,6 +18,7 @@
 #define MEGA_MOE_ARCH35_H
 
 #include "kernel_operator.h"
+#include "kernels/common/core_context.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "mc2_common/mc2_kernel_utils.hpp"
 #include "kernel_operator_list_tensor_intf.h"
@@ -51,6 +52,14 @@ using namespace AscendC;
 template <TemplateMegaMoeTypeClass>
 class MegaMoe {
 public:
+    __aicore__ inline void SetCoreContext(const deepep::CoreContext& core)
+    {
+        const uint32_t ration = static_cast<uint32_t>(GetTaskRation());
+        blockAivNum_ = core.count;
+        blockNum_ = ration == 0U ? core.count : core.count / ration;
+        aivCoreIdx_ = core.index;
+        blockIdx_ = ration == 0U ? core.index : core.index / ration;
+    }
     template <int32_t QM>
     struct QuantTraits {
         using OutType = fp8_e4m3fn_t;
@@ -236,7 +245,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
     GM_ADDR sharedWeight2, GM_ADDR sharedWeightScales1, GM_ADDR sharedWeightScales2, GM_ADDR yOut,
     GM_ADDR expertTokenNumsOut, GM_ADDR workspaceGM, MegaMoeTilingData* tilingData, GM_ADDR tilingGM, GM_ADDR timerGM)
 {
-    timer_.Init(timerGM);
+    timer_.Init(timerGM, static_cast<int32_t>(aivCoreIdx_));
     k_ = tilingData->h;
     worldSize_ = tilingData->epWorldSize;
     moeExpertPerRank_ = tilingData->moeExpertPerRank;
@@ -298,7 +307,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
 #if !defined(ASCEND_DEEPEP_DISABLE_MEGA_MOE_EXCEPTION_DUMP)
     gmmLoopCount_ =
         MegaMoeImpl::RegisterMegaMoeExceptionDump(exceptionDump_, dumpBase, tilingGM, tilingData, params_.peermemInfo,
-                                                  reinterpret_cast<GM_ADDR>(&mc2Context_->epRankId));
+                                                  reinterpret_cast<GM_ADDR>(&mc2Context_->epRankId), aivCoreIdx_, blockNum_);
 #else
     (void)dumpBase;
     (void)tilingGM;
