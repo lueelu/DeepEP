@@ -151,8 +151,8 @@ random 仅指随机路由，hidden/权重仍使用确定性精度输入，不代
 ### Global Clos 的 Notify 计数回传
 
 UDMA 的 fresh dispatch 在需要精确输出容量时，默认通过 Buffer 持有的映射
-Host 通知区接收行数和专家计数。计数就绪后 Host 即可继续分配输出，无须等待
-Notify 后续的 Handle 元数据生成结束，也不再为这组计数执行阻塞 `.cpu()`。
+Host 通知区接收行数和专家计数，由 Notify 使用 MTE3 写入。计数就绪后 Host 即可继续
+分配输出，无须等待 Notify 后续的 Handle 元数据生成结束，也不再为这组计数执行阻塞 `.cpu()`。
 Dispatch 仍在原执行流中排在 Notify 之后，不会提前读取未完成的元数据。
 
 这条路径仍会等待准确计数，不代表整个 API 完全异步。Cached dispatch、固定容量

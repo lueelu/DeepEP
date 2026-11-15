@@ -28,6 +28,17 @@ __aicore__ inline int32_t NotifyIntMin(int32_t lhs, int32_t rhs)
     return lhs < rhs ? lhs : rhs;
 }
 
+// Pack count+1 into UB so zero remains the host's not-ready value.
+__simt_vf__ __launch_bounds__(128) inline void PackNotifyHostCountsVf(
+    const __gm__ int32_t* total, const __gm__ int32_t* experts, __ubuf__ uint32_t* packed,
+    uint32_t offset, uint32_t length)
+{
+    for (uint32_t i = threadIdx.x; i < length; i += 128) {
+        const uint32_t slot = offset + i;
+        packed[i] = static_cast<uint32_t>(slot == 0 ? *total : experts[slot - 1]) + 1U;
+    }
+}
+
 } // namespace
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void notify_dispatch_kernel(
@@ -363,13 +374,28 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     AscendC::SyncAll<true>();
 
     if (tiling.notify_host_counts != 0 && core_idx == 0) {
-        asc_vf_call<ascend_deepep::NotifyHostCountsVf>(
-            dim3(128), reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),
-            reinterpret_cast<__gm__ int32_t*>(num_recv_tokens_per_expert),
-            reinterpret_cast<volatile __gm__ uint32_t*>(tiling.notify_host_counts), tiling.rank, tiling.world_size,
-            tiling.num_local_experts);
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        // The mapped host address is only accessed by MTE3. Core 0 owns all
+        // slots and reuses its aligned accumulator after the local barrier.
+        AscendC::GlobalTensor<uint32_t> host_counts_gm;
+        host_counts_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(tiling.notify_host_counts));
+        auto packed_ub = accumulator_ub.ReinterpretCast<uint32_t>();
+        const auto* total = reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix) +
+                            uint64_t(world_size - 1) * world_size + rank;
+        const uint32_t count = 1U + tiling.num_local_experts;
+        for (uint32_t offset = 0; offset < count;) {
+            const uint32_t remaining = count - offset;
+            const uint32_t length = remaining < kMaxVectorTileElems ? remaining : kMaxVectorTileElems;
+            asc_vf_call<PackNotifyHostCountsVf>(
+                dim3(128), total, reinterpret_cast<__gm__ int32_t*>(num_recv_tokens_per_expert),
+                reinterpret_cast<__ubuf__ uint32_t*>(packed_ub.GetPhyAddr()), offset, length);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
+            AscendC::DataCopyExtParams copy(1, length * kNotifyInt32Bytes, 0, 0, 0);
+            AscendC::DataCopyPad(host_counts_gm[offset], packed_ub, copy);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID6);
+            offset += length;
+        }
     }
     if (tiling.v2_rank_prefix != 0 && core_idx == 0) {
         asc_vf_call<ascend_deepep::V2HandleCountsVf>(dim3(128),
