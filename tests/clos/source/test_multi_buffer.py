@@ -1,12 +1,11 @@
-"""Global Clos multi-Buffer precision, ownership and concurrent-stream regression.
+"""Global Clos multi-Buffer precision, ownership and shared-stream regression.
 
 Expected tensors come from the existing Clos CPU golden, never another Buffer.
-Construct/destroy collectively in a fixed order; only operations on distinct
-Buffers run concurrently. Each participating Host thread selects its NPU device.
+One Host thread submits old/new operations in the same order on all ranks.
+Two compute streams feed one shared communication stream.
 """
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 import gc
 import hashlib
@@ -14,9 +13,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from threading import Barrier
 from time import monotonic
-import traceback
 import weakref
 
 import torch
@@ -178,68 +175,54 @@ def run_rank(local_rank, args):
     else:
         raise AssertionError("foreign Buffer handle accepted")
 
-    ready = Barrier(2)
-    torch.npu.synchronize()
-
-    def run_worker(name, owner, shape, offset, after):
-        torch.npu.set_device(device)
-        stream = torch.npu.Stream(device=device)
-
-        def trace(stage, cycle):
-            if args.trace_workers:
-                print(
-                    f"MULTI_BUFFER_WORKER rank={rank} buffer={name} stream={stream.npu_stream} "
-                    f"cycle={cycle} stage={stage} monotonic={monotonic():.6f}",
-                    flush=True,
-                )
-
-        with torch.npu.stream(stream):
-            ready.wait(timeout=60)
-            if after is not None:
-                after.result()
-            trace("dispatch_enter", "fresh")
-            first = dispatch(owner, shape, rank, offset)
-            trace("dispatch_returned", "fresh")
-            check_dispatch(first, shape, rank, offset)
-            trace("combine_enter", "fresh")
-            combine(owner, first, shape, rank, offset)
-            trace("combine_checked", "fresh")
-            for cycle in range(args.cycles):
-                delta = offset + cycle + 1
-                trace("dispatch_enter", cycle)
-                current = dispatch(owner, shape, rank, delta, first[3])
-                trace("dispatch_returned", cycle)
-                check_dispatch(current, shape, rank, delta, cached=True)
-                trace("combine_enter", cycle)
-                combine(owner, current, shape, rank, delta)
-                trace("combine_checked", cycle)
-                check_dispatch(first, shape, rank, offset)
-            trace("stream_sync_enter", "final")
-            stream.synchronize()
-            trace("stream_sync_done", "final")
-        return stream.npu_stream
-
-    def worker(name, owner, shape, offset, after=None):
-        try:
-            return run_worker(name, owner, shape, offset, after)
-        except Exception:
-            print(
-                f"MULTI_BUFFER_WORKER_ERROR rank={rank} buffer={name}\n{traceback.format_exc()}",
-                file=sys.stderr,
-                flush=True,
-            )
-            raise
-
+    comm_stream = cached_buffer.get_comm_stream()
+    assert buffer.get_comm_stream() is comm_stream, "Buffers must share the device communication stream"
+    compute_streams = [torch.npu.Stream(device=device), torch.npu.Stream(device=device)]
+    stream_ids = [stream.npu_stream for stream in compute_streams]
+    assert stream_ids[0] != stream_ids[1]
+    assert all(stream_id != comm_stream.npu_stream for stream_id in stream_ids)
+    owners = [("old", cached_buffer, small, 16.0), ("new", buffer, args, 32.0)]
+    first_outputs = []
     print(
-        f"MULTI_BUFFER_STAGE rank={rank} stage={'serialized' if args.serialize_streams else 'concurrent'} "
-        f"requested_aiv={args.num_aiv} device_aiv={buffer._native.num_device_aiv()}",
+        f"MULTI_BUFFER_STAGE rank={rank} stage=shared_comm_stream "
+        f"requested_aiv={args.num_aiv} device_aiv={buffer._native.num_device_aiv()} "
+        f"comm_stream={comm_stream.npu_stream} compute_streams={stream_ids}",
         flush=True,
     )
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        a = pool.submit(worker, "old", cached_buffer, small, 16.0)
-        b = pool.submit(worker, "new", buffer, args, 32.0, a if args.serialize_streams else None)
-        stream_ids = [a.result(), b.result()]
-    assert stream_ids[0] != stream_ids[1]
+
+    def trace(name, stream, stage, cycle):
+        if args.trace_workers:
+            print(
+                f"MULTI_BUFFER_WORKER rank={rank} buffer={name} stream={stream.npu_stream} "
+                f"comm_stream={comm_stream.npu_stream} cycle={cycle} stage={stage} monotonic={monotonic()}",
+                flush=True,
+            )
+
+    for cycle in range(args.cycles + 1):
+        cycle_name = "fresh" if cycle == 0 else cycle - 1
+        outputs = []
+        # Enqueue both dispatches before checking their tensors on CPU. The
+        # compute streams stay distinct, but communication has one rank-consistent
+        # order. No Host thread races or inter-Buffer device synchronization.
+        for (name, owner, shape, offset), stream in zip(owners, compute_streams):
+            with torch.npu.stream(stream):
+                trace(name, stream, "dispatch_enter", cycle_name)
+                handle = None if cycle == 0 else first_outputs[len(outputs)][3]
+                outputs.append(dispatch(owner, shape, rank, offset + cycle, handle))
+                trace(name, stream, "dispatch_returned", cycle_name)
+        if cycle == 0:
+            first_outputs = outputs
+        for i, ((name, owner, shape, offset), stream) in enumerate(zip(owners, compute_streams)):
+            with torch.npu.stream(stream):
+                check_dispatch(outputs[i], shape, rank, offset + cycle, cached=cycle != 0)
+                trace(name, stream, "combine_enter", cycle_name)
+                combine(owner, outputs[i], shape, rank, offset + cycle)
+                trace(name, stream, "combine_checked", cycle_name)
+                check_dispatch(first_outputs[i], shape, rank, offset)
+    for (name, _, _, _), stream in zip(owners, compute_streams):
+        trace(name, stream, "stream_sync_enter", "final")
+        stream.synchronize()
+        trace(name, stream, "stream_sync_done", "final")
     check_dispatch(pending, small, rank)
     # Destroy either instance independently, then reuse the freed ID while the
     # other Buffer remains capable of dispatch/combine with its old handle.
@@ -247,6 +230,8 @@ def run_rank(local_rank, args):
     cached_buffer.destroy()
     check_dispatch(pending, small, rank)
     replacement = create(size_hint, small)
+    assert replacement.get_comm_stream() is comm_stream
+    assert buffer.get_comm_stream() is comm_stream
     latest = dispatch(replacement, small, rank, 48.0)
     check_dispatch(latest, small, rank, 48.0)
     combine(replacement, latest, small, rank, 48.0)
@@ -274,7 +259,9 @@ def run_rank(local_rank, args):
                 api=args.api,
                 cycles=args.cycles,
                 num_aiv=args.num_aiv,
-                serialized_streams=args.serialize_streams,
+                shared_communication_stream=True,
+                communication_stream=comm_stream.npu_stream,
+                submission_order="old_then_new",
                 tokens=[small.num_tokens, args.num_tokens],
                 hidden=args.hidden,
                 dtype=args.dtype,
@@ -309,7 +296,9 @@ def main():
     p.add_argument("--allocate-on-comm-stream", action="store_true")
     p.add_argument("--trace-workers", action="store_true", help="Log worker phases without adding device waits")
     p.add_argument(
-        "--serialize-streams", action="store_true", help="Run old then new Buffer workers as a sequential control"
+        "--serialize-streams",
+        action="store_true",
+        help="Compatibility flag; ordered shared-stream submission is always used",
     )
     p.add_argument("--inject-error", action="store_true")
     p.add_argument("--expand", action="store_true", help="V2 expert-expanded dispatch and aggregate/combine")

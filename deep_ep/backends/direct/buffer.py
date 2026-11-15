@@ -19,6 +19,8 @@ from .udma_policy import resolve_udma_policy, validate_manual_config
 
 
 _ORPHANED_NATIVE_RESOURCES: list[tuple[Any, ...]] = []
+_COMMUNICATION_STREAMS: dict[tuple[int, int], Any] = {}
+_COMMUNICATION_STREAM_LOCK = RLock()
 _MAX_SHMEM_INTRANODE_RANKS = 1024
 _SUPPORTED_TRANSPORTS = frozenset(("auto", "mte", "roce", "sdma", "udma"))
 
@@ -1358,14 +1360,26 @@ def _resolve_group_or_comm(group: Any, comm: Optional[Any]) -> Tuple[int, int, A
 
 
 def _create_communication_stream() -> Any:
-    """Create a dedicated stream on the current NPU device."""
+    """Return the process/device communication stream shared by V1 and V2.
+
+    Keep it alive independently of any Buffer. Callers must submit collective
+    operations in the same order on all ranks; sharing a stream does not order
+    independent Host threads across ranks.
+    """
 
     try:
         import torch_npu  # noqa: F401
         import torch
     except ImportError as exc:
         raise ImportError("torch_npu must be installed before creating a Buffer communication stream") from exc
-    return torch.npu.Stream(device=torch.npu.current_device())
+    device = int(torch.npu.current_device())
+    key = (os.getpid(), device)
+    with _COMMUNICATION_STREAM_LOCK:
+        stream = _COMMUNICATION_STREAMS.get(key)
+        if stream is None:
+            stream = torch.npu.Stream(device=device)
+            _COMMUNICATION_STREAMS[key] = stream
+        return stream
 
 
 def _validate_config_world_size(num_ranks: int) -> None:
