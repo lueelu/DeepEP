@@ -201,6 +201,23 @@ class UdmaPolicy:
         base = self.for_num_aiv(num_aiv)
         cores = num_aiv or 32
         plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
+        if self.world_size == 128 and cores >= 16:
+            # One fixed EP128 schedule for every row size and operation. Match
+            # the measured rank/P8/W1/Q1/visit16 candidate, including its legacy
+            # self-copy and weight paths. Smaller budgets keep the capacity
+            # fallback selected by for_num_aiv().
+            plan = replace(
+                base,
+                peer_order=0,
+                peers_per_worker=8,
+                workers_per_peer=1,
+                qps_per_worker=1,
+                wqes_per_visit=16,
+                self_copy=0,
+                weight_mode=0,
+            )
+            plan.validate_num_aiv(num_aiv)
+            return plan
         if v2 and not expanded and bf16:
             bucket = "small" if row_bytes <= 4096 else "large"
             # Extra auxiliary AIVs must not discard the EP32 dispatch profile.
@@ -268,33 +285,6 @@ class UdmaPolicy:
                     row_bytes <= _SIMT_WEIGHT_MAX_ROW_BYTES or (measured_weight_fit and self.world_size == 64)
                 ) and plan.send_workers < cores
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
-            if (
-                self.world_size == 128
-                and self.topology_known
-                and self.ranks_per_group == 16
-                and cores == 32
-                and row_bytes == 5632
-            ):
-                # EP128/G16 BF16 H2816 coarse sweep, not a precision or
-                # performance guarantee. Preserve each complete candidate,
-                # including its copy mode, after the generic resource rules.
-                # Fresh and cached dispatch share the payload launch policy;
-                # only cached dispatch was measured in this sweep.
-                order, peers, visit, copy, weight = {
-                    "dispatch": (3, 2, 16, 0, 0),
-                    "combine": (3, 2, 16, 2, 0),
-                    "weighted": (0, 8, 8, 0, 2),
-                }[operation]
-                plan = replace(
-                    plan,
-                    peer_order=order,
-                    peers_per_worker=peers,
-                    workers_per_peer=1,
-                    qps_per_worker=1,
-                    wqes_per_visit=visit,
-                    self_copy=copy,
-                    weight_mode=weight,
-                )
         plan.validate_num_aiv(num_aiv)
         if not plan.valid_group_capacity():
             raise ValueError("automatic UDMA plan exceeds the per-worker peer table")
@@ -372,6 +362,8 @@ def resolve_udma_policy(
         raise ValueError("automatic UDMA policy requires EP between 2 and 1024")
     w, q = (2 if world_size <= 8 else 1), 1
     p, visit = (1, 8) if world_size <= 16 else (4, 32)
+    if world_size == 128:
+        p, visit = 8, 16
     while ((world_size - 2) // p + 1) * w * q > 32 and p < 8:
         p *= 2
     if ((world_size - 2) // p + 1) * w * q > 32:
