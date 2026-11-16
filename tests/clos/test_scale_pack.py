@@ -9,6 +9,61 @@ import pytest
 from tests.utils.cpp import cpp_functions
 
 
+def test_serial_aggregate_self_copy_native_gate(tmp_path):
+    """Execute native tiling selection with serial and overlapping producers."""
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("a C++17 compiler is required")
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "csrc/direct/ops/combine.cpp").read_text()
+    begin = source.index("    if (use_udma && epilogue && !tiling.udma_token_schedule")
+    end = source.index("    tiling.udma_weight_mode", begin)
+    gate = source[begin:end]
+    harness = (
+        r"""
+#include <cassert>
+#include <cstdlib>
+#include <stdexcept>
+#define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("gate"); } while (0)
+namespace ascend_deepep::udma {
+int MetadataFirst(int, int, int, int, int, int) { return 6; }
+}
+struct Tiling {
+    bool udma_token_schedule = false, udma_self_copy_after_submit = false;
+    int udma_self_copy_first_aiv = 0;
+    int world_size = 4, udma_peers_per_worker = 1, block_dim = 48;
+    int udma_peer_order = 0, udma_ranks_per_group = 4, udma_workers_per_peer = 2;
+};
+int main() {
+    for (bool expanded_x : {false,true})
+    for (bool aggregate : {false,true})
+    for (int pipeline_chunk_tokens : {0,32})
+    for (bool topk_weights : {false,true})
+    for (bool use_udma : {false,true})
+    for (bool epilogue : {false,true})
+    for (bool token : {false,true})
+    for (int mode : {0,1,2}) {
+        Tiling tiling;
+        tiling.udma_token_schedule = token;
+        struct { int self_copy; } udma_launch{mode};
+"""
+        + gate
+        + r"""
+        bool serial_peer = use_udma && epilogue && !token && !aggregate && !pipeline_chunk_tokens;
+        assert(tiling.udma_self_copy_after_submit == (serial_peer && mode == 2));
+        assert(tiling.udma_self_copy_first_aiv ==
+               (serial_peer && mode == 1 && !topk_weights ? 6 : 0));
+    }
+}
+"""
+    )
+    path = tmp_path / "combine_gate.cpp"
+    executable = tmp_path / "combine_gate"
+    path.write_text(harness)
+    subprocess.run([compiler, "-std=c++17", "-O2", str(path), "-o", str(executable)], check=True, timeout=60)
+    subprocess.run([str(executable)], check=True, timeout=30)
+
+
 def test_batched_notify_count_tiles_and_source_ownership(tmp_path):
     """Run production integer reductions against scalar sums, including tails."""
     compiler = shutil.which("g++") or shutil.which("clang++")

@@ -326,7 +326,10 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
-    if (use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !expanded_x && !pipeline_chunk_tokens) {
+    // Serial aggregate materializes every self row; remote single-source rows
+    // may still read expanded_x through the sender's existing slot mapping.
+    // Early-single and pipeline paths retain their original copy ordering.
+    if (use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens) {
         const char* overlap = std::getenv("DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY");
         const char* after_submit = std::getenv("DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT");
         const bool use_spare_aivs = udma_launch.self_copy >= 0 ? udma_launch.self_copy == 1

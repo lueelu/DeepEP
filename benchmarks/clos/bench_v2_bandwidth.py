@@ -319,7 +319,13 @@ def effective_udma_config(
                     row_bytes if op == "dispatch" else (combine_row_bytes or row_bytes),
                     op,
                     bf16=bf16 if op == "dispatch" else True,
-                    expanded=expanded,
+                    expanded=expanded
+                    and (
+                        op == "dispatch"
+                        or not v2
+                        or getattr(buffer, "_use_early_single_source_combine", False)
+                        or bool(getattr(buffer, "_aggregate_pipeline_chunk_tokens", 0))
+                    ),
                     v2=v2,
                 )
                 for op in ("dispatch", "combine", "weighted")

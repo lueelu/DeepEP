@@ -399,6 +399,7 @@ def test_udma_combine_core_overrides_reach_native_and_preserve_handle():
         b._udma_auto_policy = SimpleNamespace(for_launch=lambda n, *a, **kw: (
             policies.append(n) or SimpleNamespace(peers_per_worker=4, wqes_per_visit=8, native_plan=lambda: [])))
         b._aggregate_pipeline_chunk_tokens = 0
+        b._use_early_single_source_combine = False
         b._communication_stream = None
         b._validate_handle = lambda h: None
         b._unpack_bias = lambda bias: (None, None)
@@ -467,6 +468,63 @@ def test_udma_combine_core_overrides_reach_native_and_preserve_handle():
                 assert 'UDMA' in str(e)
             else:
                 raise AssertionError('MTE accepted independent cores')
+        b._destroyed = True
+    """)
+
+
+def test_serial_expanded_combine_uses_unexpanded_plan_after_aggregate():
+    run_host("""
+        from contextlib import nullcontext
+        from dataclasses import replace
+        from deep_ep.backends.direct import elastic as m
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        m._validate_combine_tensors = lambda *a: None
+        m._get_allocation_stream_id = lambda *a: None
+        m._try_record_event = lambda *a: None
+        m._use_stream_after_event = lambda *a: nullcontext()
+        m._record_recv_outputs_on_current_stream = lambda *a: None
+        b = object.__new__(m.ElasticBuffer)
+        b._destroyed = False
+        b.num_device_aiv = 64
+        b.transport = 'udma'
+        b._udma_schedule = 'peer'
+        b._udma_qps_per_worker = 1
+        b._communication_stream = None
+        b._validate_handle = lambda h: None
+        b._unpack_bias = lambda bias: (None,None)
+        b._finish_comm_event = lambda *a: None
+        x = SimpleNamespace(size=lambda dim: (128,2816)[dim],element_size=lambda:2,dtype='torch.bfloat16')
+        h = SimpleNamespace(num_sms=32,do_expand=True,num_max_tokens_per_rank=128,
+            _dispatch_layout=tuple(object() for _ in range(6)),
+            _expand_layout=(None,None,object(),None),_single_source_slots=object())
+        base = replace(resolve_udma_policy(True,4,'udma',None,None,None,None,None),
+                       ranks_per_group=4,topology_known=True)
+        b._udma_auto_policy = base
+        for early, chunk in ((False,0),(True,0),(False,32)):
+            b._use_early_single_source_combine = early
+            b._aggregate_pipeline_chunk_tokens = chunk
+            for single in (False,True):
+                if chunk and not single: continue
+                b._use_single_source_combine = single
+                for weights in (None,object()):
+                    events, calls = [], []
+                    def aggregate(*args):
+                        events.append('aggregate')
+                        return x,weights
+                    def begin(*args):
+                        events.append('begin')
+                        calls.append(args)
+                        return SimpleNamespace(run=lambda: (x,weights))
+                    b._native = SimpleNamespace(aggregate=aggregate,_intranode_combine_begin=begin)
+                    b.combine(x,h,topk_weights=weights)
+                    overlap = early or bool(chunk)
+                    expected = base.for_launch(32,5632,'weighted' if weights is not None else 'combine',
+                                               bf16=True,expanded=overlap)
+                    assert calls[-1][-1] == expected.native_plan()
+                    assert events == (['begin'] if single and overlap else ['aggregate','begin'])
+                    assert calls[-1][15] is (x if single else None)
+                    assert calls[-1][16] is (h._single_source_slots if single else None)
+                    assert calls[-1][17] is (h._expand_layout[2] if single and overlap else None)
         b._destroyed = True
     """)
 
@@ -888,6 +946,15 @@ def test_benchmark_reports_separate_launch_plans():
         assert plans['weighted']['qps_per_worker'] == 1
         assert plans['weighted']['weight_mode'] == 1
         assert plans['combine']['self_copy'] == 2
+        for early, chunk in ((False,0),(True,0),(False,32)):
+            b._use_early_single_source_combine = early
+            b._aggregate_pipeline_chunk_tokens = chunk
+            report = effective_udma_config(b,num_aiv=8,row_bytes=5632,bf16=True,expanded=True)
+            from dataclasses import asdict
+            for op in ('dispatch','combine','weighted'):
+                expected = base.for_launch(8,5632,op,bf16=True,
+                    expanded=op == 'dispatch' or early or bool(chunk))
+                assert report['operation_plans'][op] == asdict(expected)
     """)
 
 
@@ -912,6 +979,8 @@ def test_benchmark_worker_reports_the_expand_mode_passed_to_dispatch(expand):
         policy = replace(resolve_udma_policy(True,32,'udma',None,None,None,None,None),
                          ranks_per_group=8, topology_known=True)
         buffer = Mock(udma_auto_policy=policy)
+        buffer._use_early_single_source_combine = False
+        buffer._aggregate_pipeline_chunk_tokens = 0
         for name in ('schedule', 'dispatch_peer_order', 'combine_peer_order', 'ranks_per_group',
                      'peers_per_group_per_worker', 'workers_per_peer', 'qps_per_worker'):
             setattr(buffer, 'udma_' + name, None)
@@ -942,7 +1011,7 @@ def test_benchmark_worker_reports_the_expand_mode_passed_to_dispatch(expand):
                 actual = buffer.dispatch.call_args.kwargs['do_expand']
                 assert actual is bool(expand)
                 assert args.effective_udma_config['operation_plans'] == {
-                    op: asdict(policy.for_launch(32,5632,op,bf16=True,expanded=actual))
+                    op: asdict(policy.for_launch(32,5632,op,bf16=True,expanded=actual and op == 'dispatch'))
                     for op in ('dispatch','combine','weighted')
                 }
             else:

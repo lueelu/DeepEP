@@ -1053,7 +1053,10 @@ class ElasticBuffer:
                 int(x.size(1)) * x.element_size(),
                 "weighted" if topk_weights is not None else "combine",
                 bf16=str(x.dtype) == "torch.bfloat16",
-                expanded=handle.do_expand,
+                # Serial aggregate completes on this stream before communication.
+                # Only overlapping aggregate paths retain the expanded fallback.
+                expanded=handle.do_expand
+                and (self._use_early_single_source_combine or bool(self._aggregate_pipeline_chunk_tokens)),
             )
             if self._udma_auto_policy is not None
             else None
