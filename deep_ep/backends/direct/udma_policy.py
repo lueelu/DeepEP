@@ -6,7 +6,17 @@ from functools import lru_cache
 
 from .config import Config, _MAX_NUM_AIV
 
-_SIMT_WEIGHT_MAX_ROW_BYTES = 7168
+
+def _simt_weight_row_fits(world_size, row_bytes):
+    # EP32 favors UDMA above the small-row band; EP64 measured SIMT wins
+    # through 12288 B. Extend those anchors by EP bands, not payload profiles.
+    # EP128 reports use SIMT when auxiliary AIVs exist; larger EPs follow that
+    # preference without an unmeasured upper cutoff. These are heuristic fits.
+    if world_size < 64:
+        return row_bytes <= 7168
+    if world_size < 128:
+        return row_bytes <= 12288
+    return True
 
 
 @lru_cache(maxsize=128)
@@ -288,9 +298,7 @@ class UdmaPolicy:
                         self_copy=2,
                     )
                 # SIMT needs an AIV outside the payload sending plan.
-                use_simt_weights = (
-                    row_bytes <= _SIMT_WEIGHT_MAX_ROW_BYTES or (measured_weight_fit and self.world_size == 64)
-                ) and plan.send_workers < cores
+                use_simt_weights = _simt_weight_row_fits(self.world_size, row_bytes) and plan.send_workers < cores
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
         plan.validate_num_aiv(num_aiv)
         if not plan.valid_group_capacity():

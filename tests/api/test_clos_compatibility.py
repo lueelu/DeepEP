@@ -513,7 +513,7 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
             for row_bytes, mode in ((5632,2), (7168,2), (7170,1), (8192,1), (12288,1)):
                 plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
                 assert plan.send_workers < cores, (ep, cores, plan)
-                assert plan.weight_mode == (0 if ep == 128 else mode), (ep, cores, row_bytes, plan)
+                assert plan.weight_mode == (0 if ep == 128 else 2 if ep == 64 else mode), (ep, cores, row_bytes, plan)
         # At EP8/G8/AIV8 the fitted plan uses every AIV for payload.
         base = resolve_udma_policy(True,8,'udma',None,None,None,None,None)
         policy = replace(base, ranks_per_group=8, topology_known=True)
@@ -525,8 +525,7 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
             policy = replace(base, ranks_per_group=group, topology_known=known)
             for row_bytes in (8192, 9216, 12288):
                 plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
-                use_fit = group == 16 and known and cores >= 32
-                assert plan.weight_mode == (2 if use_fit else 1)
+                assert plan.weight_mode == 2
     """)
 
 
@@ -564,14 +563,50 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
                 assert p.peer_order == (2 if ep == 32 and size <= 12288 else 0)
             for cores in ((8,20,64) if ep == 32 else (8,20)):
                 p = base.for_launch(cores,8192,'weighted',bf16=True)
-                assert p.peer_order == 0 and p.weight_mode == 1
+                assert p.peer_order == 0
+                assert p.weight_mode == (2 if ep == 64 and p.send_workers < cores else 1)
             for other in (replace(base,topology_known=False), replace(base,ranks_per_group=24-group)):
                 p = other.for_launch(32,8192,'weighted',bf16=True)
-                assert p.peer_order == 0 and p.weight_mode == 1
+                assert p.peer_order == 0 and p.weight_mode == (2 if ep == 64 else 1)
             for opts in ({'expanded':True}, {'v2':False}, {'bf16':False}):
                 p = base.for_launch(32,8192,'weighted',**{'bf16':True,**opts})
                 assert p.native_plan()[1:] == [0,group,4,1,1,32,0,0]
             assert base.signature() == before
+    """)
+
+
+def test_weight_preference_does_not_return_to_simt_as_rows_grow():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy, _simt_weight_row_fits
+
+        for ep, limit in ((4,7168),(32,7168),(48,7168),(64,12288),(96,12288)):
+            assert _simt_weight_row_fits(ep,limit)
+            assert not _simt_weight_row_fits(ep,limit+1)
+        for ep in (128,192,256):
+            assert _simt_weight_row_fits(ep,1<<20)
+        sizes = sorted(set(range(256,32769,256)) | {2047,2049,4095,4097,7167,7169,8191,8193,12287,12289})
+        for ep in (4,8,16,32,48,64,96,128,192,256):
+            for group in (1,2,4,8,16):
+                if ep % group: continue
+                for known in (False,True):
+                    base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                   ranks_per_group=group,topology_known=known)
+                    for cores in range(8,65,2):
+                        try: base.for_num_aiv(cores)
+                        except ValueError: continue
+                        udma_seen = False
+                        for size in sizes:
+                            plan = base.for_launch(cores,size,'weighted',bf16=True)
+                            # Legacy mode 0 uses SIMT when a helper exists,
+                            # under the normal SIMT-enabled peer kernel build.
+                            preferred = _simt_weight_row_fits(ep,size)
+                            simt = plan.weight_mode != 1 and plan.send_workers < cores
+                            assert simt == (preferred and plan.send_workers < cores)
+                            # Capacity fallback is separate from the row rule:
+                            # no helper must remain legal even in the SIMT band.
+                            assert not (udma_seen and preferred), (ep,size)
+                            udma_seen |= not preferred
     """)
 
 
