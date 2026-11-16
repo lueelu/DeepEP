@@ -8,12 +8,12 @@ from .config import Config, _MAX_NUM_AIV
 
 
 def _simt_weight_row_fits(world_size, row_bytes):
-    # EP16/H4096 BF16 favors SIMT at 48 AIVs with the payload plan fixed.
-    # Extend the row limit across core budgets; the caller still requires a
-    # spare AIV. Keep H6144 and the independently measured EP32 rule unchanged.
-    if world_size == 16:
+    # Prefer SIMT through H4096 BF16 for EP16/32, independent of core budget
+    # and topology. EP16 has measured gains; EP32 shares this configured limit.
+    # The caller still requires a spare AIV. H6144 keeps its UDMA preference.
+    if world_size in (16, 32):
         return row_bytes <= 8192
-    # EP32 favors UDMA above the small-row band; EP64 measured SIMT wins
+    # Other small EPs retain their row limit; EP64 measured SIMT wins
     # through 12288 B. Extend those anchors by EP bands, not payload profiles.
     # EP128 reports use SIMT when auxiliary AIVs exist; larger EPs follow that
     # preference without an unmeasured upper cutoff. These are heuristic fits.
@@ -281,7 +281,7 @@ class UdmaPolicy:
             if operation == "weighted":
                 # Keep the complete measured plan together: the weight-path
                 # comparison used RR/1/1/1/visit8 and after-submit self-copy.
-                # Its winner differs between EP32/G8 and EP64/G16.
+                # Retain that payload plan; weight preference is selected below.
                 # Keep the EP64 plan with larger core budgets too: additional
                 # auxiliary AIVs must not silently switch weights back to UDMA.
                 # Interpolate between measured row widths; retain both endpoint
