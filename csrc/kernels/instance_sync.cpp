@@ -1,4 +1,3 @@
-// Copyright (c) 2026, DeepEP contributors
 #include "kernel_operator.h"
 #include "shmem.h"
 

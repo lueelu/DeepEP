@@ -1,4 +1,3 @@
-// Copyright (c) 2026, DeepEP contributors
 #pragma once
 #include <cstdint>
 #include <mutex>

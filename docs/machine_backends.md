@@ -1,7 +1,7 @@
 # Mesh+PCIe、Mesh+Clos 与 Global Clos
 
 一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
-`29fad1201858af29f687c4b8637d112d5d0ff28b`（官方 `dev`）。Mesh+Clos 保留本仓已有的 HT、LL、
+`29fad1201858af29f687c4b8637d112d5d0ff28b`。Mesh+Clos 保留本仓已有的 HT、LL、
 实验组件和接口限制。Direct 实现包含 V1 Buffer、V2 ElasticBuffer、
 MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
@@ -131,118 +131,9 @@ V2 的 `get_buffer_size_hint(..., machine_type=...)` 也须选择同一后端；
 非 collective，不增加跨 rank 同步。直接让构造函数按 shape 计算可避免选错 hint。
 Mesh+Clos 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `shmem_ip_port` 方式。
 
-## 全 Clos 的默认调度与手动调优
+## 全 Clos 精度与带宽测试
 
-全 Clos 中含核间同步或跨核等待的 kernel 入口使用 `__schedmode__(1)`（batch mode），
-等待所需核资源可用后整体调度，避免多 stream 竞争时部分核先启动并阻塞在同步点。
-此设置覆盖 layout、notify、dispatch、combine 通信阶段和 expand；独立 reduce、
-aggregate 和 cached dispatch plan 构建没有跨核同步，保留普通调度。
-batch mode 不替代 stream/event 依赖、跨 rank 完成确认，也不保证所有 rank 同时进入。
-
-V1/V2 在 UDMA 下默认 `udma_auto_policy=True`。机型识别先选择通信实现，
-Clos 策略再选择发送参数。`clos-v4` 将初始化资源与逐次调用的策略分开：
-
-- Buffer 构造时在 EP group 内交换主机 boot ID。仅在各主机 rank 连续且数量相等时，
-  将其识别为物理分组；不会默认每台 8 rank，也不使用 `LOCAL_WORLD_SIZE` 猜测。
-  不可识别时采用 rank 顺序；极低核数需要轮转兜底时使用明确的逻辑分组。
-- 一次 SHMEM 初始化预留所支持 peer 顺序、P=1/2/4/8 和 W×Q=1/2 的 QP 映射并集。
-  每个发送 AIV 仍独占对应 SQ，QP 总数保持 32；预留的 peer/QP 连接数可能比旧策略多。
-- 每次调用只查缓存并生成不可变 launch plan，按 EP、实际 payload 行字节数、通信核数、
-  dispatch/无权重 combine/带权重 combine 分别选择顺序、P/W/Q、visit 和本卡复制方式。
-  不读取设备上的计数，不执行在线摸测，不修改 Buffer 的全局调度状态，也不额外同步。
-
-当前离线模板来自 EP4/8/16/32、AIV8/32、BF16、非展开随机路由测试，按不超过 4 KiB
-和较大行分档，覆盖测得的 2 KiB、5632 B、12 KiB 行。它是已有数据的保守拟合，
-不是所有 shape 的最优性能保证。模板还有实际分组约束：EP32 的 G=8 测量结果不会
-套用到 G=16。EP32/G8 的 dispatch 模板在通信核数不少于 32 时继续使用相同发送计划，
-额外核参与辅助工作；EP32 combine 不继承这项扩展。其余未覆盖的核数、EP/行大小保留
-保守发送参数；除下述 EP128 固定配置外，FP8、展开路径和 V1 保留原有策略。
-
-非展开 BF16 V2 dispatch 和带权重 combine 在至少 16 个通信核、且发送计划只剩
-1–2 个辅助核时，先将每 peer 的重复发送 worker 减为 1，必要时增加每 worker 负责的
-peer 数；只有新计划留下超过 2 个辅助核且满足容量约束时才采用。该规则不固定发送核
-与辅助核的比例，不改变 8 核策略、无权重 combine 或发送核占满时的原有回退。
-例如 EP8/16 核的发送核从 14 减到 7，EP16/16 核从 15 减到 8。这是避免辅助工作
-集中在极少核上的资源启发式，性能收益仍需同环境对照验证。
-
-非展开 BF16 无权重 V2 combine 根据实际通信核数选择本卡复制方式：
-空余 AIV 数不少于 payload 发送 AIV 数时，使用空余 AIV 并行复制，否则先提交远端
-再复制本卡。该规则不限定总核数，QP 数不计作发送核数，reduce 核数不参与判断。
-这是资源启发式，不保证每个 shape 都有性能收益；下述 EP128 配置保留其完整本卡复制方式。
-非展开 BF16 带权重 V2 combine 按 EP 档位和 payload 行字节数选择权重发送偏好：
-
-| EP 范围 | 优先 SIMT 的行宽 | 更大行宽 |
-| --- | --- | --- |
-| EP < 64 | ≤7168 B | UDMA |
-| 64 ≤ EP < 128 | ≤12288 B | UDMA |
-| EP ≥128 | 不设行宽上限 | 优先 SIMT |
-
-SIMT 必须有空余 AIV，且 kernel 构建启用了该路径；发送核占满时仍回退 UDMA。
-该表使行宽偏好只朝 SIMT→UDMA 切换，但容量回退仍可能随 payload 计划改变。
-阈值参考 EP32、EP64 的权重对照和 EP128 的已有报告；其他 EP、行宽、核数属于
-经验推广，不代表已经验证最优性能。下述 EP128 固定配置继续保留旧版自动权重路径。
-
-Payload 发送配置与权重偏好分开：8192～12288 B 闭区间内，已识别 EP32/G8 的
-32～62 核及 EP64/G16 的至少 32 核带权重 combine 保留
-`group_round_robin/P1/W1/Q1/visit8`，先提交远端再复制本卡。
-权重规则不改变该发送配置、dispatch、无权重 combine 或 reduce 核数。
-
-EP128 在实际通信核数不少于 16 时，所有操作统一使用
-`rank/P8/W1/Q1/visit16`，由 16 个 AIV 发送 payload。构造时的默认 P/visit 同样为 8/16。
-该配置优先于上述模板和资源启发式，不区分行大小、dtype、展开状态、V1/V2 或物理分组；
-rank 顺序不依赖主机分组识别。本卡复制保持 `self_copy=0`（default），权重保持
-`weight_mode=0`，由原有 kernel 条件选择传输路径，不强制 SIMT 或 UDMA。
-这替换了此前仅面向 EP128/G16/AIV32/BF16 H2816 的逐算子配置。
-
-远端验证报告覆盖 G16、BF16、T8192/16384、H2816/6144/7168、AIV32/64、K8/E512、
-1 GiB 大页开启的 12 组场景，记录了全张量精度通过及 128 rank 正常退出。
-该验证范围不代表其他 dtype、核数及展开路径均已实测，也不保证所有 shape 的最优性能。
-策略不读取 token 数、路由或专家计数，不会自动开启大页。通信核数 0 按现有 API 规则
-解析为实际核数后匹配，不使用 reduce 核数进行匹配。少于 16 个通信核仍使用容量兜底；
-其他 EP 和手动模式保持原行为。
-
-未命中模板时按核数增加 peers/worker，必要时改为轮转分组，检查发送核数、32-QP 预算
-及每 worker 64-peer 容量后才下发。例如 EP128/AIV8、G=16 可用轮转 P=2/W=1/Q=1；
-这表示资源上可执行，不代表已验证 EP128/AIV8 的性能。资源仍放不下时在下发前报错。
-
-策略不增加用户指定的通信核数。V1 通过 `Config(num_sms=...)` 指定；未传 Config
-沿用 `set_num_sms`，默认 32。V2 fresh dispatch 的 `num_sms=0` 默认 32；cached dispatch
-的 0 沿用 handle。combine 的 `num_sms` 保留 handle 的逻辑通道数；`combine_num_sms`
-独立指定通信核数，`reduce_num_sms` 独立指定最终 reduce 核数，二者 0 均继承 handle
-核数。前置 aggregate 仍使用 handle 核数，实验性 aggregate pipeline 不允许改变通道数。
-fresh dispatch 前的独立 layout 仍按专家数和设备能力选核，不受通信核数参数限制。
-
-`buffer.udma_auto_policy` 是不可变初始资源策略，`.for_num_aiv(n)` 仅是核数兜底，
-不代表最终 shape 策略。`.for_launch(n, row_bytes, operation, bf16=True, expanded=False)`
-返回实际策略，其中 operation 为 `dispatch`、`combine` 或 `weighted`；V1 查询需加
-`v2=False`。带宽报告的 `effective_udma_config.operation_plans` 分别记录三种策略。
-手动模式保留原有行为；原生扩展和 Python 必须同步重新编译安装。
-
-自动模式下显式传入的策略参数不改变结果；与有效值不同会在 rank 0 记录 warning。
-要调优，请在构造 Buffer 时设 `udma_auto_policy=False`，完整指定所用策略参数。例如 V2：
-
-```python
-buffer = deep_ep.ElasticBuffer(
-    group=ep_group, num_max_tokens_per_rank=8192, hidden=6144, num_topk=8,
-    machine_type="global_clos", explicitly_destroy=True,
-    udma_auto_policy=False, udma_schedule="peer",
-    udma_dispatch_peer_order="rank", udma_combine_peer_order="rank",
-    udma_peers_per_worker=4, udma_workers_per_peer=1,
-    udma_qps_per_worker=1, udma_wqes_per_visit=32,
-)
-```
-
-V1 的 peers/worker 和 WQEs/visit 放在每次调用的 `Config` 中，其余参数在 Buffer 构造时设置。
-group 顺序还需 `udma_ranks_per_group`；group_round_robin 还需
-`udma_peers_per_group_per_worker`。MTE 不启用 UDMA 自动策略。
-
-UDMA 控制区固定在工作区开头，每个源 rank 保留 512 字节（256 字节对齐），
-dispatch/combine 数据区与容量计算同步后移。普通 combine 省去前置 cached-notify，
-但保留 kernel Begin 的跨 rank 同步、接收完成等待和发送 Quiet，避免上一轮读写尚未结束就复用数据。
-cached dispatch、MTE 和需要独立初始化的实验路径保留对应 notify。
-这些改动需要整体重编 Python/native/device 库，不能只替换 Python 文件。
-
-Clos 仅保留两个精度与带宽入口，均使用库的默认自动调度策略，不提供手动调度或参数扫描：
+Clos 提供以下精度与带宽测试入口：
 
 ```bash
 python benchmarks/clos/bench_v1_bandwidth.py --ep-size 8 --output clos_v1_ep8
