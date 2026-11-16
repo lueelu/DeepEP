@@ -264,11 +264,13 @@ class UdmaPolicy:
                 # Its winner differs between EP32/G8 and EP64/G16.
                 # Keep the EP64 plan with larger core budgets too: additional
                 # auxiliary AIVs must not silently switch weights back to UDMA.
+                # Interpolate between measured row widths; retain both endpoint
+                # plans and the existing topology/core-budget requirements.
                 measured_weight_fit = (
                     self.topology_known
                     and (self.world_size, self.ranks_per_group) in ((32, 8), (64, 16))
                     and (cores == 32 or (self.world_size == 64 and cores > 32))
-                    and row_bytes in (8192, 12288)
+                    and 8192 <= row_bytes <= 12288
                 )
                 if measured_weight_fit:
                     plan = replace(

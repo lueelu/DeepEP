@@ -525,7 +525,7 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
             policy = replace(base, ranks_per_group=group, topology_known=known)
             for row_bytes in (8192, 9216, 12288):
                 plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
-                use_fit = group == 16 and known and cores >= 32 and row_bytes in (8192, 12288)
+                use_fit = group == 16 and known and cores >= 32
                 assert plan.weight_mode == (2 if use_fit else 1)
     """)
 
@@ -542,7 +542,7 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
                            ranks_per_group=group, topology_known=True)
             before = base.signature()
             for cores in ((0,32) if ep == 32 else (0,32,34,48,64)):
-                for row_bytes in (8192,12288):
+                for row_bytes in (8192,8193,8194,9216,10240,12286,12287,12288):
                     plan = base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     assert plan.native_plan() == [1,3,group,1,1,1,8,2,mode]
                     assert plan.send_workers == group
@@ -559,7 +559,7 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
                 assert base.for_launch(32,8192,op,bf16=True) == base.for_launch(32,5632,op,bf16=True)
                 assert base.for_launch(32,12288,op,bf16=True) == base.for_launch(32,5632,op,bf16=True)
             # Width/topology scopes remain unchanged; EP32 combine is not inherited.
-            for size in (7168,7170,8190,8194,12286,12290):
+            for size in (7168,7170,8190,8191,12289,12290):
                 p = base.for_launch(32,size,'weighted',bf16=True)
                 assert p.peer_order == (2 if ep == 32 and size <= 12288 else 0)
             for cores in ((8,20,48,64) if ep == 32 else (8,20)):
@@ -572,6 +572,37 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
                 p = base.for_launch(32,8192,'weighted',**{'bf16':True,**opts})
                 assert p.native_plan()[1:] == [0,group,4,1,1,32,0,0]
             assert base.signature() == before
+    """)
+
+
+def test_reported_300_operator_plans_remain_unchanged():
+    # Frozen native plans from the November 16 EP8-128 reports, not generated
+    # from the selector. Keep all five operators for each of the 60 shapes.
+    run_host("""
+        import csv
+        import json
+        from dataclasses import replace
+        from pathlib import Path
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+
+        with Path('tests/api/fixtures/udma_plans_20261116.csv').open() as source:
+            rows = list(csv.DictReader(source))
+        assert len(rows) == 300
+        cases = {}
+        operations = {'dispatch_with_weights', 'dispatch_without_weights',
+                      'cached_dispatch', 'combine_weighted', 'combine_unweighted'}
+        for row in rows:
+            key = tuple(int(row[k]) for k in ('EP','tokens','hidden','topk','experts','aiv','G'))
+            ep, tokens, hidden, topk, experts, cores, group = key
+            cases.setdefault(key, []).append(row['operator'])
+            op = {'combine_weighted':'weighted', 'combine_unweighted':'combine'}.get(row['operator'], 'dispatch')
+            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=group, topology_known=True)
+            plan = base.for_launch(cores,hidden*2,op,bf16=True)
+            assert plan.native_plan() == json.loads(row['native_plan']), (key, op, plan)
+            assert plan.send_workers == int(row['send_aivs']), (key, op, plan)
+        assert len(cases) == 60
+        assert all(len(ops) == 5 and set(ops) == operations for ops in cases.values())
     """)
 
 
