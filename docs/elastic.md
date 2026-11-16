@@ -161,6 +161,13 @@ Dispatch 仍在原执行流中排在 Notify 之后，不会提前读取未完成
 未设置或设为 `1` 时启用。比较性能时，应同时检查 Notify、Notify 到通信的间隔
 以及调用总耗时；通信 kernel 的计时边界没有改变。
 
+Notify 的跨 rank 计数汇总默认按 source 分配给 AIV，批量读取完整 rank 计数行，
+再从本地快照计算前缀和与专家计数。分块宽度由 EP、UB 和现有暂存区容量决定，
+不限定 hidden、专家数或 32/64 核；例如 EP256 的 rank 矩阵分四个列块处理。
+专家矩阵超过暂存容量时分块复用，容量不足一个对齐块时保留原实现。
+工作区生命周期同步和 MTE3 Host 通知不变，cached Notify 与 payload 发送策略不变。
+这项优化减少 fresh Notify 的小请求开销，收益须按目标环境测量，不计入通信 kernel 带宽。
+
 ### Global Clos V2 的独立 Combine / Reduce 核数
 
 UDMA 路径的 `combine()` 支持两个可选关键字参数：
