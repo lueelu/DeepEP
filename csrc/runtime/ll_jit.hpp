@@ -13,6 +13,7 @@ namespace deepep {
 enum class LlJitOperation : uint32_t {
     Dispatch = 0U,
     Combine = 1U,
+    UbxCombine = 2U,
 };
 
 struct LlJitSignature {

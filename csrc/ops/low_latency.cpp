@@ -200,7 +200,7 @@ LlJitSignature combine_static_spec(int world, int rank, bool rdma, int b, int h,
 {
     (void)rdma;
     LlJitSignature signature;
-    signature.operation = LlJitOperation::Combine;
+    signature.operation = rdma ? LlJitOperation::UbxCombine : LlJitOperation::Combine;
     signature.bs = uint32_t(b);
     signature.hidden = uint32_t(h);
     signature.topK = uint32_t(k);
@@ -496,13 +496,12 @@ void bind_low_latency(py::module_& module)
         const auto parsed = build_combine_args(session, tensors, b, h, k, e, dtype);
         session.invalidate_dispatch_controls();
         py::gil_scoped_release release;
-        if (parsed.rdmaTransport) {
-            ubx_combine_launch(reinterpret_cast<void*>(stream_address), &parsed.rdma);
-        } else {
-            const auto spec = combine_static_spec(session.world(), session.rank(), false, b, h, k, e, dtype, capacity,
-                                                  parsed.cores);
+        const auto spec = combine_static_spec(session.world(), session.rank(), parsed.rdmaTransport, b, h, k, e, dtype,
+                                              capacity, parsed.cores);
+        if (parsed.rdmaTransport)
+            ll_jit_launch(spec, &parsed.rdma, sizeof(parsed.rdma), reinterpret_cast<void*>(stream_address));
+        else
             ll_jit_launch(spec, &parsed.args, sizeof(parsed.args), reinterpret_cast<void*>(stream_address));
-        }
     },
                py::arg("session"), py::arg("tensors"), py::arg("b"), py::arg("h"), py::arg("k"), py::arg("e"),
                py::arg("dtype"), py::arg("stream"), py::arg("capacity") = 0);

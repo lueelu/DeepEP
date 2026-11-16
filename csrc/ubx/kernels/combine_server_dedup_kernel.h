@@ -5,6 +5,7 @@
 #define COMBINE_DEDUP_EP_COMBINE_MEMORY_SERVER_DEDUP_KERNEL_H
 
 #include "kernel_operator.h"
+#include "../../kernels/common/core_context.h"
 
 #include "ep_memory_server_dedup_count_layout.h"
 #include "comm_args.h"
@@ -25,9 +26,11 @@ public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
                                 GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK, uint32_t experts, uint8_t dtype,
-                                int64_t magic, bool enableDedup = true)
+                                int64_t magic, bool enableDedup = true,
+                                deepep::CoreContext core = deepep::OrdinaryCoreContext())
     {
-        coreNum_ = GetBlockNum();
+        coreContext_ = core;
+        coreNum_ = core.count;
         recvCores_ = EpCombineRecvCoreCount(coreNum_);
         if (recvCores_ == 0U) {
             Trap();
@@ -35,7 +38,7 @@ public:
         }
         // Task partitions and control rows retain physical core ordering.
 
-        core_ = CombineLogicalCore(GetBlockIdx(), coreNum_);
+        core_ = CombineLogicalCore(core.index, coreNum_);
         sendCores_ = coreNum_ - recvCores_;
         notifyBegin_ = coreNum_ - UbxDispatch::kLlNotifyCoreNum;
         args_ = reinterpret_cast<const __gm__ UbxDispatch::CommArgs*>(commArgs);
@@ -404,7 +407,7 @@ private:
 
         if (selected_ == 0U) return;
 
-        if (UbxTransport::Rdma(args_)) returnBatch_.Init(args_, resultStride_);
+        if (UbxTransport::Rdma(args_)) returnBatch_.Init(args_, resultStride_, core_, coreNum_);
         const uint32_t servers = uint32_t(args_->rankSize) / Group;
         const uint32_t ownServer = uint32_t(args_->rank) / Group;
         uint32_t owner = 0U, sendSequence = 0U;
@@ -498,7 +501,7 @@ private:
         ServerDedupPartial<Group> partial;
         partial.Init(args_, &pipe_, arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes], expertAddr_,
                      tableAddr_, relayAddr_, typesAddr_, tokens_, bs_, h_, topK_, experts_, dtype_, window_, workspace_,
-                     &returnBatch_);
+                     &returnBatch_, coreContext_);
 
         partial.SetReady(&groupReady_);
         partialTasks_ = partial.Process();
@@ -577,6 +580,7 @@ private:
     EpCombineM45WorkspaceLayout workspace_{};
     ReturnBatch returnBatch_;
     uint32_t partialTasks_ = 0U;
+    deepep::CoreContext coreContext_{};
     uint32_t coreNum_ = 0, sendCores_ = 0, recvCores_ = 0, notifyBegin_ = 0;
     TPipe pipe_;
     TBuf<> arena_;

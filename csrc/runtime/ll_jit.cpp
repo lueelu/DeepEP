@@ -12,6 +12,7 @@
 #include "jit_runtime.hpp"
 #include "../kernels/combine/low_latency/launch.hpp"
 #include "../kernels/dispatch/low_latency/launch.hpp"
+#include "../ubx/launch.hpp"
 
 #ifndef DEEPEP_JIT_PI_ON_CHIP
 #define DEEPEP_JIT_PI_ON_CHIP 0
@@ -91,6 +92,42 @@ std::string combine_source(const LlJitSignature& s)
     return text.str();
 }
 
+std::string ubx_combine_source(const LlJitSignature& s)
+{
+    std::ostringstream args;
+    args << s.group << ", " << s.capacity << ", " << s.dedup << ", " << s.cores;
+    const std::string shape = args.str();
+    std::ostringstream text;
+    text << "#include <ubx/kernels/combine_entry.h>\n"
+         << "extern \"C\" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void "
+            "ubx_combine_route_plan_jit(GM_ADDR comm, GM_ADDR expert, GM_ADDR destination, GM_ADDR counts, "
+            "GM_ADDR weights, GM_ADDR types, GM_ADDR relay, GM_ADDR mask, GM_ADDR output, GM_ADDR tiling)\n"
+         << "{\n"
+         << "    const UbxCombineEntry::ArgsBlock block{comm, expert, destination, counts, weights, types, relay, mask, "
+            "output, tiling, 0U};\n"
+         << "    UbxCombineEntry::Run<" << shape
+         << ">(block, deepep::OrdinaryCoreContext(), false);\n"
+         << "}\n"
+         << "static void __instantiate_kernel()\n"
+         << "{\n"
+         << "    auto ptr = reinterpret_cast<void*>(&ubx_combine_route_plan_jit);\n"
+         << "    (void)ptr;\n"
+         << "}\n";
+    for (uint32_t i = 0; i < 4U; ++i) {
+        text << "__sk__ __vector__ void ubx_combine_route_plan_sk" << i
+             << "(const UbxCombineEntry::ArgsBlock* block, sk::SkSystemArgs* sysArgs)\n"
+             << "{\n"
+             << "    sysArgs->SkInit();\n"
+             << "    const deepep::CoreContext core{sysArgs->SkGetBlockIdx(), sysArgs->SkGetNumBlocks()};\n"
+             << "    const UbxCombineEntry::ArgsBlock local = *block;\n"
+             << "    UbxCombineEntry::Run<" << shape << ">(local, core, true);\n"
+             << "}\n";
+    }
+    text << "SK_BIND(ubx_combine_route_plan_jit, 0, ubx_combine_route_plan_sk0, ubx_combine_route_plan_sk1, "
+            "ubx_combine_route_plan_sk2, ubx_combine_route_plan_sk3);\n";
+    return text.str();
+}
+
 std::vector<std::string> flags(const LlJitSignature& signature)
 {
     (void)signature;
@@ -101,6 +138,7 @@ std::vector<std::string> flags(const LlJitSignature& signature)
         "-DL2_CACHE_HINT",
         "-DDEEPEP_LL_RDMA=1",
         "-DDEEPEP_LL_JIT_TU=1",
+        "-DDEEPEP_UBX_JIT_TU=1",
         "-DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1",
         std::string("-DACLSHMEMI_HNS_1825_PI_ON_CHIP=") + std::to_string(DEEPEP_JIT_PI_ON_CHIP),
         "--cce-auto-infer-kernel-type=false",
@@ -132,6 +170,13 @@ void launch_combine(const LlJitSignature& signature, const EpServerDedupCombineK
                args.sourceMask, args.yOut, args.tilingData);
 }
 
+void launch_ubx_combine(const LlJitSignature& signature, const ubx::CombineArgs& args, void* stream)
+{
+    const auto kernel = jit_compile("ubx_combine", ubx_combine_source(signature), flags(signature));
+    jit_launch(kernel, stream, static_cast<int>(signature.cores), 0, args.comm, args.expert, args.destination,
+               args.counts, args.weights, args.types, args.relay, args.mask, args.output, args.tiling);
+}
+
 }  // namespace
 
 void ll_jit_launch(const LlJitSignature& signature, const void* arguments, std::size_t bytes, void* stream)
@@ -147,7 +192,13 @@ void ll_jit_launch(const LlJitSignature& signature, const void* arguments, std::
                 throw std::invalid_argument("Combine launch argument size mismatch");
             launch_combine(signature, *static_cast<const EpServerDedupCombineKernelArgs*>(arguments), stream);
             break;
+        case LlJitOperation::UbxCombine:
+            if (bytes != sizeof(ubx::CombineArgs))
+                throw std::invalid_argument("UBX combine launch argument size mismatch");
+            launch_ubx_combine(signature, *static_cast<const ubx::CombineArgs*>(arguments), stream);
+            break;
     }
 }
+
 
 }  // namespace deepep

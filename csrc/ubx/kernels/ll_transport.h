@@ -46,19 +46,20 @@ __aicore__ inline GlobalTensor<uint8_t> Tensor(GM_ADDR p, bool uncached = false)
     if (uncached) t.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
     return t;
 }
-__aicore__ inline GM_ADDR Stage(const __gm__ Args* a, uint32_t bytes)
+__aicore__ inline GM_ADDR Stage(const __gm__ Args* a, uint32_t bytes, uint32_t coreIdx, uint32_t coreNum)
 {
-    if (GetBlockNum() != a->reservedConfig[1] || GetBlockIdx() >= a->reservedConfig[1] || bytes > UbxRdma::kCoreBytes)
+    if (coreNum != a->reservedConfig[1] || coreIdx >= a->reservedConfig[1] || bytes > UbxRdma::kCoreBytes)
         Trap();
-    return a->reservedAddresses[1] + uint64_t(GetBlockIdx()) * UbxRdma::kCoreBytes;
+    return a->reservedAddresses[1] + uint64_t(coreIdx) * UbxRdma::kCoreBytes;
 }
 __aicore__ inline void Put(const __gm__ Args* a, uint32_t peer, GM_ADDR dst, GM_ADDR src, uint32_t bytes,
-                           LocalTensor<uint8_t> scratch, uint32_t syncId = 7U)
+                           LocalTensor<uint8_t> scratch, uint32_t syncId = 7U, uint32_t coreIdx = 0U)
 {
-    aclshmemx_roce_qp_put_nbi(dst, src, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), bytes, peer, GetBlockIdx(), syncId);
+    aclshmemx_roce_qp_put_nbi(dst, src, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), bytes, peer, coreIdx, syncId);
 }
-__aicore__ inline void Quiet(uint32_t peer, LocalTensor<uint8_t> scratch, uint32_t syncId = 7U)
+__aicore__ inline void Quiet(uint32_t peer, LocalTensor<uint8_t> scratch, uint32_t syncId = 7U,
+                             uint32_t coreIdx = 0U)
 {
-    aclshmemx_roce_qp_quiet(peer, GetBlockIdx(), (__ubuf__ uint8_t*)scratch.GetPhyAddr(), syncId);
+    aclshmemx_roce_qp_quiet(peer, coreIdx, (__ubuf__ uint8_t*)scratch.GetPhyAddr(), syncId);
 }
 }  // namespace UbxTransport
