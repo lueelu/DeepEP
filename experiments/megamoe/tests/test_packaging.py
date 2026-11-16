@@ -53,7 +53,14 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         "test.dist-info/licenses/deepseek-deepep.LICENSE": b"fixture",
     }
     if payload:
-        for name in ("api.py", "benchmark.py", "configs/smoke.json", "libmegamoe_kernel.so", "_C.fake.so"):
+        for name in (
+            "api.py",
+            "benchmark.py",
+            "configs/smoke.json",
+            "libmegamoe_kernel.so",
+            "libmegamoe_urma_kernel.so",
+            "_C.fake.so",
+        ):
             entries["deep_ep_experimental/megamoe/" + name] = b"fixture"
         entries["test.dist-info/licenses/cann.LICENSE"] = b"fixture"
     if ep_gmm_fused:
@@ -69,6 +76,15 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         ):
             entries[prefix + name] = b"fixture"
         entries[prefix + "_build_info.json"] = json.dumps({"shmem_revision": "test-sdk"}).encode()
+    runtime_hashes = {}
+    for name in ("libshmem.so", "libshmem_utils.so", "aclshmem_bootstrap_config_store.so", "aclshmem_bootstrap_uid.so"):
+        data = name.encode()
+        entries["deep_ep/.libs/" + name] = data
+        runtime_hashes[name] = hashlib.sha256(data).hexdigest()
+    entries["licenses/cann.LICENSE"] = b"fixture"
+    info = json.loads(entries["deep_ep/_build_info.json"])
+    info["shmem_runtime"] = runtime_hashes
+    entries["deep_ep/_build_info.json"] = json.dumps(info).encode()
     path = tmp_path / "synthetic.whl"
     with zipfile.ZipFile(path, "w") as archive:
         for name, content in entries.items():

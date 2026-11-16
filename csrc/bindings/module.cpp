@@ -5,11 +5,17 @@
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
 #include "runtime/session.hpp"
+#ifdef DEEPEP_BUILD_MEGAMOE
+#include "runtime/megamoe_session.hpp"
+#endif
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
 #include <pybind11/stl.h>
 #endif
 
 #include "ops/low_latency.hpp"
+#include "ops/notify.hpp"
+#include "ops/dispatch.hpp"
+#include "ops/combine.hpp"
 
 namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
@@ -26,8 +32,8 @@ PYBIND11_MODULE(_C, module)
     module.def(
         "create_mpi_runtime",
         [](int rank, int size, uint64_t bytes, unsigned timeout, bool use_1g_huge_pages) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, "", timeout, true, false, true, false,
-                                                     use_1g_huge_pages);
+            return std::make_unique<deepep::Session>(rank, size, bytes, "", timeout, true,
+                                                     false, true, false, use_1g_huge_pages);
         },
         py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("timeout"), py::arg("use_1g_huge_pages") = false,
         py::call_guard<py::gil_scoped_release>());
@@ -35,16 +41,16 @@ PYBIND11_MODULE(_C, module)
         "create_combine_runtime",
         [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool mpi,
            bool use_1g_huge_pages) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, true, false, mpi, true,
-                                                     use_1g_huge_pages);
+            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, true,
+                                                     false, mpi, true, use_1g_huge_pages);
         },
         py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("mpi"),
         py::arg("use_1g_huge_pages") = false, py::call_guard<py::gil_scoped_release>());
     py::class_<deepep::Session>(module, "Runtime")
         .def(py::init([](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
                          bool use_1g_huge_pages) {
-                 return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, udma, false, false,
-                                                          false, use_1g_huge_pages);
+                 return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, udma,
+                                                          false, false, false, use_1g_huge_pages);
              }),
              py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"),
              py::arg("udma") = false, py::arg("use_1g_huge_pages") = false, py::call_guard<py::gil_scoped_release>())
@@ -55,14 +61,12 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("use_1g_huge_pages", &deepep::Session::use_1g_huge_pages)
         .def_property_readonly("workspace_allocation_bytes", &deepep::Session::workspace_allocation_bytes)
         .def_property_readonly("sparse_qp_enabled", &deepep::Session::sparse_qp_enabled)
+        .def_property_readonly("peer_access_error", &deepep::Session::peer_access_error)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
-    module.def(
-        "create_megamoe_runtime",
-        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, false, true);
-        },
-        py::call_guard<py::gil_scoped_release>());
+    module.def("create_megamoe_runtime", &deepep::megamoe::create_runtime, py::arg("rank"), py::arg("size"),
+               py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("backend") = "mte",
+               py::call_guard<py::gil_scoped_release>());
     module.def("megamoe_workspace_address", &deepep::Session::workspace_address);
 #endif
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
@@ -75,11 +79,8 @@ PYBIND11_MODULE(_C, module)
                py::call_guard<py::gil_scoped_release>());
 #endif
 
-    module.attr("high_throughput_enabled") = false;
-    for (const char* operation : {"notify", "dispatch", "combine"}) {
-        module.def(operation, [](py::args, py::kwargs) {
-            throw std::runtime_error("HT operations are unavailable in this LL-only NDR build");
-        });
-    }
+    deepep::bind_notify(module);
+    deepep::bind_dispatch(module);
+    deepep::bind_combine(module);
     deepep::bind_low_latency(module);
 }

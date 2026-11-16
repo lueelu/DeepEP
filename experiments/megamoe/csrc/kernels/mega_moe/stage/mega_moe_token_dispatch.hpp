@@ -18,7 +18,7 @@
  * 保留 Prefill 的规则配额快路径；索引批量预取、token 环跨 peer 复用，不增加 UB 或核间同步。
  */
 
-#include "../common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 #include "../common/mega_moe_peer_rows.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"

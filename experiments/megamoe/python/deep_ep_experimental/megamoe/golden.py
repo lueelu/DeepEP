@@ -25,16 +25,20 @@ def token_indices(bs, check_tokens):
 
 
 def contract(config, world, bs, input_kind, routing, check_tokens):
-    from . import reference
+    from . import reference, numerics
     from .benchmark import inputs
 
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
-    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed"):
+    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed", "random-balanced"):
         raise ValueError("Invalid Golden input/routing")
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
-    source = inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
+    source = inspect.getsource(numerics) + inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
+    if routing == "random-balanced":
+        from .benchmark import ROUTING_SEED, _global_routes, random_balanced_indices
+
+        source += str(ROUTING_SEED) + inspect.getsource(_global_routes) + inspect.getsource(random_balanced_indices)
     return dict(
         version=1,
         reference_sha256=hashlib.sha256(source.encode()).hexdigest(),
@@ -45,7 +49,7 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
         input=input_kind,
         routing=routing,
         check_tokens=check_tokens,
-        numerical_contract="ascend_post_gmm2_route_weight_v1",
+        numerical_contract=("ascend_pre_quant_route_weight_v1" if config["model"].get("topk_weights_type", 0) else "ascend_post_gmm2_route_weight_v1"),
     )
 
 
@@ -159,7 +163,12 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 yield token, weights[token, slot], pair
         shared = model["num_shared_experts"]
         if shared:
-            raw = make_weights(shared, model["hidden"], model["intermediate_hidden"], config["seed"] + 100000)
+            raw = make_weights(
+                shared,
+                model["hidden"],
+                model.get("shared_intermediate_hidden", model["intermediate_hidden"]),
+                config["seed"] + 100000,
+            )
             for expert in range(shared):
                 yield np.arange(len(x)), None, tuple((data[expert], scale[expert]) for data, scale in raw)
 
@@ -169,8 +178,10 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
-            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2)
-        if route_weight is not None:
+            result[start:stop] = expert_forward(
+                x[token[start:stop]], w1, w2, model.get("activation_clamp"),
+                route_weight[start:stop] if route_weight is not None and model.get("topk_weights_type", 0) == 1 else None)
+        if route_weight is not None and model.get("topk_weights_type", 0) == 0:
             result *= route_weight[:, None]
         return token, result
 
@@ -271,7 +282,7 @@ def main():
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
-    parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
+    parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--chunk-tokens", type=int, default=256)

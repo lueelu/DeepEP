@@ -10,7 +10,7 @@
 #define MEGA_MOE_ARCH35_SWIGLU_ACTIVATION_H
 
 #if defined(__DAV_C310__)
-#include "activation_common.hpp"
+#include "kernels/mega_moe_common/epilogue/activation/activation_common.hpp"
 
 namespace MegaMoeImpl {
 namespace Activation {
@@ -44,6 +44,8 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
         AscendC::Reg::RegTensor<float> expReg;
         AscendC::Reg::RegTensor<float> denominatorReg;
         AscendC::Reg::RegTensor<float> sigmoidReg;
+        AscendC::Reg::RegTensor<float> oneReg;
+        AscendC::Reg::Duplicate(oneReg, scalarOne);
         AscendC::Reg::RegTensor<float> outputFp32Reg;
         AscendC::Reg::RegTensor<float> weightReg;
         AscendC::Reg::RegTensor<bfloat16_t> outputReg;
@@ -78,7 +80,10 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
                 AscendC::Reg::Muls(negReg, gateFp32Reg, negScalarOne, fullMask);
                 AscendC::Reg::Exp(expReg, negReg, fullMask);
                 AscendC::Reg::Adds(denominatorReg, expReg, scalarOne, fullMask);
-                AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, fullMask);
+                // Use the same FP32 sigmoid-then-multiply sequence as the
+                // independent NPU reference, before BF16/MX rounding.
+                AscendC::Reg::Div(sigmoidReg, oneReg, denominatorReg, fullMask);
+                AscendC::Reg::Mul(sigmoidReg, gateFp32Reg, sigmoidReg, fullMask);
                 if constexpr (IsStep) {
                     AscendC::Reg::Mins(sigmoidReg, sigmoidReg, params.clampLimit, fullMask);
                 }
@@ -115,7 +120,10 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
                 AscendC::Reg::Muls(negReg, gateFp32Reg, negScalarOne, tailComputeMask);
                 AscendC::Reg::Exp(expReg, negReg, tailComputeMask);
                 AscendC::Reg::Adds(denominatorReg, expReg, scalarOne, tailComputeMask);
-                AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, tailComputeMask);
+                // Use the same FP32 sigmoid-then-multiply sequence as the
+                // independent NPU reference, before BF16/MX rounding.
+                AscendC::Reg::Div(sigmoidReg, oneReg, denominatorReg, tailComputeMask);
+                AscendC::Reg::Mul(sigmoidReg, gateFp32Reg, sigmoidReg, tailComputeMask);
                 if constexpr (IsStep) {
                     AscendC::Reg::Mins(sigmoidReg, sigmoidReg, params.clampLimit, tailComputeMask);
                 }

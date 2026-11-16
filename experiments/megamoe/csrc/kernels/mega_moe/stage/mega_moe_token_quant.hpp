@@ -5,7 +5,7 @@
 #define MEGA_MOE_TOKEN_QUANT_H
 
 #include "../common/mega_moe_mxfp8_utils.hpp"
-#include "../common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 
 namespace MegaMoeImpl {
 
@@ -86,7 +86,7 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
 // FP8 输入只重排为原来的逐 token 通信记录；不解量化、不重复量化。
-template <typename ActivationType>
+template <typename ActivationType, bool TopkWeightsPrefetch = false>
 __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidden, const Params& params,
                                           const QuantProcessConfig& config,
                                           QuantProcessScratch<ActivationType>& scratch)
@@ -107,6 +107,17 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
         DataCopyPad(buffer, input[row * hidden], {1U, hidden, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes], {1U, scaleBytes, 0U, 0U, 0U},
                     {false, 0U, 0U, 0U});
+        if constexpr (TopkWeightsPrefetch) {
+            // FP8 direct input bypasses QuantizeLocalTokens' BF16 branch, but
+            // must still append the same FP32 top-k payload before Dispatch.
+            GlobalTensor<float> weights;
+            weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.probsGmAddr));
+            auto weightUb = buffer[config.quantTokenAlignBytes + config.quantScaleAlignBytes]
+                                .template ReinterpretCast<float>();
+            DataCopyPad(weightUb, weights[row * params.tilingData->topK],
+                        {1U, static_cast<uint32_t>(params.tilingData->topK * sizeof(float)), 0U, 0U, 0U},
+                        {false, 0U, 0U, 0.0F});
+        }
         SetFlag<HardEvent::MTE2_MTE3>(event);
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         DataCopyPad(output[row * config.quantTokenScaleAlignBytes], buffer,
@@ -132,7 +143,7 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
     }
     uint32_t hiddenDim = common.tokenHiddenDim;
     if (params.inputScaleGmAddr != nullptr) {
-        PackFp8LocalTokens(tokenRange, hiddenDim, params, config, scratch);
+        PackFp8LocalTokens<ActivationType, TopkWeightsPrefetch>(tokenRange, hiddenDim, params, config, scratch);
         return;
     }
     GlobalTensor<bfloat16_t> srcGlobalTensor;

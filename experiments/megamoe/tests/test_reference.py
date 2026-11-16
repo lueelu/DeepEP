@@ -172,3 +172,20 @@ def test_balanced_routes_require_valid_ep_and_rank(world, rank):
     config = dict(seed=13, model=dict(hidden=32, num_experts=384, num_topk=6))
     with pytest.raises(ValueError):
         inputs(config, rank, 96, world=world)
+
+
+def test_early_weight_clamp_order_and_zero_negative_routes():
+    rng = np.random.default_rng(41)
+    x = rng.normal(size=(4, 64)).astype(np.float32)
+    w1 = rng.normal(size=(128, 64)).astype(np.float32)
+    w2 = rng.normal(size=(64, 64)).astype(np.float32)
+    weights = np.array([0, -0.37, 0.21, 1], np.float32)
+    gate, up = np.split(bf16(x @ w1.T), 2, axis=-1)
+    gate, up = np.minimum(gate, 0.25), np.clip(up, -0.25, 0.25)
+    activated = bf16((gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up) * weights[:, None])
+    expected = bf16(dequantize_input(*quantize_input(activated)) @ w2.T)
+    early = expert_forward(x, w1, w2, 0.25, weights)
+    np.testing.assert_array_equal(early, expected)
+    np.testing.assert_array_equal(early[0], 0)
+    late = expert_forward(x, w1, w2, 0.25) * weights[:, None]
+    assert error_metrics(early, late)["relative_rmse"] > 1e-3

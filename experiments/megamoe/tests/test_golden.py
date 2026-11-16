@@ -247,3 +247,23 @@ def test_cpu_only_cli_cache_is_readable_by_benchmark(config, tmp_path):
         assert marker in result.stdout
     spec = golden.contract(config, 2, 7, "fp8", "balanced", 0)
     np.testing.assert_array_equal(golden.load(tmp_path / "cache", spec, 0)[0], naive(config, 2, 0, 7, "balanced", 0)[0])
+
+
+def test_early_weights_shared_expert_unweighted_and_cache_contract(config):
+    config["model"].update(topk_weights_type=1, activation_clamp=0.02)
+    spec = golden.contract(config, 2, 7, "fp8", "random", 0)
+    result = golden.generate(config, spec, [0], workers=1)[0][0]
+    x, ids, weights = inputs(config, 0, 7, "random", world=2)
+    x = dequantize_input(*quantize_input(x))
+    expected = np.zeros_like(x)
+    for owner in range(2):
+        w1, w2 = map(unpack_weight, make_weights(2, 64, 64, config["seed"] + owner))
+        for local in range(2):
+            token, slot = np.where(ids == owner * 2 + local)
+            np.add.at(expected, token, expert_forward(x[token], w1[local], w2[local], 0.02, weights[token, slot]))
+    shared1, shared2 = map(unpack_weight, make_weights(1, 64, 64, config["seed"] + 100000))
+    expected += expert_forward(x, shared1[0], shared2[0], 0.02)
+    np.testing.assert_array_equal(result, bf16(expected))
+    changed = copy.deepcopy(config)
+    changed["model"]["topk_weights_type"] = 0
+    assert golden.contract(changed, 2, 7, "fp8", "random", 0) != spec

@@ -14,12 +14,28 @@
 #endif
 
 namespace deepep {
+// Generic resource policy passed by an optional backend factory.  The common
+// Session remains the owner of SHMEM/LL resources; MegaMoE selects these
+// values in experiments/megamoe/csrc/runtime without changing the LL ABI.
+struct SessionOptions {
+    bool megamoe = false;
+    bool udma = false;
+    bool dedicated_peer_qp = false;
+    uint64_t maximum_bytes = (1ULL << 63) - 1U;
+    uint64_t required_peer_transports = 0;
+    bool mpi = false;
+    bool combine_only = false;
+    bool use_1g_huge_pages = false;
+};
+
 // The framework owns ACL initialization, device and context. Only this workspace
 // and the SHMEM instance are owned here. Destruction is an explicit collective.
 class Session {
 public:
     Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
             bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false);
+    Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout,
+            const SessionOptions& options);
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
@@ -111,6 +127,7 @@ public:
     bool ll_rdma() const { return ll_rdma_; }
     uint32_t ll_rdma_qps() const { return ll_rdma_qps_; }
     void* ll_rdma_stage() const { check_context(); return ll_rdma_stage_; }
+    const std::string& peer_access_error() const { return peer_access_error_; }
 
 private:
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
@@ -137,6 +154,7 @@ private:
     int rank_ = 0;
     int world_ = 0;
     bool udma_ = false;
+    std::string peer_access_error_;
     bool combine_only_ = false;
     bool sparse_qp_enabled_ = false;
     bool peer_table_ = false;

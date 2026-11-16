@@ -9,6 +9,8 @@ import threading
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
+from functools import partial
+from typing import NamedTuple
 from uuid import UUID
 
 from ._native import npu_api, require_native
@@ -17,6 +19,19 @@ from ._store import StoreGroup
 from ._backend_lock import LOCK as _LOCK
 
 _OWNER = None
+
+
+class _MegaMoEProfile(NamedTuple):
+    maximum_capacity: int
+    udma: bool
+    peer_access_check: bool
+    world_sizes: tuple | None
+
+
+_MEGAMOE_PROFILES = {
+    "mte": _MegaMoEProfile(1 << 30, False, False, None),
+    "urma": _MegaMoEProfile(32 << 30, True, True, (4, 8, 16)),
+}
 
 
 def integer(name, value, minimum, maximum):
@@ -68,6 +83,7 @@ class Runtime:
     """One explicit collective lifetime per process; a live owner is retained."""
 
     _megamoe = False
+    _megamoe_backend = "mte"
 
     def __init__(
         self,
@@ -84,11 +100,16 @@ class Runtime:
         debug_collectives=False,
     ):
         global _OWNER
+        profile = None
+        if self._megamoe:
+            if self._megamoe_backend not in _MEGAMOE_PROFILES:
+                raise ValueError("MegaMoE backend must be mte or urma")
+            profile = _MEGAMOE_PROFILES[self._megamoe_backend]
         native = require_native("Runtime.__init__")
         self.ll_backend = os.environ.get("DEEPEP_LL_BACKEND", "mte")
         if self.ll_backend not in ("mte", "rdma"):
             raise ValueError("DEEPEP_LL_BACKEND must be mte or rdma")
-        integer("capacity", capacity, 2 << 20, (1 << 30) if self._megamoe else (1 << 63) - 1)
+        integer("capacity", capacity, 2 << 20, profile.maximum_capacity if profile else (1 << 63) - 1)
         if capacity % (2 << 20):
             raise ValueError("capacity must be aligned to 2 MiB")
         integer("timeout", timeout, 1, 3600)
@@ -122,7 +143,7 @@ class Runtime:
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap
         store_group = isinstance(group, StoreGroup)
-        if self._megamoe and (group is None or udma):
+        if self._megamoe and (group is None or udma or self.ll_backend == "rdma"):
             raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
         if store_group:
             if rank is not None or world_size is not None:
@@ -133,9 +154,12 @@ class Runtime:
         factory = native.Runtime
         if self._megamoe:
             integer("world_size", size, 2, 128)
-            factory = getattr(native, "create_megamoe_runtime", None)
-            if factory is None:
+            if profile.world_sizes is not None and size not in profile.world_sizes:
+                raise ValueError("Selected MegaMoE backend requires EP4/EP8/EP16")
+            create = getattr(native, "create_megamoe_runtime", None)
+            if create is None:
                 raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE=ON")
+            factory = partial(create, backend=self._megamoe_backend)
         else:
             from .buffers._elastic_layout import WORLD_SIZES
 
@@ -188,6 +212,7 @@ class Runtime:
                     + 8 * int(use_1g_huge_pages)
                     + 16 * int(debug_collectives)
                     + 32 * int(self.ll_backend == "rdma")
+                    + 64 * int(profile is not None and profile.peer_access_check)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -209,7 +234,8 @@ class Runtime:
                     raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
                 if any(value[-1] != values[0][-1] for value in values):
                     raise ValueError(
-                        "Ranks disagree on MTE/URMA/RDMA runtime engines, QP configuration, page size or debug_collectives"
+                        "Ranks disagree on MTE/URMA/RDMA runtime engines, QP configuration, page size, "
+                        "debug_collectives or MegaMoE backend profile"
                     )
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
@@ -268,7 +294,22 @@ class Runtime:
             )
             _OWNER = self
             self.coordination_failed = False
-            if capacity == 8 << 30 and 16 <= size <= 256:
+            if profile is not None and profile.peer_access_check:
+                try:
+                    topology_error = self.native.peer_access_error
+                    if store_group:
+                        readiness = group.all_gather(topology_error, "peer access readiness")
+                    else:
+                        readiness = [None] * size
+                        dist.all_gather_object(readiness, topology_error, group=group)
+                    failures = [f"rank={peer}: {error}" for peer, error in enumerate(readiness) if error]
+                    if failures:
+                        raise RuntimeError("Required peer access is not ready: " + "; ".join(failures))
+                except Exception as error:
+                    if store_group:
+                        group.abort(f"peer access readiness: {error}")
+                    raise
+            if capacity == 8 << 30 and 16 <= size <= 256 and not self._megamoe:
                 # LL peers must finish initialization before any payload writes.
                 if self.host_coordinated:
                     self._host_collective("barrier")

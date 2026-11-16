@@ -19,14 +19,14 @@
 #else
 #include "kernel_operator.h"
 #endif
-#include "../common/ascend_timer_v2_device.hpp"
+#include "kernels/mega_moe_common/common/ascend_timer_v2_device.hpp"
 #include "kernel_tiling/kernel_tiling.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "lib/matmul_intf.h"
 #include "tensor_api/tensor.h"
 #include "adv_api/reduce/reduce.h"
-#include "../common/mega_moe_gmm_common.hpp"
-#include "../common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_gmm_common.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../mc2_common/mc2_kernel_utils.hpp"
 #include "../mc2_common/quantize_functions.hpp"

@@ -345,6 +345,7 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
         "deep_ep_experimental/megamoe/configs/smoke.json",
         "deep_ep_experimental/megamoe/_C.fake.so",
         "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
+        "deep_ep_experimental/megamoe/libmegamoe_urma_kernel.so",
         "deep_ep_experimental/megamoe/cann.LICENSE",
     }
     wheel = tmp_path / "combined.whl"
@@ -523,11 +524,12 @@ def test_source_native_never_overwrites_unmanaged_files(build, source_native, fo
 def test_source_native_removes_only_managed_old_abi_links(build, source_native, monkeypatch):
     package, destination, names = source_native
     build.publish_source_native(destination)
-    for name in names[:2]:
+    native_names = [name for name in names if name.endswith(".test.so")]
+    for name in native_names:
         (destination / name).rename(destination / name.replace(".test.so", ".next.so"))
     monkeypatch.setattr(build.sysconfig, "get_config_var", lambda key: ".next.so")
     build.publish_source_native(destination)
-    assert all(not (package / name).is_symlink() for name in names[:2])
+    assert all(not (package / name).is_symlink() for name in native_names)
     assert (package / "_C.next.so").is_file()
 
 

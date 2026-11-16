@@ -60,8 +60,21 @@ add_custom_command(OUTPUT "${kernel_library}"
         -o "${kernel_library}"
     DEPENDS csrc/kernels/mega_moe/mega_moe.cpp csrc/kernel_launch.hpp ${kernel_headers}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
-add_custom_target(megamoe_device DEPENDS "${kernel_library}")
-pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp)
+set(urma_kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_urma_kernel.so")
+set(urma_kernel_flags ${kernel_flags})
+list(PREPEND urma_kernel_flags "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe_urma")
+list(APPEND urma_kernel_flags -fvisibility=hidden -DDEEPEP_MEGAMOE_URMA=1)
+list(REMOVE_ITEM urma_kernel_flags -Wl,-soname,libmegamoe_kernel.so)
+list(APPEND urma_kernel_flags -Wl,-soname,libmegamoe_urma_kernel.so)
+add_custom_command(OUTPUT "${urma_kernel_library}"
+    COMMAND "${BISHENG}" ${urma_kernel_flags} csrc/kernels/mega_moe_urma/mega_moe_urma.cpp
+        "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
+        -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
+        -o "${urma_kernel_library}"
+    DEPENDS csrc/kernels/mega_moe_urma/mega_moe_urma.cpp ${kernel_headers}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
+add_custom_target(megamoe_device DEPENDS "${kernel_library}" "${urma_kernel_library}")
+pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/kernel_launch.cpp)
 set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
     INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include")
@@ -72,12 +85,15 @@ if(DEEPEP_MEGAMOE_TIMER)
     target_compile_definitions(megamoe_ext PRIVATE DEEPEP_MEGAMOE_TIMER=1)
 endif()
 add_library(megamoe_kernel SHARED IMPORTED)
+add_library(megamoe_urma_kernel SHARED IMPORTED)
+set_target_properties(megamoe_urma_kernel PROPERTIES IMPORTED_LOCATION "${urma_kernel_library}")
 set_target_properties(megamoe_kernel PROPERTIES IMPORTED_LOCATION "${kernel_library}")
 add_dependencies(megamoe_ext megamoe_device)
 target_link_libraries(megamoe_ext PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIBRARY}"
-    "${TORCH_NPU_LIBRARY}" megamoe_kernel shmem ascendcl)
+    "${TORCH_NPU_LIBRARY}" megamoe_kernel megamoe_urma_kernel shmem ascendcl)
 target_link_directories(megamoe_ext PRIVATE "${ASCEND_HOME_PATH}/lib64")
 target_link_libraries(megamoe_ext PRIVATE platform tiling_api)
 target_link_options(megamoe_ext PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 install(TARGETS megamoe_ext LIBRARY DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
+install(FILES "${urma_kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)

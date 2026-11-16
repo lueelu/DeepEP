@@ -8,14 +8,18 @@
 #endif
 #include <cstring>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <exception>
 #include <vector>
 #include "kernels/udma_layout.hpp"
+#include "runtime/udma_peer_masks.hpp"
 #include <mutex>
 #include <stdexcept>
 #include "host/init/shmem_host_init.h"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_cc.h"
+#include "host/shmem_host_def.h"
+#include "host_device/shmem_common_types.h"
 #include <limits>
 #include <cstdio>
 
@@ -57,6 +61,42 @@ void checked_barrier(int rank)
     check(status, "SHMEM barrier completion");
     check(destroy_status, "destroy SHMEM barrier stream");
 }
+
+std::string check_peer_access(int rank, int world, uint64_t required_transports)
+{
+    const auto* state = static_cast<const aclshmem_device_host_state_t*>(dlsym(RTLD_DEFAULT, "g_state"));
+    if (state == nullptr) return "Cannot verify peer access: SHMEM lacks the pinned SDK's g_state symbol";
+    if (state->mype != rank || state->npes != world)
+        return "Cannot verify peer access: SHMEM host state rank/world mismatch";
+    std::string missing;
+    std::string missing_udma;
+    for (int peer = 0; peer < world; ++peer) {
+        if (peer != rank && (required_transports & ACLSHMEM_TRANSPORT_MTE) &&
+            (state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) == 0) {
+            if (!missing.empty()) missing += ",";
+            missing += std::to_string(peer);
+        }
+        if (peer != rank && (required_transports & ACLSHMEM_TRANSPORT_UDMA) &&
+            (state->topo_list[peer] & ACLSHMEM_TRANSPORT_UDMA) == 0) {
+            if (!missing_udma.empty()) missing_udma += ",";
+            missing_udma += std::to_string(peer);
+        }
+    }
+    if (!missing.empty())
+        return "Runtime rank=" + std::to_string(rank) + " has peers without MTE mappings: " + missing +
+               "; all peers must share an MTE-accessible UB domain for completion signals";
+    if (!missing_udma.empty())
+        return "Runtime rank=" + std::to_string(rank) + " has peers without UDMA transport: " + missing_udma;
+    return {};
+}
+
+SessionOptions legacy_options(bool udma, bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages)
+{
+    if (megamoe && udma)
+        throw std::invalid_argument("MegaMoE UDMA resources must be selected through its backend factory");
+    return SessionOptions{megamoe, udma, false, megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U), 0, mpi,
+                          combine_only, use_1g_huge_pages};
+}
 }  // namespace
 
 bool Session::busy()
@@ -67,12 +107,23 @@ bool Session::busy()
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
                  bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages)
+: Session(rank, size, bytes, endpoint, timeout,
+          legacy_options(udma, megamoe, mpi, combine_only, use_1g_huge_pages))
+{}
+
+Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout,
+                 const SessionOptions& options)
 {
     init_trace(rank, "Session constructor enter");
     const char* backend_env = std::getenv("DEEPEP_LL_BACKEND");
     const std::string backend = backend_env ? backend_env : "mte";
     if (backend != "mte" && backend != "rdma") throw std::invalid_argument("DEEPEP_LL_BACKEND must be mte or rdma");
     ll_rdma_ = backend == "rdma";
+    const bool udma = options.udma;
+    const bool megamoe = options.megamoe;
+    const bool mpi = options.mpi;
+    const bool combine_only = options.combine_only;
+    const bool use_1g_huge_pages = options.use_1g_huge_pages;
     if (ll_rdma_ && (udma || megamoe || combine_only || use_1g_huge_pages))
         throw std::invalid_argument("RDMA LL requires a plain LL Session; mixed HT/UDMA runtimes are unsupported");
 #ifndef DEEPEP_LL_RDMA
@@ -85,22 +136,17 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     const char* dense_env = std::getenv("DEEPEP_SHMEM_DENSE_QPS");
     const std::string dense = dense_env == nullptr ? "0" : dense_env;
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
-    if (udma && dense != "1") {
-        throw std::runtime_error(
-            "Pinned SHMEM no longer supports sparse UDMA peer-QP masks; explicitly select dense channels "
-            "with DEEPEP_SHMEM_DENSE_QPS=1");
-    }
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
-        bytes < alignment || bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
-        timeout < 1 || timeout > 3600 || (megamoe && (udma || mpi)) ||
+        bytes < alignment || bytes > options.maximum_bytes || bytes % alignment != 0 || timeout < 1 || timeout > 3600 ||
+        (megamoe && (mpi || combine_only || use_1g_huge_pages)) ||
         (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
                   endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     // BF16 and FP8 use the same peer-table transport at every supported EP size.
-    peer_table_ = udma;
+    peer_table_ = udma && !megamoe;
     if (peer_table_ && (size < 2 || size > 512 || (size & (size - 1)))) {
         throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256/512");
     }
@@ -150,6 +196,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.option_attr.shm_init_timeout = timeout;
     attr.option_attr.shm_create_timeout = timeout;
     attr.option_attr.control_operation_timeout = timeout;
+    using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
+    auto set_masks =
+        udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
     // Preserve option_attr.version from attr{}: the SDK uses it to recognize
     // the appended runtime_config layout.
     if (udma) attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_ENABLED;
@@ -162,12 +211,30 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
 #ifdef DEEPEP_LL_RDMA
         if (ll_rdma_ && size > int(DispatchDedup::kLlPhysicalRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
 #endif
-        if (udma) {
+        if (options.dedicated_peer_qp) {
+            // MegaMoE owns one UDMA QP per peer and does not use shared Clos
+            // SQs.  This branch is selected only by the MegaMoE factory.
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE)");
+            attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_DISABLED;
+            if (set_masks) check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE)");
+        } else if (udma) {
             // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
             // Serialized operators reuse the bank, not concurrent SQ writers.
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
                   "aclshmemx_set_qp_num");
+            std::vector<uint64_t> masks;
+            if (set_masks && dense != "1") {
+                masks.resize(size);
+                for (int peer = 0; peer < size; ++peer)
+                    masks[peer] = combine_only ? first_hit_schedule::CombineQpMask(rank, peer, size)
+                                               : udma_admission::PeerMask(rank, peer, size);
+            }
+            if (set_masks) {
+                check(set_masks(masks.empty() ? nullptr : masks.data(), masks.size()),
+                      "aclshmemx_set_udma_peer_qp_masks");
+                sparse_qp_enabled_ = !masks.empty();
+            }
         }
         const auto mode = mpi ? ACLSHMEMX_INIT_WITH_MPI : ACLSHMEMX_INIT_WITH_DEFAULT;
         if (use_1g_huge_pages_) {
@@ -206,6 +273,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
         init_trace(rank, "workspace memset return");
         if (staging_bytes) ll_rdma_stage_ = static_cast<uint8_t*>(workspace_) + workspace_bytes;
+        if (options.required_peer_transports) {
+            peer_access_error_ = check_peer_access(rank, size, options.required_peer_transports);
+        }
         bytes_ = bytes;
         allocation_bytes_ = allocation_bytes;
         rank_ = rank;

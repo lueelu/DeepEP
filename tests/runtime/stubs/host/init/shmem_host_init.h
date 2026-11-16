@@ -16,18 +16,23 @@ struct aclshmemx_uniqueid_t {
 constexpr int ACLSHMEM_CONFIG_DEFAULT = 0;
 constexpr int ACLSHMEM_CONFIG_DISABLED = 1;
 constexpr int ACLSHMEM_CONFIG_ENABLED = 2;
+constexpr int ACLSHMEM_INIT_ATTR_VERSION = 1;
 struct aclshmemx_init_attr_t {
     int my_pe = 0;
     int n_pes = 0;
     uint64_t local_mem_size = 0;
     char ip_port[64]{};
     void* comm_args = nullptr;
+    int instance_id = 0;
     struct {
+        int version = ACLSHMEM_INIT_ATTR_VERSION;
+        int sockFd = 0;
         int data_op_engine_type = 0;
         unsigned shm_init_timeout = 120, shm_create_timeout = 120, control_operation_timeout = 120;
     } option_attr;
     struct {
         int udma_shared_jetty = ACLSHMEM_CONFIG_DEFAULT;
+        uint64_t reserved[8]{};
     } runtime_config;
 };
 int aclshmemx_init_status();

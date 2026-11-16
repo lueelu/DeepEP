@@ -3,7 +3,7 @@
 #ifndef MEGA_MOE_CATLASS_GROUPED_MATMUL_H
 #define MEGA_MOE_CATLASS_GROUPED_MATMUL_H
 
-#include "../common/mega_moe_types.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_types.hpp"
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "catlass/gemm/gemm_type.hpp"
 #include "block_mmad_a8w4.hpp"

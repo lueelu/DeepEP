@@ -2155,7 +2155,6 @@ int main()
                 expected_combine = combine;
                 expected_dense = dense;
                 setenv("DEEPEP_SHMEM_DENSE_QPS", dense ? "1" : "0", 1);
-
                 deepep::Session s(0, world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, false, false, combine);
                 assert(s.combine_only() == combine);
 #ifdef WITH_MASKS
