@@ -85,6 +85,17 @@ class L2CacheFlush:
         return invoke
 
 
+def prepare_v2_sample(buffer, flush_cache):
+    """Finish eviction, then rendezvous on the Buffer's existing stream.
+
+    L2CacheFlush completes eviction before returning. The blocking device
+    barrier orders both caller/communication streams before sample markers;
+    runtime.barrier() instead creates and destroys an ACL stream per call.
+    """
+    flush_cache()
+    buffer.barrier(use_comm_stream=True, with_cpu_sync=True)
+
+
 STAGES = {
     "dispatch_layout_kernel": "layout",
     "notify_dispatch_kernel": "notify",
@@ -229,7 +240,7 @@ def byte_ledger(counts, rank, *, tokens, hidden, topk, dtype, idx_bytes, op):
     )
 
 
-def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barrier=False):
+def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barrier=False, allow_elastic_barrier=False):
     """Select fixed IDs 0..N-1 using caller-stream device events, not row count.
 
     Guards may be clipped by capture boundaries. A missing marker/kernel in a
@@ -317,12 +328,18 @@ def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barri
         if not overlap:
             if begin < intervals[0][0] or begin >= intervals[-1][1]:
                 continue  # explicitly outside the fixed measured interval
-            # CANN SHMEM's blocking Host barrier launches this device kernel.
-            # Only benchmark alignment in a gap is excluded; an in-sample
-            # barrier is retained, and unknown/out-of-device tasks still fail.
+            # Only benchmark alignment in a gap is excluded. ElasticBuffer's
+            # one-AIV barrier shares the internal combine-notify kernel name:
+            # an in-sample notify must remain measured, never filtered by name.
             if (
-                allow_shmem_barrier
-                and row["Name"] == "_Z24barrier_on_stream_kernelim"
+                (
+                    (allow_shmem_barrier and row["Name"] == "_Z24barrier_on_stream_kernelim")
+                    or (
+                        allow_elastic_barrier
+                        and row["Name"] == "cached_notify_combine_kernel"
+                        and str(row["Block Num"]).strip() == "1"
+                    )
+                )
                 and str(row["Device_id"]).strip() == str(device)
                 and str(row["Step Id"]).strip() == "1"
             ):
@@ -516,6 +533,7 @@ def parse_profile(
             iterations,
             device,
             allow_shmem_barrier=op.startswith("combine") or all_rank_sync_each_iteration,
+            allow_elastic_barrier=all_rank_sync_each_iteration,
         )
     if flush_l2_cache and not all_rank_sync_each_iteration:
         rows, flush_intervals, flush_kernels = split_cache_flush(

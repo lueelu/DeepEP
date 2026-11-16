@@ -50,7 +50,8 @@ METADATA = dict(
 
 @pytest.mark.parametrize("op", ["dispatch", "cached-dispatch", "combine_unweighted", "combine_weighted"])
 @pytest.mark.parametrize("flush", [False, True])
-def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush):
+@pytest.mark.parametrize("barrier", ["_Z24barrier_on_stream_kernelim", "cached_notify_combine_kernel"])
+def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush, barrier):
     from benchmarks.clos.stage_metrics import L2_FLUSH_RANGE, PROFILE_SAMPLE_RANGE, parse_profile
 
     events, rows = [], []
@@ -84,7 +85,7 @@ def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush
         if flush:
             linked(L2_FLUSH_RANGE, host, device, "InplaceZero")
             rows.append(dict(zip(columns, ("InplaceZero", device, 3, 0, 1, 32))))
-        rows.append(dict(zip(columns, ("_Z24barrier_on_stream_kernelim", device + 10, 5, 0, 1, 1))))
+        rows.append(dict(zip(columns, (barrier, device + 10, 5, 0, 1, 1))))
         if sample < 0:
             linked(f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
             continue
@@ -113,9 +114,14 @@ def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush
     rows.append(dict(zip(columns, ("unexpected_kernel", 2090, 2, 0, 1, 1))))
     with pytest.raises(ValueError, match="unassigned kernel"):
         parse()
-    rows[-1]["Name"] = "_Z24barrier_on_stream_kernelim"
+    rows[-1]["Name"] = barrier
+    if barrier == "cached_notify_combine_kernel":
+        rows[-1]["Block Num"] = 32
+        with pytest.raises(ValueError, match="unassigned kernel"):
+            parse()
+        rows[-1]["Block Num"] = 1
     rows[-1]["Start Time(us)"] = 2025
-    with pytest.raises(ValueError, match="incomplete profiler iteration|kernel sequence"):
+    with pytest.raises(ValueError):
         parse()
     rows.pop()
     if flush:
@@ -126,6 +132,35 @@ def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush
             ]
             with pytest.raises(ValueError, match="missing/ambiguous pre-sample L2 flush"):
                 parse()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_v2_sample_preparation_finishes_flush_before_reused_stream_barrier(enabled):
+    from benchmarks.clos.stage_metrics import prepare_v2_sample
+
+    events = []
+
+    def flush():
+        if enabled:
+            events.extend(["evict", "eviction_complete"])
+
+    def barrier(*, use_comm_stream, with_cpu_sync):
+        assert use_comm_stream and with_cpu_sync
+        if enabled:
+            assert events[-1] == "eviction_complete"
+        events.extend(["existing_stream_barrier", "barrier_complete"])
+
+    # No runtime.barrier method: that path allocates a temporary ACL stream.
+    buffer = SimpleNamespace(barrier=barrier)
+    for _ in range(3):
+        events.clear()
+        prepare_v2_sample(buffer, flush)
+        events.append("sample_start")
+        assert events == (["evict", "eviction_complete"] if enabled else []) + [
+            "existing_stream_barrier",
+            "barrier_complete",
+            "sample_start",
+        ]
 
 
 @pytest.mark.parametrize("previous", [None, "0", "1"])

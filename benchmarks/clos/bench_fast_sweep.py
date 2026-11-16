@@ -349,13 +349,12 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
     )
 
     def call():
-        buffer.barrier(with_cpu_sync=True)
-        flush_cache()
+        prepare_v2_sample(buffer, flush_cache)
         result = invoke()
         result[-1].current_stream_wait()
         torch.npu.synchronize()
 
-    from stage_metrics import L2CacheFlush, profile_combine_notify
+    from stage_metrics import L2CacheFlush, prepare_v2_sample, profile_combine_notify
 
     flush_cache = L2CacheFlush(torch, buffer, args.flush_l2_cache)
     # Start/stop the profiler once for the entire strategy list, not per strategy.

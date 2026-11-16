@@ -26,7 +26,7 @@ import time
 import traceback
 
 from stage_metrics import L2CacheFlush, L2_CACHE_FLUSH_BYTES, ProfileSamples, PROFILE_GUARD_ITERS
-from stage_metrics import COMBINE_NOTIFY_ENV, profile_combine_notify
+from stage_metrics import COMBINE_NOTIFY_ENV, prepare_v2_sample, profile_combine_notify
 
 from route_workloads import (
     DEFAULTS as ROUTE_DEFAULTS,
@@ -619,9 +619,7 @@ def worker(args):
         def before_iteration():
             # Evict first, then align every rank immediately before the sample.
             # Both eviction and the blocking rendezvous stay outside all timers.
-            flush_cache()
-            torch.npu.synchronize()
-            buffer.runtime.barrier()
+            prepare_v2_sample(buffer, flush_cache)
 
         for op, fn in functions.items():
             dist.barrier()
