@@ -571,7 +571,8 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
             for row_bytes, mode in ((5632,2), (7168,2), (7170,1), (8192,1), (12288,1)):
                 plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
                 assert plan.send_workers < cores, (ep, cores, plan)
-                assert plan.weight_mode == (0 if ep == 128 else 2 if ep == 64 else mode), (ep, cores, row_bytes, plan)
+                expected = 0 if ep == 128 else 2 if ep == 64 or (ep == 16 and row_bytes <= 8192) else mode
+                assert plan.weight_mode == expected, (ep, cores, row_bytes, plan)
         # At EP8/G8/AIV8 the fitted plan uses every AIV for payload.
         base = resolve_udma_policy(True,8,'udma',None,None,None,None,None)
         policy = replace(base, ranks_per_group=8, topology_known=True)
@@ -584,6 +585,30 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
             for row_bytes in (8192, 9216, 12288):
                 plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
                 assert plan.weight_mode == 2
+    """)
+
+
+def test_ep16_weight_row_limit_preserves_payload_plan_across_core_budgets():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+
+        base = resolve_udma_policy(True,16,'udma',None,None,None,None,None)
+        for group in (1,2,4,8,16):
+            for known in (False,True):
+                policy = replace(base,ranks_per_group=group,topology_known=known)
+                for cores in range(8,65,2):
+                    reference = policy.for_launch(cores,12288,'weighted',bf16=True)
+                    assert reference.weight_mode == 1
+                    for size in (5632,7168,7170,8190,8192,8194,12288):
+                        plan = policy.for_launch(cores,size,'weighted',bf16=True)
+                        expected = 2 if size <= 8192 and plan.send_workers < cores else 1
+                        assert plan.weight_mode == expected, (group,known,cores,size,plan)
+                        assert replace(plan,weight_mode=1) == reference
+        # Reproduce the compared payload configuration, without a 48-core rule.
+        policy = replace(base,ranks_per_group=8,topology_known=True)
+        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,0,2]
+        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,0,1]
     """)
 
 
@@ -638,7 +663,7 @@ def test_weight_preference_does_not_return_to_simt_as_rows_grow():
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy, _simt_weight_row_fits
 
-        for ep, limit in ((4,7168),(32,7168),(48,7168),(64,12288),(96,12288)):
+        for ep, limit in ((4,7168),(16,8192),(32,7168),(48,7168),(64,12288),(96,12288)):
             assert _simt_weight_row_fits(ep,limit)
             assert not _simt_weight_row_fits(ep,limit+1)
         for ep in (128,192,256):

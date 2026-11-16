@@ -8,6 +8,11 @@ from .config import Config, _MAX_NUM_AIV
 
 
 def _simt_weight_row_fits(world_size, row_bytes):
+    # EP16/H4096 BF16 favors SIMT at 48 AIVs with the payload plan fixed.
+    # Extend the row limit across core budgets; the caller still requires a
+    # spare AIV. Keep H6144 and the independently measured EP32 rule unchanged.
+    if world_size == 16:
+        return row_bytes <= 8192
     # EP32 favors UDMA above the small-row band; EP64 measured SIMT wins
     # through 12288 B. Extend those anchors by EP bands, not payload profiles.
     # EP128 reports use SIMT when auxiliary AIVs exist; larger EPs follow that
