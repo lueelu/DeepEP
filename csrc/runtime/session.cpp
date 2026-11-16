@@ -35,8 +35,10 @@ bool Session::busy()
 }
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                 bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages)
+                 bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages, bool megamoe_train)
 {
+    if (megamoe_train && (udma || megamoe || mpi || combine_only || use_1g_huge_pages))
+        throw std::invalid_argument("Training requires a dedicated MTE Session");
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
         throw std::invalid_argument("1 GiB huge pages require the Elastic UDMA runtime");
@@ -46,9 +48,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
-    if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
-        bytes < alignment || bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
-        timeout < 1 || timeout > 3600 || (megamoe && (udma || mpi)) ||
+    if (size < 2 || size > (megamoe ? 128 : (megamoe_train ? 1024 : 512)) ||
+        (!megamoe && !megamoe_train && (size & (size - 1))) || rank < 0 || rank >= size || bytes < alignment ||
+        bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 || timeout < 1 ||
+        timeout > 3600 || (megamoe && (udma || mpi)) ||
         (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
                   endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");

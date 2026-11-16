@@ -19,7 +19,8 @@ namespace deepep {
 class Session {
 public:
     Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
-            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false);
+            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false,
+            bool megamoe_train = false);
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.

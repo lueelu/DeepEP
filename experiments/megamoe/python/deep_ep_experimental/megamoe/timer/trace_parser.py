@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 from statistics import median
 
+from deep_ep._timer import event_family, merge_intervals, write_summary
+
 from .protocol import CYCLE_TO_US
 
 SYNC_ANCHOR_EVENT = "AIV_INPUT_CROSS_RANK_SYNC"
@@ -33,16 +35,6 @@ def event_names(fields):
         if name != "KERNEL_TIMING" and f"{name}_end_cycle" in field_set:
             result.append(name)
     return result
-
-
-def merge_intervals(intervals):
-    merged = []
-    for start, end in sorted(item for item in intervals if item[1] > item[0]):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
 
 
 def compressed_cycle(cycle, removed):
@@ -219,47 +211,6 @@ def trace_events(
             }
         )
     return result
-
-
-def event_family(name: str) -> str:
-    name = re.sub(r"^wave_(?:\d+|global)_", "", name)
-    return re.sub(r"_\d+$", "", name)
-
-
-def write_summary(events, path: Path) -> None:
-    grouped = defaultdict(list)
-    for event in events:
-        grouped[(event["rank"], event_family(event["name"]))].append(event)
-    with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(
-            [
-                "rank",
-                "event_family",
-                "event_count",
-                "first_start_cycle",
-                "last_end_cycle",
-                "envelope_us",
-                "sum_active_us",
-                "max_event_us",
-            ]
-        )
-        for (rank, family), items in sorted(grouped.items()):
-            first = min(item["start_cycle"] for item in items)
-            last = max(item["end_cycle"] for item in items)
-            durations = [(item["end_cycle"] - item["start_cycle"]) / CYCLE_TO_US for item in items]
-            writer.writerow(
-                [
-                    rank,
-                    family,
-                    len(items),
-                    first,
-                    last,
-                    f"{(last - first) / CYCLE_TO_US:.3f}",
-                    f"{sum(durations):.3f}",
-                    f"{max(durations):.3f}",
-                ]
-            )
 
 
 def main():

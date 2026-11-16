@@ -280,6 +280,22 @@ int main(int argc, char** argv)
         assert(session.udma() && qp_count == 32);
         session.close();
         assert(!deepep::Session::busy());
+    } else if (mode == "megamoe-train") {
+        // Training has its own range/window contract and shares process exclusion.
+        expected_world = 768;
+        expected_bytes = 3ULL << 30;
+        fails([]() {
+            deepep::Session s(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true, false, false, false, false, true);
+        });
+        assert(!deepep::Session::busy());
+        deepep::Session session(767, expected_world, expected_bytes, "tcp://127.0.0.1:19091", 30, false, false, false,
+                                false, false, true);
+        assert(session.capacity() == expected_bytes && !session.udma());
+        assert(session.workspace_address() == reinterpret_cast<uintptr_t>(session.workspace()));
+        fails(create);
+        session.close();
+        session.close();
+        assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
     } else if (mode == "megamoe") {
         fails([]() { deepep::Session s(0, 256, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true); });
         fails([]() { deepep::Session s(0, 2, 2ULL << 30, "tcp://127.0.0.1:19091", 30, false, true); });

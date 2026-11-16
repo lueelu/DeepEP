@@ -62,4 +62,4 @@ repos:
         files: \.(md|rst|txt|py|c|h|cpp|hpp|cc|hh|cxx|hxx|asc|ya?ml|toml)$
         exclude: ^(third-party/(?!README\.md$)|csrc/direct/|deep_ep/backends/direct/|tests/clos/|benchmarks/clos/)
         # AGRS、CANN、Clos、ND 布局，以及代码中的 Te、sav、aActual 标识符；EnQue 是 SDK API 名。
-        args: ["--ignore-words-list=agrs,cann,clos,nd,te,sav,aactual,EnQue"]
+        args: ["--ignore-words-list=agrs,cann,clos,nd,te,sav,aactual,EnQue,copyin"]

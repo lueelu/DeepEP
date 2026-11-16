@@ -20,6 +20,7 @@ Modified by Joyce_An 2026
 | `elastic/test_low_latency_host.py`、`elastic/test_ll_st_contract.py` | LL Host 分支、计数通信、启动参数、测试参考及统计 |
 | `integration/` | CPU/NPU 测试适配器、安装检查和结果校验 |
 | `../experiments/megamoe/tests/` | MegaMoE 接口、Golden、主机协调、打包与计时解析；设备入口见 [MegaMoE 文档](../experiments/megamoe/README.md) |
+| `../experiments/megamoe_train/tests/` | Ascend950 BF16 训练、保存状态和 autograd；测试命令见[测试说明](../experiments/megamoe_train/README.md#测试)，接口、用例与限制见[训练模块说明](../experiments/megamoe_train/README.md) |
 | `../experiments/ep_gmm_fused/tests/` | 通信计算融合算子的路由参考、精度、性能与 profiler；命令见[组件测试说明](../experiments/ep_gmm_fused/tests/README.md) |
 | `test_reference.py`、`test_precision.py`、`utils/` | 独立路由参考、Golden、dtype 模拟和精度比较器 |
 | `legacy/` 及通用 V2 设备用例 | 兼容性测试入口；其参数矩阵不等于当前 Elastic 算子支持范围 |

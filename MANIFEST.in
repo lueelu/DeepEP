@@ -23,3 +23,4 @@ recursive-include experiments/megamoe *.sh *.py *.cpp *.hpp *.cmake CMakeLists.t
 include experiments/__init__.py
 include experiments/ep_gmm_fused/tests/requirements.txt
 recursive-include experiments/ep_gmm_fused *.py *.cpp *.hpp *.h *.cmake CMakeLists.txt *.md *.json LICENSE
+recursive-include experiments/megamoe_train *.py *.cpp *.hpp *.cmake CMakeLists.txt *.md *.json *.csv

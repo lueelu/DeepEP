@@ -37,6 +37,7 @@ Python Runtime → C++ Session → SHMEM / CANN
 | `csrc/kernels/` | Device 实现、启动声明和共用布局 |
 | `cmake/`、`build_support.py` | 依赖校验、Host/Device 编译和安装 |
 | `experiments/megamoe/` | MegaMoE Python API、融合 kernel、构建/多机启动脚本和计时工具 |
+| `experiments/megamoe_train/` | MegaMoE 训练算子族；首批 BF16 Host/kernel、autograd、保存状态和独立验证，复用根 Session |
 | `experiments/ep_gmm_fused/` | 两类通信计算融合算子、UDMA 运行时封装及独立测试 |
 | `tests/`、`benchmarks/` | 正确性验证、测试参考及测量工具 |
 
