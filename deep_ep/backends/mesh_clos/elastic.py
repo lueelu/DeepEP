@@ -530,7 +530,16 @@ class ElasticBuffer:
                     for value in retained:
                         value.record_stream(runtime.stream)
                     native.dispatch_low_latency(
-                        runtime.native, tensors, b, h, k, num_experts, output_rows, dtype, runtime.stream.npu_stream
+                        runtime.native,
+                        tensors,
+                        b,
+                        h,
+                        k,
+                        num_experts,
+                        output_rows,
+                        dtype,
+                        runtime.stream.npu_stream,
+                        capacity=capacity,
                     )
                     result = EPHandle(
                         True,
@@ -664,7 +673,18 @@ class ElasticBuffer:
                     value.record_stream(runtime.stream)
                 runtime.notify_inflight = retained
                 try:
-                    native.combine_low_latency(runtime.native, tensors, b, h, k, e, dtype, runtime.stream.npu_stream)
+                    capacity = handle.num_max_tokens_per_rank
+                    native.combine_low_latency(
+                        runtime.native,
+                        tensors,
+                        b,
+                        h,
+                        k,
+                        e,
+                        dtype,
+                        runtime.stream.npu_stream,
+                        capacity=capacity,
+                    )
                     event = EventOverlap._from_resources(EventHandle(), retained)
                 except Exception:
                     runtime.notify_failed = True

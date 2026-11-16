@@ -90,12 +90,13 @@ public:
         Init(baseAddr, tilingAddr);
     }
 
-    __aicore__ inline void Init(GM_ADDR baseAddr, GM_ADDR tilingAddr)
+    __aicore__ inline void Init(GM_ADDR baseAddr, GM_ADDR tilingAddr, uint32_t aivId = ~0U,
+                                uint32_t blockNum = 0U)
     {
         if ASCEND_IS_NOT_AIV {
             return;
         }
-        aivId_ = GetBlockIdx();
+        aivId_ = aivId == ~0U ? static_cast<uint32_t>(GetBlockIdx()) : aivId;
         header_ = reinterpret_cast<__gm__ Header*>(baseAddr);
         blockStage_ = reinterpret_cast<__gm__ BlockStage*>(baseAddr + DUMP_HEADER_REGION_SIZE +
                                                            DUMP_TILING_REGION_SIZE + aivId_ * sizeof(BlockStage));
@@ -114,7 +115,7 @@ public:
             header_->opType = static_cast<int32_t>(Policy::OP_TYPE);
             header_->stageNum = static_cast<uint32_t>(StageEnumT::END);
             header_->tilingDataSize = static_cast<uint32_t>(sizeof(TilingDataT));
-            header_->numBlocks = GetBlockNum() * GetSubBlockNum();
+            header_->numBlocks = (blockNum == 0U ? static_cast<uint32_t>(GetBlockNum()) : blockNum) * GetSubBlockNum();
             header_->dumpCount = 0;
             header_->execTimes[static_cast<size_t>(Policy::OP_TYPE)]++;
             header_->headerMagic = HEADER_MAGIC;

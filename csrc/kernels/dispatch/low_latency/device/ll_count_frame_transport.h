@@ -1,28 +1,34 @@
 #pragma once
 #include "ll_transport.h"
+#include "../common/ll_jit_spec.h"
 namespace LlTransport {
 // Per-core CQ bookkeeping, independent of receiver publication. A payload
 // quiet on the same peer/QP also retires the earlier count request.
 class CountRetirement {
     const __gm__ Args* args_ = nullptr;
+    deepep::CoreContext core_{};
     uint32_t pending_ = 0U;
 public:
-    __aicore__ inline void Init(const __gm__ Args* args) { args_ = args; pending_ = 0U; }
-    __aicore__ inline void Posted(uint32_t task) { pending_ |= 1U << (task / GetBlockNum()); }
+    __aicore__ inline void Init(const __gm__ Args* args, deepep::CoreContext core) {
+        args_ = args;
+        core_ = core;
+        pending_ = 0U;
+    }
+    __aicore__ inline void Posted(uint32_t task) { pending_ |= 1U << (task / core_.count); }
     __aicore__ inline bool Pending() const { return pending_ != 0U; }
     __aicore__ inline void Completed(uint32_t peer) {
-        const uint32_t host = uint32_t(args_->rank) / 16U * 16U;
+        const uint32_t host = uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) / 16U * 16U;
         if (peer >= host && peer < host + 16U) return;
         const uint32_t task = peer < host ? peer : peer - 16U;
-        if (task % GetBlockNum() == GetBlockIdx()) pending_ &= ~(1U << (task / GetBlockNum()));
+        if (task % core_.count == core_.index) pending_ &= ~(1U << (task / core_.count));
     }
     __aicore__ inline void Finish(LocalTensor<uint8_t> scratch) {
-        const uint32_t host = uint32_t(args_->rank) / 16U * 16U;
-        for (uint32_t task = GetBlockIdx(), bit = 1U; task < uint32_t(args_->rankSize) - 16U;
-             task += GetBlockNum(), bit <<= 1U) {
+        const uint32_t host = uint32_t(DEEPEP_LL_LAUNCH_RANK(args_)) / 16U * 16U;
+        for (uint32_t task = core_.index, bit = 1U; task < DEEPEP_LL_LAUNCH_WORLD(args_) - 16U;
+             task += core_.count, bit <<= 1U) {
             if (!(pending_ & bit)) continue;
             const uint32_t peer = task < host ? task : task + 16U;
-            Quiet(peer, scratch);
+            Quiet(peer, scratch, core_);
         }
         pending_ = 0U;
     }
@@ -39,19 +45,21 @@ static_assert(kCountTxBase + (1024U + 256U) * 32U < 2U * 1024U * 1024U, "count T
 // existing payload quiet or final core completion, never required by SendCnt.
 __aicore__ inline void DirectCountFrame(const __gm__ Args* args, uint32_t peer,
                                        uint64_t frameOffset, LocalTensor<uint8_t> records,
-                                       uint32_t count, LocalTensor<uint8_t> scratch, uint64_t window = 0U) {
+                                       uint32_t count, LocalTensor<uint8_t> scratch,
+                                       deepep::CoreContext core, uint64_t window = 0U) {
     const uint32_t bytes = (count + 1U) * 32U;
     Check(args, peer, frameOffset, bytes);
-    auto stage = args->peerMems[args->rank] + window + kCountTxBase + uint64_t(peer) * bytes;
+    auto stage = args->peerMems[DEEPEP_LL_LAUNCH_RANK(args)] + window + kCountTxBase + uint64_t(peer) * bytes;
     DataCopy(Tensor(stage,true), records, bytes);
     Sync<HardEvent::MTE3_S>(7U);
-    Put(args,peer,Address(args,peer,frameOffset),stage,bytes,scratch);
+    Put(args,peer,Address(args,peer,frameOffset),stage,bytes,scratch,core);
 }
 // One contiguous body plus one separate 32B commit. The receiver must not read
 // body ready/count words until it has acquired the frame commit.
 __aicore__ inline void CountFrame(const __gm__ Args* args, uint32_t peer,
                                  uint64_t frameOffset, uint64_t commitOffset,
-                                 LocalTensor<uint8_t> records, uint32_t count, LocalTensor<uint8_t> scratch) {
+                                 LocalTensor<uint8_t> records, uint32_t count, LocalTensor<uint8_t> scratch,
+                                 deepep::CoreContext core) {
     Check(args, peer, frameOffset, uint64_t(count)*32U);
     Check(args, peer, commitOffset, 32U);
     auto dst=Address(args,peer,frameOffset);
@@ -62,12 +70,12 @@ __aicore__ inline void CountFrame(const __gm__ Args* args, uint32_t peer,
         DataCopy(Tensor(commit,Rdma(args)),records,32U);
         return;
     }
-    auto stage=Stage(args,count*32U);
+    auto stage=Stage(args,count*32U,core);
     DataCopy(Tensor(stage,true),records,count*32U);
     Sync<HardEvent::MTE3_S>(7U);
-    Put(args,peer,dst,stage,count*32U,scratch);
-    Quiet(peer,scratch);
-    Put(args,peer,commit,stage,32U,scratch);
-    Quiet(peer,scratch);
+    Put(args,peer,dst,stage,count*32U,scratch,core);
+    Quiet(peer,scratch,core);
+    Put(args,peer,commit,stage,32U,scratch,core);
+    Quiet(peer,scratch,core);
 }
 }

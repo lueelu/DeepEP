@@ -60,9 +60,9 @@ __aicore__ inline __gm__ GmmLoopCount* RegisterMegaMoeExceptionDump(ExceptionDum
                                                                     GM_ADDR tilingGM,
                                                                     const MegaMoeTilingData* tilingData,
                                                                     const MegaMoeImpl::PeermemInfo& peermemInfo,
-                                                                    GM_ADDR epRankIdAddr)
+                                                                    GM_ADDR epRankIdAddr, uint32_t aivId, uint32_t blockNum)
 {
-    engine.Init(dumpBase, tilingGM);
+    engine.Init(dumpBase, tilingGM, aivId, blockNum);
     engine.UpdateStage(Stage::INIT);
     engine.Dump(epRankIdAddr, sizeof(uint32_t));
     size_t routeRecvSize = static_cast<size_t>(CalcRouteIndexRecvSize(
@@ -76,7 +76,7 @@ __aicore__ inline __gm__ GmmLoopCount* RegisterMegaMoeExceptionDump(ExceptionDum
     if ASCEND_IS_NOT_AIV {
         return nullptr;
     }
-    __gm__ GmmLoopCount* loopCount = reinterpret_cast<__gm__ GmmLoopCount*>(loopCountBase) + GetBlockIdx();
+    __gm__ GmmLoopCount* loopCount = reinterpret_cast<__gm__ GmmLoopCount*>(loopCountBase) + aivId;
     loopCount->gmm1Count = 0U;
     loopCount->gmm2Count = 0U;
     GlobalTensor<uint8_t> loopCountGlobal;

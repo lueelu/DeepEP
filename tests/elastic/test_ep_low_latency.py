@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026, Lu Lu
+# Copyright (c) 2026, Lu Lu
 # Modified by ryan_li 2026
 
 """Installed-wheel LL functional/performance ST, modeled on DeepEP test_ep.py.
@@ -761,7 +761,6 @@ def run_case(buffer, args, rank, world, m, mode):
     mapped = {line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines() if len(line.split()) >= 6}
     classes = [
         [p for p in mapped if "/deep_ep/_C." in p and p.endswith(".so")],
-        [p for p in mapped if p.endswith("/libdeepep_kernels.so")],
         [p for p in mapped if p.endswith("/libshmem.so")],
         [p for p in mapped if p.endswith("/aclshmem_bootstrap_config_store.so")],
     ]

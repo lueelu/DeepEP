@@ -41,11 +41,10 @@ def test_native_topology_manifest_and_direct_source_paths():
     assert entries["mesh_pcie"]["transport"] == "mte"
     assert entries["global_clos"]["transport"] == "udma"
     assert entries["mesh_pcie"]["module"] == entries["global_clos"]["module"] == "deep_ep._clos_C"
-    for name in ("cmake/Direct.cmake", "cmake/device/CMakeLists.txt"):
-        cmake = (ROOT / name).read_text()
-        assert "csrc/direct" in cmake and "csrc/clos" not in cmake
-        for path in re.findall(r'"\$\{_direct(?:_root)?\}/([^"$]+)"', cmake):
-            assert (ROOT / "csrc/direct" / path).exists(), path
+    cmake = (ROOT / "cmake/Direct.cmake").read_text()
+    assert "csrc/direct" in cmake and "csrc/clos" not in cmake
+    for path in re.findall(r'"\$\{_direct(?:_root)?\}/([^"$]+)"', cmake):
+        assert (ROOT / "csrc/direct" / path).exists(), path
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -290,45 +289,7 @@ def test_lock_declares_operators_without_claiming_device_qualification():
     assert len(lock["shmem"]["header_sha256_lf"]) == 6
 
 
-@pytest.mark.parametrize(
-    "capability",
-    [
-        "elastic-notify-metadata-v6",
-        "elastic-notify-metadata-v7",
-        "elastic-dispatch-expanded-v1",
-        "elastic-combine-expanded-v3",
-    ],
-)
-def test_elastic_wheel_requires_device_library(tmp_path, capability, shmem_wheel_payload):
-    validator = load(ROOT / "scripts/validate_package.py")
-    operations = ["ElasticBuffer.dispatch", "ElasticBuffer.combine"]
-    for device_library in (False, True):
-        wheel = tmp_path / f"elastic-{device_library}.whl"
-        with zipfile.ZipFile(wheel, "w") as archive:
-            archive.writestr("deep_ep/_C.fake.so", b"test")
-            archive.writestr("deep_ep/deepseek-deepep.LICENSE", b"test")
-            archive.writestr(
-                "deep_ep/_build_info.json",
-                json.dumps(
-                    {
-                        "communication_operations": operations,
-                        "capabilities": [capability],
-                        "shmem_runtime": shmem_wheel_payload(archive),
-                    }
-                ),
-            )
-            if device_library:
-                archive.writestr("deep_ep/libdeepep_kernels.so", b"test")
-        if device_library:
-            assert validator.inspect_wheel(wheel)["communication_operations"] == operations
-        else:
-            with pytest.raises(RuntimeError, match="Device library"):
-                validator.inspect_wheel(wheel)
-
-
-@pytest.mark.parametrize(
-    "missing", [None, "deep_ep/libdeepep_kernels.so", "deep_ep_experimental/megamoe/libmegamoe_kernel.so"]
-)
+@pytest.mark.parametrize("missing", [None, "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_common.hpp"])
 def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
     info = {
@@ -338,13 +299,12 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
     }
     members = {
         "deep_ep/_C.fake.so",
-        "deep_ep/libdeepep_kernels.so",
         "deep_ep/deepseek-deepep.LICENSE",
         "deep_ep_experimental/megamoe/api.py",
         "deep_ep_experimental/megamoe/benchmark.py",
         "deep_ep_experimental/megamoe/configs/smoke.json",
         "deep_ep_experimental/megamoe/_C.fake.so",
-        "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
+        "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_common.hpp",
         "deep_ep_experimental/megamoe/cann.LICENSE",
     }
     wheel = tmp_path / "combined.whl"
@@ -407,8 +367,7 @@ def source_native(build, monkeypatch, tmp_path):
     names = [
         "_C.test.so",
         "_clos_C.test.so",
-        "libdeepep_kernels.so",
-        "libdeepep_clos_kernels.so",
+        "libdeepep_jit.so",
         "_build_info.json",
     ]
     for name in names:
@@ -590,7 +549,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
             (directory / "compiler-info.json").write_text('{"id":"test","version":"1"}')
             (directory / "capabilities.json").write_text(json.dumps(capabilities))
         if "--install" in argv:
-            (destination / "libdeepep_kernels.so").write_bytes(b"new")
+            (destination / "_C.test.so").write_bytes(b"new")
 
     monkeypatch.setattr(build, "checked_run", run)
     monkeypatch.setattr(build, "bundle_shmem_runtime", lambda sdk, target: {"test": "hash"})
@@ -607,7 +566,6 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     command.run()
     assert published == ([] if inplace else [destination.resolve()])
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
-    assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
     assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]

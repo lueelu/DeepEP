@@ -6,6 +6,7 @@
 
 #include "kernel_operator.h"
 #include "../common/ep_memory_server_dedup_count_layout.h"
+#include "../common/ll_jit_spec.h"
 
 namespace DispatchDedup {
 // 中文审计：每轮每核仅调用一次，轮转本地双窗口状态；初值由Host清零，随后按1/0交替。
@@ -22,7 +23,7 @@ __aicore__ inline uint32_t RotateDispatchServerDedupMagic(const __gm__ CommArgs*
     pipe->InitBuffer(scratch, 32U);
     auto state = scratch.Get<uint32_t>();
     auto* slot =
-        reinterpret_cast<__gm__ uint32_t*>(args->peerMems[args->rank] + uint64_t(core) * kEpServerDedupMagicStride);
+        reinterpret_cast<__gm__ uint32_t*>(args->peerMems[DEEPEP_LL_LAUNCH_RANK(args)] + uint64_t(core) * kEpServerDedupMagicStride);
     GlobalTensor<uint32_t> slotGm;
     slotGm.SetGlobalBuffer(slot);
     DataCopy(state, slotGm, 8U);

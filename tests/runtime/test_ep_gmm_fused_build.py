@@ -136,7 +136,6 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
             (directory / "compiler-info.json").write_text('{"id":"test","version":"1"}')
             (directory / "capabilities.json").write_text(json.dumps(capabilities))
         if "--install" in argv:
-            (destination / "libdeepep_kernels.so").write_bytes(b"new")
             if ep_gmm_fused:
                 component.mkdir(parents=True)
 
@@ -153,7 +152,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
     command.build_extension(ext)
     assert published == [destination.resolve()]
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
-    assert f"-DDEEPEP_DEVICE_JOBS={expected_jobs}" in calls[0]
+    assert f"-DCMAKE_BUILD_TYPE={expected_build_type}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}" in calls[0]
     assert calls[1][-2:] == ["--parallel", expected_jobs]
