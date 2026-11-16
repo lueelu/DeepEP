@@ -122,7 +122,7 @@ deep_jit::Runtime<deep_jit::Ascend>& jit_runtime()
 {
     static std::once_flag once;
     std::call_once(once, [] {
-        const deep_jit::Config config(source_root(), "DEEPEP", "", include_dirs(), {});
+        const deep_jit::Config config(source_root(), "DEEPEP", "", include_dirs(), {"kernels/"});
         runtime_storage() = std::make_unique<deep_jit::Runtime<deep_jit::Ascend>>(config);
         runtime_storage()->default_compiler_options.arch = static_cast<int>(target_arch());
     });

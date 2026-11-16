@@ -535,7 +535,6 @@ def publish_source_native(destination):
     names = [
         "_C" + suffix,
         "_clos_C" + suffix,
-        "libdeepep_jit.so",
         "_build_info.json",
         "_kernel_src",
     ]

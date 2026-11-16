@@ -57,6 +57,28 @@ set(DEEPEP_FMT_SIGNATURE "")
 set(DEEPEP_FMT_LICENSE_SHA256 "")
 set(_deepep_compat_dir "${CMAKE_BINARY_DIR}/generated/deepjit-compat")
 
+# DeepJIT's Ascend backend hardcodes aarch64-linux/asc/include/adv_api. Keep the
+# vendor checkout untouched and copy just that header into the build-output
+# compatibility tree with the locally installed devkit path. x86_64 is preferred
+# when present; aarch64 remains the fallback for the existing Ascend hosts.
+set(_deepep_asc_adv_api_rel "aarch64-linux/asc/include/adv_api")
+if(EXISTS "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include/adv_api")
+    set(_deepep_asc_adv_api_rel "${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include/adv_api")
+elseif(EXISTS "${ASCEND_HOME_PATH}/x86_64-linux/asc/include/adv_api")
+    set(_deepep_asc_adv_api_rel "x86_64-linux/asc/include/adv_api")
+endif()
+set(_deepep_vendor_backend "${DEEPJIT_ROOT}/include/deep_jit/backend/ascend/backend.hpp")
+if(EXISTS "${_deepep_vendor_backend}")
+    file(MAKE_DIRECTORY "${_deepep_compat_dir}/deep_jit/backend/ascend")
+    file(READ "${_deepep_vendor_backend}" _deepep_backend_text)
+    string(REPLACE "aarch64-linux/asc/include/adv_api" "${_deepep_asc_adv_api_rel}" _deepep_backend_text "${_deepep_backend_text}")
+    file(WRITE "${_deepep_compat_dir}/deep_jit/backend/ascend/backend.hpp" "${_deepep_backend_text}")
+    if(DEEPEP_DEEPJIT_COMPAT_INCLUDE STREQUAL "")
+        set(DEEPEP_DEEPJIT_COMPAT_INCLUDE "${_deepep_compat_dir}")
+    endif()
+    message(STATUS "DeepJIT Ascend adv_api include: ${_deepep_asc_adv_api_rel}")
+endif()
+
 if(NOT DEEPEP_DEEPJIT_HAS_STD_FORMAT)
     # GCC 11's libstdc++ has no <format>. Provide a generated <format> header
     # that forwards the used surface to fmt, then compile-check the shim.

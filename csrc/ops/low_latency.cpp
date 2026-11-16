@@ -11,6 +11,7 @@
 #include "runtime/ll_jit.hpp"
 #include "runtime/ll_core_config.hpp"
 #include "ubx/v2.hpp"
+#include "ubx/launch.hpp"
 #include "../kernels/dispatch/low_latency/common/ll_rdma_layout.h"
 #include "../kernels/dispatch/low_latency/common/ll_stage_timer_layout.h"
 #include "../kernels/dispatch/low_latency/common/ll_reference_profile_layout.h"
@@ -493,14 +494,15 @@ void bind_low_latency(py::module_& module)
         if (!stream_address) throw std::invalid_argument("LL combine requires a stream");
         if (capacity <= 0) throw std::invalid_argument("LL combine requires the per-rank capacity");
         const auto parsed = build_combine_args(session, tensors, b, h, k, e, dtype);
-        const auto spec = combine_static_spec(session.world(), session.rank(), parsed.rdmaTransport, b, h, k, e, dtype,
-                                              capacity, parsed.cores);
         session.invalidate_dispatch_controls();
         py::gil_scoped_release release;
-        if (parsed.rdmaTransport)
-            ll_jit_launch(spec, &parsed.rdma, sizeof(parsed.rdma), reinterpret_cast<void*>(stream_address));
-        else
+        if (parsed.rdmaTransport) {
+            ubx_combine_launch(reinterpret_cast<void*>(stream_address), &parsed.rdma);
+        } else {
+            const auto spec = combine_static_spec(session.world(), session.rank(), false, b, h, k, e, dtype, capacity,
+                                                  parsed.cores);
             ll_jit_launch(spec, &parsed.args, sizeof(parsed.args), reinterpret_cast<void*>(stream_address));
+        }
     },
                py::arg("session"), py::arg("tensors"), py::arg("b"), py::arg("h"), py::arg("k"), py::arg("e"),
                py::arg("dtype"), py::arg("stream"), py::arg("capacity") = 0);

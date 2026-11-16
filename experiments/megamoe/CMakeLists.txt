@@ -40,7 +40,7 @@ set(beta_include
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api"
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api/include")
 
-pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/jit_entry.cpp)
+pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/jit_entry.cpp "${PROJECT_SOURCE_DIR}/csrc/runtime/jit_runtime.cpp")
 set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON
     INSTALL_RPATH "$ORIGIN/../../deep_ep:$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
@@ -56,7 +56,7 @@ if(DEEPEP_MEGAMOE_TIMER)
 endif()
 deepep_apply_deepjit(megamoe_ext)
 target_link_libraries(megamoe_ext PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIBRARY}"
-    "${TORCH_NPU_LIBRARY}" deepep_jit shmem ascendcl)
+    "${TORCH_NPU_LIBRARY}" shmem ascendcl)
 target_link_directories(megamoe_ext PRIVATE "${ASCEND_HOME_PATH}/lib64")
 target_link_libraries(megamoe_ext PRIVATE platform tiling_api)
 target_link_options(megamoe_ext PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
