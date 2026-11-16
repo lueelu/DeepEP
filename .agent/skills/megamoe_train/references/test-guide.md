@@ -113,7 +113,7 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 
 | `backward` | 窗口外先跑一次前向建图（不计时），窗口内只圈 `y.backward(dy)` |
 | `complete` | 一次窗口内前向 + 反向 |
 
-`--warmup N --loops M` 对三个口径和 baseline 共用，`--loops` 默认 20。**不构建、不开启、不读取任何设备 Timer**。
+`--warmup N --loops M` 对三个口径和 baseline 共用，`--loops` 默认 20。**普通 Event 采样不启用设备 Timer**；可用 `--timer` 单独追加一次前反向采集，见模块 README 的“核内 Timer”。
 
 `--baseline on`（默认）额外计时移植过来的 dropless 小算子链（permute、alltoall dispatch、
 GMM1、带路由权重的 SwiGLU、GMM2、combine、unpermute），与算子共用同一份路由、权重

@@ -32,6 +32,7 @@ set(beta_include
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api"
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api/include")
 set(kernel_flags
+    "-I${PROJECT_SOURCE_DIR}"
     -O2 -std=c++17 -xasc --npu-arch=dav-3510 --cce-auto-infer-kernel-type=false
     --cce-auto-sync=off --cce-fatobj-link -shared -fPIC -Wl,-soname,libmegamoe_kernel.so
     -DCATLASS_ARCH=3510 -DASCEND_DEEPEP_DIRECT_TENSOR_INPUT=1
@@ -53,6 +54,8 @@ if(api_header)
 endif()
 set(kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_kernel.so")
 file(GLOB_RECURSE kernel_headers CONFIGURE_DEPENDS "csrc/kernels/*.hpp")
+file(GLOB_RECURSE shared_timer_headers CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/csrc/kernels/common/timer/*.hpp")
+list(APPEND kernel_headers ${shared_timer_headers})
 add_custom_command(OUTPUT "${kernel_library}"
     COMMAND "${BISHENG}" ${kernel_flags} csrc/kernels/mega_moe/mega_moe.cpp
         "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"

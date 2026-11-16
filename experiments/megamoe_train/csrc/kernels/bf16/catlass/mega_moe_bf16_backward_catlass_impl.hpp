@@ -183,6 +183,11 @@ __aicore__ inline void GroupMatmulRecompute(BackwardGroupMatmulParam<RowMajor, W
                                             const GMMAddrInfo& gmmAddrInfo, GM_ADDR gatePlane, GM_ADDR upPlane,
                                             uint32_t& startBlockIdx, uint32_t expertIdx)
 {
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);
     const uint32_t n = static_cast<uint32_t>(Get<N_VALUE>(problemShape));
     const uint32_t k = static_cast<uint32_t>(Get<K_VALUE>(problemShape));
@@ -221,6 +226,9 @@ __aicore__ inline void GroupMatmulRecompute(BackwardGroupMatmulParam<RowMajor, W
         const uint32_t mLoc = blockCoord.m() * L1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(g_coreType == AscendC::AIC ? gmmAddrInfo.timer : nullptr,
+                                             MegaMoeTrainTimer::AIC_BW_RECOMPUTE, expertIdx, mLoc, nLoc,
+                                             actualShape.m(), actualShape.n(), actualShape.k(), L1_TILE_M, L1_TILE_N);
 
         if constexpr (g_coreType == AscendC::AIC) {
             auto tensorBlockA =
@@ -256,6 +264,12 @@ __aicore__ inline void GMM2GradSwiGLUGradGM(
     __gm__ int32_t* dispatchReadyFlag, int32_t dispatchTarget, const BackwardDispatchReadyView& rowReady,
     __gm__ int32_t* dHpReadyFlag)
 {
+    epilogueOp.SetTimer(gmmAddrInfo.timer);
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);
     const uint32_t n = Get<N_VALUE>(problemShape);
     const uint32_t k = Get<K_VALUE>(problemShape);
@@ -277,13 +291,19 @@ __aicore__ inline void GMM2GradSwiGLUGradGM(
     }
     if constexpr (g_coreType == AscendC::AIC) {
         if (first < loops && !rowReady.enabled) {
-            while (dispatchTarget != AscendC::ReadGmByPassDCache(dispatchReadyFlag)) {
+            {
+                MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_BW_DHP_WAIT);
+                while (dispatchTarget != AscendC::ReadGmByPassDCache(dispatchReadyFlag)) {
+                }
             }
         }
     } else {
         epilogueOp.UpdateGlobalAddr(expertRowBase);
 
-        while (AscendC::ReadGmByPassDCache(dHpReadyFlag) < static_cast<int32_t>(gmm2Params.blockNum)) {
+        {
+            MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD_WAIT);
+            while (AscendC::ReadGmByPassDCache(dHpReadyFlag) < static_cast<int32_t>(gmm2Params.blockNum)) {
+            }
         }
     }
     for (uint32_t index = first; index < loops; index += gmm2Params.blockNum, ++nextTargetAiv) {
@@ -299,12 +319,24 @@ __aicore__ inline void GMM2GradSwiGLUGradGM(
         const uint32_t row = coord.m() * L1_TILE_M;
         const uint32_t col = coord.n() * L1_TILE_N;
         const uint32_t depth = coord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(
+            (g_coreType == AscendC::AIC || gmm2Params.subBlockIdx == (nextTargetAiv & 1U)) ? gmmAddrInfo.timer
+                                                                                           : nullptr,
+            g_coreType == AscendC::AIC ? MegaMoeTrainTimer::AIC_BW_DHP : MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD,
+            expertIdx, row, col, shape.m(), shape.n(), shape.k(), L1_TILE_M, L1_TILE_N, rowReady.enabled ? 3U : 2U);
+
         if constexpr (g_coreType == AscendC::AIC) {
             if (rowReady.enabled) {
                 if (producerSchedule.Enabled() && producerTile.known) {
-                    WaitProducerPhaseRows(rowReady, producerTile, row, shape.m());
+                    {
+                        MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_BW_DHP_WAIT);
+                        WaitProducerPhaseRows(rowReady, producerTile, row, shape.m());
+                    }
                 } else {
-                    rowReady.WaitRows(row, shape.m());
+                    {
+                        MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_BW_DHP_WAIT);
+                        rowReady.WaitRows(row, shape.m());
+                    }
                 }
             }
             auto tileA = tla::GetTile(tensorA, tla::MakeCoord(row, depth), tla::MakeShape(shape.m(), shape.k()));
@@ -341,6 +373,12 @@ __aicore__ inline void GMM2GradSwiGLUGradDualAiv(
     uint32_t& startBlockIdx, int32_t& outstandingMask, uint32_t& nextTargetAiv, uint32_t expertIdx,
     int64_t expertRowBase, __gm__ int32_t* dispatchReadyFlag, int32_t dispatchTarget, uint32_t p1Event)
 {
+    epilogueOp.SetTimer(gmmAddrInfo.timer);
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);
     const uint32_t n = static_cast<uint32_t>(Get<N_VALUE>(problemShape));  // F
     const uint32_t k = static_cast<uint32_t>(Get<K_VALUE>(problemShape));  // K
@@ -373,6 +411,11 @@ __aicore__ inline void GMM2GradSwiGLUGradDualAiv(
         const uint32_t mLoc = blockCoord.m() * L1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(
+            (g_coreType == AscendC::AIC || gmm2Params.subBlockIdx == (nextTargetAiv & 1U)) ? gmmAddrInfo.timer
+                                                                                           : nullptr,
+            g_coreType == AscendC::AIC ? MegaMoeTrainTimer::AIC_BW_DHP : MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD,
+            expertIdx, mLoc, nLoc, actualShape.m(), actualShape.n(), actualShape.k(), L1_TILE_M, L1_TILE_N);
 
         // Keep parity across experts so single-tile experts alternate between both AIVs.
         const uint32_t targetAiv = nextTargetAiv & 1U;
@@ -381,14 +424,20 @@ __aicore__ inline void GMM2GradSwiGLUGradDualAiv(
 
         if constexpr (g_coreType == AscendC::AIC) {
             if (loopIdx == startLoopIdx) {
-                while (dispatchTarget != AscendC::ReadGmByPassDCache(dispatchReadyFlag)) {
-                    const int64_t start = AscendC::GetSystemCycle();
-                    while (AscendC::GetSystemCycle() - start < 100) {
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_BW_DHP_WAIT);
+                    while (dispatchTarget != AscendC::ReadGmByPassDCache(dispatchReadyFlag)) {
+                        const int64_t start = AscendC::GetSystemCycle();
+                        while (AscendC::GetSystemCycle() - start < 100) {
+                        }
                     }
                 }
             }
             if ((outstandingMask & targetBit) != 0) {
-                WaitForVector(targetEvent);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_BW_DHP_UB_WAIT);
+                    WaitForVector(targetEvent);
+                }
             }
             auto tensorBlockA =
                 tla::GetTile(tensorA, tla::MakeCoord(mLoc, kLoc), tla::MakeShape(actualShape.m(), actualShape.k()));
@@ -408,7 +457,10 @@ __aicore__ inline void GMM2GradSwiGLUGradDualAiv(
                 AscendC::Coord<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
                     mLoc * n + nLoc, 0, 0, 0, 0, 0};
 
-                WaitForCube(p1Event);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD_WAIT);
+                    WaitForCube(p1Event);
+                }
 
                 epilogueOp.SwiGLUGrad(epilogueShape, epilogueOffset);
                 NotifyCube(p1Event);
@@ -426,6 +478,11 @@ __aicore__ inline void GMM1GradCombineGM(BackwardGroupMatmulParam<RowMajor, Weig
                                          const GMMAddrInfo& addr, GM_ADDR dxBase, uint32_t& startBlockIdx,
                                          uint32_t expertIdx, __gm__ int32_t* dxReady)
 {
+    if (addr.timer != nullptr) {
+        addr.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        addr.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);
     const uint32_t n = Get<N_VALUE>(problemShape);
     const uint32_t k = Get<K_VALUE>(problemShape);
@@ -433,7 +490,10 @@ __aicore__ inline void GMM1GradCombineGM(BackwardGroupMatmulParam<RowMajor, Weig
         // The caller establishes this expert's input readiness before P2.
 
     } else if (mm.subBlockIdx == 0) {
-        while (AscendC::ReadGmByPassDCache(dxReady) < static_cast<int32_t>(mm.blockNum)) {
+        {
+            MegaMoeTrainTimerWaitScope timerWait(addr.timer, MegaMoeTrainTimer::AIV_BW_COMBINE_WAIT);
+            while (AscendC::ReadGmByPassDCache(dxReady) < static_cast<int32_t>(mm.blockNum)) {
+            }
         }
     }
     AscendC::GlobalTensor<bfloat16_t> a, b, c;
@@ -452,6 +512,11 @@ __aicore__ inline void GMM1GradCombineGM(BackwardGroupMatmulParam<RowMajor, Weig
         const uint32_t row = coord.m() * L1_TILE_M;
         const uint32_t col = coord.n() * L1_TILE_N;
         const uint32_t depth = coord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(
+            (g_coreType == AscendC::AIC || mm.subBlockIdx == 0) ? addr.timer : nullptr,
+            g_coreType == AscendC::AIC ? MegaMoeTrainTimer::AIC_BW_DX : MegaMoeTrainTimer::AIV_BW_COMBINE, expertIdx,
+            row, col, shape.m(), shape.n(), shape.k(), L1_TILE_M, L1_TILE_N, 2U);
+
         if constexpr (g_coreType == AscendC::AIC) {
             auto tileA = tla::GetTile(tensorA, tla::MakeCoord(row, depth), tla::MakeShape(shape.m(), shape.k()));
             auto tileB = tla::GetTile(tensorB, tla::MakeCoord(depth, col), tla::MakeShape(shape.k(), shape.n()));
@@ -490,6 +555,11 @@ __aicore__ inline void GMM1GradCombine(BackwardGroupMatmulParam<RowMajor, Weight
                                        const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& vecSetSyncCom,
                                        uint32_t expertIdx, int64_t expertRowBase, uint16_t& pingpongIdx)
 {
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);
     const uint32_t n = static_cast<uint32_t>(Get<N_VALUE>(problemShape));  // K
     const uint32_t k = static_cast<uint32_t>(Get<K_VALUE>(problemShape));  // N
@@ -520,12 +590,20 @@ __aicore__ inline void GMM1GradCombine(BackwardGroupMatmulParam<RowMajor, Weight
         const uint32_t mLoc = blockCoord.m() * L1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(
+            (g_coreType == AscendC::AIC || gmm1Params.subBlockIdx == 0) ? gmmAddrInfo.timer : nullptr,
+            g_coreType == AscendC::AIC ? MegaMoeTrainTimer::AIC_BW_DX : MegaMoeTrainTimer::AIV_BW_COMBINE, expertIdx,
+            mLoc, nLoc, actualShape.m(), actualShape.n(), actualShape.k(), L1_TILE_M, L1_TILE_N);
+
         auto tensorUb = pingpongIdx == 0 ? tensorUbFirst : tensorUbSecond;
         auto outputUb = pingpongIdx == 0 ? gmm1Params.l0cOutUbFirst : gmm1Params.l0cOutUbSecond;
 
         if constexpr (g_coreType == AscendC::AIC) {
             if (vecSetSyncCom >= 2) {
-                WaitForVector(pingpongIdx + targetEventOffset);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_BW_DX_UB_WAIT);
+                    WaitForVector(pingpongIdx + targetEventOffset);
+                }
             }
             auto tensorBlockA =
                 tla::GetTile(tensorA, tla::MakeCoord(mLoc, kLoc), tla::MakeShape(actualShape.m(), actualShape.k()));
@@ -540,7 +618,10 @@ __aicore__ inline void GMM1GradCombine(BackwardGroupMatmulParam<RowMajor, Weight
         ++vecSetSyncCom;
         if constexpr (g_coreType == AscendC::AIV) {
             if (gmm1Params.subBlockIdx == TargetUBIdx) {
-                WaitForCube(pingpongIdx);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_BW_COMBINE_WAIT);
+                    WaitForCube(pingpongIdx);
+                }
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
                 MegaMoeCombineImpl::CombineTokens<bfloat16_t, Catlass::GemmCoord>(
@@ -560,6 +641,11 @@ __aicore__ inline void GMM1DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 0,
                               const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
                               const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t expertIdx)
 {
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);                         // canonical N / legacy K
     const uint32_t n = static_cast<uint32_t>(Get<N_VALUE>(problemShape));  // canonical K / legacy N
     const uint32_t k = static_cast<uint32_t>(Get<K_VALUE>(problemShape));  // Me
@@ -591,6 +677,10 @@ __aicore__ inline void GMM1DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 0,
         const uint32_t mLoc = blockCoord.m() * L1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(g_coreType == AscendC::AIC ? gmmAddrInfo.timer : nullptr,
+                                             MegaMoeTrainTimer::AIC_BW_DW1, expertIdx, mLoc, nLoc, actualShape.m(),
+                                             actualShape.n(), actualShape.k(), L1_TILE_M, L1_TILE_N);
+
         auto tensorBlockA =
             tla::GetTile(tensorA, tla::MakeCoord(mLoc, kLoc), tla::MakeShape(actualShape.m(), actualShape.k()));
         auto tensorBlockB =
@@ -608,6 +698,11 @@ __aicore__ inline void GMM2DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 1,
                               const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
                               const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t expertIdx)
 {
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);                         // canonical K / legacy F
     const uint32_t n = static_cast<uint32_t>(Get<N_VALUE>(problemShape));  // canonical F / legacy K
     const uint32_t k = static_cast<uint32_t>(Get<K_VALUE>(problemShape));  // Me
@@ -639,6 +734,10 @@ __aicore__ inline void GMM2DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 1,
         const uint32_t mLoc = blockCoord.m() * L1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(g_coreType == AscendC::AIC ? gmmAddrInfo.timer : nullptr,
+                                             MegaMoeTrainTimer::AIC_BW_DW2, expertIdx, mLoc, nLoc, actualShape.m(),
+                                             actualShape.n(), actualShape.k(), L1_TILE_M, L1_TILE_N);
+
         auto tensorBlockA =
             tla::GetTile(tensorA, tla::MakeCoord(mLoc, kLoc), tla::MakeShape(actualShape.m(), actualShape.k()));
         auto tensorBlockB =

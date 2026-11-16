@@ -255,6 +255,12 @@ __aicore__ inline void GroupMatmulSwiglu(
     const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& vecSetSyncCom, uint32_t expertIdx,
     bool useTileReady, uint32_t readyBlocksPerProducerPartition)
 {
+    epilogueOp.SetTimer(gmmAddrInfo.timer);
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     using ReadyLayout = MegaMoeBF16Training::ForwardDispatchTileReadyLayout;
     static_assert(ReadyLayout::kReadyRows % GMM1_TILE_M == 0,
                   "Dispatch ready rows must contain whole BF16 GMM1 M tiles");
@@ -316,6 +322,10 @@ __aicore__ inline void GroupMatmulSwiglu(
         const uint32_t mLoc = blockCoord.m() * GMM1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(
+            (g_coreType == AscendC::AIC || gmm1Params.subBlockIdx == 0) ? gmmAddrInfo.timer : nullptr,
+            g_coreType == AscendC::AIC ? MegaMoeTrainTimer::AIC_GMM1 : MegaMoeTrainTimer::AIV_SWIGLU, expertIdx, mLoc,
+            nLoc, actualShape.m(), actualShape.n(), actualShape.k(), GMM1_TILE_M, L1_TILE_N, useTileReady ? 1U : 0U);
 
         if constexpr (g_coreType == AscendC::AIC) {
             if (loopIdx == startLoopIdx) {
@@ -332,9 +342,12 @@ __aicore__ inline void GroupMatmulSwiglu(
                         reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.ptrFlagDispatchToGmm1) +
                         expertIdx * INT_CACHELINE;
                     const uint32_t target = params.tilingData->epWorldSize * gmm1Params.dispatchBlockNumPerEP;
-                    while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
-                        const int64_t start = AscendC::GetSystemCycle();
-                        while (AscendC::GetSystemCycle() - start < 100) {
+                    {
+                        MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                        while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
+                            const int64_t start = AscendC::GetSystemCycle();
+                            while (AscendC::GetSystemCycle() - start < 100) {
+                            }
                         }
                     }
                 }
@@ -345,9 +358,12 @@ __aicore__ inline void GroupMatmulSwiglu(
                             reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.ptrFlagDispatchToGmm1) +
                             expertIdx * INT_CACHELINE;
                         const uint32_t target = params.tilingData->epWorldSize * gmm1Params.dispatchBlockNumPerEP;
-                        while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
-                            const int64_t start = AscendC::GetSystemCycle();
-                            while (AscendC::GetSystemCycle() - start < 100) {
+                        {
+                            MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                            while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
+                                const int64_t start = AscendC::GetSystemCycle();
+                                while (AscendC::GetSystemCycle() - start < 100) {
+                                }
                             }
                         }
                     }
@@ -361,9 +377,12 @@ __aicore__ inline void GroupMatmulSwiglu(
                         const uint32_t readyBlock = mLoc / ReadyLayout::kReadyRows;
                         __gm__ int32_t* flag = gmmAddrInfo.groupFlagList2 + readyBlock * INT_CACHELINE;
                         const int32_t target = static_cast<int32_t>(ReadyLayout::RowsInReadyBlock(readyBlock, m));
-                        while (target != AscendC::ReadGmByPassDCache(flag)) {
-                            const int64_t start = AscendC::GetSystemCycle();
-                            while (AscendC::GetSystemCycle() - start < 100) {
+                        {
+                            MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                            while (target != AscendC::ReadGmByPassDCache(flag)) {
+                                const int64_t start = AscendC::GetSystemCycle();
+                                while (AscendC::GetSystemCycle() - start < 100) {
+                                }
                             }
                         }
                     }
@@ -371,14 +390,20 @@ __aicore__ inline void GroupMatmulSwiglu(
             } else if (loopIdx == startLoopIdx) {
                 const uint32_t target = params.tilingData->epWorldSize * gmm1Params.dispatchBlockNumPerEP;
                 __gm__ int32_t* flag = (__gm__ int32_t*)dispatchFlags.GetPhyAddr();
-                while (target != AscendC::ReadGmByPassDCache(flag)) {
-                    const int64_t start = AscendC::GetSystemCycle();
-                    while (AscendC::GetSystemCycle() - start < 100) {
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                    while (target != AscendC::ReadGmByPassDCache(flag)) {
+                        const int64_t start = AscendC::GetSystemCycle();
+                        while (AscendC::GetSystemCycle() - start < 100) {
+                        }
                     }
                 }
             }
             if (vecSetSyncCom) {
-                WaitForVector();
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_UB_WAIT);
+                    WaitForVector();
+                }
             }
             auto tensorBlockA =
                 tla::GetTile(tensorA, tla::MakeCoord(mLoc, kLoc), tla::MakeShape(actualShape.m(), actualShape.k()));
@@ -404,7 +429,10 @@ __aicore__ inline void GroupMatmulSwiglu(
                     mLoc * gmm1Params.outputN + nLoc, 0, 0, 0, 0, 0};
                 if (loopIdx == startLoopIdx) {
                 }
-                WaitForCube();
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_SWIGLU_WAIT);
+                    WaitForCube();
+                }
                 if (loopIdx == startLoopIdx) {
                 }
                 epilogueOp.template Run<SaveMode>(epilogueShape, epilogueOffset);
@@ -432,6 +460,12 @@ __aicore__ inline void GroupMatmulSwigluGm(
     const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t expertIdx, bool useTileReady,
     uint32_t readyBlocksPerProducerPartition, uint64_t savedElementOffset)
 {
+    epilogueOp.SetTimer(gmmAddrInfo.timer);
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     using ReadyLayout = MegaMoeBF16Training::ForwardDispatchTileReadyLayout;
     static_assert(ReadyLayout::kReadyRows % GMM1_TILE_M == 0,
                   "Dispatch ready rows must contain whole BF16 GMM1 M tiles");
@@ -473,9 +507,12 @@ __aicore__ inline void GroupMatmulSwigluGm(
             return;
         }
 
-        while (AscendC::ReadGmByPassDCache(gmmReady) != gmm1Params.blockNum) {
-            const int64_t start = AscendC::GetSystemCycle();
-            while (AscendC::GetSystemCycle() - start < 100) {
+        {
+            MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_SWIGLU_WAIT);
+            while (AscendC::ReadGmByPassDCache(gmmReady) != gmm1Params.blockNum) {
+                const int64_t start = AscendC::GetSystemCycle();
+                while (AscendC::GetSystemCycle() - start < 100) {
+                }
             }
         }
     }
@@ -525,6 +562,10 @@ __aicore__ inline void GroupMatmulSwigluGm(
         const uint32_t mLoc = blockCoord.m() * GMM1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(
+            (g_coreType == AscendC::AIC || gmm1Params.subBlockIdx == 0) ? gmmAddrInfo.timer : nullptr,
+            g_coreType == AscendC::AIC ? MegaMoeTrainTimer::AIC_GMM1 : MegaMoeTrainTimer::AIV_SWIGLU, expertIdx, mLoc,
+            nLoc, actualShape.m(), actualShape.n(), actualShape.k(), GMM1_TILE_M, L1_TILE_N, useTileReady ? 1U : 0U);
 
         if constexpr (g_coreType == AscendC::AIC) {
             if (loopIdx == startLoopIdx) {
@@ -541,9 +582,12 @@ __aicore__ inline void GroupMatmulSwigluGm(
                         reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.ptrFlagDispatchToGmm1) +
                         expertIdx * INT_CACHELINE;
                     const uint32_t target = params.tilingData->epWorldSize * gmm1Params.dispatchBlockNumPerEP;
-                    while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
-                        const int64_t start = AscendC::GetSystemCycle();
-                        while (AscendC::GetSystemCycle() - start < 100) {
+                    {
+                        MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                        while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
+                            const int64_t start = AscendC::GetSystemCycle();
+                            while (AscendC::GetSystemCycle() - start < 100) {
+                            }
                         }
                     }
                 }
@@ -554,9 +598,12 @@ __aicore__ inline void GroupMatmulSwigluGm(
                             reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.ptrFlagDispatchToGmm1) +
                             expertIdx * INT_CACHELINE;
                         const uint32_t target = params.tilingData->epWorldSize * gmm1Params.dispatchBlockNumPerEP;
-                        while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
-                            const int64_t start = AscendC::GetSystemCycle();
-                            while (AscendC::GetSystemCycle() - start < 100) {
+                        {
+                            MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                            while (target != AscendC::ReadGmByPassDCache(expertFlag)) {
+                                const int64_t start = AscendC::GetSystemCycle();
+                                while (AscendC::GetSystemCycle() - start < 100) {
+                                }
                             }
                         }
                     }
@@ -570,9 +617,12 @@ __aicore__ inline void GroupMatmulSwigluGm(
                         const uint32_t readyBlock = mLoc / ReadyLayout::kReadyRows;
                         __gm__ int32_t* flag = gmmAddrInfo.groupFlagList2 + readyBlock * INT_CACHELINE;
                         const int32_t target = static_cast<int32_t>(ReadyLayout::RowsInReadyBlock(readyBlock, m));
-                        while (target != AscendC::ReadGmByPassDCache(flag)) {
-                            const int64_t start = AscendC::GetSystemCycle();
-                            while (AscendC::GetSystemCycle() - start < 100) {
+                        {
+                            MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                            while (target != AscendC::ReadGmByPassDCache(flag)) {
+                                const int64_t start = AscendC::GetSystemCycle();
+                                while (AscendC::GetSystemCycle() - start < 100) {
+                                }
                             }
                         }
                     }
@@ -580,9 +630,12 @@ __aicore__ inline void GroupMatmulSwigluGm(
             } else if (loopIdx == startLoopIdx) {
                 const uint32_t target = params.tilingData->epWorldSize * gmm1Params.dispatchBlockNumPerEP;
                 __gm__ int32_t* flag = (__gm__ int32_t*)dispatchFlags.GetPhyAddr();
-                while (target != AscendC::ReadGmByPassDCache(flag)) {
-                    const int64_t start = AscendC::GetSystemCycle();
-                    while (AscendC::GetSystemCycle() - start < 100) {
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM1_WAIT);
+                    while (target != AscendC::ReadGmByPassDCache(flag)) {
+                        const int64_t start = AscendC::GetSystemCycle();
+                        while (AscendC::GetSystemCycle() - start < 100) {
+                        }
                     }
                 }
             }
@@ -638,6 +691,11 @@ __aicore__ inline void GroupMatmul2(ForwardGroupMatmulParam<1, TransW>& gmm2Para
                                     const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& vecSetSyncCom,
                                     uint32_t groupIdx, uint32_t expertRowOffset, uint16_t& pingpongIdx, int32_t rankId)
 {
+    if (gmmAddrInfo.timer != nullptr) {
+        gmmAddrInfo.timer->SetSlice(groupIdx, 0, Get<M_VALUE>(problemShape));
+        gmmAddrInfo.timer->SetTaskContext(-1);
+    }
+
     const uint32_t m = Get<M_VALUE>(problemShape);
     const uint32_t n = gmm2Params.n;
     const uint32_t k = gmm2Params.k;
@@ -667,6 +725,11 @@ __aicore__ inline void GroupMatmul2(ForwardGroupMatmulParam<1, TransW>& gmm2Para
         const uint32_t mLoc = blockCoord.m() * L1_TILE_M;
         const uint32_t nLoc = blockCoord.n() * L1_TILE_N;
         const uint32_t kLoc = blockCoord.k() * L1_TILE_K;
+        MegaMoeTrainTimerTileScope timerTile(
+            (g_coreType == AscendC::AIC || gmm2Params.subBlockIdx == 1) ? gmmAddrInfo.timer : nullptr,
+            g_coreType == AscendC::AIC ? MegaMoeTrainTimer::AIC_GMM2 : MegaMoeTrainTimer::AIV_COMBINE, groupIdx, mLoc,
+            nLoc, actualShape.m(), actualShape.n(), actualShape.k(), L1_TILE_M, L1_TILE_N);
+
         auto tensorUb = pingpongIdx == 0 ? tensorUbFirst : tensorUbSecond;
         auto outputUb = pingpongIdx == 0 ? gmm2Params.l0cOutUbFirst : gmm2Params.l0cOutUbSecond;
 
@@ -675,14 +738,20 @@ __aicore__ inline void GroupMatmul2(ForwardGroupMatmulParam<1, TransW>& gmm2Para
                 BlockScheduler gmm1Scheduler({m, k, n}, Catlass::MakeCoord(GMM1_TILE_M, L1_TILE_N));
                 const uint32_t target = gmm1Scheduler.GetCoreLoops();
                 __gm__ int32_t* flag = (__gm__ int32_t*)swigluFlags.GetPhyAddr();
-                while (target != AscendC::ReadGmByPassDCache(flag)) {
-                    const int64_t start = AscendC::GetSystemCycle();
-                    while (AscendC::GetSystemCycle() - start < 100) {
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM2_WAIT);
+                    while (target != AscendC::ReadGmByPassDCache(flag)) {
+                        const int64_t start = AscendC::GetSystemCycle();
+                        while (AscendC::GetSystemCycle() - start < 100) {
+                        }
                     }
                 }
             }
             if (vecSetSyncCom >= 2) {
-                WaitForVector(pingpongIdx + FLAG_ID_MAX);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIC_GMM2_UB_WAIT);
+                    WaitForVector(pingpongIdx + FLAG_ID_MAX);
+                }
             }
             auto tensorBlockA =
                 tla::GetTile(tensorA, tla::MakeCoord(mLoc, kLoc), tla::MakeShape(actualShape.m(), actualShape.k()));
@@ -699,7 +768,10 @@ __aicore__ inline void GroupMatmul2(ForwardGroupMatmulParam<1, TransW>& gmm2Para
             if (gmm2Params.subBlockIdx == 1) {
                 if (loopIdx == startLoopIdx) {
                 }
-                WaitForCube(pingpongIdx);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_COMBINE_WAIT);
+                    WaitForCube(pingpongIdx);
+                }
                 if (loopIdx == startLoopIdx) {
                 }
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);

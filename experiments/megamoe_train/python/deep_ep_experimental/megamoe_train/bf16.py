@@ -50,10 +50,17 @@ class _MegaMoeBF16TrainFunction(torch.autograd.Function):
     def forward(ctx, op, x, ids, weights, w1, w2, max_recv, limit, mode, out):
         op._check_ready()
         op._runtime.validate_topk_weight_type(weights.dtype, 0)
-        if out is None:
+        capture = getattr(op, "_timer_capture", None)
+        ctx.timer_capture = capture
+        if capture is not None:
+            capture.claim()
+            result = op._executor.forward_with_timer(x, ids, weights, w1, w2, max_recv, limit, mode, out)
+            capture.forward = result.timer
+        elif out is None:
             result = op._executor.forward(x, ids, weights, w1, w2, max_recv, limit, mode)
         else:
             result = op._executor.forward_out(out, x, ids, weights, w1, w2, max_recv, limit, mode)
+        if out is not None:
             ctx.mark_dirty(out)
         ctx.op = op
         ctx.max_recv, ctx.limit, ctx.mode = max_recv, limit, mode
@@ -68,7 +75,11 @@ class _MegaMoeBF16TrainFunction(torch.autograd.Function):
         op = ctx.op
         op._check_ready()
         op._runtime.validate_topk_weight_type(weights.dtype, 1)
-        result = op._executor.backward(
+        capture = ctx.timer_capture
+        if capture is not None:
+            capture.begin_backward()
+        backward = op._executor.backward if capture is None else op._executor.backward_with_timer
+        result = backward(
             grad_y.contiguous(),
             weights,
             w1,
@@ -80,6 +91,8 @@ class _MegaMoeBF16TrainFunction(torch.autograd.Function):
             ctx.limit,
             ctx.mode,
         )
+        if capture is not None:
+            capture.backward = result.timer
         return None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None, None, None, None
 
 
@@ -150,6 +163,12 @@ class MegaMoeBF16Train(torch.nn.Module):
         return _MegaMoeBF16TrainFunction.apply(
             self, x, topk_ids, topk_weights, w1, w2, max_recv_tokens, limit, save_gmm1_output, None
         )
+
+    def capture_timer(self, *, enabled=True):
+        """Capture one forward/backward pair with a Timer-enabled wheel."""
+        from .timer import capture_timer
+
+        return capture_timer(self, enabled=enabled)
 
     def close(self):
         """Collectively release the window; callers must finish backward first."""

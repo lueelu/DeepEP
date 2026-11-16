@@ -17,7 +17,7 @@ void LaunchMegaMoeBF16ForwardKernel(torch::Tensor context, torch::Tensor x, torc
                                     torch::Tensor training_saved_state, torch::Tensor dispatch_output,
                                     torch::Tensor forward_transient_workspace, const MegaMoeTilingData& tiling,
                                     uint32_t block_dim, void* symmetric_buffer, std::size_t symmetric_buffer_bytes,
-                                    int rank, int world_size, uint64_t ffts_addr);
+                                    int rank, int world_size, uint64_t ffts_addr, torch::Tensor timer = {});
 
 bool MegaMoeBF16SwigluDecoupled(uint64_t hidden, uint32_t saved_mode);
 
@@ -30,4 +30,4 @@ void LaunchMegaMoeBF16BackwardKernel(torch::Tensor context, torch::Tensor grad_y
                                      torch::Tensor dispatch_output, torch::Tensor backward_workspace,
                                      const MegaMoeTilingData& tiling, uint32_t splitExperts, uint32_t block_dim,
                                      void* symmetric_buffer, std::size_t symmetric_buffer_bytes, int rank,
-                                     int world_size, uint64_t ffts_addr);
+                                     int world_size, uint64_t ffts_addr, torch::Tensor timer = {});

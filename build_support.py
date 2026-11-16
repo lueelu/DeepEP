@@ -258,8 +258,8 @@ def build_configuration(environment=None):
     timer = env.get("DEEPEP_MEGAMOE_TIMER", "OFF")
     if beta not in {"ON", "OFF"} or timer not in {"ON", "OFF"}:
         raise RuntimeError("MegaMoE build options accept ON or OFF only")
-    if timer == "ON" and beta != "ON":
-        raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
+    if timer == "ON" and beta != "ON" and not train:
+        raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON or DEEPEP_BUILD_MEGAMOE_TRAIN=ON")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
@@ -351,6 +351,7 @@ def build_configuration(environment=None):
     result["compiler_path"] = compiler
     result["megamoe_train"] = {
         "enabled": train,
+        "timer": timer == "ON" and train,
         "force_expert_ready": force_expert_ready,
         "source_commit": "b8cff14854d12aef77b6ae54b5890123759b4d28",
         "gmm1_schedule": "expert-ready" if force_expert_ready else "adaptive-auto",
@@ -442,6 +443,8 @@ class VariantBuild(ConfiguredBuild):
         variant = "megamoe-timer" if beta and timer else ("megamoe" if beta else "core")
         if enabled("DEEPEP_BUILD_MEGAMOE_TRAIN"):
             variant += "-megamoe-train"
+            if timer and not beta:
+                variant += "-timer"
             if enabled("DEEPEP_BF16_FORCE_EXPERT_READY"):
                 variant += "-expert-ready"
         self.build_base = str(Path(self.build_base) / variant)

@@ -236,3 +236,44 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1 \
 去掉 `--case-id` 可运行所选套件，`--list-cases` 仅列出配置。
 精度测试须预留 CPU FP64 参考计算及梯度所需内存；仅运行性能测试不构成精度验收。
 可用 `--output <新目录>` 指定报告目录，该目录不能已存在。
+
+## 核内 Timer
+
+默认不编译核内打点。需要分析流水时，设置 `DEEPEP_MEGAMOE_TIMER=ON` 并重新构建、安装完整 wheel；
+训练组件可独立开启，不要求构建推理组件。普通训练接口和 Event 性能采样保持原样。
+
+测试入口增加 `--timer`，在普通验证、计时之后，用同一输入单独采集一次前反向，并检查
+Y、counts 和四项梯度与未采集调用逐元素一致。`--timer-ranks 0-7` 选择采集 rank，默认前八个；
+所有 EP rank 仍参与正常计算。
+
+程序内可使用同一资源对象采集，公开算子参数不变：
+
+```python
+with buffer.capture_timer() as capture:
+    bf16_mega_moe_train(y, w1, w2, buffer, x=x, topk_idx=topk_ids,
+                       topk_weights=topk_weights, max_recv_tokens=max_recv_tokens)
+    y.backward(dy)
+capture.export("timer")
+```
+
+每个采集对象对应一个前向及其一次反向；可在退出 `with` 后再对该图反向，记录仍绑定该图。
+原始数据、坐标 CSV、阶段汇总及时间线保存在指定目录。离线重新解析：
+
+```bash
+python -m deep_ep_experimental.megamoe_train.timer timer --ranks 0-7 --merge
+```
+
+输出逐 rank 和合并的前向、反向、前反向 JSON，可用 Perfetto/Chrome Trace 查看。
+每个 rank 的前反向共用一个时间原点，保留两次 kernel 之间的间隔；不同 NPU 的时钟各自展示。
+默认按核、按专家阶段展示，沿用 `group_0_AIC_0`、`group_0_AIV_0`、`group_0_AIV_1` 泳道名。
+阶段名为 `AIC_GMM1_0`、`AIV_DISPATCH_0`、`AIV_COMBINE_0` 等，末尾编号是本 rank 内的专家编号。
+专家阶段区间从满足已记录前置依赖后的首个操作开始，到该专家最后操作完成；包含阶段内部的等待和调度间隙。
+主图不显示 `KERNEL_TIMING` 父区间，核总耗时保留在汇总中。
+等待默认隐藏，可用 `--include-wait` 显示专家阶段入口等待，不在主图逐条显示 tile 级等待。
+流水等待完成点先同步到 Scalar 再记录时间戳；普通未采集调用不执行这些计时同步。
+逐 tile、分片及 Gate/Up 保存/恢复明细保存在
+`rank_<r>_<phase>_detail_trace.json` 和原始 CSV 中。前向 GMM1 的一个 tile 覆盖 Gate、Up
+两次矩阵乘，N 坐标按 F 维编号；dW 的 M/N 对应权重梯度矩阵，K 对应路由行。
+
+Timer 仅在显式采集时分配独立缓冲，并在本核确认任务完成。采集开销体现在打点调用中；
+正式性能取普通版本的 Event 结果。原始协议带版本、实际核数和容量，溢出或格式不匹配时解析报错。

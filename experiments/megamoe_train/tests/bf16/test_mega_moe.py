@@ -137,6 +137,10 @@ def parse_args(argv=None):
     parser.add_argument("--swiglu-limit", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=20260825)
     parser.add_argument("--chunk-rows", type=int, default=256, help="CPU FP64 expert-row chunk size")
+    parser.add_argument(
+        "--timer", action="store_true", help="One separate forward/backward Timer capture after measurement"
+    )
+    parser.add_argument("--timer-ranks", default=None, help="Selected EP ranks, e.g. 0-7 or 0,3; default first eight")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--loops", type=int, default=20)
     parser.add_argument(
@@ -960,8 +964,8 @@ def local_truth(inputs, args, rank):
 # Ported from ascend_deepep_hkq@f575fc1 test/bigop_fused: test_speed.py owns the
 # three measurement scopes and the per-iteration synchronization, timing.py owns
 # the statistics, golden.py owns the dropless small-operator chain that is timed
-# here as the baseline. The source tree removed its kernel Timer
-# instrumentation, so nothing here builds, enables or reads a device Timer: every
+# here as the baseline. Event sampling is independent of the optional
+# diagnostic Timer capture; every
 # sample is one synchronized NPU Event window.
 #
 # The source times its `BigOp.apply(x, moe_layer)` chain, which runs a router
@@ -1788,7 +1792,59 @@ def execute_case(local_rank, args, rank, world, op, local_mem, phase_seconds, ex
             "status": "NOT_RUN",
             "reason": "--skip performance" if not performance else "precision or smoke checks failed",
         }
+    if not int(failed.item()) and getattr(args, "timer", False):
+        report["timer"] = collect_timer(op, tensors, capacity, args, rank, world, output)
     return report, output
+
+
+def collect_timer(op, tensors, capacity, args, rank, world, output):
+    """Keep diagnostic sampling and CPU export outside all Event windows."""
+    import hashlib
+    import torch
+    import torch.distributed as dist
+    from deep_ep_experimental.megamoe_train.timer.__main__ import export, parse_ranks
+
+    ranks = parse_ranks(args.timer_ranks) if args.timer_ranks else list(range(min(world, 8)))
+    if any(value >= world for value in ranks):
+        raise ValueError("Timer rank exceeds this EP group")
+    x, ids, p, w1, w2, dy = tensors
+
+    def snapshot():
+        for leaf in (x, p, w1, w2):
+            leaf.grad = None
+        y, counts = fused_forward(
+            op,
+            x,
+            ids,
+            p,
+            w1,
+            w2,
+            capacity,
+            save_gmm1_output=args.save_gmm1_output,
+            swiglu_limit=args.swiglu_limit,
+            api=args.api,
+        )
+        y.backward(dy)
+        torch.npu.synchronize()
+        return {
+            name: hashlib.sha256(value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+            for name, value in dict(y=y, counts=counts, dx=x.grad, dp=p.grad, dw1=w1.grad, dw2=w2.grad).items()
+        }
+
+    dist.barrier()
+    plain = snapshot()
+    dist.barrier()
+    with op.capture_timer(enabled=rank in ranks) as capture:
+        timed = snapshot()
+    checks = {name: plain[name] == timed[name] for name in plain}
+    capture.export(output / "timer", parse=False)
+    dist.barrier()
+    if rank == 0:
+        export(output / "timer", ranks)
+    dist.barrier()
+    if not all(checks.values()):
+        raise AssertionError(f"Timer on/off result mismatch: {checks}")
+    return dict(passed=True, bitwise_equal=checks, ranks=ranks, output=str(output / "timer"))
 
 
 def performance_summary(reports):

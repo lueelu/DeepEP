@@ -18,13 +18,20 @@ __mix__(1, 2) __global__ __aicore__
     void mega_moe_bf16_backward(GM_ADDR context, GM_ADDR gradY, GM_ADDR topkWeights, GM_ADDR weight1, GM_ADDR weight2,
                                 GM_ADDR gradX, GM_ADDR gradTopkWeights, GM_ADDR gradWeight1, GM_ADDR gradWeight2,
                                 GM_ADDR trainingSavedState, GM_ADDR dispatchOutput, GM_ADDR backwardWorkspace,
-                                MegaMoeTilingData tilingData, uint32_t splitExperts)
+                                MegaMoeTilingData tilingData, uint32_t splitExperts, GM_ADDR timerAddr)
 {
     InitSocState();
+    MegaMoeTrainTimerDevice timer;
+    timer.Init(timerAddr);
+    timer.Start(MegaMoeTrainTimer::KERNEL_TIMING);
     MegaMoeBF16Backward<TopkWeightT> op;
     op.Init(context, gradY, topkWeights, weight1, weight2, gradX, gradTopkWeights, gradWeight1, gradWeight2,
             trainingSavedState, dispatchOutput, backwardWorkspace, &tilingData, splitExperts);
+    op.SetTimer(timer.Enabled() ? &timer : nullptr);
     op.Process();
+    if (timer.Enabled()) AscendC::PipeBarrier<PIPE_ALL>();
+    timer.End(MegaMoeTrainTimer::KERNEL_TIMING);
+    timer.FlushDynamicCounts();
 }
 
 extern "C" ASCEND_MEGAMOE_EXPORT void deepep_train_mega_moe_bf16_backward_ready_k_kernel_do(
@@ -38,10 +45,29 @@ extern "C" ASCEND_MEGAMOE_EXPORT void deepep_train_mega_moe_bf16_backward_ready_
     if (tiling.topkWeightType == 1U) {
         mega_moe_bf16_backward<float><<<block_dim, nullptr, stream>>>(
             context, grad_y, topk_weights, weight1, weight2, grad_x, grad_topk_weights, grad_weight1, grad_weight2,
-            training_saved_state, dispatch_output, backward_workspace, tiling, split_experts);
+            training_saved_state, dispatch_output, backward_workspace, tiling, split_experts, nullptr);
     } else {
         mega_moe_bf16_backward<bfloat16_t><<<block_dim, nullptr, stream>>>(
             context, grad_y, topk_weights, weight1, weight2, grad_x, grad_topk_weights, grad_weight1, grad_weight2,
-            training_saved_state, dispatch_output, backward_workspace, tiling, split_experts);
+            training_saved_state, dispatch_output, backward_workspace, tiling, split_experts, nullptr);
+    }
+}
+
+extern "C" ASCEND_MEGAMOE_EXPORT void deepep_train_mega_moe_bf16_backward_timer_kernel_do(
+    uint32_t block_dim, void* stream, uint8_t* context, uint8_t* grad_y, uint8_t* topk_weights, uint8_t* weight1,
+    uint8_t* weight2, uint8_t* grad_x, uint8_t* grad_topk_weights, uint8_t* grad_weight1, uint8_t* grad_weight2,
+    uint8_t* training_saved_state, uint8_t* dispatch_output, uint8_t* backward_workspace, const uint8_t* tiling_host,
+    uint64_t ffts_addr, uint32_t split_experts, uint8_t* timer)
+{
+    (void)ffts_addr;
+    const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
+    if (tiling.topkWeightType == 1U) {
+        mega_moe_bf16_backward<float><<<block_dim, nullptr, stream>>>(
+            context, grad_y, topk_weights, weight1, weight2, grad_x, grad_topk_weights, grad_weight1, grad_weight2,
+            training_saved_state, dispatch_output, backward_workspace, tiling, split_experts, timer);
+    } else {
+        mega_moe_bf16_backward<bfloat16_t><<<block_dim, nullptr, stream>>>(
+            context, grad_y, topk_weights, weight1, weight2, grad_x, grad_topk_weights, grad_weight1, grad_weight2,
+            training_saved_state, dispatch_output, backward_workspace, tiling, split_experts, timer);
     }
 }

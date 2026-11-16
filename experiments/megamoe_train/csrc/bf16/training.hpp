@@ -19,6 +19,7 @@ struct ForwardResult {
     torch::Tensor counts;
     torch::Tensor saved_state;
     torch::Tensor dispatch_output;
+    torch::Tensor timer;
 };
 
 struct BackwardResult {
@@ -26,20 +27,23 @@ struct BackwardResult {
     torch::Tensor dtopk_weights;
     torch::Tensor dw1;
     torch::Tensor dw2;
+    torch::Tensor timer;
 };
 
 ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::Tensor topk_ids,
                                  torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
                                  int64_t max_recv_tokens, int rank, int world_size, std::size_t symmetric_buffer_bytes,
                                  uint64_t ffts_addr, void* symmetric_buffer, double swiglu_limit = 0.0,
-                                 const std::string& save_gmm1_output = "bf16", torch::Tensor out = {});
+                                 const std::string& save_gmm1_output = "bf16", torch::Tensor out = {},
+                                 torch::Tensor timer = {});
 
 BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor grad_y, torch::Tensor topk_weights,
                                    torch::Tensor weight1, torch::Tensor weight2, torch::Tensor expert_token_nums,
                                    torch::Tensor training_saved_state, torch::Tensor dispatch_output,
                                    int64_t max_recv_tokens, int rank, int world_size,
                                    std::size_t symmetric_buffer_bytes, uint64_t ffts_addr, void* symmetric_buffer,
-                                   double swiglu_limit = 0.0, const std::string& save_gmm1_output = "bf16");
+                                   double swiglu_limit = 0.0, const std::string& save_gmm1_output = "bf16",
+                                   torch::Tensor timer = {});
 
 }  // namespace deepep::megamoe_train::ops
 
@@ -64,6 +68,15 @@ public:
                                  torch::Tensor weight2, torch::Tensor counts, torch::Tensor saved_state,
                                  torch::Tensor dispatch_output, int64_t max_recv_tokens, double swiglu_limit,
                                  const std::string& save_gmm1_output);
+
+    ops::ForwardResult forward_with_timer(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
+                                          torch::Tensor weight1, torch::Tensor weight2, int64_t max_recv_tokens,
+                                          double swiglu_limit, const std::string& save_gmm1_output,
+                                          c10::optional<torch::Tensor> out);
+    ops::BackwardResult backward_with_timer(torch::Tensor grad_y, torch::Tensor topk_weights, torch::Tensor weight1,
+                                            torch::Tensor weight2, torch::Tensor counts, torch::Tensor saved_state,
+                                            torch::Tensor dispatch_output, int64_t max_recv_tokens, double swiglu_limit,
+                                            const std::string& save_gmm1_output);
 
 private:
     torch::Tensor Context(const torch::Tensor& like);

@@ -34,6 +34,10 @@ static constexpr AscendC::Reg::CastTrait kCastFP32ToBF16 = {
 template <typename L0TileShape_, bool ApplyTopkWeight_, typename TopkWeightT = bfloat16_t>
 class BlockEpilogueSwigluForwardBF16 {
 public:
+    __aicore__ inline void SetTimer(MegaMoeTrainTimerDevice* timer)
+    {
+        timer_ = timer;
+    }
     static_assert(std::is_same_v<TopkWeightT, bfloat16_t> || std::is_same_v<TopkWeightT, float>,
                   "TopK weights must be BF16 or FP32");
     struct Arguments {
@@ -146,6 +150,7 @@ public:
     }
 
 private:
+    MegaMoeTrainTimerDevice* timer_ = nullptr;
     static constexpr uint32_t kTileRows = tla::get<0>(L0TileShape_{});
     static constexpr uint32_t kTileColumns = tla::get<1>(L0TileShape_{});
     static constexpr uint32_t kTileElements = kTileRows * kTileColumns;
@@ -155,6 +160,7 @@ private:
     template <uint32_t SaveMode>
     __aicore__ inline void SaveGateUp(uint16_t mSize, uint16_t nSize, int64_t offset)
     {
+        MegaMoeTrainTimerSpanScope timerSave(timer_, MegaMoeTrainTimer::AIV_SAVE_GATE_UP);
         if constexpr (SaveMode == MegaMoeBF16Training::kSaveMxFp8) {
             quantSave_.Save(l0cOutUbFirst_, l0cOutUbSecond_, params_.savedGateGmAddr, params_.savedUpGmAddr,
                             params_.savedGateScaleGmAddr, params_.savedUpScaleGmAddr, params_.savedGateHighGmAddr,

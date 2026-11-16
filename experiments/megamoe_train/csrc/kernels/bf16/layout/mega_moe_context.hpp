@@ -10,6 +10,7 @@
 #define MEGA_MOE_CONTEXT_HPP
 
 #include "lib/std/tuple.h"
+#include "timer/ascend_timer_device.hpp"
 #include "mega_moe_tiling.hpp"
 #include "routing/moe_init_routing_v3/arch35/moe_init_routing_v3_apt.hpp"
 #include "layout/mega_moe_workspace_view.hpp"
@@ -24,6 +25,7 @@ struct Mc2MoeContext {
 };
 
 struct GMMAddrInfo {
+    MegaMoeTrainTimerDevice* timer = nullptr;
     GM_ADDR aGlobal;
     GM_ADDR bGlobal;
     GM_ADDR aScaleGlobal;
@@ -34,6 +36,7 @@ struct GMMAddrInfo {
 };
 
 struct Params {
+    MegaMoeTrainTimerDevice* timer = nullptr;
     GM_ADDR aGmAddr;
     GM_ADDR expertIdxGmAddr;
     GM_ADDR bGmAddr;

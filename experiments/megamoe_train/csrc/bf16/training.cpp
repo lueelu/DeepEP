@@ -19,6 +19,8 @@
 
 #include "check.hpp"
 #include "launcher.hpp"
+#include "csrc/kernels/bf16/timer/ascend_timer.hpp"
+#include <vector>
 #include "csrc/kernels/bf16/common/mega_moe_tiling.hpp"
 #include "csrc/kernels/bf16/layout/mega_moe_layout.hpp"
 #include "csrc/kernels/bf16/layout/mega_moe_saved_meta.hpp"
@@ -189,6 +191,53 @@ torch::Tensor AllocateBackwardWorkspace(const MegaMoeBF16BackwardWorkspaceLayout
     return workspace;
 }
 
+torch::Tensor AllocateTrainingTimer(const torch::Tensor& like, const torch::Tensor& weights,
+                                    const torch::Tensor& weight1, const torch::Tensor& weight2, int64_t maxRecv,
+                                    int phase, double limit, const std::string& mode)
+{
+#ifndef DEEPEP_MEGAMOE_TIMER
+    TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before capturing training timers");
+#endif
+    using namespace MegaMoeTrainTimer;
+    const int64_t h = like.size(1), e = weight1.size(0);
+    const auto w = ResolveBf16WeightLayout(weight1, weight2, h);
+    const int64_t f = w.n / 2;
+    const int64_t groups = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
+    TORCH_CHECK(groups > 0 && groups <= kMaxCoreGroups, "unsupported Timer AIC count");
+    auto ceil = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+    const int64_t rows = phase == 0 ? 192 : 128;
+    const int64_t tiles = ceil(maxRecv + e * (rows - 1), rows) * ceil(std::max(h, 2 * f), 256);
+    const int64_t dwTiles = e * std::max(ceil(2 * f, 128) * ceil(h, 256), ceil(h, 128) * ceil(f, 256));
+    const int64_t bound = ceil(std::max(tiles, phase == 0 ? int64_t(0) : dwTiles), groups) + 4 * e + 32;
+    const int capacity = static_cast<int>(ceil(std::max(bound, int64_t(128)), 64) * 64);
+    TORCH_CHECK(capacity <= kMaxCapacity, "training Timer task capacity exceeds supported bound");
+    const Layout layout{static_cast<int>(groups * 3), capacity};
+    TORCH_CHECK(layout.Elements() * 8 <= 256LL * 1024 * 1024, "training Timer exceeds 256 MiB per phase");
+    auto timer = torch::zeros({layout.Elements()}, like.options().dtype(torch::kInt64));
+    const int64_t saved = mode == "none" ? 0 : (mode == "bf16" || (mode == "auto" && limit > 0) ? 1 : 2);
+    const int64_t flags = saved | (MegaMoeBF16SwigluDecoupled(h, saved) ? 256 : 0) |
+                          (DEEPEP_BF16_FORCE_EXPERT_READY ? 512 : 0) | (w.transW ? 1024 : 0);
+    std::vector<int64_t> values{kMagic,
+                                kVersion,
+                                groups * 3,
+                                capacity,
+                                phase,
+                                FIXED_TIMING_COUNT,
+                                DYNAMIC_TYPE_COUNT,
+                                kMetadataWords,
+                                maxRecv,
+                                like.size(0),
+                                h,
+                                f,
+                                e,
+                                weights.size(1),
+                                weights.scalar_type() == torch::kFloat32 ? 1 : 0,
+                                flags};
+    auto header = torch::tensor(values, torch::TensorOptions().dtype(torch::kInt64));
+    timer.narrow(0, 0, kHeaderWords).copy_(header);
+    return timer;
+}
+
 }  // namespace
 
 namespace deepep::megamoe_train::ops {
@@ -197,7 +246,7 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
                                  torch::Tensor topkWeights, torch::Tensor weight1, torch::Tensor weight2,
                                  int64_t maxRecvTokens, int rank, int worldSize, std::size_t symmetricBufferBytes,
                                  uint64_t ffts_addr, void* symmetricBuffer, double swigluLimit,
-                                 const std::string& save_gmm1_output, torch::Tensor out)
+                                 const std::string& save_gmm1_output, torch::Tensor out, torch::Tensor timer)
 {
     CheckNpuContiguous(x, "x");
     CheckNpuContiguous(topkIds, "topk_ids");
@@ -290,13 +339,14 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
         context, x, topkIds, topkWeights, weight1, weight2, y, expertTokenNums, trainingSavedState, dispatchOutput,
         forwardTransientWorkspace, tiling,
         static_cast<uint32_t>(platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic()),
-        symmetricBuffer, symmetricBufferBytes, rank, worldSize, ffts_addr);
+        symmetricBuffer, symmetricBufferBytes, rank, worldSize, ffts_addr, timer);
     const auto stream = c10_npu::getCurrentNPUStream();
     for (const auto* tensor : {&context, &x, &topkIds, &topkWeights, &weight1, &weight2, &y, &expertTokenNums,
                                &trainingSavedState, &dispatchOutput, &forwardTransientWorkspace}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
-    return {y, expertTokenNums, trainingSavedState, dispatchOutput};
+    if (timer.defined()) c10_npu::NPUCachingAllocator::recordStream(timer.storage().data_ptr(), stream);
+    return {y, expertTokenNums, trainingSavedState, dispatchOutput, timer};
 }
 
 BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, torch::Tensor topkWeights,
@@ -304,7 +354,7 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
                                    torch::Tensor trainingSavedState, torch::Tensor dispatchOutput,
                                    int64_t maxRecvTokens, int rank, int worldSize, std::size_t symmetricBufferBytes,
                                    uint64_t ffts_addr, void* symmetricBuffer, double swigluLimit,
-                                   const std::string& save_gmm1_output)
+                                   const std::string& save_gmm1_output, torch::Tensor timer)
 {
     const int64_t m = gradY.size(0);
     const int64_t k = gradY.size(1);
@@ -449,14 +499,15 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
         context, gradY, topkWeights, weight1, weight2, gradX, gradTopkWeights, gradWeight1, gradWeight2,
         trainingSavedState, dispatchOutput, backwardWorkspace, tiling, splitExperts,
         static_cast<uint32_t>(platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic()),
-        symmetricBuffer, symmetricBufferBytes, rank, worldSize, ffts_addr);
+        symmetricBuffer, symmetricBufferBytes, rank, worldSize, ffts_addr, timer);
     const auto stream = c10_npu::getCurrentNPUStream();
     for (const auto* tensor :
          {&context, &gradY, &topkWeights, &weight1, &weight2, &expertTokenNums, &trainingSavedState, &dispatchOutput,
           &gradX, &gradTopkWeights, &gradWeight1, &gradWeight2, &backwardWorkspace}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
-    return {gradX, gradTopkWeights, gradWeight1, gradWeight2};
+    if (timer.defined()) c10_npu::NPUCachingAllocator::recordStream(timer.storage().data_ptr(), stream);
+    return {gradX, gradTopkWeights, gradWeight1, gradWeight2, timer};
 }
 
 }  // namespace deepep::megamoe_train::ops
@@ -511,6 +562,29 @@ ops::BackwardResult BF16Executor::backward(torch::Tensor grad_y, torch::Tensor t
     return ops::MegaMoeBF16Backward(Context(grad_y), grad_y, topk_weights, weight1, weight2, counts, saved_state,
                                     dispatch_output, max_recv_tokens, rank_, world_size_, SymmetricBufferBytes(),
                                     ffts_addr_, SymmetricBuffer(), swiglu_limit, save_gmm1_output);
+}
+
+ops::ForwardResult BF16Executor::forward_with_timer(torch::Tensor x, torch::Tensor ids, torch::Tensor weights,
+                                                    torch::Tensor w1, torch::Tensor w2, int64_t maxRecv, double limit,
+                                                    const std::string& mode, c10::optional<torch::Tensor> out)
+{
+    TORCH_CHECK(address_ != 0, "training operator has been closed");
+    auto timer = AllocateTrainingTimer(x, weights, w1, w2, maxRecv, 0, limit, mode);
+    return ops::MegaMoeBF16Forward(Context(x), x, ids, weights, w1, w2, maxRecv, rank_, world_size_,
+                                   SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(), limit, mode,
+                                   out.value_or(torch::Tensor()), timer);
+}
+
+ops::BackwardResult BF16Executor::backward_with_timer(torch::Tensor dy, torch::Tensor weights, torch::Tensor w1,
+                                                      torch::Tensor w2, torch::Tensor counts, torch::Tensor saved,
+                                                      torch::Tensor dispatch, int64_t maxRecv, double limit,
+                                                      const std::string& mode)
+{
+    TORCH_CHECK(address_ != 0, "training operator has been closed");
+    auto timer = AllocateTrainingTimer(dy, weights, w1, w2, maxRecv, 1, limit, mode);
+    return ops::MegaMoeBF16Backward(Context(dy), dy, weights, w1, w2, counts, saved, dispatch, maxRecv, rank_,
+                                    world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(), limit, mode,
+                                    timer);
 }
 
 torch::Tensor BF16Executor::Context(const torch::Tensor& like)

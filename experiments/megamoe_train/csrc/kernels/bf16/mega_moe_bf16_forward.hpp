@@ -49,6 +49,11 @@ public:
                                 MegaMoeTilingData* tilingData, GM_ADDR transientWorkspaceGM = nullptr,
                                 GM_ADDR dispatchOutputGM = nullptr, bool allowCompactTokenCountExchange = true);
     __aicore__ inline void Process();
+    __aicore__ inline void SetTimer(MegaMoeTrainTimerDevice* timer)
+    {
+        timer_ = timer;
+        params_.timer = timer;
+    }
     template <uint32_t SaveMode, bool TransW>
     __aicore__ inline void ProcessSelected();
     template <uint32_t SaveMode, bool TransW, bool GmSwiglu = false>
@@ -132,6 +137,7 @@ private:
 
     __gm__ Mc2MoeContext* mc2Context_{nullptr};
     Params params_{};
+    MegaMoeTrainTimerDevice* timer_ = nullptr;
     TupleShape problemShape_{};
     BlockOffset baseOffset_{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
@@ -275,6 +281,7 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::EnableDispatchTileReady(
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::FirstBuffInit(TPipe* tPipe)
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BUFFER_INIT);
     // 对CrossRankSync、Dispatch、GetCumSum过程涉及到的LocalTensor初始化管理
     const MegaMoeBF16Training::ForwardDispatchUbLayout layout(worldSize_, expertPerRank_, k_, dispatchRows_);
     tPipe->InitBuffer(CrossRankSyncBuf_, layout.syncBytes);
@@ -435,6 +442,7 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ExpertTokenNumCopyOut()
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::SaveForwardState()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_SAVE_STATE);
     if constexpr (g_coreType == AIC) {
         return;
     }
@@ -524,6 +532,7 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::EndGMM2Sync()
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CrossRankSyncCntPerExpert()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_COUNT_EXCHANGE);
     if constexpr (g_coreType == AIC) {
         return;
     }
@@ -701,6 +710,7 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CrossRankSyncCntPerExper
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::GatherRoutedTopkWeights()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_GATHER_TOPK_WEIGHTS);
     if constexpr (g_coreType == AscendC::AIC) {
         return;
     }
@@ -833,6 +843,9 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::DispatchTokens(GMMAddrIn
                 rowsPerCore = rowStartInDst + rowsCopyCnt - rowDstOffsetPerCore;
             }
             if (rowsPerCore > 0) {
+                MegaMoeTrainTimerTileScope timerDispatch(
+                    useTileReady ? nullptr : timer_, MegaMoeTrainTimer::AIV_DISPATCH, expertIdx, rowDstOffsetPerCore, 0,
+                    rowsPerCore, widthA, 0, 384, 256, 0, dstRankIdx);
                 GlobalTensor<QuantOutType> gmRemoteA;
                 GlobalTensor<QuantScaleOutType> aScaleGlobalTensor;
                 GlobalTensor<TopkWeightT> gmRemoteTopkWeights;
@@ -866,6 +879,9 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::DispatchTokens(GMMAddrIn
                     while (copiedRows < rowsPerCore) {
                         const uint32_t expertRow = rowDstOffsetPerCore + copiedRows;
                         const uint32_t fragmentRows = ReadyLayout::FragmentRows(expertRow, rowsPerCore - copiedRows);
+                        MegaMoeTrainTimerTileScope timerDispatch(timer_, MegaMoeTrainTimer::AIV_DISPATCH, expertIdx,
+                                                                 expertRow, 0, fragmentRows, widthA, 0, 384, 256, 1,
+                                                                 dstRankIdx);
                         CopyGMToGMPerTokenV2(aGlobalTensor[static_cast<int64_t>(expertRow) * widthA],
                                              aScaleGlobalTensor[gmOffsetAScale],
                                              gmRemoteA[gmOffsetPeer + static_cast<int64_t>(copiedRows) * widthA],
@@ -953,6 +969,7 @@ __aicore__ inline bool MegaMoeBF16Forward<TopkWeightT>::UpdateGroupParams(uint32
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::UpdateGlobalBuffer(GMMAddrInfo& gmmAddrInfo, uint32_t gmmIndex)
 {
+    gmmAddrInfo.timer = timer_;
     if (gmmIndex == 0) {
         gmmAddrInfo.aGlobal = params_.workspaceInfo.ptrA + Get<IDX_A_OFFSET>(baseOffset_) * sizeof(QuantOutType);
         gmmAddrInfo.aScaleGlobal =
@@ -998,6 +1015,7 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::UpdateGlobalBuffer(GMMAd
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ResetTokenPerExpert()
 {
+    MegaMoeTrainTimerFixedScope timerReset(timer_, MegaMoeTrainTimer::AIV_RESET);
     if (aivCoreIdx_ != blockAivNum_ - 1) {
         return;
     }
@@ -1023,6 +1041,7 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ResetTokenPerExpert()
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::UnpermuteV2()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_UNPERMUTE);
     if constexpr (g_coreType == AscendC::AIC) {
         return;
     }
@@ -1040,6 +1059,8 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::UnpermuteV2()
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CrossRankSyncInWorldSize()
 {
+    MegaMoeTrainTimerWaitScope timerWait(g_coreType == AscendC::AIV ? timer_ : nullptr,
+                                         MegaMoeTrainTimer::AIV_SYNC_WAIT);
     __gm__ int32_t* syncRank = (__gm__ int32_t*)(params_.peermemInfo.ptrBase);
     __gm__ int32_t* syncCount =
         (__gm__ int32_t*)(params_.peermemInfo.ptrBase + MegaMoeBF16Training::PeerSyncCountOffset(worldSize_));
@@ -1110,19 +1131,25 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::ProcessWithSaveMode()
     }
     int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
     // 1. Initialize routing and pack BF16 tokens without quantization.
-    moe_init_routing_v3<bfloat16_t, QuantOutType>(
-        params_.aGmAddr, params_.expertIdxGmAddr, nullptr, nullptr, params_.peermemInfo.ptrA0,
-        params_.workspaceInfo.expandedRowIdx, tokenPerExpertCurRankAddr_, nullptr,
-        params_.workspaceInfo.expandedRowIdxGather, params_.workspaceInfo.ptrA,
-        &params_.tilingData->moeInitRoutingTilingData, params_.tilingData->moeInitRoutingTilingData.tilingKey);
+    {
+        MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_INIT_ROUTING);
+        moe_init_routing_v3<bfloat16_t, QuantOutType>(
+            params_.aGmAddr, params_.expertIdxGmAddr, nullptr, nullptr, params_.peermemInfo.ptrA0,
+            params_.workspaceInfo.expandedRowIdx, tokenPerExpertCurRankAddr_, nullptr,
+            params_.workspaceInfo.expandedRowIdxGather, params_.workspaceInfo.ptrA,
+            &params_.tilingData->moeInitRoutingTilingData, params_.tilingData->moeInitRoutingTilingData.tilingKey);
+    }
 
     // Finish and release the optional gather-only UB phase before Dispatch
     // buffer allocation.
     bool routedWeightsReady = false;
     if constexpr (g_coreType == AscendC::AIV) {
-        routedWeightsReady = MegaMoeBF16Routing::TryGatherTopkWeights<TopkWeightT>(
-            params_.probsGmAddr, params_.workspaceInfo.expandedRowIdx, params_.peermemInfo.ptrRoutedTopkWeights,
-            static_cast<uint64_t>(m_) * topK_, aivCoreIdx_, blockAivNum_, true);
+        {
+            MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_GATHER_TOPK_WEIGHTS);
+            routedWeightsReady = MegaMoeBF16Routing::TryGatherTopkWeights<TopkWeightT>(
+                params_.probsGmAddr, params_.workspaceInfo.expandedRowIdx, params_.peermemInfo.ptrRoutedTopkWeights,
+                static_cast<uint64_t>(m_) * topK_, aivCoreIdx_, blockAivNum_, true);
+        }
     }
 
     // 2. buffer申请 & workspace Init

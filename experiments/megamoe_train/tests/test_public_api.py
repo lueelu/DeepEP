@@ -72,6 +72,61 @@ def test_public_exports_include_training_entry_and_legacy_module(api):
     assert set(package.__all__) == {"bf16_mega_moe_train", "SymmBuffer", "MegaMoeBF16Train"}
 
 
+@pytest.mark.parametrize("entry", ["module", "functional"])
+def test_timer_stays_with_its_graph_after_context_exit(api, operator, monkeypatch, entry):
+    op, _ = operator
+    package = importlib.import_module("deep_ep_experimental.megamoe_train")
+    monkeypatch.setattr(package, "_C", SimpleNamespace(timer_enabled=True), raising=False)
+    calls = []
+
+    def timed_forward(*args):
+        calls.append("forward")
+        result = op._executor.forward(*args[:-1], out=args[-1])
+        result.timer = torch.zeros(1, dtype=torch.int64)
+        return result
+
+    def timed_backward(*args):
+        calls.append("backward")
+        result = op._executor.backward(*args)
+        result.timer = torch.ones(1, dtype=torch.int64)
+        return result
+
+    op._executor.forward_with_timer = timed_forward
+    op._executor.backward_with_timer = timed_backward
+    x, ids, weights, w1, w2 = inputs(torch.float32)
+    with op.capture_timer() as capture:
+        if entry == "module":
+            y, _ = op(x, ids, weights, w1, w2, 32)
+        else:
+            y = torch.empty_like(x)
+            api.bf16_mega_moe_train(y, w1, w2, op, x=x, topk_idx=ids, topk_weights=weights, max_recv_tokens=32)
+    ordinary_y, _ = op(x, ids, weights, w1, w2, 32)
+    y.float().sum().backward()
+    ordinary_y.float().sum().backward()
+    assert calls == ["forward", "backward"]
+    assert capture.forward.item() == 0 and capture.backward.item() == 1
+    assert op._timer_capture is None
+
+
+def test_disabled_capture_keeps_ordinary_executor_path(api, operator):
+    op, calls = operator
+    with op.capture_timer(enabled=False) as capture:
+        y, _ = op(*inputs(torch.bfloat16), 32)
+        y.float().sum().backward()
+    assert len(calls) == 1
+    assert capture.forward is capture.backward is None
+
+
+def test_capture_requires_timer_build_before_forward(api, operator, monkeypatch):
+    op, calls = operator
+    package = importlib.import_module("deep_ep_experimental.megamoe_train")
+    monkeypatch.setattr(package, "_C", SimpleNamespace(timer_enabled=False), raising=False)
+    with pytest.raises(RuntimeError, match="DEEPEP_MEGAMOE_TIMER"):
+        with op.capture_timer():
+            raise AssertionError("capture entered without a Timer-enabled build")
+    assert calls == []
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("mode", ["bf16", "none", "mxfp8", "auto"])
 def test_output_first_api_retains_gradients_options_and_cumulative_counts(api, operator, dtype, mode):

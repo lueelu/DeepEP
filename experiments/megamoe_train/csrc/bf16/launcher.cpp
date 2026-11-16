@@ -66,7 +66,7 @@ void LaunchMegaMoeBF16ForwardKernel(torch::Tensor context, torch::Tensor x, torc
                                     torch::Tensor training_saved_state, torch::Tensor dispatch_output,
                                     torch::Tensor forward_transient_workspace, const MegaMoeTilingData& tiling,
                                     uint32_t block_dim, void* symmetric_buffer, std::size_t symmetric_buffer_bytes,
-                                    int rank, int world_size, uint64_t ffts_addr)
+                                    int rank, int world_size, uint64_t ffts_addr, torch::Tensor timer)
 {
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
     TORCH_CHECK(world_size <= 1024, "MegaMoe BF16 supports at most 1024 EP ranks");
@@ -75,12 +75,22 @@ void LaunchMegaMoeBF16ForwardKernel(torch::Tensor context, torch::Tensor x, torc
 
     aclrtStream stream = GetCurrentAclStream();
 
-    auto kernel = &deepep_train_mega_moe_bf16_forward_kernel_do;
-    kernel(block_dim, stream, BytePtr(context.data_ptr()), BytePtr(x.data_ptr()), BytePtr(topk_ids.data_ptr()),
-           BytePtr(topk_weights.data_ptr()), BytePtr(weight1.data_ptr()), BytePtr(weight2.data_ptr()),
-           BytePtr(y.data_ptr()), BytePtr(expert_token_nums.data_ptr()), BytePtr(training_saved_state.data_ptr()),
-           dispatch_output.defined() ? BytePtr(dispatch_output.data_ptr()) : nullptr,
-           BytePtr(forward_transient_workspace.data_ptr()), reinterpret_cast<const uint8_t*>(&tiling), ffts_addr);
+    if (timer.defined()) {
+        auto kernel = &deepep_train_mega_moe_bf16_forward_timer_kernel_do;
+        kernel(block_dim, stream, BytePtr(context.data_ptr()), BytePtr(x.data_ptr()), BytePtr(topk_ids.data_ptr()),
+               BytePtr(topk_weights.data_ptr()), BytePtr(weight1.data_ptr()), BytePtr(weight2.data_ptr()),
+               BytePtr(y.data_ptr()), BytePtr(expert_token_nums.data_ptr()), BytePtr(training_saved_state.data_ptr()),
+               dispatch_output.defined() ? BytePtr(dispatch_output.data_ptr()) : nullptr,
+               BytePtr(forward_transient_workspace.data_ptr()), reinterpret_cast<const uint8_t*>(&tiling), ffts_addr,
+               BytePtr(timer.data_ptr()));
+    } else {
+        auto kernel = &deepep_train_mega_moe_bf16_forward_kernel_do;
+        kernel(block_dim, stream, BytePtr(context.data_ptr()), BytePtr(x.data_ptr()), BytePtr(topk_ids.data_ptr()),
+               BytePtr(topk_weights.data_ptr()), BytePtr(weight1.data_ptr()), BytePtr(weight2.data_ptr()),
+               BytePtr(y.data_ptr()), BytePtr(expert_token_nums.data_ptr()), BytePtr(training_saved_state.data_ptr()),
+               dispatch_output.defined() ? BytePtr(dispatch_output.data_ptr()) : nullptr,
+               BytePtr(forward_transient_workspace.data_ptr()), reinterpret_cast<const uint8_t*>(&tiling), ffts_addr);
+    }
 
     (void)symmetric_buffer_bytes;
 }
@@ -92,7 +102,7 @@ void LaunchMegaMoeBF16BackwardKernel(torch::Tensor context, torch::Tensor grad_y
                                      torch::Tensor dispatch_output, torch::Tensor backward_workspace,
                                      const MegaMoeTilingData& tiling, uint32_t splitExperts, uint32_t block_dim,
                                      void* symmetric_buffer, std::size_t symmetric_buffer_bytes, int rank,
-                                     int world_size, uint64_t ffts_addr)
+                                     int world_size, uint64_t ffts_addr, torch::Tensor timer)
 {
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
     TORCH_CHECK(world_size <= 1024, "MegaMoe BF16 supports at most 1024 EP ranks");
@@ -100,11 +110,22 @@ void LaunchMegaMoeBF16BackwardKernel(torch::Tensor context, torch::Tensor grad_y
     TORCH_CHECK(context_bytes >= sizeof(MegaMoeContext), "MegaMoe BF16 context tensor is too small");
 
     aclrtStream stream = GetCurrentAclStream();
-    auto kernel = &deepep_train_mega_moe_bf16_backward_ready_k_kernel_do;
-    kernel(block_dim, stream, BytePtr(context.data_ptr()), BytePtr(grad_y.data_ptr()), BytePtr(topk_weights.data_ptr()),
-           BytePtr(weight1.data_ptr()), BytePtr(weight2.data_ptr()), BytePtr(grad_x.data_ptr()),
-           BytePtr(grad_topk_weights.data_ptr()), BytePtr(grad_weight1.data_ptr()), BytePtr(grad_weight2.data_ptr()),
-           BytePtr(training_saved_state.data_ptr()), BytePtr(dispatch_output.data_ptr()),
-           BytePtr(backward_workspace.data_ptr()), reinterpret_cast<const uint8_t*>(&tiling), ffts_addr, splitExperts);
+    if (timer.defined()) {
+        auto kernel = &deepep_train_mega_moe_bf16_backward_timer_kernel_do;
+        kernel(block_dim, stream, BytePtr(context.data_ptr()), BytePtr(grad_y.data_ptr()),
+               BytePtr(topk_weights.data_ptr()), BytePtr(weight1.data_ptr()), BytePtr(weight2.data_ptr()),
+               BytePtr(grad_x.data_ptr()), BytePtr(grad_topk_weights.data_ptr()), BytePtr(grad_weight1.data_ptr()),
+               BytePtr(grad_weight2.data_ptr()), BytePtr(training_saved_state.data_ptr()),
+               BytePtr(dispatch_output.data_ptr()), BytePtr(backward_workspace.data_ptr()),
+               reinterpret_cast<const uint8_t*>(&tiling), ffts_addr, splitExperts, BytePtr(timer.data_ptr()));
+    } else {
+        auto kernel = &deepep_train_mega_moe_bf16_backward_ready_k_kernel_do;
+        kernel(block_dim, stream, BytePtr(context.data_ptr()), BytePtr(grad_y.data_ptr()),
+               BytePtr(topk_weights.data_ptr()), BytePtr(weight1.data_ptr()), BytePtr(weight2.data_ptr()),
+               BytePtr(grad_x.data_ptr()), BytePtr(grad_topk_weights.data_ptr()), BytePtr(grad_weight1.data_ptr()),
+               BytePtr(grad_weight2.data_ptr()), BytePtr(training_saved_state.data_ptr()),
+               BytePtr(dispatch_output.data_ptr()), BytePtr(backward_workspace.data_ptr()),
+               reinterpret_cast<const uint8_t*>(&tiling), ffts_addr, splitExperts);
+    }
     (void)symmetric_buffer_bytes;
 }

@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 import sys
 
+from deep_ep._timer import core_info, validate_event_lane
+
 from .protocol import (
     COUNTERS_PER_CORE,
     CYCLE_TO_US,
@@ -49,31 +51,6 @@ def load_raw(path: Path):
             "C++ and Python timer schemas synchronized"
         )
     return values
-
-
-def core_info(core_id: int) -> tuple[int, str, int]:
-    group_id, lane = divmod(core_id, 3)
-    return (
-        (group_id, "AIC", 0)
-        if lane == 0
-        else (
-            group_id,
-            "AIV",
-            lane - 1,
-        )
-    )
-
-
-def validate_event_lane(name: str, core_id: int, core_type: str, start: int, end: int) -> None:
-    if start <= 0 or end <= start:
-        return
-    expected = "AIC" if name.startswith("AIC_") else ("AIV" if name.startswith("AIV_") else None)
-    if expected is not None and core_type != expected:
-        raise ValueError(
-            f"{name}: nonzero event found in logical core {core_id} "
-            f"({core_type}); expected {expected}. Rebuild with the corrected "
-            "MIX_AIC_1_2 timer core mapping and recollect the raw trace."
-        )
 
 
 def event_names(dynamic_counts: list[int]) -> list[tuple[str, int]]:

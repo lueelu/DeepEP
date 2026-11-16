@@ -85,6 +85,11 @@ public:
                                 GM_ADDR trainingSavedState, GM_ADDR dispatchOutput, GM_ADDR backwardWorkspace,
                                 MegaMoeTilingData* tilingData, uint32_t splitExperts);
     __aicore__ inline void Process();
+    __aicore__ inline void SetTimer(MegaMoeTrainTimerDevice* timer)
+    {
+        timer_ = timer;
+        params_.timer = timer;
+    }
 
 private:
     __aicore__ inline void InitStageLayout();
@@ -169,6 +174,7 @@ private:
 
     __gm__ Mc2MoeContext* mc2Context_{nullptr};
     Params params_{};
+    MegaMoeTrainTimerDevice* timer_ = nullptr;
     BackwardSavedStateInfo savedState_{};
     BackwardWorkspaceInfo bwWs_{};
     uint32_t splitExperts_ = 0;
@@ -366,6 +372,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::TopkGradBuffInit(TPipe*
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GatherRoutes()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_GATHER);
     if constexpr (g_coreType == AscendC::AIC) {
         return;
     }
@@ -443,6 +450,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GatherRoutes()
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::RestoreTokenPerExpert()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_RESTORE_TABLE);
     const bool prepareMetadata = MegaMoeBF16Training::UseGmForBackwardDataGrad(savedGateUpMode_) && splitExperts_ > 0;
     int32_t perRank = static_cast<int32_t>(perRankStridesInTokenPerExpert_);
     LocalTensor<int32_t> tmpBuffer = StageUb(perRank * sizeof(int32_t)).template ReinterpretCast<int32_t>();
@@ -496,6 +504,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::RestoreTokenPerExpert()
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ResetTokenPerExpert()
 {
+    MegaMoeTrainTimerFixedScope timerReset(timer_, MegaMoeTrainTimer::AIV_RESET);
     // Restored counts must be cleared before the next forward's atomic count exchange.
     if (aivCoreIdx_ != blockAivNum_ - 1) {
         return;
@@ -555,6 +564,11 @@ template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchTokensBackward(GM_ADDR dstBase, uint32_t expertIdx,
                                                                                 uint32_t ordinal)
 {
+    if (timer_ != nullptr) {
+        timer_->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape_));
+        timer_->SetTaskShape(128, 256);
+    }
+    MegaMoeTrainTimerSpanScope timerDispatch(timer_, MegaMoeTrainTimer::AIV_BW_DISPATCH);
     int64_t widthA = k_;
     int32_t pingpongId = 0;
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
@@ -724,6 +738,7 @@ template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::UpdateGlobalBuffer(GMMAddrInfo& gmmAddrInfo, uint32_t phase,
                                                                             uint32_t expertIdx)
 {
+    gmmAddrInfo.timer = timer_;
     const int64_t base = cumMRows_;
     const uint64_t bf16 = sizeof(bfloat16_t);
     if (phase == BW_PHASE_RECOMPUTE) {
@@ -759,6 +774,8 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::UpdateGlobalBuffer(GMMA
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::CrossRankSyncInWorldSize()
 {
+    MegaMoeTrainTimerWaitScope timerWait(g_coreType == AscendC::AIV ? timer_ : nullptr,
+                                         MegaMoeTrainTimer::AIV_SYNC_WAIT);
     if constexpr (g_coreType == AscendC::AIC) {
         return;
     }
@@ -928,10 +945,17 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM1GradReuseDOPhase()
         auto* doReleased = reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwFlagDOReleased) + expertIdx * INT_CACHELINE;
         auto* dxReady = reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwFlagDXReady) + expertIdx * INT_CACHELINE;
         const int64_t rows = Get<M_VALUE>(problemShape_);
+        if (timer_ != nullptr) {
+            timer_->SetSlice(expertIdx, 0, rows);
+            timer_->SetTaskContext(-1, 2U);
+        }
         if constexpr (g_coreType == AscendC::AIC) {
             // Wait for all AIV dZ/Hp stores, which also retire the corresponding AIC dO reads.
 
-            while (ReadGmByPassDCache(dzReady) < 2 * static_cast<int32_t>(blockNum_)) {
+            {
+                MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_BW_DX_WAIT);
+                while (ReadGmByPassDCache(dzReady) < 2 * static_cast<int32_t>(blockNum_)) {
+                }
             }
 
             {
@@ -949,7 +973,13 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM1GradReuseDOPhase()
 
             // Count idle AICs too; no core may overwrite dO before all dW2 readers retire.
             AtomicAdd(doReleased, int32_t(1));
-            while (ReadGmByPassDCache(doReleased) < static_cast<int32_t>(blockNum_)) {
+            {
+                if (timer_ != nullptr) {
+                    timer_->SetSlice(expertIdx, 0, rows);
+                }
+                MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_BW_DO_REUSE_WAIT);
+                while (ReadGmByPassDCache(doReleased) < static_cast<int32_t>(blockNum_)) {
+                }
             }
         }
         {
@@ -1026,6 +1056,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM2DWPhase()
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::UnpermuteBackward()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_UNPERMUTE);
     if constexpr (g_coreType == AscendC::AIC) {
         return;
     }
@@ -1129,6 +1160,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceDpPartialBatch(ui
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_DP_REDUCE);
     if constexpr (g_coreType == AscendC::AIC) {
         return;
     }
@@ -1213,7 +1245,16 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad(
                     SyncFunc<AscendC::HardEvent::V_MTE3>();
                     AscendC::DataCopyExtParams copyParams{1U, static_cast<uint32_t>(batchRows * sizeof(TopkWeightT)),
                                                           0U, 0U, 0U};
-                    AscendC::DataCopyPad(remoteD[dstExpertOffset + coreRowBegin + batchBegin], routeBuf, copyParams);
+                    {
+                        if (timer_ != nullptr) {
+                            timer_->SetSlice(expert, rankRowBegin + coreRowBegin + batchBegin, batchRows);
+                            timer_->SetTaskShape(batchCapacity, 1, 0, partialTiles, 1);
+                            timer_->SetTaskContext(dstRank);
+                        }
+                        MegaMoeTrainTimerSpanScope timerSend(timer_, MegaMoeTrainTimer::AIV_BW_DP_SEND);
+                        AscendC::DataCopyPad(remoteD[dstExpertOffset + coreRowBegin + batchBegin], routeBuf,
+                                             copyParams);
+                    }
 
                     // Retire MTE3 before the next batch refills routeBuf.
                     SyncFunc<AscendC::HardEvent::MTE3_V>();
@@ -1228,6 +1269,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad(
 template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::UnpermuteTopkGrad()
 {
+    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_TOPK_UNPERMUTE);
     if constexpr (g_coreType == AscendC::AIC) {
         return;
     }
@@ -1335,16 +1377,25 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
         const int32_t p1OutstandingMask = vecSetSyncCom_;
         if constexpr (g_coreType == AscendC::AIC) {
             if ((p1OutstandingMask & 1) != 0) {
-                WaitForVector(BW_P1_EVENT);  // AIV0 wrote its last dZ tile
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_BW_DX_UB_WAIT);
+                    WaitForVector(BW_P1_EVENT);
+                }  // AIV0 wrote its last dZ tile
             }
             if ((p1OutstandingMask & 2) != 0) {
-                WaitForVector(BW_P1_EVENT + FLAG_ID_MAX);  // AIV1 wrote the last dZ tile
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_BW_DX_UB_WAIT);
+                    WaitForVector(BW_P1_EVENT + FLAG_ID_MAX);
+                }  // AIV1 wrote the last dZ tile
             }
             // Pair-local events cover only local tiles; P2/P3 require every AIV's dZ stores.
             const int32_t p1ReadyTarget = 2 * static_cast<int32_t>(blockNum_);
-            while (ReadGmByPassDCache(bwFlagAiv1Ready_) < p1ReadyTarget) {
-                const int64_t start = GetSystemCycle();
-                while (GetSystemCycle() - start < 100) {
+            {
+                MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_SYNC_WAIT);
+                while (ReadGmByPassDCache(bwFlagAiv1Ready_) < p1ReadyTarget) {
+                    const int64_t start = GetSystemCycle();
+                    while (GetSystemCycle() - start < 100) {
+                    }
                 }
             }
         }
@@ -1381,10 +1432,19 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
             // Tail sync: ensure AIV0 consumed every dX tile before P3/P4.
 
             if (vecSetSyncCom_ == 1) {
-                WaitForVector(0);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_BW_DX_UB_WAIT);
+                    WaitForVector(0);
+                }
             } else if (vecSetSyncCom_ >= 2) {
-                WaitForVector(gmm2PingPongIdx_);
-                WaitForVector(1 - gmm2PingPongIdx_);
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_BW_DX_UB_WAIT);
+                    WaitForVector(gmm2PingPongIdx_);
+                }
+                {
+                    MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_BW_DX_UB_WAIT);
+                    WaitForVector(1 - gmm2PingPongIdx_);
+                }
             }
         }
     }
@@ -1398,9 +1458,12 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
             GMM1DWPhase<false>();
         }
 
-        while (2 * static_cast<int32_t>(blockNum_) != ReadGmByPassDCache(bwFlagHDone_)) {
-            const int64_t start = GetSystemCycle();
-            while (GetSystemCycle() - start < 100) {
+        {
+            MegaMoeTrainTimerWaitScope timerWait(timer_, MegaMoeTrainTimer::AIC_SYNC_WAIT);
+            while (2 * static_cast<int32_t>(blockNum_) != ReadGmByPassDCache(bwFlagHDone_)) {
+                const int64_t start = GetSystemCycle();
+                while (GetSystemCycle() - start < 100) {
+                }
             }
         }
 

@@ -49,6 +49,10 @@ static constexpr float kClampMaskScale = 1.0e30F;
 template <typename L0TileShape_, typename TopkWeightT = bfloat16_t>
 class BlockEpilogueSwigluBackwardBF16 {
 public:
+    __aicore__ inline void SetTimer(MegaMoeTrainTimerDevice* timer)
+    {
+        timer_ = timer;
+    }
     static_assert(std::is_same_v<TopkWeightT, bfloat16_t> || std::is_same_v<TopkWeightT, float>,
                   "TopK weights must be BF16 or FP32");
     struct Arguments {
@@ -219,6 +223,7 @@ public:
     }
 
 private:
+    MegaMoeTrainTimerDevice* timer_ = nullptr;
     static constexpr uint32_t kTileRows = tla::get<0>(L0TileShape_{});
     static constexpr uint32_t kTileColumns = tla::get<1>(L0TileShape_{});
     static constexpr uint32_t kTileElements = kTileRows * kTileColumns;
@@ -269,6 +274,7 @@ private:
                                            AscendC::LocalTensor<bfloat16_t>& upDst)
     {
         if (params_.savedGateUpMode == MegaMoeBF16Training::kSaveMxFp8) {
+            MegaMoeTrainTimerSpanScope timerDecode(timer_, MegaMoeTrainTimer::AIV_BW_DECODE_GATE_UP);
             DecodeMxFp8Plane(gateMxFp8Gm_, gateScaleGm_, gateHighGm_, gateHighGm_, rowStart, nLoc, singleM, singleN,
                              gateDst, true);
             DecodeMxFp8Plane(upMxFp8Gm_, upScaleGm_, upLowGm_, upHighGm_, rowStart, nLoc, singleM, singleN, upDst,
