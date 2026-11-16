@@ -1,7 +1,7 @@
 # Mesh+PCIe、Mesh+Clos 与 Global Clos
 
 一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
-`29fad1201858af29f687c4b8637d112d5d0ff28b`。Mesh+Clos 保留本仓已有的 HT、LL、
+`a5e55f750d506d0fcfe01b5959299cbf019f762a`。Mesh+Clos 保留本仓已有的 HT、LL、
 实验组件和接口限制。Direct 实现包含 V1 Buffer、V2 ElasticBuffer、
 MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
