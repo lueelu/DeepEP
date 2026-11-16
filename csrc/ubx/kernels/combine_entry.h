@@ -7,14 +7,14 @@
 
 #include <cstdint>
 
-#include "kernel_operator.h"
-#include "shmem.h"
+#include <kernel_operator.h>
+#include <shmem.h>
 
-#include "../../kernels/common/core_context.h"
-#include "../../ubx/launch.hpp"
-#include "combine_server_dedup_kernel.h"
-#include "dispatch_server_dedup_magic.h"
-#include "ep_memory_server_dedup_combine_tiling.h"
+#include <kernels/common/core_context.h>
+#include <ubx/launch.hpp>
+#include <ubx/kernels/combine_server_dedup_kernel.h>
+#include <ubx/kernels/dispatch_server_dedup_magic.h>
+#include <ubx/kernels/ep_memory_server_dedup_combine_tiling.h>
 
 namespace UbxCombineEntry {
 

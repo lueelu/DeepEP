@@ -4,8 +4,8 @@
 #ifndef MEGA_MOE_SEND_MASK_H
 #define MEGA_MOE_SEND_MASK_H
 
-#include "../common/mega_moe_utils.hpp"
-#include "mega_moe_route_compact.hpp"
+#include <kernels/mega_moe/common/mega_moe_utils.hpp>
+#include <kernels/mega_moe/stage/mega_moe_route_compact.hpp>
 
 namespace MegaMoeImpl {
 

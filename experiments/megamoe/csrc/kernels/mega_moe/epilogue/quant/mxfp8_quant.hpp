@@ -10,7 +10,7 @@
 #define MEGA_MOE_ARCH35_MXFP8_QUANT_H
 
 #if defined(__DAV_C310__)
-#include "mx_quant_common.hpp"
+#include <kernels/mega_moe/epilogue/quant/mx_quant_common.hpp>
 
 namespace MegaMoeImpl {
 namespace MxQuant {

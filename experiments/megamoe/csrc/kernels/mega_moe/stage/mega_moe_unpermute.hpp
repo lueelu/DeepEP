@@ -12,8 +12,8 @@
 #ifndef MEGA_MOE_UNPERMUTE_H
 #define MEGA_MOE_UNPERMUTE_H
 
-#include "../common/mega_moe_mxfp8_utils.hpp"
-#include "../common/mega_moe_utils.hpp"
+#include <kernels/mega_moe/common/mega_moe_mxfp8_utils.hpp>
+#include <kernels/mega_moe/common/mega_moe_utils.hpp>
 
 namespace MegaMoeImpl {
 

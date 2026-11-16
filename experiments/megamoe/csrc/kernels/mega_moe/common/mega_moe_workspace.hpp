@@ -10,7 +10,7 @@
 #define MEGA_MOE_WORKSPACE_H
 
 // peermem 窗口的布局与尺寸（含 HOST_DEVICE / GM_ADDR 宏与基础 include）。
-#include "mega_moe_peermem.hpp"
+#include <kernels/mega_moe/common/mega_moe_peermem.hpp>
 
 namespace MegaMoeImpl {
 

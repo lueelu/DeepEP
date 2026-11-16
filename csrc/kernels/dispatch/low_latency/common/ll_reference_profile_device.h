@@ -1,9 +1,9 @@
 #pragma once
-#include "kernel_operator.h"
-#include "../../../common/core_context.h"
-#include "ll_reference_profile_layout.h"
+#include <kernel_operator.h>
+#include <kernels/common/core_context.h>
+#include <kernels/dispatch/low_latency/common/ll_reference_profile_layout.h>
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
-#include "shmem.h"
+#include <shmem.h>
 #endif
 #if defined(DEEPEP_LL_STAGE_TIMER)
 #error Legacy LL stage/expert instrumentation has been removed

@@ -3,10 +3,10 @@
 #ifndef MEGA_MOE_CATLASS_MX_MATMUL_H
 #define MEGA_MOE_CATLASS_MX_MATMUL_H
 
-#include "tensor_api/tensor.h"
-#include "catlass/detail/alignment.hpp"
-#include "catlass/gemm/block/block_mmad.hpp"
-#include "block_mmad_mx.hpp"
+#include <tensor_api/tensor.h>
+#include <catlass/detail/alignment.hpp>
+#include <catlass/gemm/block/block_mmad.hpp>
+#include <kernels/mega_moe/catlass_gmm/block_mmad_mx.hpp>
 
 namespace MegaMoeImpl::GmmKernel {
 

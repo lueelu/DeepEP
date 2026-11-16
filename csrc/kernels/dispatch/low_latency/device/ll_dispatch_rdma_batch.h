@@ -1,7 +1,7 @@
 #pragma once
-#include "ll_transport.h"
-#include "ll_count_frame_transport.h"
-#include "../common/ll_reference_profile_device.h"
+#include <kernels/dispatch/low_latency/device/ll_transport.h>
+#include <kernels/dispatch/low_latency/device/ll_count_frame_transport.h>
+#include <kernels/dispatch/low_latency/common/ll_reference_profile_device.h>
 
 namespace LlTransport {
 // One staged-but-not-posted packet. Reuse the existing GM batch and output

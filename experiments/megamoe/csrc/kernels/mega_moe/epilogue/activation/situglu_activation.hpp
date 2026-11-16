@@ -10,7 +10,7 @@
 #define MEGA_MOE_ARCH35_SITUGLU_ACTIVATION_H
 
 #if defined(__DAV_C310__)
-#include "activation_common.hpp"
+#include <kernels/mega_moe/epilogue/activation/activation_common.hpp>
 
 /*
  * SiTUGLU 两段式 tanh：|x| < 0.6 使用多项式路径，其余使用 sigmoid 分解路径。

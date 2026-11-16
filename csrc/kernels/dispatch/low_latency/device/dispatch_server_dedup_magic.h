@@ -4,9 +4,9 @@
 #ifndef DISPATCH_SERVER_DEDUP_MAGIC_H
 #define DISPATCH_SERVER_DEDUP_MAGIC_H
 
-#include "kernel_operator.h"
-#include "../common/ep_memory_server_dedup_count_layout.h"
-#include "../common/ll_jit_spec.h"
+#include <kernel_operator.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
 
 namespace DispatchDedup {
 // 中文审计：每轮每核仅调用一次，轮转本地双窗口状态；初值由Host清零，随后按1/0交替。

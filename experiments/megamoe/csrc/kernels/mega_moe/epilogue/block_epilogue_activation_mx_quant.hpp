@@ -19,21 +19,21 @@
 
 #if defined(__DAV_C310__)
 #if ASC_DEVKIT_MAJOR >= 9
-#include "basic_api/kernel_basic_intf.h"
+#include <basic_api/kernel_basic_intf.h>
 #else
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 #endif
-#include "../common/mega_moe_constants.hpp"
-#include "../common/mega_moe_utils.hpp"
-#include "activation/activation_common.hpp"
-#include "activation/situglu_activation.hpp"
-#include "activation/swiglu_activation.hpp"
-#include "activation/swigluoai_activation.hpp"
-#include "block_epilogue_ub_layout.hpp"
-#include "quant/mx_quant_common.hpp"
-#include "quant/mx_quant_compute_scale.hpp"
-#include "quant/mxfp4_quant.hpp"
-#include "quant/mxfp8_quant.hpp"
+#include <kernels/mega_moe/common/mega_moe_constants.hpp>
+#include <kernels/mega_moe/common/mega_moe_utils.hpp>
+#include <kernels/mega_moe/epilogue/activation/activation_common.hpp>
+#include <kernels/mega_moe/epilogue/activation/situglu_activation.hpp>
+#include <kernels/mega_moe/epilogue/activation/swiglu_activation.hpp>
+#include <kernels/mega_moe/epilogue/activation/swigluoai_activation.hpp>
+#include <kernels/mega_moe/epilogue/block_epilogue_ub_layout.hpp>
+#include <kernels/mega_moe/epilogue/quant/mx_quant_common.hpp>
+#include <kernels/mega_moe/epilogue/quant/mx_quant_compute_scale.hpp>
+#include <kernels/mega_moe/epilogue/quant/mxfp4_quant.hpp>
+#include <kernels/mega_moe/epilogue/quant/mxfp8_quant.hpp>
 
 namespace ActivationQuantMsg {
 using ActMode = MegaMoeImpl::MegaMoeActMode;

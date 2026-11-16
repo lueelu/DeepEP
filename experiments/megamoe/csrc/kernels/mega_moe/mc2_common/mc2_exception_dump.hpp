@@ -18,7 +18,7 @@
 #ifndef MC2_EXCEPTION_DUMP_H
 #define MC2_EXCEPTION_DUMP_H
 
-#include "version/asc_devkit_version.h"
+#include <version/asc_devkit_version.h>
 
 namespace MC2ExceptionDump {
 
@@ -64,9 +64,9 @@ struct alignas(8) DumpParams {
 
 #if defined(__CCE_AICORE__)
 #if ASC_DEVKIT_MAJOR >= 9
-#include "basic_api/kernel_basic_intf.h"
+#include <basic_api/kernel_basic_intf.h>
 #else
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 #endif
 
 using namespace AscendC;

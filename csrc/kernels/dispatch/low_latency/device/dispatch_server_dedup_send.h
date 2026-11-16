@@ -6,20 +6,20 @@
 // prepare_snapshot.py仅在实验副本中截断SendPacket并加入观测输出，生产路径不受该提取影响。
 #ifndef DISPATCH_SERVER_DEDUP_SEND_H
 #define DISPATCH_SERVER_DEDUP_SEND_H
-#include "../common/ll_reference_profile_device.h"
+#include <kernels/dispatch/low_latency/common/ll_reference_profile_device.h>
 
-#include "kernel_operator.h"
-#include "ll_transport.h"
-#include "ll_dispatch_rdma_batch.h"
-#include "dispatch_dedup_mxfp8_quant.h"
-#include "../common/ep_memory_server_dedup_data_layout.h"
-#include "../common/ep_memory_server_dedup_protocol.h"
-#include "../common/ll_send_order.h"
-#include "../common/ll_fullmesh_first_hop.h"
-#include "../common/ll_jit_spec.h"
-#include "../common/ll_sender_route_plan.h"
-#include "../common/ll_sender_input_reuse.h"
-#include "../../../common/ep_packet_receive_layout.h"
+#include <kernel_operator.h>
+#include <kernels/dispatch/low_latency/device/ll_transport.h>
+#include <kernels/dispatch/low_latency/device/ll_dispatch_rdma_batch.h>
+#include <kernels/dispatch/low_latency/device/dispatch_dedup_mxfp8_quant.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_data_layout.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_protocol.h>
+#include <kernels/dispatch/low_latency/common/ll_send_order.h>
+#include <kernels/dispatch/low_latency/common/ll_fullmesh_first_hop.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
+#include <kernels/dispatch/low_latency/common/ll_sender_route_plan.h>
+#include <kernels/dispatch/low_latency/common/ll_sender_input_reuse.h>
+#include <kernels/common/ep_packet_receive_layout.h>
 
 namespace DispatchDedup {
 using namespace AscendC;

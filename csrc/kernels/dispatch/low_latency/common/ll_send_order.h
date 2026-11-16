@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "../../../common/ep_server_order.h"
+#include <kernels/common/ep_server_order.h>
 
 namespace DispatchDedup {
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)

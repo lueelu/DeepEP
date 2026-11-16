@@ -13,7 +13,7 @@
 #endif
 
 #if DISPATCH_DEDUP_ASCENDC_AICORE_COMPILE
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 #endif
 
 #ifndef GM_ADDR

@@ -4,10 +4,10 @@
 #ifndef MEGA_MOE_MXFP8_UTILS_H
 #define MEGA_MOE_MXFP8_UTILS_H
 
-#include "kernel_operator.h"
-#include "op_common/op_kernel/math_util.h"
-#include "mega_moe_constants.hpp"
-#include "../mc2_common/quantize_functions.hpp"
+#include <kernel_operator.h>
+#include <op_common/op_kernel/math_util.h>
+#include <kernels/mega_moe/common/mega_moe_constants.hpp>
+#include <kernels/mega_moe/mc2_common/quantize_functions.hpp>
 
 namespace MegaMoeImpl {
 

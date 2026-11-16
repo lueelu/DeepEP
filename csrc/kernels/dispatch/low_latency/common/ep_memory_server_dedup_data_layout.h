@@ -4,8 +4,8 @@
 #ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_DATA_LAYOUT_H
 #define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_DATA_LAYOUT_H
 
-#include "ep_memory_server_dedup_count_layout.h"
-#include "ep_memory_server_dedup_input.h"
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_input.h>
 
 namespace DispatchDedup {
 #if DISPATCH_DEDUP_ASCENDC_AICORE_COMPILE

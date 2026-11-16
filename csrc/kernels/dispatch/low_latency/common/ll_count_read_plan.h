@@ -1,5 +1,5 @@
 #pragma once
-#include "ll_count_frame_layout.h"
+#include <kernels/dispatch/low_latency/common/ll_count_frame_layout.h>
 
 namespace DispatchDedup {
 // At most ceil(1024 / 8)=128 logical records per receiver and world>=32.

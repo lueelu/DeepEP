@@ -4,10 +4,10 @@
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_SOURCE_AGGREGATE_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_SOURCE_AGGREGATE_H
 
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
-#include "ep_memory_server_dedup_combine_config.h"
-#include "dispatch_dedup_types.h"
+#include <ubx/kernels/ep_memory_server_dedup_combine_config.h>
+#include <ubx/kernels/dispatch_dedup_types.h>
 
 namespace UbxCombine {
 using namespace AscendC;

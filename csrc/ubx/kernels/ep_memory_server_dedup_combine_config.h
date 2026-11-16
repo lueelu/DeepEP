@@ -5,11 +5,11 @@
 #define COMBINE_DEDUP_EP_MEMORY_SERVER_DEDUP_COMBINE_CONFIG_H
 
 #include <cstdint>
-#include "ep_memory_server_dedup_protocol.h"
-#include "ll_core_config.h"
-#include "combine_notify_layout.h"
-#include "combine_core_layout.h"
-#include "combine_source_index.h"
+#include <ubx/kernels/ep_memory_server_dedup_protocol.h>
+#include <ubx/kernels/ll_core_config.h>
+#include <ubx/kernels/combine_notify_layout.h>
+#include <ubx/kernels/combine_core_layout.h>
+#include <ubx/kernels/combine_source_index.h>
 
 #if 0 && (0 || 0 || 0)
 #error "local-first cannot combine with early-reduce, progress-probe or simt-flag"

@@ -13,15 +13,15 @@
 #ifndef MEGA_MOE_BLOCK_MMAD_MX_H
 #define MEGA_MOE_BLOCK_MMAD_MX_H
 
-#include "resource.hpp"
-#include "catlass/catlass.hpp"
-#include "catlass/coord.hpp"
-#include "catlass/numeric_size.hpp"
-#include "catlass/gemm/dispatch_policy.hpp"
-#include "catlass/gemm/helper.hpp"
-#include "catlass/gemm_coord.hpp"
-#include "tla/layout.hpp"
-#include "tla/tensor.hpp"
+#include <kernels/mega_moe/catlass_gmm/resource.hpp>
+#include <catlass/catlass.hpp>
+#include <catlass/coord.hpp>
+#include <catlass/numeric_size.hpp>
+#include <catlass/gemm/dispatch_policy.hpp>
+#include <catlass/gemm/helper.hpp>
+#include <catlass/gemm_coord.hpp>
+#include <tla/layout.hpp>
+#include <tla/tensor.hpp>
 
 namespace Catlass::Gemm::Block {
 

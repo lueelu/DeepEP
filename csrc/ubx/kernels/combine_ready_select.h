@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
 namespace UbxCombine {
 constexpr uint32_t kReadyTaskDone = 1U << 16U;

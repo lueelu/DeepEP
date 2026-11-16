@@ -12,9 +12,9 @@
 #ifndef MEGA_MOE_ARCH35_EXCEPTION_DUMP_POLICY_H
 #define MEGA_MOE_ARCH35_EXCEPTION_DUMP_POLICY_H
 
-#include "../mc2_common/mc2_exception_dump.hpp"
-#include "mega_moe_workspace.hpp"
-#include "../mega_moe_tiling.hpp"
+#include <kernels/mega_moe/mc2_common/mc2_exception_dump.hpp>
+#include <kernels/mega_moe/common/mega_moe_workspace.hpp>
+#include <kernels/mega_moe/mega_moe_tiling.hpp>
 
 namespace MegaMoeImpl {
 

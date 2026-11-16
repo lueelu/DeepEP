@@ -1,6 +1,6 @@
 // Copyright (c) 2026, Lu Lu
 #pragma once
-#include "../../kernels/dispatch/low_latency/common/ll_group_policy.h"
+#include <kernels/dispatch/low_latency/common/ll_group_policy.h>
 
 namespace UbxDispatch {
 using DispatchDedup::kLlPhysicalRanksPerHost;

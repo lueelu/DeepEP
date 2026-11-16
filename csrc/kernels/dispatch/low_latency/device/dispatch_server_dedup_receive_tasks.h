@@ -4,8 +4,8 @@
 #ifndef DISPATCH_SERVER_DEDUP_RECEIVE_TASKS_H
 #define DISPATCH_SERVER_DEDUP_RECEIVE_TASKS_H
 
-#include "kernel_operator.h"
-#include "../common/ep_memory_server_dedup_data_layout.h"
+#include <kernel_operator.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_data_layout.h>
 
 namespace DispatchDedup {
 using namespace AscendC;

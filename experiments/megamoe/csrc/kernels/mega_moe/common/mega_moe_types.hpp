@@ -12,15 +12,15 @@
 #ifndef MEGA_MOE_TYPES_H
 #define MEGA_MOE_TYPES_H
 
-#include "lib/std/tuple.h"
-#include "tensor_api/tensor.h"
-#include "../mega_moe_tiling.hpp"
-#include "mega_moe_constants.hpp"
-#include "mega_moe_workspace.hpp"
+#include <lib/std/tuple.h>
+#include <tensor_api/tensor.h>
+#include <kernels/mega_moe/mega_moe_tiling.hpp>
+#include <kernels/mega_moe/common/mega_moe_constants.hpp>
+#include <kernels/mega_moe/common/mega_moe_workspace.hpp>
 #if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
-#include "adv_api/hcomm/hcomm.h"
+#include <adv_api/hcomm/hcomm.h>
 #endif
-#include "../mc2_common/mc2_moe_context.hpp"
+#include <kernels/mega_moe/mc2_common/mc2_moe_context.hpp>
 
 class AscendTimerDevice;
 

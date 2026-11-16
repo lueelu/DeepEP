@@ -6,7 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include "ll_group_policy.h"
+#include <ubx/kernels/ll_group_policy.h>
 
 namespace UbxDispatch {
 // Routing group is selected by Host tiling key; this constant is capacity only.

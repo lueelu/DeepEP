@@ -4,11 +4,11 @@
 #ifndef DISPATCH_SERVER_DEDUP_KERNEL_H
 #define DISPATCH_SERVER_DEDUP_KERNEL_H
 
-#include "common/ll_reference_profile_device.h"
-#include "device/dispatch_server_dedup_magic.h"
-#include "device/dispatch_server_dedup_counts.h"
-#include "device/dispatch_server_dedup_send.h"
-#include "device/dispatch_server_dedup_recv.h"
+#include <kernels/dispatch/low_latency/common/ll_reference_profile_device.h>
+#include <kernels/dispatch/low_latency/device/dispatch_server_dedup_magic.h>
+#include <kernels/dispatch/low_latency/device/dispatch_server_dedup_counts.h>
+#include <kernels/dispatch/low_latency/device/dispatch_server_dedup_send.h>
+#include <kernels/dispatch/low_latency/device/dispatch_server_dedup_recv.h>
 
 namespace DispatchDedup {
 // The input element class and the group size are the only compile-time axes;

@@ -14,14 +14,14 @@
 
 #include <type_traits>
 
-#include "kernel_operator.h"
-#include "../common/ascend_timer_v2_device.hpp"
-#include "kernel_tiling/kernel_tiling.h"
-#include "kernel_operator_list_tensor_intf.h"
-#include "lib/matmul_intf.h"
-#include "tensor_api/tensor.h"
-#include "../epilogue/block_epilogue_activation_mx_quant.hpp"
-#include "../common/mega_moe_gmm_common.hpp"
+#include <kernel_operator.h>
+#include <kernels/mega_moe/common/ascend_timer_v2_device.hpp>
+#include <kernel_tiling/kernel_tiling.h>
+#include <kernel_operator_list_tensor_intf.h>
+#include <lib/matmul_intf.h>
+#include <tensor_api/tensor.h>
+#include <kernels/mega_moe/epilogue/block_epilogue_activation_mx_quant.hpp>
+#include <kernels/mega_moe/common/mega_moe_gmm_common.hpp>
 
 namespace MegaMoeImpl {
 

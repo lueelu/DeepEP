@@ -2,8 +2,8 @@
 // Modified by SimpleBright_Man 2026
 #pragma once
 
-#include "catlass/gemm/block/block_swizzle.hpp"
-#include "tensor_api/tensor.h"
+#include <catlass/gemm/block/block_swizzle.hpp>
+#include <tensor_api/tensor.h>
 
 namespace MegaMoeImpl::GmmKernel {
 // Shared by W4A8 and generic GEMM. CATLASS returns tile indices; the existing Wave stages consume element offsets.

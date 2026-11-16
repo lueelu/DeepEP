@@ -13,7 +13,7 @@
 #define MEGA_MOE_CONSTANTS_H
 
 #include <cstdint>
-#include "mega_moe_shared_policy.hpp"
+#include <kernels/mega_moe/common/mega_moe_shared_policy.hpp>
 
 namespace MegaMoeImpl {
 

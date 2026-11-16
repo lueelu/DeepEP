@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "ll_group_policy.h"
+#include <kernels/dispatch/low_latency/common/ll_group_policy.h>
 
 namespace DispatchDedup {
 struct LlCountAssignment {

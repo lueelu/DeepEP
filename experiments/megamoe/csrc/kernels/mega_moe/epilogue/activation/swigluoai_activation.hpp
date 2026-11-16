@@ -10,7 +10,7 @@
 #define MEGA_MOE_ARCH35_SWIGLUOAI_ACTIVATION_H
 
 #if defined(__DAV_C310__)
-#include "activation_common.hpp"
+#include <kernels/mega_moe/epilogue/activation/activation_common.hpp>
 
 namespace MegaMoeImpl {
 namespace Activation {

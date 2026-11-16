@@ -17,26 +17,26 @@
 #ifndef MEGA_MOE_ARCH35_H
 #define MEGA_MOE_ARCH35_H
 
-#include "kernel_operator.h"
-#include "kernels/common/core_context.h"
-#include "kernel_tiling/kernel_tiling.h"
-#include "mc2_common/mc2_kernel_utils.hpp"
-#include "kernel_operator_list_tensor_intf.h"
-#include "common/mega_moe_types.hpp"
-#include "common/mega_moe_workspace.hpp"
-#include "common/mega_moe_utils.hpp"
-#include "common/ascend_timer_v2_device.hpp"
-#include "common/mega_moe_exception_dump_policy.hpp"
-#include "epilogue/block_epilogue_activation_mx_quant.hpp"
-#include "stage/mega_moe_token_quant.hpp"
-#include "stage/mega_moe_send_mask.hpp"
-#include "stage/mega_moe_workspace_reset.hpp"
-#include "stage/mega_moe_shared_expert_input.hpp"
-#include "stage/mega_moe_token_dispatch.hpp"
-#include "stage/mega_moe_gmm1_activation.hpp"
-#include "stage/mega_moe_gmm2_combine.hpp"
-#include "stage/mega_moe_unpermute.hpp"
-#include "mc2_common/quantize_functions.hpp"
+#include <kernel_operator.h>
+#include <kernels/common/core_context.h>
+#include <kernel_tiling/kernel_tiling.h>
+#include <kernels/mega_moe/mc2_common/mc2_kernel_utils.hpp>
+#include <kernel_operator_list_tensor_intf.h>
+#include <kernels/mega_moe/common/mega_moe_types.hpp>
+#include <kernels/mega_moe/common/mega_moe_workspace.hpp>
+#include <kernels/mega_moe/common/mega_moe_utils.hpp>
+#include <kernels/mega_moe/common/ascend_timer_v2_device.hpp>
+#include <kernels/mega_moe/common/mega_moe_exception_dump_policy.hpp>
+#include <kernels/mega_moe/epilogue/block_epilogue_activation_mx_quant.hpp>
+#include <kernels/mega_moe/stage/mega_moe_token_quant.hpp>
+#include <kernels/mega_moe/stage/mega_moe_send_mask.hpp>
+#include <kernels/mega_moe/stage/mega_moe_workspace_reset.hpp>
+#include <kernels/mega_moe/stage/mega_moe_shared_expert_input.hpp>
+#include <kernels/mega_moe/stage/mega_moe_token_dispatch.hpp>
+#include <kernels/mega_moe/stage/mega_moe_gmm1_activation.hpp>
+#include <kernels/mega_moe/stage/mega_moe_gmm2_combine.hpp>
+#include <kernels/mega_moe/stage/mega_moe_unpermute.hpp>
+#include <kernels/mega_moe/mc2_common/quantize_functions.hpp>
 
 namespace MegaMoeImpl {
 

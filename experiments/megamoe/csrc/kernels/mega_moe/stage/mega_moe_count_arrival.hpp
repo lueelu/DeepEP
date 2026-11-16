@@ -3,7 +3,7 @@
 #ifndef MEGA_MOE_COUNT_ARRIVAL_H
 #define MEGA_MOE_COUNT_ARRIVAL_H
 
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
 namespace MegaMoeImpl {
 

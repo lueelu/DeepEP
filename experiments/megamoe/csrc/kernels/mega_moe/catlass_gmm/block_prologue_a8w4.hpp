@@ -12,17 +12,17 @@
 #ifndef MEGA_MOE_CATLASS_BLOCK_PROLOGUE_A8W4_HPP
 #define MEGA_MOE_CATLASS_BLOCK_PROLOGUE_A8W4_HPP
 
-#include "resource.hpp"
-#include "a8w4_k_plan.hpp"
-#include "catlass/catlass.hpp"
-#include "catlass/coord.hpp"
-#include "catlass/numeric_size.hpp"
-#include "catlass/gemm/dispatch_policy.hpp"
-#include "catlass/gemm/helper.hpp"
-#include "catlass/gemm_coord.hpp"
-#include "catlass/epilogue/tile/tile_copy.hpp"
-#include "tla/layout.hpp"
-#include "tla/tensor.hpp"
+#include <kernels/mega_moe/catlass_gmm/resource.hpp>
+#include <kernels/mega_moe/catlass_gmm/a8w4_k_plan.hpp>
+#include <catlass/catlass.hpp>
+#include <catlass/coord.hpp>
+#include <catlass/numeric_size.hpp>
+#include <catlass/gemm/dispatch_policy.hpp>
+#include <catlass/gemm/helper.hpp>
+#include <catlass/gemm_coord.hpp>
+#include <catlass/epilogue/tile/tile_copy.hpp>
+#include <tla/layout.hpp>
+#include <tla/tensor.hpp>
 
 namespace Catlass::Gemm::Block {
 template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, class TileShapeL1_, class TileCopy_>

@@ -1,5 +1,5 @@
 #pragma once
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
 namespace DispatchDedup {
 // Same MicroAPI/VF calling convention as pinned SHMEM's GetExpertFreq.

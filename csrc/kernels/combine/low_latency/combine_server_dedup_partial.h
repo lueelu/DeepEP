@@ -4,13 +4,13 @@
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 
-#include "kernel_operator.h"
-#include "../../dispatch/low_latency/common/comm_args.h"
-#include "../../dispatch/low_latency/common/dispatch_dedup_types.h"
-#include "../../dispatch/low_latency/common/ll_jit_spec.h"
-#include "ep_memory_server_dedup_buffer_layout.h"
-#include "ep_memory_server_dedup_combine_config.h"
-#include "combine_server_dedup_select.h"
+#include <kernel_operator.h>
+#include <kernels/dispatch/low_latency/common/comm_args.h>
+#include <kernels/dispatch/low_latency/common/dispatch_dedup_types.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
+#include <kernels/combine/low_latency/ep_memory_server_dedup_buffer_layout.h>
+#include <kernels/combine/low_latency/ep_memory_server_dedup_combine_config.h>
+#include <kernels/combine/low_latency/combine_server_dedup_select.h>
 
 namespace CombineDedup {
 using namespace AscendC;

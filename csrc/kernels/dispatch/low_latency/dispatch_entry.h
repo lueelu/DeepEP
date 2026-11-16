@@ -22,19 +22,19 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "kernel_operator.h"
-#include "shmem.h"
+#include <kernel_operator.h>
+#include <shmem.h>
 
-#include "../../launch.hpp"
-#include "../../common/core_context.h"
-#include "common/dispatch_dedup_types.h"
-#include "common/ep_memory_server_dedup_tiling.h"
-#include "common/ll_core_config.h"
-#include "common/ll_dispatch_variant.h"
-#include "common/ll_group_policy.h"
-#include "common/ll_reference_profile_layout.h"
-#include "dispatch_server_dedup_kernel.h"
-#include "launch.hpp"
+#include <kernels/launch.hpp>
+#include <kernels/common/core_context.h>
+#include <kernels/dispatch/low_latency/common/dispatch_dedup_types.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_tiling.h>
+#include <kernels/dispatch/low_latency/common/ll_core_config.h>
+#include <kernels/dispatch/low_latency/common/ll_dispatch_variant.h>
+#include <kernels/dispatch/low_latency/common/ll_group_policy.h>
+#include <kernels/dispatch/low_latency/common/ll_reference_profile_layout.h>
+#include <kernels/dispatch/low_latency/dispatch_server_dedup_kernel.h>
+#include <kernels/dispatch/low_latency/launch.hpp>
 
 #if CATLASS_ARCH == 3510
 namespace DispatchDedupEntry {

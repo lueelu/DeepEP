@@ -13,16 +13,16 @@
 #ifndef MEGA_MOE_CATLASS_BLOCK_MMAD_A8W4_HPP
 #define MEGA_MOE_CATLASS_BLOCK_MMAD_A8W4_HPP
 
-#include "resource.hpp"
-#include "a8w4_k_plan.hpp"
-#include "catlass/catlass.hpp"
-#include "catlass/coord.hpp"
-#include "catlass/numeric_size.hpp"
-#include "catlass/gemm/dispatch_policy.hpp"
-#include "catlass/gemm/helper.hpp"
-#include "catlass/gemm_coord.hpp"
-#include "tla/layout.hpp"
-#include "tla/tensor.hpp"
+#include <kernels/mega_moe/catlass_gmm/resource.hpp>
+#include <kernels/mega_moe/catlass_gmm/a8w4_k_plan.hpp>
+#include <catlass/catlass.hpp>
+#include <catlass/coord.hpp>
+#include <catlass/numeric_size.hpp>
+#include <catlass/gemm/dispatch_policy.hpp>
+#include <catlass/gemm/helper.hpp>
+#include <catlass/gemm_coord.hpp>
+#include <tla/layout.hpp>
+#include <tla/tensor.hpp>
 
 namespace Catlass::Gemm::Block {
 

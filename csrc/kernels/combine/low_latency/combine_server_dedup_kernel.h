@@ -4,16 +4,16 @@
 #ifndef COMBINE_DEDUP_EP_COMBINE_MEMORY_SERVER_DEDUP_KERNEL_H
 #define COMBINE_DEDUP_EP_COMBINE_MEMORY_SERVER_DEDUP_KERNEL_H
 
-#include "kernel_operator.h"
-#include "../../common/core_context.h"
-#include "../../dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h"
-#include "../../dispatch/low_latency/common/comm_args.h"
-#include "../../dispatch/low_latency/common/ll_jit_spec.h"
-#include "ep_memory_server_dedup_buffer_layout.h"
-#include "ep_memory_server_dedup_combine_config.h"
-#include "combine_server_dedup_partial.h"
-#include "combine_server_dedup_source_aggregate.h"
-#include "combine_server_dedup_select.h"
+#include <kernel_operator.h>
+#include <kernels/common/core_context.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
+#include <kernels/dispatch/low_latency/common/comm_args.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
+#include <kernels/combine/low_latency/ep_memory_server_dedup_buffer_layout.h>
+#include <kernels/combine/low_latency/ep_memory_server_dedup_combine_config.h>
+#include <kernels/combine/low_latency/combine_server_dedup_partial.h>
+#include <kernels/combine/low_latency/combine_server_dedup_source_aggregate.h>
+#include <kernels/combine/low_latency/combine_server_dedup_select.h>
 
 namespace CombineDedup {
 using namespace AscendC;

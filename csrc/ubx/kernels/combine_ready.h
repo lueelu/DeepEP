@@ -1,10 +1,10 @@
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
-#include "ll_transport.h"
-#include "ep_memory_server_dedup_buffer_layout.h"
+#include <ubx/kernels/ll_transport.h>
+#include <ubx/kernels/ep_memory_server_dedup_buffer_layout.h>
 
 namespace UbxCombine {
 // Each receive core polls and clears its own ready row in the active window.

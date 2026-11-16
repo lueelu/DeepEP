@@ -19,11 +19,11 @@
 
 #if defined(__DAV_C310__)
 #if ASC_DEVKIT_MAJOR >= 9
-#include "basic_api/kernel_basic_intf.h"
+#include <basic_api/kernel_basic_intf.h>
 #else
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 #endif
-#include "../../common/mega_moe_constants.hpp"
+#include <kernels/mega_moe/common/mega_moe_constants.hpp>
 
 namespace MegaMoeImpl {
 namespace Activation {

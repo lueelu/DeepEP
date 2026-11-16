@@ -4,7 +4,7 @@
 #ifndef MEGA_MOE_ROUTE_COMPACT_H
 #define MEGA_MOE_ROUTE_COMPACT_H
 
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
 namespace MegaMoeImpl {
 

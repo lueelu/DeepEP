@@ -4,7 +4,7 @@
 #ifndef DISPATCH_DEDUP_EP_KERNELS_DISPATCH_DEDUP_EP_MXFP8_QUANT_H
 #define DISPATCH_DEDUP_EP_KERNELS_DISPATCH_DEDUP_EP_MXFP8_QUANT_H
 
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
 namespace DispatchDedupMxfp8Quant {
 using namespace AscendC;

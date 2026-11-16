@@ -4,20 +4,20 @@
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 
-#include "kernel_operator.h"
-#include "../../kernels/common/core_context.h"
-#include "combine_ready.h"
-#include "combine_ready_select.h"
+#include <kernel_operator.h>
+#include <kernels/common/core_context.h>
+#include <ubx/kernels/combine_ready.h>
+#include <ubx/kernels/combine_ready_select.h>
 
-#include "ll_transport.h"
-#include "combine_rdma_return.h"
-#include "combine_stage_wire.h"
-#include "comm_args.h"
-#include "dispatch_dedup_types.h"
-#include "ep_memory_server_dedup_buffer_layout.h"
-#include "ep_memory_server_dedup_combine_config.h"
-#include "combine_server_dedup_select.h"
-#include "combine_partial_plan.h"
+#include <ubx/kernels/ll_transport.h>
+#include <ubx/kernels/combine_rdma_return.h>
+#include <ubx/kernels/combine_stage_wire.h>
+#include <ubx/kernels/comm_args.h>
+#include <ubx/kernels/dispatch_dedup_types.h>
+#include <ubx/kernels/ep_memory_server_dedup_buffer_layout.h>
+#include <ubx/kernels/ep_memory_server_dedup_combine_config.h>
+#include <ubx/kernels/combine_server_dedup_select.h>
+#include <ubx/kernels/combine_partial_plan.h>
 
 namespace UbxCombine {
 using namespace AscendC;

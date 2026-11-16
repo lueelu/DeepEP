@@ -1,6 +1,6 @@
 #pragma once
-#include "ll_transport.h"
-#include "../common/ll_jit_spec.h"
+#include <kernels/dispatch/low_latency/device/ll_transport.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
 namespace LlTransport {
 // Per-core CQ bookkeeping, independent of receiver publication. A payload
 // quiet on the same peer/QP also retires the earlier count request.

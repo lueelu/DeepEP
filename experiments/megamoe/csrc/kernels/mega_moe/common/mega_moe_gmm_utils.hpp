@@ -3,7 +3,7 @@
 #pragma once
 
 #include <type_traits>
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
 namespace MegaMoeImpl::GmmKernel {
 // Both Ascend FP4 encodings pack two logical elements into one byte.

@@ -4,7 +4,7 @@
 #ifndef ASCEND_DEEPEP_MEGA_MOE_ASCEND_TIMER_V2_DEVICE_H
 #define ASCEND_DEEPEP_MEGA_MOE_ASCEND_TIMER_V2_DEVICE_H
 
-#include "ascend_timer_v2.hpp"
+#include <kernels/mega_moe/common/ascend_timer_v2.hpp>
 
 class AscendTimerDevice {
 public:

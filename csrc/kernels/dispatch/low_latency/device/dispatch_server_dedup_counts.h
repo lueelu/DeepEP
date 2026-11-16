@@ -4,19 +4,19 @@
 #ifndef DISPATCH_SERVER_DEDUP_COUNTS_H
 #define DISPATCH_SERVER_DEDUP_COUNTS_H
 
-#include "kernel_operator.h"
-#include "ll_transport.h"
-#include "ll_count_frame_transport.h"
-#include "ll_count_frame_receive.h"
+#include <kernel_operator.h>
+#include <kernels/dispatch/low_latency/device/ll_transport.h>
+#include <kernels/dispatch/low_latency/device/ll_count_frame_transport.h>
+#include <kernels/dispatch/low_latency/device/ll_count_frame_receive.h>
 #ifdef DEEPEP_LL_COUNT_HISTOGRAM
-#include "ll_count_histogram.h"
+#include <kernels/dispatch/low_latency/device/ll_count_histogram.h>
 #endif
-#include "../common/ll_count_frame_layout.h"
-#include "../common/ll_count_assignment.h"
-#include "../common/ll_jit_spec.h"
-#include "../common/ll_reference_profile_device.h"
-#include "adv_api/reduce/sum.h"
-#include "../common/ep_memory_server_dedup_count_layout.h"
+#include <kernels/dispatch/low_latency/common/ll_count_frame_layout.h>
+#include <kernels/dispatch/low_latency/common/ll_count_assignment.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
+#include <kernels/dispatch/low_latency/common/ll_reference_profile_device.h>
+#include <adv_api/reduce/sum.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
 
 namespace DispatchDedup {
 using namespace AscendC;

@@ -1,8 +1,8 @@
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
-#include "shmem.h"
-#include "ll_transport.h"
+#include <shmem.h>
+#include <ubx/kernels/ll_transport.h>
 
 namespace UbxCombine {
 

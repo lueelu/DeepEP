@@ -1,11 +1,11 @@
 #pragma once
-#include "../common/ll_rdma_layout.h"
-#include "../common/ll_group_policy.h"
-#include "../common/ll_jit_spec.h"
-#include "../../../common/core_context.h"
-#include "kernel_operator.h"
+#include <kernels/dispatch/low_latency/common/ll_rdma_layout.h>
+#include <kernels/dispatch/low_latency/common/ll_group_policy.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
+#include <kernels/common/core_context.h>
+#include <kernel_operator.h>
 #ifdef DEEPEP_LL_RDMA
-#include "device/gm2gm/engine/shmem_device_rdma.h"
+#include <device/gm2gm/engine/shmem_device_rdma.h>
 #endif
 namespace LlTransport {
 using namespace AscendC;

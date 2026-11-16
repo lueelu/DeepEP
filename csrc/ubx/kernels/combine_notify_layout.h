@@ -2,9 +2,9 @@
 
 #pragma once
 #include <cstdint>
-#include "ll_core_config.h"
-#include "ep_memory_server_dedup_protocol.h"
-#include "ep_memory_server_dedup_buffer_layout.h"
+#include <ubx/kernels/ll_core_config.h>
+#include <ubx/kernels/ep_memory_server_dedup_protocol.h>
+#include <ubx/kernels/ep_memory_server_dedup_buffer_layout.h>
 
 namespace UbxCombine {
 // Each consumer owns a separate row; no reader clears another reader's flags.

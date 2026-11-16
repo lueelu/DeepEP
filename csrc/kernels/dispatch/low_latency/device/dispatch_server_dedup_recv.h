@@ -3,16 +3,16 @@
 
 #ifndef DISPATCH_SERVER_DEDUP_RECV_H
 #define DISPATCH_SERVER_DEDUP_RECV_H
-#include "../common/ll_reference_profile_device.h"
+#include <kernels/dispatch/low_latency/common/ll_reference_profile_device.h>
 
-#include "kernel_operator.h"
-#include "ll_transport.h"
-#include "adv_api/reduce/sum.h"
-#include "../common/ep_memory_server_dedup_protocol.h"
-#include "../common/ll_jit_spec.h"
-#include "../../../common/ep_packet_receive_layout.h"
-#include "dispatch_server_dedup_receive_tasks.h"
-#include "dispatch_server_dedup_receive_packet.h"
+#include <kernel_operator.h>
+#include <kernels/dispatch/low_latency/device/ll_transport.h>
+#include <adv_api/reduce/sum.h>
+#include <kernels/dispatch/low_latency/common/ep_memory_server_dedup_protocol.h>
+#include <kernels/dispatch/low_latency/common/ll_jit_spec.h>
+#include <kernels/common/ep_packet_receive_layout.h>
+#include <kernels/dispatch/low_latency/device/dispatch_server_dedup_receive_tasks.h>
+#include <kernels/dispatch/low_latency/device/dispatch_server_dedup_receive_packet.h>
 
 namespace DispatchDedup {
 using namespace AscendC;

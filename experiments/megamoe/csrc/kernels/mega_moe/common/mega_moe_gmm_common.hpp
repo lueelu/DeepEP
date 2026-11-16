@@ -12,15 +12,15 @@
 #ifndef MEGA_MOE_GMM_COMMON_H
 #define MEGA_MOE_GMM_COMMON_H
 
-#include "kernel_operator.h"
-#include "tensor_api/tensor.h"
-#include "mega_moe_constants.hpp"
-#include "mega_moe_types.hpp"
-#include "mega_moe_utils.hpp"
-#include "../catlass_gmm/mega_moe_mx_matmul.hpp"
-#include "../catlass_gmm/mega_moe_grouped_matmul.hpp"
-#include "mega_moe_gmm_utils.hpp"
-#include "mega_moe_block_scheduler.hpp"
+#include <kernel_operator.h>
+#include <tensor_api/tensor.h>
+#include <kernels/mega_moe/common/mega_moe_constants.hpp>
+#include <kernels/mega_moe/common/mega_moe_types.hpp>
+#include <kernels/mega_moe/common/mega_moe_utils.hpp>
+#include <kernels/mega_moe/catlass_gmm/mega_moe_mx_matmul.hpp>
+#include <kernels/mega_moe/catlass_gmm/mega_moe_grouped_matmul.hpp>
+#include <kernels/mega_moe/common/mega_moe_gmm_utils.hpp>
+#include <kernels/mega_moe/common/mega_moe_block_scheduler.hpp>
 
 namespace MegaMoeImpl {
 

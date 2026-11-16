@@ -1,9 +1,9 @@
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
-#include "ll_transport.h"
+#include <ubx/kernels/ll_transport.h>
 
-#include "combine_wqe_prepare.h"
+#include <ubx/kernels/combine_wqe_prepare.h>
 
 namespace UbxCombine {
 // One quiet per used peer before any GM slot is recycled. M5 may overlap

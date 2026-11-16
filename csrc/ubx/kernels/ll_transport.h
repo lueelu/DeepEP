@@ -1,10 +1,10 @@
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
-#include "ll_rdma_layout.h"
-#include "ll_group_policy.h"
-#include "kernel_operator.h"
-#include "device/gm2gm/engine/shmem_device_rdma.h"
+#include <ubx/kernels/ll_rdma_layout.h>
+#include <ubx/kernels/ll_group_policy.h>
+#include <kernel_operator.h>
+#include <device/gm2gm/engine/shmem_device_rdma.h>
 namespace UbxTransport {
 using namespace AscendC;
 using Args = UbxDispatch::CommArgs;

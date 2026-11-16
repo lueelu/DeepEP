@@ -2,7 +2,7 @@
 // Modified by SimpleBright_Man 2026
 #ifndef MEGA_MOE_CATLASS_RESOURCE_H
 #define MEGA_MOE_CATLASS_RESOURCE_H
-#include "catlass/arch/arch.hpp"
+#include <catlass/arch/arch.hpp>
 
 namespace Catlass::Gemm::Block {
 // Non-owning views of the Wave stage's scratch memory. Creating a CATLASS TPipe

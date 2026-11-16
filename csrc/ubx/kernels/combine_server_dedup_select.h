@@ -4,8 +4,8 @@
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_SELECT_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_SELECT_H
 
-#include "kernel_operator.h"
-#include "ep_server_order.h"
+#include <kernel_operator.h>
+#include <ubx/kernels/ep_server_order.h>
 
 namespace UbxCombine {
 // Dispatch and Combine share the same large-world half ordering.

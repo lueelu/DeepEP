@@ -3,7 +3,7 @@
 #ifndef DEEPEP_LL_CORE_CONFIG_H
 #define DEEPEP_LL_CORE_CONFIG_H
 #include <cstdint>
-#include "ll_metadata_config.h"
+#include <ubx/kernels/ll_metadata_config.h>
 namespace UbxDispatch {
 constexpr uint32_t kLlCoreProtocolVersion =
     41000U + 2U * kLlMetadataCores;  // local and remote count targets round-robin across metadata cores

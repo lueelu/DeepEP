@@ -8,16 +8,16 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "kernel_operator.h"
-#include "shmem.h"
+#include <kernel_operator.h>
+#include <shmem.h>
 
-#include "../../launch.hpp"
-#include "../../common/core_context.h"
-#include "../../dispatch/low_latency/common/dispatch_dedup_types.h"
-#include "../../dispatch/low_latency/device/dispatch_server_dedup_magic.h"
-#include "combine_server_dedup_kernel.h"
-#include "ep_memory_server_dedup_combine_tiling.h"
-#include "launch.hpp"
+#include <kernels/launch.hpp>
+#include <kernels/common/core_context.h>
+#include <kernels/dispatch/low_latency/common/dispatch_dedup_types.h>
+#include <kernels/dispatch/low_latency/device/dispatch_server_dedup_magic.h>
+#include <kernels/combine/low_latency/combine_server_dedup_kernel.h>
+#include <kernels/combine/low_latency/ep_memory_server_dedup_combine_tiling.h>
+#include <kernels/combine/low_latency/launch.hpp>
 
 namespace CombineDedupEntry {
 struct ArgsBlock {

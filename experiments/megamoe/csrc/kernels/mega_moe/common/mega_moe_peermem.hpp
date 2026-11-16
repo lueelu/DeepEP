@@ -21,18 +21,18 @@
 #define MEGA_MOE_PEERMEM_H
 
 #if defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
-#include "kernel_operator.h"
-#include "op_common/op_kernel/math_util.h"
+#include <kernel_operator.h>
+#include <op_common/op_kernel/math_util.h>
 #define HOST_DEVICE __forceinline__[aicore]
 #else
 #define GM_ADDR uint8_t*
 // host 侧命名空间级自由函数需显式 inline 保 ODR；类内成员函数本就隐式 inline，加之无副作用。
 #define HOST_DEVICE inline
 // host 侧自洽：Ops::Base::CeilAlign/CeilDiv 的提供方，不再依赖包含方的 include 顺序。
-#include "op_common/op_host/util/math_util.h"
+#include <op_common/op_host/util/math_util.h>
 #endif
-#include "../mega_moe_tiling.hpp"
-#include "mega_moe_constants.hpp"
+#include <kernels/mega_moe/mega_moe_tiling.hpp>
+#include <kernels/mega_moe/common/mega_moe_constants.hpp>
 
 namespace MegaMoeImpl {
 

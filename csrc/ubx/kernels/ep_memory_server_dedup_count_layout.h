@@ -4,12 +4,12 @@
 #ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_COUNT_LAYOUT_H
 #define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_COUNT_LAYOUT_H
 
-#include "comm_args.h"
-#include "ll_core_config.h"
-#include "ll_group_policy.h"
-#include "dispatch_dedup_types.h"
+#include <ubx/kernels/comm_args.h>
+#include <ubx/kernels/ll_core_config.h>
+#include <ubx/kernels/ll_group_policy.h>
+#include <ubx/kernels/dispatch_dedup_types.h>
 
-#include "ep_memory_server_dedup_mode.h"
+#include <ubx/kernels/ep_memory_server_dedup_mode.h>
 
 namespace UbxDispatch {
 constexpr uint32_t kEpServerDedupMaxExperts = 1024U;

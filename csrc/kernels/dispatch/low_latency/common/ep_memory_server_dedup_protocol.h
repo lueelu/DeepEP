@@ -6,7 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include "ll_group_policy.h"
+#include <kernels/dispatch/low_latency/common/ll_group_policy.h>
 
 #ifdef DEEPEP_LL_RANKS_PER_GROUP
 #error LL grouping is selected by tiling key; remove DEEPEP_LL_RANKS_PER_GROUP
