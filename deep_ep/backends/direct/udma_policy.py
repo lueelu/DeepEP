@@ -221,8 +221,13 @@ class UdmaPolicy:
         if v2 and not expanded and bf16:
             bucket = "small" if row_bytes <= 4096 else "large"
             # Extra auxiliary AIVs must not discard the EP32 dispatch profile.
-            # Combine profiles have different evidence and are not inherited.
-            profile_cores = min(cores, 32) if self.world_size == 32 and operation == "dispatch" else cores
+            # Combine retains its separate 64-core baseline.
+            # Select a measured tier without truncating the actual launch budget.
+            # Intermediate budgets retain the baseline; 64+ retains the historic
+            # large-budget plans, except for EP32 dispatch's existing inheritance.
+            profile_cores = 8 if 8 <= cores < 16 else 32 if 32 <= cores < 64 else None
+            if self.world_size == 32 and operation == "dispatch" and cores >= 32:
+                profile_cores = 32
             entry = _PROFILES.get((self.world_size, profile_cores, bucket, operation))
             if (
                 entry is not None
@@ -269,7 +274,7 @@ class UdmaPolicy:
                 measured_weight_fit = (
                     self.topology_known
                     and (self.world_size, self.ranks_per_group) in ((32, 8), (64, 16))
-                    and (cores == 32 or (self.world_size == 64 and cores > 32))
+                    and (32 <= cores < 64 or (self.world_size == 64 and cores >= 64))
                     and 8192 <= row_bytes <= 12288
                 )
                 if measured_weight_fit:

@@ -541,7 +541,7 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                            ranks_per_group=group, topology_known=True)
             before = base.signature()
-            for cores in ((0,32) if ep == 32 else (0,32,34,48,64)):
+            for cores in ((0,32,34,48,62) if ep == 32 else (0,32,34,48,62,64)):
                 for row_bytes in (8192,8193,8194,9216,10240,12286,12287,12288):
                     plan = base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     assert plan.native_plan() == [1,3,group,1,1,1,8,2,mode]
@@ -562,7 +562,7 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
             for size in (7168,7170,8190,8191,12289,12290):
                 p = base.for_launch(32,size,'weighted',bf16=True)
                 assert p.peer_order == (2 if ep == 32 and size <= 12288 else 0)
-            for cores in ((8,20,48,64) if ep == 32 else (8,20)):
+            for cores in ((8,20,64) if ep == 32 else (8,20)):
                 p = base.for_launch(cores,8192,'weighted',bf16=True)
                 assert p.peer_order == 0 and p.weight_mode == 1
             for other in (replace(base,topology_known=False), replace(base,ranks_per_group=24-group)):
@@ -572,6 +572,47 @@ def test_measured_weight_plans_preserve_the_complete_compared_configuration():
                 p = base.for_launch(32,8192,'weighted',**{'bf16':True,**opts})
                 assert p.native_plan()[1:] == [0,group,4,1,1,32,0,0]
             assert base.signature() == before
+    """)
+
+
+def test_core_tiers_preserve_actual_budgets_and_capacity():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy, _PROFILES
+
+        for (ep, tier, bucket, op), (groups, order, p, w, q, visit, copy) in _PROFILES.items():
+            for group in groups:
+                base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                               ranks_per_group=group, topology_known=True)
+                for cores in (range(8,16,2) if tier == 8 else range(32,64,2)):
+                    plan = base.for_launch(cores,2048 if bucket == 'small' else 5632,op,bf16=True)
+                    assert plan.native_plan()[:7] == [1,order,group,p,w,q,visit]
+                    assert base.config(cores).num_aiv == cores
+                    if op == 'combine':
+                        assert plan.self_copy == (1 if cores >= 2*plan.send_workers else 2)
+                    if op == 'weighted':
+                        assert plan.weight_mode == (2 if cores > plan.send_workers else 1)
+        # Scan legal budgets and both sides of row-width boundaries, including
+        # unknown topology and widths outside the measured profiles.
+        for ep in (4,8,16,32,64,128,256):
+            for group in (1,min(ep,8),min(ep,16)):
+                for known in (False,True):
+                    base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                   ranks_per_group=group, topology_known=known)
+                    for cores in range(2,65,2):
+                        for size in (2048,4096,5632,7168,8190,8192,10240,12288,12290,14336):
+                            for op in ('dispatch','combine','weighted'):
+                                try:
+                                    plan = base.for_launch(cores,size,op,bf16=True)
+                                except ValueError:
+                                    # A budget rejected by the base allocator is
+                                    # not a new tier-selection failure.
+                                    try: base.for_num_aiv(cores)
+                                    except ValueError: continue
+                                    raise
+                                assert plan.send_workers <= cores
+                                assert plan.send_workers*plan.qps_per_worker <= 32
+                                assert plan.valid_group_capacity()
     """)
 
 
@@ -655,7 +696,7 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
     """)
 
 
-def test_ep32_dispatch_profile_survives_extra_cores_without_changing_combine():
+def test_ep32_dispatch_profile_survives_extra_cores_with_separate_combine_tiers():
     run_host("""
         from dataclasses import replace, asdict
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
@@ -680,9 +721,8 @@ def test_ep32_dispatch_profile_survives_extra_cores_without_changing_combine():
                 assert other.for_launch(cores,5632,'dispatch',bf16=True).peer_order == 0
             for options in ({'expanded':True}, {'v2':False}, {'bf16':False}):
                 assert base.for_launch(cores,5632,'dispatch',**{'bf16':True,**options}).peer_order == 0
-            if cores > 32:
                 for op in ('combine','weighted'):
-                    assert base.for_launch(cores,12288,op,bf16=True).peer_order == 0
+                    assert base.for_launch(cores,12288,op,bf16=True).peer_order == (3 if cores < 64 else 0)
     """)
 
 
@@ -696,7 +736,8 @@ def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
             plan = base.for_launch(cores,5632,'combine',bf16=True)
             assert plan.send_workers == 6 and plan.self_copy == 1
         assert base.for_launch(10,5632,'combine',bf16=True).self_copy == 2
-        assert base.for_launch(12,5632,'combine',bf16=True).self_copy == 1
+        assert base.for_launch(14,5632,'combine',bf16=True).self_copy == 2
+        assert base.for_launch(16,5632,'combine',bf16=True).self_copy == 1
         for ep in (4,8,16,32,64,128):
             policy = replace(base, world_size=ep, ranks_per_group=min(ep,16))
             for cores in (8,20,32,48,64):
@@ -707,7 +748,7 @@ def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
                         expected = 0  # Preserve the fixed rank/P8/visit16 candidate.
                     assert plan.self_copy == expected
         # Two QPs still belong to one payload sender AIV.
-        q2 = replace(base, workers_per_peer=1, qps_per_worker=2)
+        q2 = replace(base, workers_per_peer=1, qps_per_worker=2, topology_known=False)
         plan = q2.for_launch(12,5632,'combine',bf16=True)
         assert plan.send_workers == 3 and plan.self_copy == 1
         # EP128 keeps the complete fixed candidate with larger core budgets.
