@@ -25,6 +25,9 @@ struct Mc2MoeContext {
 };
 
 struct GMMAddrInfo {
+    GM_ADDR savedRowMap = nullptr;
+    uint64_t savedRowBase = 0;
+    bool savedRowsInA = false;
     MegaMoeTrainTimerDevice* timer = nullptr;
     GM_ADDR aGlobal;
     GM_ADDR bGlobal;

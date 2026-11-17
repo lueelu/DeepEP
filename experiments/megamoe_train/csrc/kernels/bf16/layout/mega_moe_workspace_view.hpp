@@ -220,6 +220,7 @@ struct BackwardWorkspaceInfo {
     GM_ADDR ptrGradZ;
     GM_ADDR ptrHp;
     GM_ADDR ptrDpProducts;
+    GM_ADDR ptrSavedRowMap;
     GM_ADDR ptrDX;
     GM_ADDR ptrBwFlagDOReleased;
     GM_ADDR ptrBwFlagDZReady;
@@ -246,6 +247,9 @@ struct BackwardWorkspaceInfo {
         offset += Ops::Base::CeilAlign(SIZE_BF_16 * r * k, ALIGN_512);
         const uint32_t savedMode =
             MegaMoeBF16Training::ResolveSavedGateUpMode(tilingData->savedGateUpMode, tilingData->swigluLimit);
+        const bool mapped = MegaMoeBF16Training::UseMappedBackwardInputs(savedMode, f, tilingData->mGroupsPerWave);
+        ptrSavedRowMap = mapped ? base + offset : nullptr;
+        if (mapped) offset += Ops::Base::CeilAlign(2 * SIZE_INT_32 * r, ALIGN_512);
         if (savedMode == MegaMoeBF16Training::kSaveNone) {
             ptrRecomputeGate = base + offset;
             offset += Ops::Base::CeilAlign(SIZE_BF_16 * r * f, ALIGN_512);
@@ -259,11 +263,9 @@ struct BackwardWorkspaceInfo {
         offset += Ops::Base::CeilAlign(SIZE_BF_16 * r * n, ALIGN_512);
         ptrHp = base + offset;
         offset += Ops::Base::CeilAlign(SIZE_BF_16 * r * f, ALIGN_512);
-        // One FP32 partial sum per [packed row, 256-wide F tile]. Different F
-        // tiles may be owned by different AIVs, so P1 writes disjoint partials
-        // and P6 performs the small final reduction without cross-core atomics.
-        const int64_t dpPartialTiles =
-            Ops::Base::CeilDiv(static_cast<uint64_t>(f), static_cast<uint64_t>(BACKWARD_DP_PARTIAL_TILE_N));
+        // Whole-row BF16 stores one completed FP32 sum per route. The tiled
+        // path stores one partial per 256-wide F tile; P6 merges those partials.
+        const int64_t dpPartialTiles = MegaMoeBF16Training::BackwardTopkPartialCount(savedMode, f);
         ptrDpProducts = base + offset;
         offset += Ops::Base::CeilAlign(SIZE_INT_32 * r * dpPartialTiles, ALIGN_512);
         // Saved-mode dX aliases dO after all expert dW2 readers retire.

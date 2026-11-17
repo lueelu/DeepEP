@@ -139,11 +139,14 @@ struct MegaMoeBF16BackwardWorkspaceLayout {
         const std::size_t k = tiling.k;
         const std::size_t n = tiling.n;
         const std::size_t f = n / 2;
-        const std::size_t dpPartialTiles = (f + BACKWARD_DP_PARTIAL_TILE_N - 1) / BACKWARD_DP_PARTIAL_TILE_N;
+        const std::size_t dpPartialTiles = MegaMoeBF16Training::BackwardTopkPartialCount(
+            MegaMoeBF16Training::ResolveSavedGateUpMode(tiling.savedGateUpMode, tiling.swigluLimit), f);
         std::size_t offset = 0;
         offset += Bf16Align(2 * r * k, 512);
         const uint32_t savedMode =
             MegaMoeBF16Training::ResolveSavedGateUpMode(tiling.savedGateUpMode, tiling.swigluLimit);
+        const bool mapped = MegaMoeBF16Training::UseMappedBackwardInputs(savedMode, f, tiling.mGroupsPerWave);
+        if (mapped) offset += Bf16Align(2 * sizeof(uint32_t) * r, 512);
         if (savedMode == MegaMoeBF16Training::kSaveNone) {
             offset += Bf16Align(2 * r * f, 512);
             offset += Bf16Align(2 * r * f, 512);
@@ -423,8 +426,8 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
                                          Bf16Align(2ULL * static_cast<std::size_t>(k) * sizeof(uint16_t), 32ULL) +
                                          ubRestoreBytes;
     const std::size_t ubUnpermuteBytes = 3ULL * Bf16Align(6ULL * static_cast<std::size_t>(k), 32ULL);
-    const std::size_t dpPartialTiles =
-        (static_cast<std::size_t>(n / 2) + BACKWARD_DP_PARTIAL_TILE_N - 1) / BACKWARD_DP_PARTIAL_TILE_N;
+    const std::size_t dpPartialTiles = MegaMoeBF16Training::BackwardTopkPartialCount(
+        MegaMoeBF16Training::ResolveSavedGateUpMode(tiling.savedGateUpMode, tiling.swigluLimit), n / 2);
     const std::size_t alignedDpPartialTiles = Bf16Align(dpPartialTiles * sizeof(float), 32ULL) / sizeof(float);
     TORCH_CHECK((alignedDpPartialTiles + kA5Fp32PerVectorRegister - 1) * sizeof(float) <= kBackwardTopkPartialUbBytes,
                 "MegaMoe BF16 backward n=", n, " exceeds the P6 partial-reduction UB capacity");

@@ -205,7 +205,7 @@ GMM1 与 SwiGLU 按配对任务交接；GMM2 等待所需 M256 行块的全部 H
 Dispatch 按完整 slice 发布 X 和 TopK weight 就绪；GMM2 的全部生产核确认该 slice 的
 FIX 写回完成后，Combine 搬运其完整 H 列输出行。两种编排采用相同的就绪协议。
 常用 shape 的普通 slice 为768行，专家尾片取实际行数；M256 是计算及 Hp 就绪粒度。
-前反向共用相同的 peer 配额和 packed 行映射。
+前向保存 peer 配额和 packed 行布局，反向据此定位对应的路由数据。
 
 通过环境变量 `DEEPEP_BF16_FORWARD_SCHEDULE` 选择编排，各 rank 使用相同值：
 
@@ -221,6 +221,18 @@ GM 输出工作区按 `max_recv_tokens * H * 2` 字节分配，另有少量就�
 另分配 `max_recv_tokens * F * 2` 字节的临时原始 Up 区。SwiGLU 读完原始值后写回 Hp；
 `mxfp8` 同时按32元素分组保存反向所需的量化 Gate/Up。保存方式不改变前向计算精度。
 通信缓冲与路由元数据按实际维度检查 UB 容量，超过容量时在 Host 报错。
+
+### 反向行序与路由权重梯度
+
+前向保存的 X、Gate/Up 和 TopK weight 保持 Wave 行布局。`bf16` 保存模式且 `F<=16384` 时，
+反向按源 rank 和 route 顺序生成 dO、dHp、dZ 和 Hp；每条 route 使用两个 uint32
+记录保存位置及连续段长度。Gate/Up 和 TopK weight 读入 UB 时映射，dW1 的 X 读入 L1 时映射，
+dW2 继续使用连续的 dO 和 Hp。映射表占 `align_512(max_recv_tokens * 8)` 字节。
+
+该路径在 Hp 覆盖 dHp 前，在 UB 中重建完整 FP32 乘积并归约 dTopK weight，
+每条 route 向 GM 写一个 FP32 完成值；最终返回类型随 TopK weight 输入。
+更宽的 F 以及 `none`、`mxfp8` 路径保留分块 partial 归约。行映射和归约均由算子内部选择，
+公开调用及 autograd 保存状态的管理方式不变。
 
 ## 生命周期与使用限制
 

@@ -10,7 +10,8 @@
  *
  * SwiGLUGrad enters with dHp in the first UB tile: saved GM callers load
  * it with LoadDHpFromGM; save=none callers wait for the AIC Fixpipe tile.
- * Gate/Up and p produce Hp, FP32 row partials of dHp*h, and dZ.
+ * Gate/Up and p produce Hp and dZ. The whole-row BF16 path completes dP
+ * before Hp overwrites dHp; other paths produce FP32 tile partials of dHp*h.
  *
  * Backward reconstructs the same FP32 H used for forward route weighting.
  * Saved MXFP8 reconstructs H from decoded Gate/Up, so it may differ from
@@ -27,6 +28,7 @@
 #include <type_traits>
 
 #include "kernel_operator.h"
+#include <adv_api/reduce/reduce.h>
 #include "kernel_tiling/kernel_tiling.h"
 #include "catlass/arch/arch.hpp"
 #include "tla/layout.hpp"
@@ -52,6 +54,18 @@ public:
     __aicore__ inline void SetTimer(MegaMoeTrainTimerDevice* timer)
     {
         timer_ = timer;
+    }
+    __aicore__ inline void SetReductionRows(uint64_t rows)
+    {
+        reductionRows_ = rows;
+    }
+    __aicore__ inline void SetSavedRowMap(GM_ADDR mapping)
+    {
+        savedRowMap_ = reinterpret_cast<__gm__ uint32_t*>(mapping);
+    }
+    __aicore__ inline uint32_t SavedMode() const
+    {
+        return params_.savedGateUpMode;
     }
     static_assert(std::is_same_v<TopkWeightT, bfloat16_t> || std::is_same_v<TopkWeightT, float>,
                   "TopK weights must be BF16 or FP32");
@@ -113,8 +127,116 @@ public:
     {
         outputN_ = Get<1>(problemShape);
         outputF_ = outputN_ / SWIGLU_N_HALF;
-        dpPartialTiles_ =
-            Ops::Base::CeilDiv(static_cast<uint64_t>(outputF_), static_cast<uint64_t>(BACKWARD_DP_PARTIAL_TILE_N));
+        dpPartialTiles_ = MegaMoeBF16Training::BackwardTopkPartialCount(params_.savedGateUpMode, outputF_);
+    }
+
+    // Read a complete dHp row before any AIV replaces that GM row with Hp.
+    // The AR primitive keeps the vector-fold and horizontal-add order used by
+    // the tensor reduction; its reusable FP32 source stays entirely in UB.
+    __aicore__ inline void ReduceTopkRows(GM_ADDR dHpBase, uint32_t rows)
+    {
+        const uint16_t f = static_cast<uint16_t>(outputF_);
+        const uint32_t rowBytes = (static_cast<uint32_t>(f) * 2U + 31U) / 32U * 32U;
+        AscendC::LocalTensor<bfloat16_t> d{AscendC::TPosition::VECIN, 0, f};
+        AscendC::LocalTensor<bfloat16_t> g{AscendC::TPosition::VECIN, rowBytes, f};
+        AscendC::LocalTensor<bfloat16_t> u{AscendC::TPosition::VECIN, rowBytes * 2U, f};
+        AscendC::LocalTensor<float> product{AscendC::TPosition::VECCALC, rowBytes * 3U, f};
+        AscendC::LocalTensor<float> result{AscendC::TPosition::VECCALC, rowBytes * 3U + static_cast<uint32_t>(f) * 4U,
+                                           2048U};
+        AscendC::GlobalTensor<bfloat16_t> dhp;
+        dhp.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(dHpBase));
+        const bool clip = params_.swigluLimit != kMegaMoeSwigluLimitDisabled;
+        const float limit = params_.swigluLimit;
+        for (uint32_t row = AscendC::GetBlockIdx(); row < rows; row += 2U * AscendC::GetBlockNum()) {
+            SyncFunc<AscendC::HardEvent::V_MTE2>();
+            SyncFunc<AscendC::HardEvent::MTE3_MTE2>();
+            const AscendC::DataCopyExtParams copy{1U, static_cast<uint32_t>(f) * 2U, 0U, 0U, 0U};
+            AscendC::DataCopyPad(d, dhp[static_cast<uint64_t>(row) * f], copy, {});
+            AscendC::DataCopyPad(g, gatePlaneGm_[SavedPhysicalRow(rowBase_ + row) * f], copy, {});
+            AscendC::DataCopyPad(u, upPlaneGm_[SavedPhysicalRow(rowBase_ + row) * f], copy, {});
+            SyncFunc<AscendC::HardEvent::MTE2_V>();
+            auto* dp = reinterpret_cast<__ubuf__ bfloat16_t*>(d.GetPhyAddr());
+            auto* gp = reinterpret_cast<__ubuf__ bfloat16_t*>(g.GetPhyAddr());
+            auto* up = reinterpret_cast<__ubuf__ bfloat16_t*>(u.GetPhyAddr());
+            auto* pp = reinterpret_cast<__ubuf__ float*>(product.GetPhyAddr());
+            __VEC_SCOPE__
+            {
+                uint32_t remaining = f;
+                AscendC::Reg::RegTensor<float> lim, negLim;
+                if (clip) {
+                    AscendC::Reg::Duplicate(lim, limit);
+                    AscendC::Reg::Duplicate(negLim, -limit);
+                }
+                for (uint16_t col = 0; col < f; col += 64U) {
+                    auto mask = AscendC::Reg::UpdateMask<float>(remaining);
+                    AscendC::Reg::RegTensor<bfloat16_t> db, gb, ub;
+                    AscendC::Reg::RegTensor<float> df, gf, uf, neg, exponent, denom, silu, h, value;
+                    AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(db, dp + col);
+                    AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(gb, gp + col);
+                    AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::LoadDist::DIST_UNPACK_B16>(ub, up + col);
+                    AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(df, db, mask);
+                    AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(gf, gb, mask);
+                    AscendC::Reg::Cast<float, bfloat16_t, kBackwardCastBF16ToFP32>(uf, ub, mask);
+                    if (clip) {
+                        AscendC::Reg::Min(gf, gf, lim, mask);
+                        AscendC::Reg::Max(uf, uf, negLim, mask);
+                        AscendC::Reg::Min(uf, uf, lim, mask);
+                    }
+                    AscendC::Reg::Muls(neg, gf, -1.0F, mask);
+                    AscendC::Reg::Exp(exponent, neg, mask);
+                    AscendC::Reg::Adds(denom, exponent, 1.0F, mask);
+                    AscendC::Reg::Div<float, &kBackwardDivMode>(silu, gf, denom, mask);
+                    AscendC::Reg::Mul(h, silu, uf, mask);
+                    AscendC::Reg::Mul(value, df, h, mask);
+                    AscendC::Reg::DataCopy(pp + col, value, mask);
+                }
+                AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            const uint32_t width =
+                MegaMoeBF16Training::TopkGradReductionWidth(reductionRows_, f, 2U * AscendC::GetBlockNum());
+            const uint16_t parts = f / width;
+            uint16_t mainParts = 1, folds = 0;
+            while (2U * mainParts < parts) {
+                mainParts *= 2U;
+                ++folds;
+            }
+            const uint16_t tailParts = parts - mainParts;
+            auto scratch = product.template ReinterpretCast<uint8_t>();
+            for (uint16_t part = 0; part < mainParts; ++part) {
+                if (part < tailParts) {
+                    AscendC::Add(product[part * width], product[part * width], product[(part + mainParts) * width],
+                                 width);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                uint32_t shape[2] = {1U, width};
+                AscendC::ReduceSum<float, AscendC::Pattern::Reduce::AR, true>(result[part * 8U], product[part * width],
+                                                                              scratch, shape, false);
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+            auto* partial = reinterpret_cast<__ubuf__ float*>(result.GetPhyAddr());
+            __VEC_SCOPE__
+            {
+                auto one = AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::VL1>();
+                for (uint16_t level = 0; level < folds; ++level) {
+                    const uint16_t pairs = mainParts >> (level + 1U);
+                    for (uint16_t pair = 0; pair < pairs; ++pair) {
+                        AscendC::Reg::RegTensor<float> left, right, sum;
+                        AscendC::Reg::DataCopy<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(left, partial + pair * 16U);
+                        AscendC::Reg::DataCopy<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(right,
+                                                                                            partial + pair * 16U + 8U);
+                        AscendC::Reg::Add(sum, left, right, one);
+                        AscendC::Reg::DataCopy(partial + pair * 8U, sum, one);
+                    }
+                    AscendC::Reg::LocalMemBar<AscendC::Reg::MemType::VEC_STORE, AscendC::Reg::MemType::VEC_LOAD>();
+                }
+            }
+            SyncFunc<AscendC::HardEvent::V_MTE3>();
+            AscendC::DataCopyPad(dpPartialsGm_[rowBase_ + row], result,
+                                 AscendC::DataCopyExtParams{1U, sizeof(float), 0U, 0U, 0U});
+        }
+        SyncFunc<AscendC::HardEvent::MTE3_MTE2>();
+        SyncFunc<AscendC::HardEvent::MTE3_S>();
     }
 
     // Saved-mode GM path: each AIV loads its assigned dHp tile into its
@@ -178,14 +300,16 @@ public:
         // tile1 holds FP32 partials and tile2 holds Hp until MTE3 consumes both.
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-        const uint32_t dpTileIdx = nLoc / BACKWARD_DP_PARTIAL_TILE_N;
-        AscendC::DataCopyExtParams partialCopyParams{
-            static_cast<uint16_t>(singleM), static_cast<uint32_t>(sizeof(float)),
-            // srcStride counts 32-byte blocks; the 4-byte partial occupies one padded block.
-            static_cast<uint32_t>(rowStrideInPlane * sizeof(bfloat16_t) / AscendC::ONE_BLK_SIZE - 1U),
-            static_cast<uint32_t>((dpPartialTiles_ - 1) * sizeof(float)), 0};
-        AscendC::DataCopyPad(dpPartialsGm_[(rowBase_ + mLoc) * dpPartialTiles_ + dpTileIdx],
-                             l0cOutUbSecond_.template ReinterpretCast<float>(), partialCopyParams);
+        if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+            const uint32_t dpTileIdx = nLoc / BACKWARD_DP_PARTIAL_TILE_N;
+            AscendC::DataCopyExtParams partialCopyParams{
+                static_cast<uint16_t>(singleM), static_cast<uint32_t>(sizeof(float)),
+                // srcStride counts 32-byte blocks; the 4-byte partial occupies one padded block.
+                static_cast<uint32_t>(rowStrideInPlane * sizeof(bfloat16_t) / AscendC::ONE_BLK_SIZE - 1U),
+                static_cast<uint32_t>((dpPartialTiles_ - 1) * sizeof(float)), 0};
+            AscendC::DataCopyPad(dpPartialsGm_[(rowBase_ + mLoc) * dpPartialTiles_ + dpTileIdx],
+                                 l0cOutUbSecond_.template ReinterpretCast<float>(), partialCopyParams);
+        }
         AscendC::DataCopyExtParams auxCopyParams{static_cast<uint16_t>(singleM),
                                                  static_cast<uint32_t>(singleN * sizeof(bfloat16_t)), 0,
                                                  static_cast<uint32_t>((outputF_ - singleN) * sizeof(bfloat16_t)), 0};
@@ -257,12 +381,35 @@ private:
     static constexpr uint32_t kWeightOffset = Catlass::Arch::Ascend950::UB_SIZE - kWeightBytes;
     static_assert(kWeightOffset >= kMxScratchEnd, "Prefetched weights must not alias live MXFP8 decode or clip masks");
 
+    __aicore__ inline uint64_t SavedPhysicalRow(uint64_t logical) const
+    {
+        return savedRowMap_ == nullptr ? logical : AscendC::ReadGmByPassDCache(savedRowMap_ + 2U * logical);
+    }
+    __aicore__ inline uint32_t SavedContiguousRows(uint64_t logical, uint32_t limit) const
+    {
+        if (savedRowMap_ == nullptr) return limit;
+        const uint32_t run = AscendC::ReadGmByPassDCache(savedRowMap_ + 2U * logical + 1U);
+        return run < limit ? run : limit;
+    }
+
     __aicore__ inline void LoadPackedWeights(uint32_t rows, uint32_t mLoc)
     {
         // This AIV has finished its P0 staging before loading weights. In
         // save=none, paired AIC Fixpipe targets only the first work tile.
         SyncFunc<AscendC::HardEvent::V_MTE2>();
         SyncFunc<AscendC::HardEvent::MTE3_MTE2>();
+        if (savedRowMap_ != nullptr) {
+            // Scalar bit copies also handle peer boundaries that are not
+            // aligned to the 32-byte destination of a UB DMA.
+            using Bits = std::conditional_t<sizeof(TopkWeightT) == 2, uint16_t, uint32_t>;
+            AscendC::GlobalTensor<Bits> source;
+            source.SetGlobalBuffer(reinterpret_cast<__gm__ Bits*>(params_.packedTopkWeightsGmAddr));
+            auto target = packedWeightUb_.template ReinterpretCast<Bits>();
+            for (uint32_t row = 0; row < rows; ++row)
+                target.SetValue(row, source.GetValue(SavedPhysicalRow(rowBase_ + mLoc + row)));
+            SyncFunc<AscendC::HardEvent::S_V>();
+            return;
+        }
         AscendC::DataCopyExtParams p{1U, static_cast<uint32_t>(rows * sizeof(TopkWeightT)), 0U, 0U, 0U};
         AscendC::DataCopyPadExtParams<TopkWeightT> pad{false, 0U, 0U, 0U};
         AscendC::DataCopyPad(packedWeightUb_, packedTopkWeightsGm_[rowBase_ + mLoc], p, pad);
@@ -279,6 +426,18 @@ private:
                              gateDst, true);
             DecodeMxFp8Plane(upMxFp8Gm_, upScaleGm_, upLowGm_, upHighGm_, rowStart, nLoc, singleM, singleN, upDst,
                              false);
+            return;
+        }
+        if (savedRowMap_ != nullptr) {
+            for (uint32_t row = 0; row < singleM;) {
+                const uint32_t take = SavedContiguousRows(rowStart + row, singleM - row);
+                const uint64_t index = SavedPhysicalRow(rowStart + row) * outputF_ + nLoc;
+                auto gateTile = gateDst[row * singleN];
+                auto upTile = upDst[row * singleN];
+                CopyPlaneTileToUb(gatePlaneGm_, index, take, singleN, outputF_, gateTile);
+                CopyPlaneTileToUb(upPlaneGm_, index, take, singleN, outputF_, upTile);
+                row += take;
+            }
             return;
         }
         const int64_t index = static_cast<int64_t>(rowStart) * outputF_ + nLoc;
@@ -503,9 +662,11 @@ private:
                     AscendC::Reg::Adds(denom, exp, 1.0F, mask);
                     AscendC::Reg::Div<float, &kBackwardDivMode>(silu, gateFp, denom, mask);
                     AscendC::Reg::Mul(hFp, silu, upFp, mask);
-                    AscendC::Reg::Mul(productFp, dHpFp, hFp, mask);
-                    AscendC::Reg::ReduceSum(rowSum, productFp, mask);
-                    AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
+                    if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+                        AscendC::Reg::Mul(productFp, dHpFp, hFp, mask);
+                        AscendC::Reg::ReduceSum(rowSum, productFp, mask);
+                        AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
+                    }
                     AscendC::Reg::Mul(hpFp, hFp, pFp, mask);
                     AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(hpBf, hpFp, mask);
                     AscendC::Reg::DataCopy<bfloat16_t, AscendC::Reg::StoreDist::DIST_PACK_B32>(up + offset, hpBf, mask);
@@ -745,9 +906,11 @@ private:
                     AscendC::Reg::Div<float, &kBackwardDivMode>(auxSilu, gateC, denom, mask);
                     // Match forward's FP32 H for dp and Hp reconstruction.
                     AscendC::Reg::Mul(hFp, auxSilu, upC, mask);
-                    AscendC::Reg::Mul(productFp, dHpFp, hFp, mask);
-                    AscendC::Reg::ReduceSum(rowSum, productFp, mask);
-                    AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
+                    if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+                        AscendC::Reg::Mul(productFp, dHpFp, hFp, mask);
+                        AscendC::Reg::ReduceSum(rowSum, productFp, mask);
+                        AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
+                    }
                     AscendC::Reg::Mul(hpFp, hFp, pFp, mask);
                     AscendC::Reg::Cast<bfloat16_t, float, kBackwardCastFP32ToBF16>(hpBf, hpFp, mask);
                     AscendC::Reg::Mul(dHFp, dHpFp, pFp, mask);
@@ -801,10 +964,12 @@ private:
         }
         AscendC::SyncFunc<AscendC::HardEvent::V_MTE2>();
         AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopyExtParams partialCopy{static_cast<uint16_t>(rows), sizeof(float), 0U,
-                                               static_cast<uint32_t>((dpPartialTiles_ - 1) * sizeof(float)), 0U};
-        AscendC::DataCopyPad(dpPartialsGm_[(rowBase_ + mLoc) * dpPartialTiles_ + nLoc / BACKWARD_DP_PARTIAL_TILE_N],
-                             fusedDpUb_, partialCopy);
+        if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+            AscendC::DataCopyExtParams partialCopy{static_cast<uint16_t>(rows), sizeof(float), 0U,
+                                                   static_cast<uint32_t>((dpPartialTiles_ - 1) * sizeof(float)), 0U};
+            AscendC::DataCopyPad(dpPartialsGm_[(rowBase_ + mLoc) * dpPartialTiles_ + nLoc / BACKWARD_DP_PARTIAL_TILE_N],
+                                 fusedDpUb_, partialCopy);
+        }
         AscendC::DataCopyExtParams hpCopy{static_cast<uint16_t>(rows),
                                           static_cast<uint32_t>(columns * sizeof(bfloat16_t)), 0U,
                                           static_cast<uint32_t>((outputF_ - columns) * sizeof(bfloat16_t)), 0U};
@@ -941,6 +1106,8 @@ private:
     AscendC::GlobalTensor<bfloat16_t> hpGm_;
     AscendC::GlobalTensor<float> dpPartialsGm_;
     AscendC::GlobalTensor<TopkWeightT> packedTopkWeightsGm_;
+    __gm__ uint32_t* savedRowMap_{nullptr};
+    uint64_t reductionRows_{0};
     int64_t rowBase_{0};
     Params params_{};
     int64_t outputN_{0};

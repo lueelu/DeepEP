@@ -30,6 +30,13 @@ int main()
     assert(MetadataBytes(8, 4) == 4096 && MetadataBytes(1024, 2) == 16384);
     assert(ScratchFits(7168, 1024, 2));
     assert(!ScratchFits(32768, 8, 4));
+    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveBf16, 3072) == 1);
+    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveNone, 3072) == 12);
+    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveMxFp8, 3072) == 12);
+    static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24467, 3072, 64) == 3072);
+    static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24258, 3072, 64) == 1536);
+    static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24693, 3072, 64) == 1536);
+    static_assert(10U * 16384U + 8192U <= 248U * 1024U);
     using Quant = MegaMoeBF16Training::SavedGateUpQuantUbLayoutFor<256, 64, 128>;
     static_assert(Quant::gateData == 2U * 256U * 128U * 2U);
     static_assert(Quant::totalBytesWithClipMasks + 256U * sizeof(float) <= 248U * 1024U);
@@ -130,6 +137,9 @@ int main()
                     for (auto c : coverage) assert(c == 1);
                 }
                 assert(expected.size() == info.rows);
+                const Row unwritten{UINT32_MAX, UINT32_MAX};
+                std::vector<Row> canonical(info.rows, unwritten);
+                std::vector<uint32_t> physical(info.rows), runs(info.rows);
                 // Packed tiles may cross peer, Wave and partial-slice boundaries.
                 for (uint32_t begin = 0; begin < info.rows; begin += 128) {
                     const uint32_t end = std::min(begin + 128, info.rows);
@@ -139,10 +149,33 @@ int main()
                     uint32_t next = begin;
                     while (inverse.Next(transfer)) {
                         assert(transfer.destinationRow == next);
-                        for (uint32_t j = 0; j < transfer.rowCount; ++j, ++next)
+                        for (uint32_t j = 0; j < transfer.rowCount; ++j, ++next) {
                             assert(expected[next] == Row(transfer.sourceRank, transfer.sourceOrdinalBegin + j));
+                            const uint32_t sourceBase =
+                                transfer.sourceRank ? prefix[(transfer.sourceRank - 1U) * experts + e] : 0U;
+                            const uint32_t target = sourceBase + transfer.sourceOrdinalBegin + j;
+                            assert(target < info.rows && canonical[target] == unwritten);
+                            canonical[target] = expected[next];
+                            physical[target] = next;
+                            runs[target] = transfer.rowCount - j;
+                        }
                     }
                     assert(next == end);
+                }
+                auto canonicalOracle = expected;
+                std::sort(canonicalOracle.begin(), canonicalOracle.end());
+                assert(canonical == canonicalOracle);
+                // Emulate a K256 L1 load using only the saved row/run map.
+                // Tile and peer boundaries need not coincide with Wave cuts.
+                for (uint32_t tile = 0; tile < info.rows; tile += 256) {
+                    const uint32_t end = std::min(tile + 256, info.rows);
+                    for (uint32_t row = tile; row < end;) {
+                        const uint32_t take = std::min(runs[row], end - row);
+                        assert(take > 0 && physical[row] + take <= expected.size());
+                        for (uint32_t j = 0; j < take; ++j)
+                            assert(expected[physical[row] + j] == canonicalOracle[row + j]);
+                        row += take;
+                    }
                 }
                 // Emulate backward source producers and their monotonic progress.
                 std::vector<uint32_t> covered(info.rows);

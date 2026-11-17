@@ -53,6 +53,7 @@
 
 #include "epilogue/block_epilogue_swiglu_backward_bf16.hpp"
 #include "catlass/copy_l0c_to_ub.hpp"
+#include "catlass/copy_saved_rows_to_l1.hpp"
 #include "layout/mega_moe_context.hpp"
 #include "schedule/backward_dispatch_ready.hpp"
 #include "schedule/backward_dispatch_schedule.hpp"
@@ -146,6 +147,10 @@ struct BackwardBF16TileCopy<LayoutA, LayoutB, TargetUBIdx, true>
     template <class TensorC>
     using CopyL0CToDst = Catlass::Gemm::Tile::CopyL0CToGmTla<ArchTag, TensorL0C, TensorC,
                                                              Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT, false>;
+    template <class TensorA>
+    using CopyGmToL1A = CopySavedRowsToL1<TensorA, typename Base::TensorL1A>;
+    template <class TensorB>
+    using CopyGmToL1B = CopySavedRowsToL1<TensorB, typename Base::TensorL1B>;
 };
 
 template <class LayoutA, class LayoutB, uint32_t TargetUBIdx = 0, bool GmOutput = false>
@@ -304,6 +309,11 @@ __aicore__ inline void GMM2GradSwiGLUGradGM(
             MegaMoeTrainTimerWaitScope timerWait(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD_WAIT);
             while (AscendC::ReadGmByPassDCache(dHpReadyFlag) < static_cast<int32_t>(gmm2Params.blockNum)) {
             }
+        }
+        if (MegaMoeBF16Training::UseWholeRowTopkGrad(epilogueOp.SavedMode(), n)) {
+            epilogueOp.ReduceTopkRows(dHpBase, m);
+            // All readers must finish before any tile overwrites dHp with Hp.
+            AscendC::SyncAll<true>();
         }
     }
     for (uint32_t index = first; index < loops; index += gmm2Params.blockNum, ++nextTargetAiv) {
@@ -650,12 +660,16 @@ __aicore__ inline void GMM1DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 0,
     const uint32_t n = static_cast<uint32_t>(Get<N_VALUE>(problemShape));  // canonical K / legacy N
     const uint32_t k = static_cast<uint32_t>(Get<K_VALUE>(problemShape));  // Me
 
-    AscendC::GlobalTensor<bfloat16_t> aGlobal;
-    AscendC::GlobalTensor<bfloat16_t> bGlobal;
+    SavedRowGlobalTensor aGlobal;
+    SavedRowGlobalTensor bGlobal;
     AscendC::GlobalTensor<bfloat16_t> cGlobal;
     aGlobal.SetGlobalBuffer((__gm__ bfloat16_t*)gmmAddrInfo.aGlobal);
     bGlobal.SetGlobalBuffer((__gm__ bfloat16_t*)gmmAddrInfo.bGlobal);
     cGlobal.SetGlobalBuffer((__gm__ bfloat16_t*)gmmAddrInfo.cGlobal);
+    auto* map = reinterpret_cast<__gm__ uint32_t*>(gmmAddrInfo.savedRowMap);
+    aGlobal.rowMap = gmmAddrInfo.savedRowsInA ? map : nullptr;
+    bGlobal.rowMap = gmmAddrInfo.savedRowsInA ? nullptr : map;
+    aGlobal.rowBase = bGlobal.rowBase = gmmAddrInfo.savedRowBase;
 
     // A is canonical dZ.T or legacy Xpacked.T, viewed as ColumnMajor.
     auto layoutA = tla::MakeLayout<bfloat16_t, Catlass::layout::ColumnMajor>(m, k);

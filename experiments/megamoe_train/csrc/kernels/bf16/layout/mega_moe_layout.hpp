@@ -132,9 +132,44 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t ResolveSavedGateUpMode(uint32_t mod
     return mode == kSaveAuto ? (tilingLimit == FLT_MAX ? kSaveMxFp8 : kSaveBf16) : mode;
 }
 
-// Ordinary forward SwiGLU handoff: 0 forces paired Gate/Up tiles through UB;
-// Use the resolved saved mode in both host allocation and device execution.
-// Saved modes use Hp/dO reuse and per-expert readiness; none retains UB.
+// A complete row uses 6F bytes of BF16 inputs, 4F bytes of FP32 products
+// and a padded scalar result. Wider rows keep the tiled partial path.
+MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseWholeRowTopkGrad(uint32_t mode, uint64_t f)
+{
+    return mode == kSaveBf16 && f > 0 && f <= 16384 && f % 64 == 0;
+}
+// CANN's FP32 contiguous AR sum first selects an A tile by core occupancy,
+// then splits R to fit its four input buffers. The rank's complete routed
+// row count is needed: one-row AR can have a different addition tree.
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t TopkGradReductionWidth(uint64_t rows, uint32_t columns, uint32_t cores)
+{
+    if (rows == 0 || columns == 0 || cores == 0) return columns;
+    constexpr uint64_t elements = (248U * 1024U - 16U * 1024U - 2U * 512U) / 16U;
+    const uint64_t rTasks = (columns + 63U) / 64U;
+    uint64_t best = 0, aTile = 1;
+    for (uint64_t candidate = 1; candidate <= rows && candidate <= 128U; ++candidate) {
+        const uint64_t outerA = (rows + candidate - 1U) / candidate;
+        const uint64_t tasks = outerA * rTasks;
+        uint64_t active = tasks / ((tasks + cores - 1U) / cores);
+        if (active > outerA) active = active / outerA * outerA;
+        if (active * 100U > cores * 85U && active > best) aTile = candidate;
+        best = active > best ? active : best;
+    }
+    if (aTile * columns <= elements) return columns;
+    uint32_t width = static_cast<uint32_t>(elements / aTile) / 8U * 8U;
+    while (width > 1U && columns % width != 0U) --width;
+    return width;
+}
+
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t BackwardTopkPartialCount(uint32_t mode, uint64_t f)
+{
+    return UseWholeRowTopkGrad(mode, f) ? 1U : (f + 255U) / 256U;
+}
+MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseMappedBackwardInputs(uint32_t mode, uint64_t f, uint32_t groups)
+{
+    return groups != 0 && UseWholeRowTopkGrad(mode, f);
+}
+
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseGmForBackwardDataGrad(uint32_t savedMode)
 {
     return savedMode != kSaveNone;
