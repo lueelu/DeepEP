@@ -308,14 +308,14 @@ def test_close_failure_retains_owner(monkeypatch):
         raise RuntimeError("close fault")
 
     runtime.native = SimpleNamespace(close=fail)
-    monkeypatch.setattr(_runtime, "_OWNER", runtime)
+    monkeypatch.setattr(_runtime, "_OWNERS", {runtime})
     with pytest.raises(RuntimeError, match="close fault"):
         runtime.close()
-    assert _runtime._OWNER is runtime and not runtime.closed
+    assert runtime in _runtime._OWNERS and not runtime.closed
     runtime.native.close = lambda: None
     runtime.close()
     runtime.close()
-    assert _runtime._OWNER is None and runtime.closed
+    assert not _runtime._OWNERS and runtime.closed
 
 
 def test_scaleup_capacity_reaches_runtime_without_translation(monkeypatch):
@@ -372,13 +372,18 @@ def test_huge_page_option_reaches_native_factory(monkeypatch, kind, huge):
         calls.append(args)
         return SimpleNamespace(close=lambda: None)
 
-    monkeypatch.setattr(_runtime, "_OWNER", None)
+    monkeypatch.setattr(_runtime, "_OWNERS", set())
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
     monkeypatch.setattr(
         _runtime,
         "require_native",
         lambda _: SimpleNamespace(
-            Runtime=factory, create_combine_runtime=factory, create_mpi_runtime=factory, runtime_busy=lambda: False
+            Runtime=factory,
+            create_combine_runtime=factory,
+            create_mpi_runtime=factory,
+            next_instance_id=lambda: 0,
+            instance_unique_id=lambda: [0] * 128,
+            runtime_busy=lambda: False,
         ),
     )
     monkeypatch.setattr(
@@ -400,7 +405,10 @@ def test_huge_page_option_reaches_native_factory(monkeypatch, kind, huge):
         combine_only="combine" in kind,
         use_1g_huge_pages=huge,
     )
-    assert len(calls) == 1 and calls[0][-1] is huge and runtime.use_1g_huge_pages is huge
+    assert len(calls) == 1 and calls[0][-1 if kind == "mpi" else -2] is huge
+    assert runtime.use_1g_huge_pages is huge
+    if kind != "mpi":
+        assert calls[0][-1] == []
     runtime.close()
 
 
@@ -433,11 +441,13 @@ def test_bootstrap_without_host_device_checks(monkeypatch, mismatch, debug):
     import torch.distributed as dist
 
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://xxx.xxx.xxx.xxx:xxxxx")
-    monkeypatch.setattr(_runtime, "_OWNER", None)
+    monkeypatch.setattr(_runtime, "_OWNERS", set())
     monkeypatch.setattr(_runtime, "rank_and_world", lambda *args: (0, 2))
     monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
     created = []
     native = SimpleNamespace(
+        next_instance_id=lambda: 0,
+        instance_unique_id=lambda: [0] * 128,
         runtime_busy=lambda: False,
         Runtime=lambda *args: created.append(args) or SimpleNamespace(close=lambda: None),
     )
@@ -464,6 +474,9 @@ def test_bootstrap_without_host_device_checks(monkeypatch, mismatch, debug):
                 peers[1][index] += 16 if mismatch == "debug" else 1
 
     monkeypatch.setattr(dist, "all_gather", gather)
+    monkeypatch.setattr(
+        dist, "all_gather_object", lambda out, value, group: out.__setitem__(slice(None), [value, value])
+    )
     if mismatch:
         message = {
             "capacity": "workspace capacity",

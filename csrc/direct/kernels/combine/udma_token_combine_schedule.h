@@ -21,7 +21,7 @@ __aicore__ inline void CombineTokenRemote(
 {
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto indices = resource.template GetBufferByByte<int32_t>(kCombineSenderBytes);
-    const uint32_t workers = TokenWorkers(td.num_channels);
+    const uint32_t workers = TokenWorkers(td.block_dim);
     if (core < workers)
         for (uint32_t first = 0; first < td.world_size - 1; first += kMaxPeers) {
             CombineSender sender(
@@ -87,7 +87,7 @@ __aicore__ inline void CombineTokenRemote(
         }
     if constexpr (Phase != 1) {
         WaitIncoming<false>(
-            workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, td.num_channels, workers);
+            workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, td.block_dim, workers);
     }
     // WaitIncoming's all-core barrier includes drained local self copies.
 }

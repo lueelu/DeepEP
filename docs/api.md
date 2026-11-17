@@ -40,7 +40,7 @@ Mesh+Clos 与 Direct 的同步调用均先建立计算流依赖，再返回 `eve
 
 ## 初始化与资源
 
-调用方先设置当前 NPU，并在所有 rank 配置相同的 `DEEPEP_SHMEM_ENDPOINT=tcp://<IPv4>:<port>`。端口范围为 1024～65535，使用作业独占且未占用的端口。多机作业使用所有节点可达的地址。
+调用方先设置当前 NPU。传入 EP 进程组时，每次构造使用组内交换的新 SHMEM UID。Mesh+Clos 的显式 `rank/world_size` 方式使用 `DEEPEP_SHMEM_ENDPOINT=tcp://<IPv4>:<port>`；端口范围为 1024～65535，应为作业独占且未占用，多机时地址须可达。Direct 后端也可通过 `shmem_ip_port` 显式指定 endpoint。
 
 ### 显式 rank/world_size
 
@@ -67,6 +67,54 @@ Mesh+Clos 与 Direct 的同步调用均先建立计算流依赖，再返回 `eve
 
 ### 容量与运行时
 
+#### Global Clos 多 Buffer
+
+同一进程可创建不同容量的 `Buffer` / `ElasticBuffer`，调用接口不变。每个对象持有独立的 SHMEM 实例、通信工作区、队列和同步状态。构造新对象不会销毁或扩展旧对象的存储：
+
+```python
+MiB = 1024 * 1024
+cached_buffer = deep_ep.Buffer(
+    ep_group, 64 * MiB, 0, machine_type="global_clos", explicitly_destroy=True,
+)
+buffer = deep_ep.Buffer(
+    ep_group, 128 * MiB, 0, machine_type="global_clos", explicitly_destroy=True,
+)
+# cached_buffer 及其未消费的 handle 仍可继续执行 cached dispatch / combine。
+# 各 rank 在对应通信完成后，按相同顺序释放各自的对象。
+cached_buffer.destroy()
+buffer.destroy()
+```
+
+上述容量仅为示例；实际容量仍按 shape 查询 size hint。同一时刻存活的对象须使用相同设备、EP 进程组与传输/QP 配置；各 rank 按相同顺序构造和销毁。默认 UID 初始化会为每个对象建立独立会话。显式 endpoint 须由调用方为每个存活实例分配独立端口。
+
+V1 路由 handle 和 V2 `EPHandle` 会保留所属 Buffer 的引用；替换外部变量不会让旧实例提前析构。handle 只能交回其原 Buffer，不能交给新对象。显式 `destroy()` 后，旧 handle 不再可用于通信；独立分配的 GM 输出仍由 Tensor 引用管理，zero-copy 视图不在此保证内。
+
+同一进程、同一设备上的 Direct V1/V2 Buffer 共用一条通信 stream，SHMEM 实例及存储仍各自独立。销毁一个 Buffer 不会销毁共享 stream。计算 stream 可以不同，输入就绪和输出完成仍通过事件衔接；异步调用允许通信与计算重叠，不表示两个 Buffer 的通信 kernel 同时执行。
+
+所有 rank 须按相同顺序提交不同 Buffer 的操作，包括 dispatch、combine 和 barrier。建议由一个 Host 线程统一提交；本地线程锁或共享 stream 本身不能纠正跨 rank 不一致的调用顺序。创建和销毁也应统一组织，不与在途 Host 调用竞争。MPI bootstrap、MegaMoE 与 fused 实验入口保留独占运行时约束。
+
+多 Buffer 用例使用两条计算 stream，由单 Host 线程按 old→new 顺序提交到共享通信 stream。覆盖容量共存、旧输出与 handle 保留、cached dispatch/combine，以及销毁后重建；每轮先提交两次 dispatch，再执行 CPU 精度检查。用例检查两个 Buffer 和重建实例复用同一通信 stream，核数保持每次 32 AIV。该共享 stream 版本须在目标设备重新回归，不将此前双通信流结果计为本版本通过。
+
+```bash
+python tests/clos/source/test_multi_buffer.py \
+    --api v2 --ep-size 8 --num-tokens 129 --small-tokens 17 \
+    --hidden 6144 --num-aiv 32 --cycles 20 --allocate-on-comm-stream
+```
+
+`--api v1` 验证 V1；V2 可加 `--expand` 覆盖专家展开与 aggregate/combine，`--dtype fp8` 覆盖量化 payload 和 scale。每项会逐 rank 输出 `MULTI_BUFFER_PASSED`，同时要求整个命令退出码为 0。`--trace-workers` 保存各阶段及计算/通信 stream ID；旧 `--serialize-streams` 参数保留兼容，当前始终按一致顺序提交。
+
+多机 EP64 在 8 台节点上分别执行同一命令；`NODE_RANK` 取 0～7，
+`MASTER_ADDR` 为 0 号节点的可达 IP，`MASTER_PORT` 为该作业独占的空闲端口。
+每台启动 8 个进程，使用本机 device 0～7：
+
+```bash
+python tests/clos/source/test_multi_buffer.py \
+    --api v2 --ep-size 64 --nnodes 8 --node-rank "$NODE_RANK" \
+    --dist-init-method "tcp://$MASTER_ADDR:$MASTER_PORT" \
+    --num-tokens 129 --small-tokens 17 --hidden 6144 --num-aiv 32 --cycles 5 \
+    --allocate-on-comm-stream --expand
+```
+
 `Buffer/ElasticBuffer` 的普通 Runtime 接受 EP2/4/8/16/32/64/128/256/512。对称工作区至少 2 MiB，按 2 MiB 对齐，字节数不能超过 int64 上限；实际分配受设备内存和 SHMEM 地址空间限制。各 rank 的容量相同。**这是资源准入范围；算子的 EP、shape 和容量限制另见 Elastic 文档。**
 
 `ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。Mesh+Clos 的 `Buffer` 使用 MTE 配置，要求显式进程组、`num_nvl_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_rdma_bytes`；资源构造不启用 V1 通信算法。Global Clos / Mesh+PCIe 的 V1 通信能力见机型后端说明。
@@ -75,11 +123,11 @@ Mesh+Clos 与 Direct 的同步调用均先建立计算流依赖，再返回 `eve
 
 ## 生命周期与失败处理
 
-一个进程同时只允许一个活跃 Session，不接管外部已初始化的 SHMEM。所有参与 rank 按相同顺序构造、调用和销毁；通信失败后应结束并重启整个分布式作业。
+同一进程可持有配置兼容的多个 Session，不接管外部已初始化的 SHMEM。每个实例的参与 rank 必须遵守相同的通信顺序；构造和销毁由框架按一致顺序协调。通信失败后应结束并重启整个分布式作业。
 
-两个 Buffer 类都要求 `explicitly_destroy=True`。使用结束后，所有 rank 显式调用 `buffer.destroy()`：先等待通信流完成，再执行 SHMEM 集体清理、释放工作区和关闭 Session。如使用进程组，在 Buffer 销毁后再销毁该组。成功销毁后重复调用不再释放资源，其他运行时操作拒绝使用已关闭的对象。
+Mesh+Clos 的两个 Buffer 类都要求 `explicitly_destroy=True`；Global Clos 也建议显式管理生命周期。使用结束后，所有 rank 显式调用 `buffer.destroy()`：先等待通信流完成，再执行 SHMEM 集体清理、释放工作区和关闭 Session。如使用进程组，在 Buffer 销毁后再销毁该组。成功销毁后重复调用不再释放资源，其他运行时操作拒绝使用已关闭的对象。
 
-忘记销毁时只发出警告并保留资源，不在 Python GC 或解释器退出时发起 collective。局部参数错误或某个 rank 退出也不代表其他 rank 已安全退出，调用方须管理整个作业的超时与终止。
+Mesh+Clos 忘记销毁时只发出警告并保留资源，不在 Python GC 或解释器退出时发起 collective。Global Clos 的异步在途资源同样不得依赖 GC 释放。局部参数错误或某个 rank 退出也不代表其他 rank 已安全退出，调用方须管理整个作业的超时与终止。
 
 `EPHandle` 由成功的 dispatch 返回，与创建它的 Buffer 绑定。不要修改内部路由 Tensor，也不要跨实例传入 handle。HT 支持在约束内 cached dispatch 和重复 combine；LL 的可用操作见 [Elastic 接口](elastic.md)。输出 Tensor 拥有独立框架存储，但 Buffer 销毁后 handle 不能继续用于通信。
 

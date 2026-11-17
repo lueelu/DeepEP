@@ -3,7 +3,9 @@
 import csv
 import hashlib
 import json
+import os
 from collections import Counter
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -11,6 +13,21 @@ L2_CACHE_FLUSH_BYTES = 256_000_000
 L2_FLUSH_RANGE = "deepep_benchmark_l2_flush"
 PROFILE_SAMPLE_RANGE = "deepep_benchmark_sample/"
 PROFILE_GUARD_ITERS = 2
+COMBINE_NOTIFY_ENV = "DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY"
+
+
+@contextmanager
+def profile_combine_notify(enabled):
+    """Scope the extra UDMA rendezvous to capture; restore even on profiler exit."""
+    previous = os.environ.get(COMBINE_NOTIFY_ENV)
+    os.environ[COMBINE_NOTIFY_ENV] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(COMBINE_NOTIFY_ENV, None)
+        else:
+            os.environ[COMBINE_NOTIFY_ENV] = previous
 
 
 class ProfileSamples:
@@ -66,6 +83,17 @@ class L2CacheFlush:
             return fn()
 
         return invoke
+
+
+def prepare_v2_sample(buffer, flush_cache):
+    """Finish eviction, then rendezvous on the Buffer's existing stream.
+
+    L2CacheFlush completes eviction before returning. The blocking device
+    barrier orders both caller/communication streams before sample markers;
+    runtime.barrier() instead creates and destroys an ACL stream per call.
+    """
+    flush_cache()
+    buffer.barrier(use_comm_stream=True, with_cpu_sync=True)
 
 
 STAGES = {
@@ -212,7 +240,7 @@ def byte_ledger(counts, rank, *, tokens, hidden, topk, dtype, idx_bytes, op):
     )
 
 
-def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barrier=False):
+def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barrier=False, allow_elastic_barrier=False):
     """Select fixed IDs 0..N-1 using caller-stream device events, not row count.
 
     Guards may be clipped by capture boundaries. A missing marker/kernel in a
@@ -300,12 +328,18 @@ def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barri
         if not overlap:
             if begin < intervals[0][0] or begin >= intervals[-1][1]:
                 continue  # explicitly outside the fixed measured interval
-            # CANN SHMEM's blocking Host barrier launches this device kernel.
-            # Only benchmark alignment in a gap is excluded; an in-sample
-            # barrier is retained, and unknown/out-of-device tasks still fail.
+            # Only benchmark alignment in a gap is excluded. ElasticBuffer's
+            # one-AIV barrier shares the internal combine-notify kernel name:
+            # an in-sample notify must remain measured, never filtered by name.
             if (
-                allow_shmem_barrier
-                and row["Name"] == "_Z24barrier_on_stream_kernelim"
+                (
+                    (allow_shmem_barrier and row["Name"] == "_Z24barrier_on_stream_kernelim")
+                    or (
+                        allow_elastic_barrier
+                        and row["Name"] == "cached_notify_combine_kernel"
+                        and str(row["Block Num"]).strip() == "1"
+                    )
+                )
                 and str(row["Device_id"]).strip() == str(device)
                 and str(row["Step Id"]).strip() == "1"
             ):
@@ -320,7 +354,7 @@ def select_profile_samples(rows, trace, iterations, device, *, allow_shmem_barri
     return selected, intervals, host_ranges, len(rows) - len(selected)
 
 
-def split_cache_flush(rows, trace, iterations, device, *, sample_host_ranges=None):
+def split_cache_flush(rows, trace, iterations, device, *, sample_host_ranges=None, before_samples=False):
     """Follow torch_to_npu flows from annotated Host calls to device kernels.
 
     Host annotations are not device execution intervals. Match flow endpoints
@@ -338,9 +372,13 @@ def split_cache_flush(rows, trace, iterations, device, *, sample_host_ranges=Non
             if not start.is_finite() or not duration.is_finite() or duration <= 0:
                 raise ValueError("invalid L2 flush annotation timestamp")
             entry = (start, start + duration, event.get("pid"), event.get("tid"))
-            if sample_host_ranges is None or any(
-                pid == entry[2] and tid == entry[3] and a <= start and start + duration <= b
-                for a, b, pid, tid in sample_host_ranges
+            if (
+                before_samples
+                or sample_host_ranges is None
+                or any(
+                    pid == entry[2] and tid == entry[3] and a <= start and start + duration <= b
+                    for a, b, pid, tid in sample_host_ranges
+                )
             ):
                 annotations.append(entry)
         if event.get("ph") == "X":
@@ -353,6 +391,35 @@ def split_cache_flush(rows, trace, iterations, device, *, sample_host_ranges=Non
             elif event.get("ph") == "f":
                 flow_ends.setdefault(key, []).append(event)
     annotations.sort(key=lambda a: a[0])
+    if before_samples:
+        if sample_host_ranges is None:
+            raise ValueError("pre-sample L2 flush requires sample markers")
+        selected = []
+        for i, (start, _, pid, tid) in enumerate(sample_host_ranges):
+            previous_ends = [
+                Decimal(str(event["ts"])) + Decimal(str(event["dur"]))
+                for event in events
+                if event.get("ph") == "X"
+                and event.get("name", "").startswith(PROFILE_SAMPLE_RANGE)
+                and event["name"].endswith("/end")
+                and (event.get("pid"), event.get("tid")) == (pid, tid)
+                and Decimal(str(event["ts"])) + Decimal(str(event["dur"])) <= start
+            ]
+            lower = max(previous_ends, default=Decimal("-Infinity"))
+            candidates = [
+                entry
+                for entry in annotations
+                if entry[2:] == (pid, tid)
+                and entry[1] <= start
+                and entry[0] >= lower
+                and (i == 0 or entry[0] >= sample_host_ranges[i - 1][1])
+            ]
+            # Warmup/guard flushes may precede sample zero. Later samples must
+            # have exactly one flush since the preceding measured call ended.
+            if not candidates or (i > 0 and len(candidates) != 1):
+                raise ValueError("missing/ambiguous pre-sample L2 flush")
+            selected.append(candidates[-1])
+        annotations = selected
     if len(annotations) != iterations or any(a[1] > b[0] for a, b in zip(annotations, annotations[1:])):
         raise ValueError("expected one nonoverlapping L2 flush annotation per iteration; check profiler trace export")
 
@@ -419,7 +486,20 @@ def split_cache_flush(rows, trace, iterations, device, *, sample_host_ranges=Non
     return kept, intervals, excluded
 
 
-def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flush_l2_cache=False, sample_markers=False):
+def parse_profile(
+    root,
+    op,
+    expanded,
+    iterations,
+    device,
+    aiv,
+    *,
+    api="v2",
+    flush_l2_cache=False,
+    sample_markers=False,
+    require_combine_notify=False,
+    all_rank_sync_each_iteration=False,
+):
     """Fail closed on missing, duplicated or unrecognizable profiler samples."""
     if api not in ("v1", "v2") or iterations <= 0:
         raise ValueError("invalid API or iteration count")
@@ -436,12 +516,26 @@ def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flus
         rows = list(csv.DictReader(stream))
     rows.sort(key=lambda r: Decimal(r["Start Time(us)"].strip()))
     sample_intervals, sample_host_ranges, discarded = [], None, 0
+    flush_intervals, flush_kernels = [], []
+    if all_rank_sync_each_iteration and not sample_markers:
+        raise ValueError("all-rank pre-sample synchronization requires sample markers")
+    if all_rank_sync_each_iteration and flush_l2_cache:
+        # New V2 captures evict before the blocking rank rendezvous and start
+        # marker. Identify those flushes by Host flows before selecting kernels.
+        _, _, host_ranges, _ = select_profile_samples([], traces[0], iterations, device)
+        rows, flush_intervals, flush_kernels = split_cache_flush(
+            rows, traces[0], iterations, device, sample_host_ranges=host_ranges, before_samples=True
+        )
     if sample_markers:
         rows, sample_intervals, sample_host_ranges, discarded = select_profile_samples(
-            rows, traces[0], iterations, device, allow_shmem_barrier=op.startswith("combine")
+            rows,
+            traces[0],
+            iterations,
+            device,
+            allow_shmem_barrier=op.startswith("combine") or all_rank_sync_each_iteration,
+            allow_elastic_barrier=all_rank_sync_each_iteration,
         )
-    flush_intervals, flush_kernels = [], []
-    if flush_l2_cache:
+    if flush_l2_cache and not all_rank_sync_each_iteration:
         rows, flush_intervals, flush_kernels = split_cache_flush(
             rows, traces[0], iterations, device, sample_host_ranges=sample_host_ranges
         )
@@ -459,9 +553,13 @@ def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flus
     if fused:
         main = "v1_combine_udma_kernel"
     required = [main]
-    # Fixed-header UDMA combine folds its entry synchronization into Begin().
-    # Accept old reports too, but reject partial/mixed notify sequences below.
-    combine_notify = ["cached_notify_combine_kernel"] if early or counts["cached_notify_combine_kernel"] else []
+    # New V1/V2 profiles require a separate all-AIV entry rendezvous. Archived reports
+    # without it remain readable; partial/mixed sequences always fail below.
+    combine_notify = (
+        ["cached_notify_combine_kernel"]
+        if early or counts["cached_notify_combine_kernel"] or (combine and require_combine_notify)
+        else []
+    )
     required += (
         combine_notify + ([] if fused else ["v1_combine_udma_reduce_kernel"])
         if combine
@@ -570,8 +668,8 @@ def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flus
                 raise ValueError("nonfinite kernel timestamp")
             if (
                 STAGES.get(name) in ("early_submit", "comm", "expand", "aggregate", "reduce", "fused_combine")
-                and int(row["Block Num"]) != aiv
-            ):
+                or name == "cached_notify_combine_kernel"
+            ) and int(row["Block Num"]) != aiv:
                 raise ValueError("unexpected launch AIV count")
             times[STAGES.get(name, "other") + "_us"] += duration
             kernels.append(
@@ -627,6 +725,7 @@ def parse_profile(root, op, expanded, iterations, device, aiv, *, api="v2", flus
             guard_iterations_per_side=PROFILE_GUARD_ITERS,
             excluded_boundary_kernels=discarded,
             device_intervals_us=[[str(a), str(b)] for a, b in sample_intervals],
+            all_rank_sync_each_iteration=all_rank_sync_each_iteration,
         )
     return result
 

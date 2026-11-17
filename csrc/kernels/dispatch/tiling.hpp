@@ -48,6 +48,7 @@ struct DispatchTiling {
     uint64_t plan_rows_offset = 0, plan_scratch_offset = 0, plan_mailbox_offset = 0;
     uint32_t rank, world, tokens, topk, rows, address_stride, fp8, hidden;
     uint64_t sync, book, input, output, weights, scales, inbox, inbox_stride, workspace_bytes;
+    uint32_t instance_id = 0;
 };
 
 // Caller validates bounds before narrowing to this device ABI. All byte

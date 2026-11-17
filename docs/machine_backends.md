@@ -1,7 +1,7 @@
 # Mesh+PCIe、Mesh+Clos 与 Global Clos
 
 一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
-`836d3fd6f9c2f3b10a6acac36ccfd531b104d4a7`。Mesh+Clos 保留本仓已有的 HT、LL、
+`a5e55f750d506d0fcfe01b5959299cbf019f762a`。Mesh+Clos 保留本仓已有的 HT、LL、
 实验组件和接口限制。Direct 实现包含 V1 Buffer、V2 ElasticBuffer、
 MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
@@ -131,64 +131,9 @@ V2 的 `get_buffer_size_hint(..., machine_type=...)` 也须选择同一后端；
 非 collective，不增加跨 rank 同步。直接让构造函数按 shape 计算可避免选错 hint。
 Mesh+Clos 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `shmem_ip_port` 方式。
 
-## 全 Clos 的默认调度与手动调优
+## 全 Clos 精度与带宽测试
 
-V1/V2 在 UDMA 下默认 `udma_auto_policy=True`，fresh/cached dispatch 与 combine
-采用相同的 peer 调度参数。机型识别与此策略是两层逻辑：先选通信实现，再选 Clos 调度。
-
-| EP | peers/worker | workers/peer | QPs/worker | WQEs/visit | peer 顺序 |
-| --- | --- | --- | --- | --- | --- |
-| 2–8 | 1 | 2 | 1 | 8 | rank |
-| 9–16 | 1 | 1 | 1 | 8 | rank |
-| 17–128 | 4 | 1 | 1 | 32 | rank |
-| 129–256 | 8 | 1 | 1 | 32 | rank |
-
-后两档是在 32 个 QP 预算内的推广，不代表所有 EP、核数和路由均已有性能测量。
-策略不修改用户指定的核数：V1 通过 `Config(num_sms=...)`，V2 在 dispatch/combine
-传 `num_sms=...`。上表为初始策略；核数不足时，自动将 peers/worker 按 1、2、4、8
-逐档增加，直到 `ceil((EP-1)/peers_per_worker) * workers_per_peer` 不超过核数及 32-QP
-预算。workers/peer、QPs/worker 和 WQEs/visit 保持不变；核数仍须为合法正偶数。
-例如 8 核下 EP4/8/16/32 的 peers/worker 分别为 1/2/2/4；EP128 的 20 核使用
-8 peers/worker、16 个发送 worker。P=8 仍放不下时在下发前报错，例如 EP32 的 2 核。
-
-QP 资源初始化已覆盖上述所有 peer 分组，无需为低核数重建 Buffer。每次调用从不可变的
-初始策略与核数推导有效策略，不改变其他 handle；V2 cached dispatch/combine 沿用
-handle 核数，因此得到同一策略。`buffer.udma_auto_policy` 返回初始策略，
-`.for_num_aiv(n)` 返回指定核数的有效策略；带宽报告记录后者，版本为 `clos-v2`。
-手动模式不做自动调整。这里的核数约束作用于通信、notify 及对应 expand/reduce；
-fresh dispatch 前的独立 layout 仍按专家数和设备能力选核，不受该参数限制。
-实验性的 aggregate pipeline 仍要求 32/64 核。
-V1 未传 `Config` 时使用 `set_num_sms` 设置的当前核数，初始值为 32，不按 handle
-自动继承核数。V2 fresh dispatch 的 `num_sms=0` 使用 32 核；cached dispatch/combine
-的 0 沿用 handle 核数，显式值必须与 handle 一致。`get_theoretical_num_sms()`
-仍可供调用方查询，但不参与 fresh dispatch 的默认选核。
-带宽脚本默认显式传 32 核，与 V2 fresh dispatch 的库默认值一致。
-
-自动模式下显式传入的策略参数不改变结果；与有效值不同会在 rank 0 记录 warning。
-要调优，请在构造 Buffer 时设 `udma_auto_policy=False`，完整指定所用策略参数。例如 V2：
-
-```python
-buffer = deep_ep.ElasticBuffer(
-    group=ep_group, num_max_tokens_per_rank=8192, hidden=6144, num_topk=8,
-    machine_type="global_clos", explicitly_destroy=True,
-    udma_auto_policy=False, udma_schedule="peer",
-    udma_dispatch_peer_order="rank", udma_combine_peer_order="rank",
-    udma_peers_per_worker=4, udma_workers_per_peer=1,
-    udma_qps_per_worker=1, udma_wqes_per_visit=32,
-)
-```
-
-V1 的 peers/worker 和 WQEs/visit 放在每次调用的 `Config` 中，其余参数在 Buffer 构造时设置。
-group 顺序还需 `udma_ranks_per_group`；group_round_robin 还需
-`udma_peers_per_group_per_worker`。MTE 不启用 UDMA 自动策略。
-
-UDMA 控制区固定在工作区开头，每个源 rank 保留 512 字节（256 字节对齐），
-dispatch/combine 数据区与容量计算同步后移。普通 combine 省去前置 cached-notify，
-但保留 kernel Begin 的跨 rank 同步、接收完成等待和发送 Quiet，避免上一轮读写尚未结束就复用数据。
-cached dispatch、MTE 和需要独立初始化的实验路径保留对应 notify。
-这些改动需要整体重编 Python/native/device 库，不能只替换 Python 文件。
-
-Clos 仅保留两个精度与带宽入口，均使用库的默认自动调度策略，不提供手动调度或参数扫描：
+Clos 提供以下精度与带宽测试入口：
 
 ```bash
 python benchmarks/clos/bench_v1_bandwidth.py --ep-size 8 --output clos_v1_ep8
@@ -202,7 +147,9 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 8 --output clos_v2_ep8
 V2 通信带宽分母仅为通信 kernel 耗时，notify/reduce 单列；V1 的 fused combine
 保留融合耗时，不能将其当作独立通信耗时。
 
-EP32 默认两机、每机 16 rank；每机只有 8 卡时显式设置 `--nnodes 4`。所有节点
+带宽脚本接受 EP128 和 EP256。EP256 默认 16 台、每台 16 rank；每台 8 rank 时用
+`--nnodes 32`，各节点的 `--node-rank` 为 0 到 31。EP32 默认两机、每机 16 rank；
+每机只有 8 卡时显式设置 `--nnodes 4`。所有节点
 使用相同的 `--ep-size`、`--nnodes`、`--master-addr` 和 `--run-id`，分别设置
 `--node-rank`。例如两机时在 node0/node1 分别执行以下命令并替换 node-rank：
 
@@ -218,10 +165,12 @@ python benchmarks/clos/bench_v2_bandwidth.py --ep-size 32 --nnodes 2 --node-rank
 V1/V2 带宽脚本在每轮预热和 profiling 调用后等待本卡 NPU 执行完成，再提交下一轮，
 避免未完成输出和分配持续积压。该 Host 等待位于采样结束标记之外，不计入 kernel
 带宽分母；报告通过 `sampling.host_sync_each_iteration=true` 记录此测量方式。
-Combine 的预热、profiling（含边界保护轮次）及独立 Event 计时还会在每次调用前，
-先等待本卡 NPU 完成，再通过 Buffer 的 Host SHMEM barrier 对齐所有 rank。
-V1 使用 `buffer.barrier()`，V2 使用 `buffer.runtime.barrier()`；该对齐位于采样标记、
-Event 起点及可选缓存清理之前，不计入耗时，也不改变算子内部同步。
+V2 的 fresh/cached dispatch、无权重/带权重 combine 在每轮预热、profiling（含边界
+保护轮次）和独立 Event 计时前，先执行可选 L2 清理，再等待本卡 NPU 完成，最后通过
+`buffer.runtime.barrier()` 对齐当前通信组的所有 rank，之后才开始计时并调用算子。
+L2 清理与外层同步均不计入耗时；报告通过 `all_rank_sync_each_iteration=true` 标识
+这一采样方式，旧报告仍按其原有顺序解析。V1 保留原行为，仅 combine 通过
+`buffer.barrier()` 在可选缓存清理之前对齐 rank。上述调整不改变算子内部同步。
 SHMEM Host barrier 内部的设备 barrier kernel 仅在采样区间之外排除，原始 profiler 仍保留它。
 它减少 rank 间的启动偏差，但不保证 kernel 同时启动；不同对齐条件下的性能需区分比较。
 

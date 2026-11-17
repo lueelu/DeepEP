@@ -166,7 +166,7 @@ public:
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset), x_, scales_,
             td_.hidden * td_.x_element_bytes, td_.num_scales * td_.scale_element_bytes,
-            td_.num_tokens, td_.has_x_scales && td_.num_scales != 0 && td_.scale_element_bytes != 0 ? 2U : 1U, spans_,
+            td_.num_tokens, td_.has_x_scales && td_.num_scales != 0 && td_.scale_element_bytes != 0 && !td_.packed_peer_scales ? 2U : 1U, spans_,
             rows_pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
@@ -185,6 +185,31 @@ public:
             Base::SelectQp(next_qp_[p]);
             next_qp_[p] ^= 1U;
         }
+    }
+
+    // Compact scales use the payload SQ and its terminal completion marker.
+    __aicore__ void PutPackedScales(uint32_t p, uint32_t first, uint32_t count, uint32_t rank_base)
+    {
+        if (!count) return;
+        Flush();
+        p = Base::QueuePeer(p);
+        const uint64_t bytes = uint64_t(td_.num_scales) * td_.scale_element_bytes;
+        const uint64_t row = uint64_t(rank_base) + first;
+        auto* output = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset) + p * kOutputRecordWords;
+        if (uint64_t(first) + count > td_.num_tokens || row + count > output[2] ||
+            uint64_t(count) * bytes > UINT32_MAX) { trap(); return; }
+        active_state_ = peers_[p].state;
+        auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
+        aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
+        if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes)) { trap(); return; }
+        auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset);
+        request[0] = output[1] + row * bytes;
+        request[1] = td_.packed_peer_scales + (uint64_t(peers_[p].peer) * td_.num_tokens + first) * bytes;
+        request[2] = uint64_t(count) * bytes;
+        request[3] = p;
+        last_ = p;
+        Base::pending_ = 1;
+        Base::Flush();
     }
 
     __aicore__ void Publish(GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t worker = 0)

@@ -8,6 +8,7 @@
  */
 
 #include "runtime/buffer_runtime.h"
+#include "runtime/instances.hpp"
 
 #include <limits>
 #include <stdexcept>
@@ -25,7 +26,7 @@
 #include "shmem.h"
 #include "tiling/platform/platform_ascendc.h"
 
-extern "C" uint64_t v1_token_schedule_abi_3();
+extern "C" uint64_t v1_multi_instance_abi_4();
 
 namespace ascend_deepep::runtime {
 namespace {
@@ -129,7 +130,7 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
                              bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker)
+                             int64_t udma_qps_per_worker, bool auto_resources)
     : rank_(rank),
       num_ranks_(num_ranks),
       num_bytes_(num_bytes),
@@ -141,9 +142,9 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
       shmem_(std::make_shared<ShmemInstance>(
           rank, num_ranks, ip_port, data_op_engine_type_, use_1g_huge_pages, unique_id, bootstrap_key, v1_shared_jetty,
           v1_token_schedule, udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
-          udma_peers_per_group_per_worker, udma_workers_per_peer, udma_qps_per_worker))
+          udma_peers_per_group_per_worker, udma_workers_per_peer, udma_qps_per_worker, auto_resources))
 {
-    TORCH_CHECK(v1_token_schedule_abi_3() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
+    TORCH_CHECK(v1_multi_instance_abi_4() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
                                               uint64_t(sizeof(ascend_deepep::CombineTilingData))),
                 "Kernel/native tiling ABI mismatch; rebuild and install with scripts/build.sh");
 
@@ -153,9 +154,10 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
         if (use_1g_huge_pages_) {
             // The fixed prefix owns the workspace; the tail owns comm metadata
             // and, for UDMA, the independently-lived output address mailbox.
-            const auto control_bytes =
-                transport_ == "udma" ? ascend_deepep::udma::OutputControlBytes(static_cast<uint32_t>(num_ranks_)) : 0;
-            shmem_->Init(static_cast<int64_t>(kCommMetaBytes + control_bytes), num_bytes_);
+            // The metadata heap retains SHMEM's 2 MiB alignment even when
+            // the payload workspace is independently allocated with 1 GiB pages.
+            const auto metadata_heap_bytes = ValidateAndGetLocalMemSize(rank_, num_ranks_, 0, transport_);
+            shmem_->Init(metadata_heap_bytes, num_bytes_);
         } else {
             shmem_->Init(local_mem_size_);
         }
@@ -183,6 +185,13 @@ bool BufferRuntime::IsInitialized() const
     return initialized_ && shmem_ != nullptr && shmem_->Initialized();
 }
 
+std::vector<int64_t> BufferRuntime::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                                    int64_t workers, int64_t qps)
+{
+    TORCH_CHECK(IsInitialized(), "Buffer is not initialized");
+    return shmem_->ConfigureTuning(dispatch_order, combine_order, group_peers, workers, qps);
+}
+
 void BufferRuntime::Barrier()
 {
     if (!IsInitialized()) {
@@ -203,6 +212,8 @@ void BufferRuntime::AbortInitialization()
 
 std::vector<std::string> BufferRuntime::MteMappingErrors() const
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     RequireShmem();
     TORCH_CHECK(data_op_engine_type_ == ACLSHMEM_DATA_OP_MTE, "mapping preflight requires MTE-only transport");
     std::vector<std::string> errors;
@@ -305,20 +316,24 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
            std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-BufferRuntime::IntranodeDispatch(
-    torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<torch::Tensor> topk_idx,
-    c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> num_tokens_per_rank,
-    torch::Tensor is_token_in_rank, c10::optional<torch::Tensor> num_tokens_per_expert, int64_t cached_num_recv_tokens,
-    c10::optional<torch::Tensor> cached_rank_prefix_matrix, c10::optional<torch::Tensor> cached_channel_prefix_matrix,
-    int64_t expert_alignment, int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
-    int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy, c10::optional<int64_t> allocation_stream_id,
-    c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit)
+BufferRuntime::IntranodeDispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales,
+                                 c10::optional<torch::Tensor> topk_idx, c10::optional<torch::Tensor> topk_weights,
+                                 c10::optional<torch::Tensor> num_tokens_per_rank, torch::Tensor is_token_in_rank,
+                                 c10::optional<torch::Tensor> num_tokens_per_expert, int64_t cached_num_recv_tokens,
+                                 c10::optional<torch::Tensor> cached_rank_prefix_matrix,
+                                 c10::optional<torch::Tensor> cached_channel_prefix_matrix, int64_t expert_alignment,
+                                 int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
+                                 int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy,
+                                 c10::optional<int64_t> allocation_stream_id,
+                                 c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker,
+                                 int64_t udma_wqes_per_visit, const std::vector<int64_t>& launch_plan)
 {
-    auto result = IntranodeDispatchWithPlan(
-        x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
-        cached_num_recv_tokens, cached_rank_prefix_matrix, cached_channel_prefix_matrix, expert_alignment,
-        num_worst_tokens, num_aiv, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, zero_copy,
-        allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit);
+    auto result = IntranodeDispatchWithPlan(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
+                                            num_tokens_per_expert, cached_num_recv_tokens, cached_rank_prefix_matrix,
+                                            cached_channel_prefix_matrix, expert_alignment, num_worst_tokens, num_aiv,
+                                            num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, zero_copy,
+                                            allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker,
+                                            udma_wqes_per_visit, c10::nullopt, launch_plan);
     return {std::get<0>(result), std::get<1>(result), std::get<2>(result), std::get<3>(result), std::get<4>(result),
             std::get<5>(result), std::get<6>(result), std::get<7>(result), std::get<8>(result), std::get<9>(result)};
 }
@@ -334,7 +349,7 @@ BufferRuntime::IntranodeDispatchWithPlan(
     int64_t expert_alignment, int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
     int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy, c10::optional<int64_t> allocation_stream_id,
     c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
-    c10::optional<torch::Tensor> cached_dispatch_plan)
+    c10::optional<torch::Tensor> cached_dispatch_plan, const std::vector<int64_t>& launch_plan)
 {
     TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
@@ -346,7 +361,7 @@ BufferRuntime::IntranodeDispatchWithPlan(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, nullptr, false, dispatch_output_control_);
+        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan);
     symmetric_workspace_active_ = true;
     return result;
 }
@@ -363,7 +378,8 @@ BufferRuntime::IntranodeDispatchWithHandle(
     int64_t expert_alignment, int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
     int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy, c10::optional<int64_t> allocation_stream_id,
     c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
-    c10::optional<torch::Tensor> cached_dispatch_plan, bool defer_public_expert_prefix)
+    c10::optional<torch::Tensor> cached_dispatch_plan, bool defer_public_expert_prefix,
+    const std::vector<int64_t>& launch_plan)
 {
     TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
@@ -376,7 +392,7 @@ BufferRuntime::IntranodeDispatchWithHandle(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_);
+        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan);
     symmetric_workspace_active_ = true;
     return {result, public_handle};
 }
@@ -387,7 +403,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> BufferRuntime::Intranode
     torch::Tensor channel_prefix_matrix, torch::Tensor send_head, int64_t num_aiv,
     int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
     c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
-    int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit)
+    int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, const std::vector<int64_t>& launch_plan)
 {
     TORCH_CHECK(num_aiv <= num_device_aiv_, "combine num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
@@ -396,7 +412,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> BufferRuntime::Intranode
         num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, static_cast<int>(rank_),
         static_cast<int>(num_ranks_), static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes),
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
-        allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit);
+        allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, nullptr,
+        c10::nullopt, c10::nullopt, {}, c10::nullopt, c10::nullopt, 0, 0, launch_plan);
     symmetric_workspace_active_ = true;
     return result;
 }
@@ -409,8 +426,10 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
     c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, c10::optional<torch::Tensor> expanded_x,
     c10::optional<torch::Tensor> single_source_slots, c10::optional<torch::Tensor> early_aggregate_map,
-    int64_t pipeline_chunk_tokens)
+    int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv, const std::vector<int64_t>& launch_plan)
 {
+    TORCH_CHECK(reduce_num_aiv >= 0 && reduce_num_aiv <= num_device_aiv_,
+                "reduce_num_aiv must be between zero and the device AIV count");
     TORCH_CHECK(num_aiv <= num_device_aiv_, "combine num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     TORCH_CHECK(pipeline_chunk_tokens == 0 || pipeline_chunk_tokens == 32 || pipeline_chunk_tokens == 64,
@@ -426,9 +445,10 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
                         single_source_slots.has_value(),
                     "early aggregate requires the expanded single-source UDMA path");
         TORCH_CHECK(x.is_same(*expanded_x), "early aggregate must consume the original expanded tensor");
-        auto plan = ascend_deepep::ops::PrepareAggregate(x, c10::nullopt, topk_weights, *early_aggregate_map, num_aiv,
-                                                         RequireShmem().FftsAddr(), allocation_stream_id,
-                                                         single_source_slots, rank_prefix_matrix,
+        // Preserve the dispatch-sized pre-aggregate when communication cores change.
+        auto plan = ascend_deepep::ops::PrepareAggregate(x, c10::nullopt, topk_weights, *early_aggregate_map,
+                                                         channel_prefix_matrix.size(1), RequireShmem().FftsAddr(),
+                                                         allocation_stream_id, single_source_slots, rank_prefix_matrix,
                                                          static_cast<int>(rank_), static_cast<int>(num_ranks_));
         x = plan.x;
         topk_weights = plan.values;
@@ -442,7 +462,7 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, &epilogue,
         expanded_x, single_source_slots, aggregate, pipeline_chunk_tokens ? early_aggregate_map : c10::nullopt,
-        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens);
+        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv, launch_plan);
     symmetric_workspace_active_ = true;
     epilogue->SetOwner(c10::intrusive_ptr<BufferRuntime>::reclaim_copy(this));
     return epilogue;
@@ -487,11 +507,13 @@ void BufferRuntime::ElasticBarrier(int64_t num_aiv)
     // It is also valid for the shared-Jetty V1 backend of ElasticBuffer.
     TORCH_CHECK(num_aiv > 0 && num_aiv <= num_device_aiv_, "elastic barrier num_aiv must be in (0, ", num_device_aiv_,
                 "]");
-    LaunchElasticBarrierKernel(num_aiv, RequireShmem().FftsAddr());
+    LaunchElasticBarrierKernel(num_aiv, RequireShmem().FftsAddr(), RequireShmem().InstanceId());
 }
 
 void BufferRuntime::AllocateCommMeta()
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     comm_meta_ptr_ = aclshmem_malloc(kCommMetaBytes);
     if (comm_meta_ptr_ == nullptr) {
         throw std::runtime_error("aclshmem_malloc failed for the 2 MiB communication metadata slot");
@@ -507,6 +529,8 @@ void BufferRuntime::AllocateCommMeta()
 
 void BufferRuntime::AllocateWorkspace()
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     if (num_bytes_ == 0) {
         return;
     }
@@ -521,8 +545,10 @@ void BufferRuntime::AllocateWorkspace()
     }
 }
 
-void BufferRuntime::FreeResources() noexcept
+void BufferRuntime::FreeResources()
 {
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    deepep::select_instance(shmem_->InstanceId());
     if (workspace_ptr_ != nullptr) {
         if (!use_1g_huge_pages_) {
             aclshmem_free(workspace_ptr_);

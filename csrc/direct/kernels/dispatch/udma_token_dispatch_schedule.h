@@ -1,13 +1,14 @@
 #pragma once
 
 #include "kernels/dispatch/udma_dispatch_sender.h"
+#include "common/platform.h"
 #include "common/types.h"
 #include "simt_api/device_sync_functions.h"
 
 namespace ascend_deepep::udma {
 // Separate list windows from the sender's in-flight WQE staging region.
 constexpr uint32_t kTokenListsOffset = kDispatchSenderBytes;
-static_assert(kTokenListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= 216 * 1024);
+static_assert(kTokenListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
 template <class Resource>

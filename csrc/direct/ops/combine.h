@@ -44,6 +44,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     c10::optional<torch::Tensor> expanded_x = c10::nullopt,
     c10::optional<torch::Tensor> single_source_slots = c10::nullopt, std::function<void()> aggregate = {},
     c10::optional<torch::Tensor> pipeline_mapping = c10::nullopt,
-    c10::optional<torch::Tensor> pipeline_values = c10::nullopt, int64_t pipeline_chunk_tokens = 0);
+    c10::optional<torch::Tensor> pipeline_values = c10::nullopt, int64_t pipeline_chunk_tokens = 0,
+    int64_t reduce_num_aiv = 0, const std::vector<int64_t>& launch_plan = {});
 
 }  // namespace ascend_deepep::ops

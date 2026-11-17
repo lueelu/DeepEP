@@ -19,6 +19,8 @@ from .udma_policy import resolve_udma_policy, validate_manual_config
 
 
 _ORPHANED_NATIVE_RESOURCES: list[tuple[Any, ...]] = []
+_COMMUNICATION_STREAMS: dict[tuple[int, int], Any] = {}
+_COMMUNICATION_STREAM_LOCK = RLock()
 _MAX_SHMEM_INTRANODE_RANKS = 1024
 _SUPPORTED_TRANSPORTS = frozenset(("auto", "mte", "roce", "sdma", "udma"))
 
@@ -124,9 +126,11 @@ class Buffer:
             operation_config=True,
         )
         if self._udma_auto_policy is not None:
+            self._udma_auto_policy = self._udma_auto_policy.bind_group(resolved_group)
             udma_schedule = "peer"
             udma_dispatch_peer_order = udma_combine_peer_order = "rank"
-            udma_ranks_per_group = udma_peers_per_group_per_worker = None
+            udma_ranks_per_group = self._udma_auto_policy.ranks_per_group
+            udma_peers_per_group_per_worker = None
             udma_workers_per_peer = self._udma_auto_policy.workers_per_peer
             udma_qps_per_worker = self._udma_auto_policy.qps_per_worker
         else:
@@ -226,7 +230,10 @@ class Buffer:
                 bootstrap_key,
                 True,  # V1 requests shared Jetty when the resolved transport is UDMA.
                 udma_schedule == "token",
-                *peer_options,
+                # Older manual options omit trailing defaults. Fill them before
+                # appending the resource flag so it cannot become a QP count.
+                *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
+                self._udma_auto_policy is not None,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -234,7 +241,7 @@ class Buffer:
         # Slot/generation tracks one future layout -> dispatch -> combine
         # session. The native runtime owns the symmetric workspace itself.
         self._slot = Slot(0, owner=self, native_resources=self._native)
-        self._communication_stream = _create_communication_stream()
+        self._communication_stream = get_global_comm_stream()
 
     @property
     def udma_auto_policy(self):
@@ -515,6 +522,16 @@ class Buffer:
         elif config is None:
             config = self.get_dispatch_config(self.group_size)
         num_aiv, nvl_send, nvl_recv = _config_to_native_args(config)
+        launch_policy = (
+            self._udma_auto_policy.for_launch(
+                num_aiv,
+                int(x_tensor.size(1)) * x_tensor.element_size(),
+                "dispatch",
+                v2=False,
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         del num_tokens_per_rdma_rank
 
         if handle is not None:
@@ -566,6 +583,7 @@ class Buffer:
                     config.udma_peers_per_worker,
                     config.udma_wqes_per_visit,
                     getattr(handle, "_dispatch_plan", None),
+                    launch_policy.native_plan() if launch_policy else [],
                 )
             if not zero_copy:
                 _record_recv_outputs_on_current_stream(recv_x, recv_x_scales)
@@ -622,6 +640,8 @@ class Buffer:
                 self.num_max_tokens_per_rank,
                 config.udma_peers_per_worker,
                 config.udma_wqes_per_visit,
+                None,
+                launch_policy.native_plan() if launch_policy else [],
             )
         if not zero_copy:
             _record_recv_outputs_on_current_stream(recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights)
@@ -685,6 +705,16 @@ class Buffer:
         elif config is None:
             config = self.get_combine_config(self.group_size)
         num_aiv, nvl_send, nvl_recv = _config_to_native_args(config)
+        launch_policy = (
+            self._udma_auto_policy.for_launch(
+                num_aiv,
+                int(x.size(1)) * x.element_size(),
+                "weighted" if topk_weights is not None else "combine",
+                v2=False,
+            )
+            if self._udma_auto_policy is not None
+            else None
+        )
         if isinstance(handle, _V1Handle) and handle._buffer_owner is not self:
             raise ValueError("V1 handle belongs to a different Buffer")
         (
@@ -714,6 +744,7 @@ class Buffer:
                 self.num_max_tokens_per_rank,
                 config.udma_peers_per_worker,
                 config.udma_wqes_per_visit,
+                launch_policy.native_plan() if launch_policy else [],
             )
         _record_recv_outputs_on_current_stream(recv_x, recv_topk_weights)
         event = self._finish_comm_event(async_finish, (recv_x, recv_topk_weights))
@@ -1257,7 +1288,7 @@ def _prepare_shmem_bootstrap(
         options += (udma_auto_options,)
     # This key is compared only within this process. Buffer retains group, so
     # its identity cannot be recycled while the associated runtime is alive.
-    key = repr((id(group), options))
+    key = repr((id(group) if comm is None else id(comm), transport, udma_schedule, udma_peer_options))
     state, uid = native.get_shmem_bootstrap(key)
     peers = _bootstrap_all_gather(group, comm, size, (options, state, uid))
     if any(peer[0] != options for peer in peers):
@@ -1265,9 +1296,9 @@ def _prepare_shmem_bootstrap(
     if any(peer[1] < 0 for peer in peers):
         raise RuntimeError("CANN SHMEM already has an active Buffer for a different group or configuration")
     if any(peer[1] != state or peer[2] != uid for peer in peers):
-        raise RuntimeError("inconsistent active SHMEM sessions across EP ranks")
-    if state or ip_port is not None:
-        return uid, key
+        raise RuntimeError("EP ranks disagree on the next Buffer instance ID")
+    if ip_port is not None:
+        return [], key
 
     # Only EP rank 0 reserves an endpoint. Other ranks receive its opaque UID,
     # never create their own endpoint or interpret a peer's socket descriptor.
@@ -1328,15 +1359,27 @@ def _resolve_group_or_comm(group: Any, comm: Optional[Any]) -> Tuple[int, int, A
         raise TypeError("group must be a valid torch.distributed process group") from exc
 
 
-def _create_communication_stream() -> Any:
-    """Create a dedicated stream on the current NPU device."""
+def get_global_comm_stream() -> Any:
+    """Return the process/device communication stream shared by V1 and V2.
+
+    Keep it alive independently of any Buffer. Callers must submit collective
+    operations in the same order on all ranks; sharing a stream does not order
+    independent Host threads across ranks.
+    """
 
     try:
         import torch_npu  # noqa: F401
         import torch
     except ImportError as exc:
         raise ImportError("torch_npu must be installed before creating a Buffer communication stream") from exc
-    return torch.npu.Stream(device=torch.npu.current_device())
+    device = int(torch.npu.current_device())
+    key = (os.getpid(), device)
+    with _COMMUNICATION_STREAM_LOCK:
+        stream = _COMMUNICATION_STREAMS.get(key)
+        if stream is None:
+            stream = torch.npu.Stream(device=device)
+            _COMMUNICATION_STREAMS[key] = stream
+        return stream
 
 
 def _validate_config_world_size(num_ranks: int) -> None:

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/platform.h"
 #include "common/types.h"
 #include "simt_api/device_sync_functions.h"
 
@@ -9,7 +10,7 @@ constexpr uint32_t kPlanRouteBytes = 65536;
 constexpr uint32_t kPlanChunkTokens = 8;
 constexpr uint32_t kPlanChunksOffset = kPlanCountBytes + kPlanRouteBytes;
 constexpr uint32_t kPlanMaxChunks = kPlanRouteBytes / kPlanChunkTokens + kPlanCountBytes / sizeof(int32_t);
-static_assert(kPlanChunksOffset + kPlanMaxChunks * sizeof(int32_t) <= 216 * 1024);
+static_assert(kPlanChunksOffset + kPlanMaxChunks * sizeof(int32_t) <= platform::kKernelUbBytes);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 // Small independent token chunks expose parallelism even for EP2/4/8. Three
@@ -66,17 +67,26 @@ __simt_vf__ __launch_bounds__(128) inline void ScatterDispatchPlanVf(
     asc_threadfence();
 }
 
-__simt_vf__ __launch_bounds__(128) inline void PrefixChannelCountsVf(
-    __ubuf__ int32_t* values, uint32_t rank_stride, uint32_t channels)
+// One thread owns one complete destination row, including its padded tail.
+// The input is the batched [channel, rank_stride] UB tile; publish directly
+// instead of storing it to GM and reading every element back through scalar.
+__simt_vf__ __launch_bounds__(128) inline void PrefixAndPublishChannelsVf(const __ubuf__ int32_t* values,
+                                                                          __gm__ int32_t* channels_out,
+                                                                          __gm__ int32_t* published, uint32_t world,
+                                                                          uint32_t rank_stride, uint32_t channels,
+                                                                          uint32_t channel_stride)
 {
-    for (uint32_t rank = threadIdx.x; rank < rank_stride; rank += 128) {
+    for (uint32_t rank = threadIdx.x; rank < world; rank += 128) {
         int32_t sum = 0;
         for (uint32_t channel = 0; channel < channels; ++channel) {
-            const uint32_t index = channel * rank_stride + rank;
-            sum += values[index];
-            values[index] = sum;
+            sum += values[channel * rank_stride + rank];
+            channels_out[uint64_t(rank) * channels + channel] = sum;
+            published[uint64_t(rank) * channel_stride + channel] = sum;
         }
+        for (uint32_t channel = channels; channel < channel_stride; ++channel)
+            published[uint64_t(rank) * channel_stride + channel] = 0;
     }
+    asc_threadfence();
 }
 
 // On return counts at UB offset 0 are ready for the existing notify count

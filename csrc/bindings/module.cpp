@@ -5,9 +5,8 @@
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
 #include "runtime/session.hpp"
-#ifdef DEEPEP_BUILD_EP_GMM_FUSED
 #include <pybind11/stl.h>
-#endif
+#include "runtime/instances.hpp"
 
 #include "ops/notify.hpp"
 #include "ops/dispatch.hpp"
@@ -18,6 +17,14 @@ namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
 {
     module.attr("runtime_protocol") = 1;
+    module.def("next_instance_id", &deepep_next_instance);
+    module.def("instance_unique_id", []() {
+        deepep::InstanceLock lock(deepep::instance_mutex());
+        aclshmemx_uniqueid_t uid{};
+        if (aclshmemx_get_uniqueid(&uid) != 0) throw std::runtime_error("Cannot create SHMEM UID");
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&uid);
+        return std::vector<uint8_t>(bytes, bytes + sizeof(uid));
+    });
     module.def("shmem_library_path", []() {
         Dl_info info{};
         if (dladdr(reinterpret_cast<void*>(&aclshmemx_init_attr), &info) == 0 || info.dli_fname == nullptr) {
@@ -37,22 +44,25 @@ PYBIND11_MODULE(_C, module)
     module.def(
         "create_combine_runtime",
         [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool mpi,
-           bool use_1g_huge_pages) {
+           bool use_1g_huge_pages, const std::vector<uint8_t>& uid) {
             return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, true, false, mpi, true,
-                                                     use_1g_huge_pages);
+                                                     use_1g_huge_pages, uid);
         },
         py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("mpi"),
-        py::arg("use_1g_huge_pages") = false, py::call_guard<py::gil_scoped_release>());
+        py::arg("use_1g_huge_pages") = false, py::arg("uid") = std::vector<uint8_t>{},
+        py::call_guard<py::gil_scoped_release>());
     py::class_<deepep::Session>(module, "Runtime")
         .def(py::init([](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                         bool use_1g_huge_pages) {
+                         bool use_1g_huge_pages, const std::vector<uint8_t>& uid) {
                  return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, udma, false, false,
-                                                          false, use_1g_huge_pages);
+                                                          false, use_1g_huge_pages, uid);
              }),
              py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"),
-             py::arg("udma") = false, py::arg("use_1g_huge_pages") = false, py::call_guard<py::gil_scoped_release>())
+             py::arg("udma") = false, py::arg("use_1g_huge_pages") = false, py::arg("uid") = std::vector<uint8_t>{},
+             py::call_guard<py::gil_scoped_release>())
         .def("barrier", &deepep::Session::barrier, py::call_guard<py::gil_scoped_release>())
         .def("close", &deepep::Session::close, py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("instance_id", &deepep::Session::instance_id)
         .def_property_readonly("closed", &deepep::Session::closed)
         .def_property_readonly("capacity", &deepep::Session::capacity)
         .def_property_readonly("use_1g_huge_pages", &deepep::Session::use_1g_huge_pages)

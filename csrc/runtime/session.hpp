@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -19,7 +20,8 @@ namespace deepep {
 class Session {
 public:
     Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
-            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false);
+            bool megamoe = false, bool mpi = false, bool combine_only = false, bool use_1g_huge_pages = false,
+            const std::vector<uint8_t>& uid_bytes = {});
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
@@ -42,6 +44,10 @@ public:
         return use_1g_huge_pages_ ? huge_page_bytes_ : allocation_bytes_;
     }
     static bool busy();
+    uint32_t instance_id() const
+    {
+        return instance_id_;
+    }
     // 仅借给可选 MegaMoE 扩展；内存仍由本 Session 独占并显式销毁。
     uintptr_t workspace_address() const;
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
@@ -109,6 +115,7 @@ private:
     void check_context() const;
     void allocate_huge_workspace(uint64_t bytes);
     void release_huge_workspace();
+    uint32_t instance_id_ = 0;
     aclrtContext context_ = nullptr;
     void* workspace_ = nullptr;
     void* huge_page_source_ = nullptr;

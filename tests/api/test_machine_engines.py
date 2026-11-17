@@ -31,6 +31,9 @@ def public_runtime(monkeypatch):
 
     class Native:
         def __init__(self, *args):
+            assert len(args) == 18
+            assert type(args[16]) is int and args[16] in (1, 2)
+            assert type(args[17]) is bool and args[17] == (args[3] == "udma")
             calls.append(("native", args[3]))
 
         def mte_mapping_errors(self):
@@ -43,14 +46,14 @@ def public_runtime(monkeypatch):
     def bootstrap(*args, **kwargs):
         calls.append(("bootstrap", args[5]))
         if args[5] == "udma":
-            assert kwargs["udma_auto_options"][0] == "clos-v2"
+            assert kwargs["udma_auto_options"][0] == "clos-v4"
         return [], "test"
 
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)
     for module in (source_v1, source_v2):
         monkeypatch.setattr(module, "get_native_class", lambda _: Native)
         monkeypatch.setattr(module, "_prepare_shmem_bootstrap", bootstrap)
-        monkeypatch.setattr(module, "_create_communication_stream", lambda: SimpleNamespace(synchronize=lambda: None))
+        monkeypatch.setattr(module, "get_global_comm_stream", lambda: SimpleNamespace(synchronize=lambda: None))
     monkeypatch.setattr(source_v2, "_validate_group_consensus", lambda *args: None)
     monkeypatch.setattr(source_v2.ElasticBuffer, "barrier", lambda *args, **kw: calls.append(("barrier",)))
     return deep_ep, group, calls

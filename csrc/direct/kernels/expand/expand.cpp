@@ -107,7 +107,7 @@ __simt_vf__ __launch_bounds__(128) inline void ExpandCoreOffsetsSimtVf(
 
 } // namespace
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void expand_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void expand_kernel(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR expanded_x, GM_ADDR expanded_x_scales,
     GM_ADDR expanded_topk_weights, GM_ADDR expert_offsets, GM_ADDR actual_expert_counts, GM_ADDR recv_to_expanded_idx,
     GM_ADDR scratch_buffer, ascend_deepep::ExpandTilingData tiling, uint64_t ffts_addr)

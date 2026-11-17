@@ -7,10 +7,28 @@ from functools import lru_cache
 from .config import Config, _MAX_NUM_AIV
 
 
+def _simt_weight_row_fits(world_size, row_bytes):
+    # Prefer SIMT through H4096 BF16 for EP16/32, independent of core budget
+    # and topology. EP16 has measured gains; EP32 shares this configured limit.
+    # The caller still requires a spare AIV. H6144 keeps its UDMA preference.
+    if world_size in (16, 32):
+        return row_bytes <= 8192
+    # Other small EPs retain their row limit; EP64 measured SIMT wins
+    # through 12288 B. Extend those anchors by EP bands, not payload profiles.
+    # EP128 reports use SIMT when auxiliary AIVs exist; larger EPs follow that
+    # preference without an unmeasured upper cutoff. These are heuristic fits.
+    if world_size < 64:
+        return row_bytes <= 7168
+    if world_size < 128:
+        return row_bytes <= 12288
+    return True
+
+
 @lru_cache(maxsize=128)
 def _warn_ignored(name, supplied, effective):
     logging.getLogger(__name__).warning(
-        "UDMA auto policy: ignoring explicit %s=%s; effective %s=%s. "
+        "UDMA auto policy: ignoring explicit %s=%s; constructor fallback %s=%s. "
+        "The effective launch plan also depends on shape and communication cores. "
         "Set udma_auto_policy=False to enable manual tuning.",
         name,
         supplied,
@@ -76,10 +94,17 @@ class UdmaPolicy:
     workers_per_peer: int
     qps_per_worker: int
     wqes_per_visit: int
-    version: str = "clos-v2"
+    version: str = "clos-v4"
+    ranks_per_group: int = 0
+    topology_known: bool = False
+    peer_order: int = 0
+    self_copy: int = 0  # 0: before send; 1: spare AIVs; 2: after submit.
+    weight_mode: int = 0  # 0: legacy; 1: UDMA; 2: SIMT when spare AIVs exist.
 
     @property
     def send_workers(self):
+        if self.peer_order == 3:
+            return ((self.ranks_per_group - 1) // self.peers_per_worker + 1) * self.workers_per_peer
         return ((self.world_size - 2) // self.peers_per_worker + 1) * self.workers_per_peer
 
     def signature(self):
@@ -90,6 +115,8 @@ class UdmaPolicy:
             self.workers_per_peer,
             self.qps_per_worker,
             self.wqes_per_visit,
+            self.ranks_per_group,
+            self.topology_known,
         )
 
     def validate_num_aiv(self, num_aiv):
@@ -108,12 +135,10 @@ class UdmaPolicy:
 
     @lru_cache(maxsize=512, typed=True)
     def for_num_aiv(self, num_aiv):
-        """Fit peer ownership to the operation budget without changing QP lanes.
+        """Fit ownership without mutating resources or another handle's plan.
 
-        PeerMask provisions all P=1/2/4/8 mappings for this immutable W/Q.
-        W is at most two in auto mode, so every supported even core budget
-        can retain W; only the peer count may need to grow. No runtime state
-        changes, including when different handles use different core counts.
+        Grow P first, then use single-worker round robin if rank ownership
+        cannot fit. Every candidate must fit the reserved mapping union.
         """
         if isinstance(num_aiv, bool) or not isinstance(num_aiv, int):
             raise TypeError("num_aiv/num_sms must be an integer")
@@ -123,8 +148,167 @@ class UdmaPolicy:
         policy = self
         while policy.send_workers > budget and policy.peers_per_worker < 8:
             policy = replace(policy, peers_per_worker=policy.peers_per_worker * 2)
+        if policy.send_workers > budget:
+            # Rank ownership cannot fit EP128/AIV8. Logical groups are a
+            # correctness fallback, never evidence of physical server locality.
+            group = self.ranks_per_group or _logical_group(self.world_size)
+            for p in (1, 2, 4):
+                candidate = replace(
+                    self, ranks_per_group=group, peer_order=3, peers_per_worker=p, workers_per_peer=1, qps_per_worker=1
+                )
+                if candidate.send_workers <= min(32, num_aiv or 32) and candidate.valid_group_capacity():
+                    policy = candidate
+                    break
         policy.validate_num_aiv(num_aiv)
         return policy
+
+    def valid_group_capacity(self):
+        if self.peer_order != 3:
+            return True
+        owners = self.send_workers // self.workers_per_peer
+        return ((self.ranks_per_group + owners - 1) // owners) * (self.world_size // self.ranks_per_group) <= 64
+
+    def native_plan(self):
+        """Versioned, per-launch value. No mutation of Buffer or SHMEM state."""
+        return [
+            1,
+            self.peer_order,
+            self.ranks_per_group,
+            self.peers_per_worker,
+            self.workers_per_peer,
+            self.qps_per_worker,
+            self.wqes_per_visit,
+            self.self_copy,
+            self.weight_mode,
+        ]
+
+    def bind_group(self, group):
+        """Collect host identities once at construction, in EP-rank order."""
+        from pathlib import Path
+        import uuid
+        from ..._machine import gather_records
+
+        # Boot identity is shared across containers on the same Linux host.
+        # Never guess G from the process count or a user-overridden hostname.
+        try:
+            host = uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip())
+            identity = str(host) if host.int else None
+        except (OSError, ValueError):
+            identity = None
+        hosts = gather_records(group, identity)
+        if len(hosts) != self.world_size:
+            raise ValueError("topology records do not match the EP group")
+        size = _contiguous_group_size(hosts)
+        return replace(self, ranks_per_group=size or _logical_group(self.world_size), topology_known=bool(size))
+
+    @lru_cache(maxsize=1024, typed=True)
+    def for_launch(self, num_aiv, row_bytes, operation, *, bf16=False, expanded=False, v2=True):
+        """Select using rank-invariant metadata only; never read tensor values.
+
+        Profiles are in-sample BF16 fits, not performance guarantees. Unmeasured
+        dtypes/expanded/V1 paths retain the baseline algorithm. Token/receive
+        counts deliberately do not participate, so skew cannot split protocols.
+        """
+        if operation not in ("dispatch", "combine", "weighted"):
+            raise ValueError("unknown UDMA operation")
+        if isinstance(row_bytes, bool) or not isinstance(row_bytes, int) or row_bytes <= 0:
+            raise ValueError("payload row bytes must be a positive integer")
+        base = self.for_num_aiv(num_aiv)
+        cores = num_aiv or 32
+        plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
+        if self.world_size == 128 and cores >= 16:
+            # One fixed EP128 schedule for every row size and operation. Match
+            # the measured rank/P8/W1/Q1/visit16 candidate, including its legacy
+            # self-copy and weight paths. Smaller budgets keep the capacity
+            # fallback selected by for_num_aiv().
+            plan = replace(
+                base,
+                peer_order=0,
+                peers_per_worker=8,
+                workers_per_peer=1,
+                qps_per_worker=1,
+                wqes_per_visit=16,
+                self_copy=0,
+                weight_mode=0,
+            )
+            plan.validate_num_aiv(num_aiv)
+            return plan
+        if v2 and not expanded and bf16:
+            bucket = "small" if row_bytes <= 4096 else "large"
+            # Extra auxiliary AIVs must not discard the EP32 dispatch profile.
+            # Combine retains its separate 64-core baseline.
+            # Select a measured tier without truncating the actual launch budget.
+            # Intermediate budgets retain the baseline; 64+ retains the historic
+            # large-budget plans, except for EP32 dispatch's existing inheritance.
+            profile_cores = 8 if 8 <= cores < 16 else 32 if 32 <= cores < 64 else None
+            if self.world_size == 32 and operation == "dispatch" and cores >= 32:
+                profile_cores = 32
+            entry = _PROFILES.get((self.world_size, profile_cores, bucket, operation))
+            if (
+                entry is not None
+                and 2048 <= row_bytes <= 12288
+                and self.topology_known
+                and self.ranks_per_group in entry[0]
+            ):
+                _, order, p, w, q, visit, copy = entry
+                plan = replace(
+                    self,
+                    peer_order=order,
+                    peers_per_worker=p,
+                    workers_per_peer=w,
+                    qps_per_worker=q,
+                    wqes_per_visit=visit,
+                    self_copy=copy,
+                )
+            elif operation != "dispatch":
+                plan = replace(plan, self_copy=2)
+            if operation in ("dispatch", "weighted") and cores >= 16 and 0 < cores - plan.send_workers <= 2:
+                # Avoid assigning all metadata/weights to just one or two AIVs.
+                # First remove duplicate payload workers, then grow peer ownership
+                # only as needed. No fixed sender/helper ratio or low-core change.
+                candidate = replace(plan, workers_per_peer=1)
+                max_peers = 4 if candidate.peer_order == 3 else 8
+                while 0 < cores - candidate.send_workers <= 2 and candidate.peers_per_worker < max_peers:
+                    candidate = replace(candidate, peers_per_worker=candidate.peers_per_worker * 2)
+                if cores - candidate.send_workers > 2 and candidate.valid_group_capacity():
+                    plan = candidate
+            if operation == "combine":
+                # Count payload AIVs, not QPs. Keep at least one spare copy
+                # AIV per sender; otherwise overlap self-copy after submission.
+                # Use this launch's communication budget, independent of reduce.
+                spare_aivs = cores - plan.send_workers
+                plan = replace(plan, self_copy=1 if spare_aivs >= plan.send_workers else 2)
+            if operation == "weighted":
+                # Keep the complete measured plan together: the weight-path
+                # comparison used RR/1/1/1/visit8 and after-submit self-copy.
+                # Retain that payload plan; weight preference is selected below.
+                # Keep the EP64 plan with larger core budgets too: additional
+                # auxiliary AIVs must not silently switch weights back to UDMA.
+                # Interpolate between measured row widths; retain both endpoint
+                # plans and the existing topology/core-budget requirements.
+                measured_weight_fit = (
+                    self.topology_known
+                    and (self.world_size, self.ranks_per_group) in ((32, 8), (64, 16))
+                    and (32 <= cores < 64 or (self.world_size == 64 and cores >= 64))
+                    and 8192 <= row_bytes <= 12288
+                )
+                if measured_weight_fit:
+                    plan = replace(
+                        plan,
+                        peer_order=3,
+                        peers_per_worker=1,
+                        workers_per_peer=1,
+                        qps_per_worker=1,
+                        wqes_per_visit=8,
+                        self_copy=2,
+                    )
+                # SIMT needs an AIV outside the payload sending plan.
+                use_simt_weights = _simt_weight_row_fits(self.world_size, row_bytes) and plan.send_workers < cores
+                plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
+        plan.validate_num_aiv(num_aiv)
+        if not plan.valid_group_capacity():
+            raise ValueError("automatic UDMA plan exceeds the per-worker peer table")
+        return plan
 
     def config(self, num_aiv=0):
         policy = self.for_num_aiv(num_aiv)
@@ -198,6 +382,8 @@ def resolve_udma_policy(
         raise ValueError("automatic UDMA policy requires EP between 2 and 1024")
     w, q = (2 if world_size <= 8 else 1), 1
     p, visit = (1, 8) if world_size <= 16 else (4, 32)
+    if world_size == 128:
+        p, visit = 8, 16
     while ((world_size - 2) // p + 1) * w * q > 32 and p < 8:
         p *= 2
     if ((world_size - 2) // p + 1) * w * q > 32:
@@ -215,3 +401,67 @@ def resolve_udma_policy(
     ):
         _check_override(name, supplied, effective, rank)
     return UdmaPolicy(world_size, p, w, q, visit)
+
+
+def _logical_group(world):
+    return next((g for g in (16, 8, 4, 2) if world % g == 0), world)
+
+
+def _contiguous_group_size(hosts):
+    if not hosts or any(not isinstance(host, str) or not host for host in hosts):
+        return 0
+    blocks = []
+    for host in hosts:
+        if not blocks or blocks[-1][0] != host:
+            blocks.append([host, 1])
+        else:
+            blocks[-1][1] += 1
+    sizes = {count for _, count in blocks}
+    if len(sizes) != 1 or len({host for host, _ in blocks}) != len(blocks):
+        return 0
+    return blocks[0][1]
+
+
+# In-sample conservative fits: BF16, non-expanded, EP4/8/16/32,
+# 2 KiB / 5.5 KiB / 12 KiB rows, random routing. Group sizes are
+# eligibility constraints, NOT an assumed physical rank-to-server mapping.
+# key: EP, communication AIVs, row-byte bucket, operation.
+# value: measured G, order (rank/group/staggered/RR), P, W, Q, visit, self-copy.
+_PROFILES = {
+    (4, 8, "large", "dispatch"): ((4,), 2, 1, 1, 2, 32, 0),
+    (4, 8, "large", "combine"): ((4,), 3, 1, 2, 1, 32, 2),
+    (4, 8, "large", "weighted"): ((4,), 3, 1, 2, 1, 32, 2),
+    (4, 8, "small", "dispatch"): ((4,), 3, 1, 2, 1, 32, 0),
+    (4, 8, "small", "combine"): ((4,), 3, 1, 2, 1, 32, 2),
+    (4, 8, "small", "weighted"): ((4,), 1, 1, 1, 2, 32, 2),
+    (4, 32, "small", "dispatch"): ((4,), 0, 1, 2, 1, 32, 0),
+    (4, 32, "small", "combine"): ((4,), 3, 1, 2, 1, 32, 1),
+    (4, 32, "small", "weighted"): ((4,), 3, 1, 2, 1, 32, 2),
+    (8, 8, "large", "dispatch"): ((8,), 0, 2, 1, 2, 32, 0),
+    (8, 8, "large", "combine"): ((8,), 1, 1, 1, 2, 32, 2),
+    (8, 8, "large", "weighted"): ((8,), 3, 1, 1, 1, 32, 2),
+    (8, 8, "small", "dispatch"): ((8,), 3, 1, 1, 2, 32, 0),
+    (8, 8, "small", "combine"): ((8,), 2, 1, 1, 2, 32, 2),
+    (8, 8, "small", "weighted"): ((8,), 3, 1, 1, 2, 32, 2),
+    (8, 32, "large", "dispatch"): ((8,), 2, 1, 1, 1, 16, 0),
+    (8, 32, "large", "combine"): ((8,), 3, 1, 1, 1, 16, 1),
+    (8, 32, "large", "weighted"): ((8,), 2, 2, 2, 1, 8, 0),
+    (8, 32, "small", "dispatch"): ((8,), 3, 1, 2, 1, 16, 0),
+    (8, 32, "small", "combine"): ((8,), 2, 1, 2, 1, 8, 1),
+    (8, 32, "small", "weighted"): ((8,), 3, 1, 1, 1, 16, 2),
+    (16, 8, "large", "dispatch"): ((8, 16), 2, 2, 1, 1, 16, 0),
+    (16, 8, "large", "combine"): ((8, 16), 0, 2, 1, 1, 16, 2),
+    (16, 8, "large", "weighted"): ((8, 16), 2, 2, 1, 1, 32, 2),
+    (16, 8, "small", "dispatch"): ((8, 16), 1, 2, 1, 2, 32, 0),
+    (16, 8, "small", "combine"): ((8, 16), 0, 2, 1, 2, 32, 2),
+    (16, 8, "small", "weighted"): ((8, 16), 2, 4, 2, 1, 32, 2),
+    (16, 32, "large", "dispatch"): ((8, 16), 2, 4, 2, 1, 16, 0),
+    (16, 32, "large", "combine"): ((8, 16), 2, 2, 1, 1, 8, 1),
+    (16, 32, "large", "weighted"): ((8, 16), 2, 2, 1, 1, 4, 0),
+    (16, 32, "small", "dispatch"): ((8, 16), 0, 2, 2, 1, 8, 0),
+    (16, 32, "small", "combine"): ((8, 16), 0, 2, 1, 1, 32, 1),
+    (16, 32, "small", "weighted"): ((8, 16), 1, 2, 2, 1, 4, 0),
+    (32, 32, "large", "dispatch"): ((8,), 1, 4, 1, 1, 32, 0),
+    (32, 32, "large", "combine"): ((8,), 3, 1, 1, 1, 8, 1),
+    (32, 32, "large", "weighted"): ((8,), 2, 4, 1, 1, 4, 0),
+}

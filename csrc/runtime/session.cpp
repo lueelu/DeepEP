@@ -1,6 +1,9 @@
 // Copyright (c) 2026, Lu Lu
 
 #include "runtime/session.hpp"
+#include "runtime/instances.hpp"
+#include "runtime/instance_endpoint.hpp"
+#include <sstream>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
@@ -14,12 +17,12 @@
 #include "host/init/shmem_host_init.h"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_cc.h"
+#include "host/data_plane/shmem_host_p2p_sync.h"
 #include <limits>
 
 namespace deepep {
 namespace {
-std::mutex runtime_mutex;
-bool occupied = false;
+
 void check(int status, const char* operation)
 {
     if (status != 0) {
@@ -30,12 +33,13 @@ void check(int status, const char* operation)
 
 bool Session::busy()
 {
-    std::lock_guard<std::mutex> guard(runtime_mutex);
-    return occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED;
+    InstanceLock guard(instance_mutex());
+    return !deepep_has_instances() && aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED;
 }
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                 bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages)
+                 bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages,
+                 const std::vector<uint8_t>& uid_bytes)
 {
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
@@ -49,8 +53,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
         bytes < alignment || bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
         timeout < 1 || timeout > 3600 || (megamoe && (udma || mpi)) ||
-        (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
-                  endpoint.find('\0') != std::string::npos))) {
+        (!mpi && uid_bytes.empty() &&
+         (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
+          endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     // BF16 and FP8 use the same peer-table transport at every supported EP size.
@@ -58,10 +63,11 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     if (peer_table_ && (size < 2 || size > 512 || (size & (size - 1)))) {
         throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256/512");
     }
-    std::lock_guard<std::mutex> guard(runtime_mutex);
-    if (occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
-        throw std::runtime_error("A SHMEM runtime already exists in this process");
-    }
+    InstanceLock guard(instance_mutex());
+    if ((megamoe || mpi) && deepep_has_instances())
+        throw std::runtime_error("MPI bootstrap and MegaMoE require exclusive runtime ownership");
+    if (!uid_bytes.empty() && uid_bytes.size() != sizeof(aclshmemx_uniqueid_t))
+        throw std::invalid_argument("Invalid SHMEM UID size");
     check(aclrtGetCurrentContext(&context_), "aclrtGetCurrentContext");
     if (context_ == nullptr) {
         throw std::runtime_error("Initialize the framework NPU context before creating a runtime");
@@ -95,13 +101,17 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
             "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
     }
-    // A failed initialization can leave SDK state behind. Keep the process
-    // reserved until a new process is launched; do not finalize foreign state.
-    occupied = true;
-    bool init_attempted = false;
+    int32_t device = -1;
+    check(aclrtGetDevice(&device), "aclrtGetDevice");
+    std::ostringstream config;
+    config << "mesh_clos:" << device << ':' << rank << ':' << size << ':' << udma << ':' << combine_only << ':' << dense
+           << ':' << megamoe << ':' << mpi;
+    const bool first = !deepep_has_instances();
+    instance_id_ = deepep_reserve_instance(config.str().c_str());
+    attr.instance_id = instance_id_;
     bool runtime_started = false;
     try {
-        if (udma) {
+        if (udma && first) {
             // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
             // Serialized operators reuse the bank, not concurrent SQ writers.
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
@@ -121,7 +131,14 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
                 sparse_qp_enabled_ = !masks.empty();
             }
         }
-        const auto mode = mpi ? ACLSHMEMX_INIT_WITH_MPI : ACLSHMEMX_INIT_WITH_DEFAULT;
+        sparse_qp_enabled_ = udma && dense != "1";
+        auto mode = mpi ? ACLSHMEMX_INIT_WITH_MPI : ACLSHMEMX_INIT_WITH_DEFAULT;
+        if (!uid_bytes.empty()) {
+            std::memcpy(&uid, uid_bytes.data(), sizeof(uid));
+            attr.ip_port[0] = '\0';
+            mode = ACLSHMEMX_INIT_WITH_UNIQUEID;
+        }
+        InstanceEndpoint endpoint_config(attr);
         if (use_1g_huge_pages_) {
             allocate_huge_workspace(allocation_bytes);
             aclshmemx_buffer_optional_attr_t optional{};
@@ -132,14 +149,12 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             descriptor.optional_attr = &optional;
             // The fixed prefix is the entire workspace; only SDK metadata uses the allocator.
             attr.local_mem_size = 0;
-            init_attempted = true;
             check(aclshmemx_init_attr_with_buffers(mode, &attr, &descriptor, 1), "aclshmemx_init_attr_with_buffers");
             runtime_started = true;
             workspace_ = aclshmemx_get_buffer_ptr(huge_page_source_);
             if (reinterpret_cast<uintptr_t>(workspace_) % 512U != 0)
                 throw std::runtime_error("SHMEM returned an unaligned 1 GiB workspace");
         } else {
-            init_attempted = true;
             check(aclshmemx_init_attr(mode, &attr), "aclshmemx_init_attr");
             runtime_started = true;
             // Peer-table aggregate packets require physical 512B boundaries.
@@ -161,10 +176,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             aclshmem_free(workspace_);
             workspace_ = nullptr;
         }
-        if (!init_attempted || (runtime_started && aclshmem_finalize() == 0)) {
+        if (!runtime_started || aclshmemx_finalize(instance_id_) == 0) {
             try {
                 release_huge_workspace();
-                occupied = false;
+                deepep_release_instance(instance_id_);
             } catch (...) {
                 // Retain the process reservation if a caller-owned mapping cannot be released.
             }
@@ -226,7 +241,7 @@ size_t Session::udma_unique_id_size()
 
 std::vector<uint8_t> Session::udma_unique_id()
 {
-    std::lock_guard<std::mutex> guard(runtime_mutex);
+    InstanceLock guard(instance_mutex());
     aclshmemx_uniqueid_t uid{};
     check(aclshmemx_get_uniqueid(&uid), "aclshmemx_get_uniqueid");
     std::vector<uint8_t> bytes(sizeof(uid));
@@ -244,8 +259,8 @@ std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_
                                endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid UDMA rank, heap, workspace, bootstrap endpoint or unique ID");
     }
-    std::lock_guard<std::mutex> guard(runtime_mutex);
-    if (occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
+    InstanceLock guard(instance_mutex());
+    if (deepep_has_instances() || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
         throw std::runtime_error("A SHMEM runtime already exists in this process");
     }
     std::unique_ptr<Session> session(new Session());
@@ -277,9 +292,11 @@ std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_
     }
     // Preserve the locked SDK's optional-attribute version and timeout defaults.
     attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA;
-    occupied = true;
-    check(aclshmemx_init_attr(mode, &attr), "aclshmemx_init_attr");
+    session->instance_id_ = deepep_reserve_instance("ep_gmm_fused");
+    bool runtime_started = false;
     try {
+        check(aclshmemx_init_attr(mode, &attr), "aclshmemx_init_attr");
+        runtime_started = true;
         session->workspace_ = aclshmem_malloc(workspace_bytes);
         if (session->workspace_ == nullptr) {
             throw std::runtime_error("aclshmem_malloc failed");
@@ -296,8 +313,8 @@ std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_
             aclshmem_free(session->workspace_);
             session->workspace_ = nullptr;
         }
-        if (aclshmem_finalize() == 0) {
-            occupied = false;
+        if (!runtime_started || aclshmemx_finalize(session->instance_id_) == 0) {
+            deepep_release_instance(session->instance_id_);
         }
         throw;
     }
@@ -306,7 +323,7 @@ std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_
 
 uintptr_t Session::udma_workspace_address() const
 {
-    std::lock_guard<std::mutex> guard(runtime_mutex);
+    InstanceLock guard(instance_mutex());
     check_context();
     if (!udma_) {
         throw std::runtime_error("This runtime does not own a UDMA workspace");
@@ -338,25 +355,27 @@ uintptr_t Session::workspace_address() const
 
 void Session::barrier()
 {
-    std::lock_guard<std::mutex> guard(runtime_mutex);
+    InstanceLock guard(instance_mutex());
     check_context();
-    aclshmem_barrier_all();
+    select_instance(instance_id_);
+    deepep_instance_barrier(instance_id_, shmemx_get_ffts_config());
 }
 
 void Session::close()
 {
-    std::lock_guard<std::mutex> guard(runtime_mutex);
+    InstanceLock guard(instance_mutex());
     if (closed_) {
         return;
     }
     check_context();
-    aclshmem_barrier_all();
+    select_instance(instance_id_);
+    deepep_instance_barrier(instance_id_, shmemx_get_ffts_config());
     if (workspace_ != nullptr && !use_1g_huge_pages_) {
         aclshmem_free(workspace_);
         workspace_ = nullptr;
     }
     // On failure retain the reservation and never claim successful cleanup.
-    const int status = aclshmem_finalize();
+    const int status = aclshmemx_finalize(instance_id_);
     if (status != 0) {
         poisoned_ = true;
         check(status, "aclshmem_finalize (restart the distributed job)");
@@ -368,7 +387,7 @@ void Session::close()
         poisoned_ = true;
         throw;
     }
-    occupied = false;
+    deepep_release_instance(instance_id_);
     closed_ = true;
 }
 }  // namespace deepep

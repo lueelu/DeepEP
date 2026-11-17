@@ -1972,8 +1972,9 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
 
 // Notify 的输出会交给后续 dispatch/combine 使用。这个 barrier kernel 负责
 // 跨 rank 的阶段交接，确保元数据就绪后再进入 payload 通信。
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispatch_barrier_kernel()
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispatch_barrier_kernel(uint32_t instance_id)
 {
+    aclshmemx_instance_ctx_set(instance_id);
 #if !defined(CATLASS_ARCH) || CATLASS_ARCH == 3510
     util_set_ffts_config(0U);
     aclshmemx_barrier_all_vec();
@@ -1986,6 +1987,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_full_
     GM_ADDR backward, GM_ADDR backward_counts, GM_ADDR ranges, GM_ADDR masks, GM_ADDR rank_rows, GM_ADDR gather_rows,
     GM_ADDR weight_return_meta, ascend_deepep::NotifyTiling t)
 {
+    aclshmemx_instance_ctx_set(t.instance_id);
 #if !defined(CATLASS_ARCH) || CATLASS_ARCH == 3510
     util_set_ffts_config(0U);
     // 核数在入口选择编译期特化，SIMT 热循环中的除法仍可优化成常量移位。
@@ -2036,6 +2038,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_profi
     GM_ADDR backward, GM_ADDR backward_counts, GM_ADDR ranges, GM_ADDR masks, GM_ADDR rank_rows, GM_ADDR gather_rows,
     GM_ADDR weight_return_meta, GM_ADDR profile, uint64_t sample, ascend_deepep::NotifyTiling t)
 {
+    aclshmemx_instance_ctx_set(t.instance_id);
 #if !defined(CATLASS_ARCH) || CATLASS_ARCH == 3510
     util_set_ffts_config(0U);
     // 核数在入口选择编译期特化，SIMT 热循环中的除法仍可优化成常量移位。
@@ -2081,7 +2084,8 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_profile_kernel_do(
                                       gather_rows, weight_return_meta, profile, sample, config);
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_barrier_kernel_do(void* stream, uint32_t num_cores)
+extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_barrier_kernel_do(void* stream, uint32_t num_cores,
+                                                                       uint32_t instance_id)
 {
-    notify_dispatch_barrier_kernel<<<num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>();
+    notify_dispatch_barrier_kernel<<<num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(instance_id);
 }

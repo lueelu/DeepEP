@@ -1,11 +1,16 @@
 #include "shmem_instance.h"
+#include "runtime/instances.hpp"
+#include "runtime/instance_endpoint.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -19,21 +24,8 @@ namespace {
 constexpr uint64_t kDeviceLargePageBytes = 2ULL * 1024ULL * 1024ULL;
 constexpr uint64_t kDeviceHugePage1gBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr uint32_t kUdmaQpCount = 2;
-bool g_runtime_shared_jetty = false;
-
-std::mutex g_runtime_mutex;
-int g_runtime_refcount = 0;
-bool g_runtime_initialized = false;
-int g_runtime_rank = -1;
-int g_runtime_world_size = -1;
-uint64_t g_runtime_local_mem_size = 0;
-uint64_t g_runtime_workspace_size = 0;
-std::string g_runtime_ip_port;
-std::vector<int64_t> g_runtime_unique_id;
-std::string g_runtime_bootstrap_key;
-int64_t g_runtime_data_op_engine_type = 0;
-bool g_runtime_use_1g_huge_pages = false;
 aclshmemx_uniqueid_t g_default_flag_uid{};
+std::map<uint32_t, std::string> bootstrap_keys;
 
 void FillInitAttributes(int rank, int world_size, uint64_t local_mem_size, const std::string& ip_port,
                         int64_t data_op_engine_type, aclshmemx_init_attr_t* attributes)
@@ -61,10 +53,7 @@ void FillInitAttributes(int rank, int world_size, uint64_t local_mem_size, const
 
 std::vector<int64_t> GetShmemUniqueId()
 {
-    std::lock_guard<std::mutex> lock(g_runtime_mutex);
-    if (g_runtime_initialized || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
-        throw std::runtime_error("cannot create a new SHMEM UID while a runtime is active");
-    }
+    deepep::InstanceLock lock(deepep::instance_mutex());
     aclshmemx_uniqueid_t uid{};
     ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_get_uniqueid(&uid));
     const auto* bytes = reinterpret_cast<const unsigned char*>(&uid);
@@ -73,11 +62,17 @@ std::vector<int64_t> GetShmemUniqueId()
 
 std::tuple<int64_t, std::vector<int64_t>> GetShmemBootstrap(const std::string& key)
 {
-    std::lock_guard<std::mutex> lock(g_runtime_mutex);
-    if (!g_runtime_initialized) {
-        return {0, {}};
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    if (deepep_has_instances()) {
+        if (bootstrap_keys.empty() || bootstrap_keys.begin()->second != key) return {-1, {}};
+    } else if (aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
+        return {-1, {}};
     }
-    return {key == g_runtime_bootstrap_key ? 1 : -1, g_runtime_unique_id};
+    try {
+        return {static_cast<int64_t>(deepep_next_instance()), {}};
+    } catch (const std::runtime_error&) {
+        return {-1, {}};
+    }
 }
 
 ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_port)
@@ -90,7 +85,7 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker)
+                             int64_t udma_qps_per_worker, bool auto_resources)
     : rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -182,6 +177,70 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     if (data_op_engine_type_ <= 0 || (data_op_engine_type_ & ~kValidEngineMask) != 0) {
         throw std::invalid_argument("invalid CANN SHMEM data operation engine type");
     }
+    auto_resources_ = auto_resources;
+    if (auto_resources_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
+        throw std::invalid_argument("automatic launch plans require shared-Jetty peer resources and a fixed group");
+    const char* tuning = std::getenv("DEEPEP_CLOS_TUNING_SESSION");
+    tuning_session_ = tuning && std::strcmp(tuning, "1") == 0;
+    if (tuning_session_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
+        throw std::invalid_argument("tuning session requires shared-Jetty peer scheduling and a fixed group size");
+}
+
+std::vector<int64_t> ShmemInstance::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
+                                                    int64_t workers, int64_t qps)
+{
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    if (!initialized_ || !tuning_session_ || auto_resources_ || !deepep_is_only_instance(instance_id_))
+        throw std::runtime_error("configure_tuning requires one active tuning-session Buffer per process");
+    // Validate before any collective or mutation. The benchmark agrees the
+    // complete plan across ranks before entering this private interface.
+    ShmemInstance candidate(rank_, world_size_, ip_port_, data_op_engine_type_, use_1g_huge_pages_, unique_id_,
+                            bootstrap_key_, true, false, dispatch_order, combine_order, ranks_per_group_, group_peers,
+                            workers, qps);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
+    Barrier();
+    dispatch_peer_order_ = candidate.dispatch_peer_order_;
+    combine_peer_order_ = candidate.combine_peer_order_;
+    peers_per_group_per_worker_ = candidate.peers_per_group_per_worker_;
+    workers_per_peer_ = candidate.workers_per_peer_;
+    qps_per_worker_ = candidate.qps_per_worker_;
+    return {dispatch_peer_order_, combine_peer_order_, peers_per_group_per_worker_, workers_per_peer_, qps_per_worker_};
+}
+
+ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t>& values, bool combine, int64_t peers,
+                                                       int64_t visit, int64_t cores) const
+{
+    using namespace ascend_deepep::udma;
+    if (values.empty()) {
+        const auto order = combine ? combine_peer_order_ : dispatch_peer_order_;
+        return {order,
+                ranks_per_group_,
+                order == kGroupRoundRobinOrder ? peers_per_group_per_worker_ : uint32_t(peers),
+                workers_per_peer_,
+                qps_per_worker_,
+                uint32_t(visit),
+                -1,
+                0};
+    }
+    // Validate before narrowing or any kernel submission. P/W/Q changes are
+    // covered by the symmetric union reserved once in InitRuntime.
+    if (!auto_resources_ || values.size() != 9 || values[0] != 1)
+        throw std::invalid_argument("invalid or unreserved UDMA launch plan");
+    const auto order = values[1], group = values[2], p = values[3], w = values[4], q = values[5];
+    const auto v = values[6], copy = values[7], weight = values[8];
+    if (order < 0 || order > 3 || group != ranks_per_group_ || p < 1 || p > 8 || !ValidPeers(p) || (w != 1 && w != 2) ||
+        (q != 1 && q != 2) || w * q > 2 || v < 4 || v > 32 || !ValidVisit(v) || copy < 0 || copy > 2 || weight < 0 ||
+        weight > 2 || (!combine && (copy || weight)))
+        throw std::invalid_argument("UDMA launch plan is outside the reserved schedule set");
+    const auto owners = Workers(world_size_, p, order, group);
+    const auto aivs = cores == 0 ? 32 : cores;
+    if (cores < 0 || cores % 2 || owners * w > aivs || owners * w * q > kQpCount)
+        throw std::invalid_argument("UDMA launch plan exceeds communication AIV/QP budget");
+    if (order == kGroupRoundRobinOrder &&
+        (p > 4 || ((group + owners - 1) / owners) * (world_size_ / group) > kGroupPeerCapacity))
+        throw std::invalid_argument("UDMA launch plan exceeds the round-robin peer table");
+    return {uint32_t(order), uint32_t(group), uint32_t(p), uint32_t(w),
+            uint32_t(q),     uint32_t(v),     copy,        uint32_t(weight)};
 }
 
 ShmemInstance::~ShmemInstance()
@@ -198,8 +257,10 @@ void ShmemInstance::Init()
         throw std::runtime_error("ShmemInstance local_mem_size is not configured; call init(local_mem_size)");
     }
 
+    deepep::InstanceLock lock(deepep::instance_mutex());
     try {
         InitRuntime();
+        deepep::select_instance(instance_id_);
         ffts_addr_ = shmemx_get_ffts_config();
         const int actual_rank = aclshmem_my_pe();
         const int actual_world_size = aclshmem_n_pes();
@@ -207,7 +268,7 @@ void ShmemInstance::Init()
             throw std::runtime_error("CANN SHMEM PE information does not match the process group");
         }
 
-        aclshmem_barrier_all();
+        deepep_instance_barrier(instance_id_, ffts_addr_);
         initialized_ = true;
     } catch (...) {
         DestroyNoThrow();
@@ -337,41 +398,53 @@ void ShmemInstance::InitRuntime()
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_runtime_mutex);
-    if (!g_runtime_initialized) {
-        if (aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
-            throw std::runtime_error("Another backend already owns the process SHMEM runtime");
-        }
-        if ((data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0) {
-            if (shared_jetty_) {
-                if (world_size_ > static_cast<int>(ascend_deepep::udma::kQpCount * 8 + 1))
-                    throw std::invalid_argument("V1 shared Jetty supports at most 257 ranks");
-                // Refuse the SDK's independent-queue fallback on older HCOMM.
-                void* hcomm = dlopen("libhcomm.so", RTLD_NOW | RTLD_LOCAL);
-                if (!hcomm) throw std::runtime_error("V1 shared Jetty requires libhcomm.so");
-                const char* missing = nullptr;
-                for (const char* symbol : {"HcommChannelConfigCreate", "HcommChannelConfigDestroy",
-                                           "HcommChannelConfigSetInt", "HcommChannelCreateWithConfig"}) {
-                    if (!dlsym(hcomm, symbol)) missing = symbol;
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    int32_t device = -1;
+    ASCEND_DEEPEP_CHECK_ACL(aclrtGetDevice(&device));
+    std::ostringstream config;
+    config << "direct:" << device << ':' << rank_ << ':' << world_size_ << ':' << data_op_engine_type_ << ':'
+           << shared_jetty_ << ':' << token_schedule_ << ':' << dispatch_peer_order_ << ':' << combine_peer_order_
+           << ':' << ranks_per_group_ << ':' << peers_per_group_per_worker_ << ':' << workers_per_peer_ << ':'
+           << qps_per_worker_ << ':' << tuning_session_ << ':' << auto_resources_ << ':' << bootstrap_key_;
+    const bool first = !deepep_has_instances();
+    instance_id_ = deepep_reserve_instance(config.str().c_str());
+    bool runtime_started = false;
+    try {
+        if (first) {
+            if ((data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0) {
+                if (shared_jetty_) {
+                    if (world_size_ > static_cast<int>(ascend_deepep::udma::kQpCount * 8 + 1))
+                        throw std::invalid_argument("V1 shared Jetty supports at most 257 ranks");
+                    // Refuse the SDK's independent-queue fallback on older HCOMM.
+                    void* hcomm = dlopen("libhcomm.so", RTLD_NOW | RTLD_LOCAL);
+                    if (!hcomm) throw std::runtime_error("V1 shared Jetty requires libhcomm.so");
+                    const char* missing = nullptr;
+                    for (const char* symbol : {"HcommChannelConfigCreate", "HcommChannelConfigDestroy",
+                                               "HcommChannelConfigSetInt", "HcommChannelCreateWithConfig"}) {
+                        if (!dlsym(hcomm, symbol)) missing = symbol;
+                    }
+                    dlclose(hcomm);
+                    if (missing)
+                        throw std::runtime_error(std::string("V1 shared Jetty requires HCOMM symbol ") + missing);
                 }
-                dlclose(hcomm);
-                if (missing) throw std::runtime_error(std::string("V1 shared Jetty requires HCOMM symbol ") + missing);
-            }
-            ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_qp_num(
-                ACLSHMEM_DATA_OP_UDMA, shared_jetty_ ? ascend_deepep::udma::kQpCount : kUdmaQpCount));
-            ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, shared_jetty_));
-            if (shared_jetty_) {
-                std::vector<uint64_t> masks(world_size_);
-                for (int peer = 0; peer < world_size_; ++peer)
-                    masks[peer] = token_schedule_
-                                      ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
-                                      : ascend_deepep::udma::PeerMask(rank_, peer, world_size_, dispatch_peer_order_,
-                                                                      combine_peer_order_, ranks_per_group_,
-                                                                      peers_per_group_per_worker_,
-                                                                      workers_per_peer_ * qps_per_worker_);
-                ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(masks.data(), masks.size()));
-            } else {
-                ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(nullptr, 0));
+                ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_qp_num(
+                    ACLSHMEM_DATA_OP_UDMA, shared_jetty_ ? ascend_deepep::udma::kQpCount : kUdmaQpCount));
+                ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, shared_jetty_));
+                if (shared_jetty_) {
+                    std::vector<uint64_t> masks(world_size_);
+                    for (int peer = 0; peer < world_size_; ++peer)
+                        masks[peer] =
+                            (tuning_session_ || auto_resources_)
+                                ? ascend_deepep::udma::TuningPeerMask(rank_, peer, world_size_, ranks_per_group_)
+                            : token_schedule_ ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
+                                              : ascend_deepep::udma::PeerMask(
+                                                    rank_, peer, world_size_, dispatch_peer_order_, combine_peer_order_,
+                                                    ranks_per_group_, peers_per_group_per_worker_,
+                                                    workers_per_peer_ * qps_per_worker_);
+                    ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(masks.data(), masks.size()));
+                } else {
+                    ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_udma_peer_qp_masks(nullptr, 0));
+                }
             }
         }
         aclshmemx_init_attr_t attributes{};
@@ -387,8 +460,9 @@ void ShmemInstance::InitRuntime()
             init_flags = ACLSHMEMX_INIT_WITH_UNIQUEID;
         }
 
-        bool runtime_started = false;
-        try {
+        attributes.instance_id = instance_id_;
+        deepep::InstanceEndpoint endpoint(attributes);
+        {
             if (use_1g_huge_pages_) {
                 AllocateHugePageWorkspace();
                 aclshmemx_buffer_optional_attr_t optional_attributes{};
@@ -409,45 +483,22 @@ void ShmemInstance::InitRuntime()
                 ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_init_attr(init_flags, &attributes));
                 runtime_started = true;
             }
-        } catch (...) {
-            const auto original_error = std::current_exception();
-            if (runtime_started) {
-                aclshmem_finalize();
-            }
-            try {
-                ReleaseHugePageWorkspace();
-            } catch (...) {
-            }
-            std::rethrow_exception(original_error);
         }
-
-        g_runtime_shared_jetty = shared_jetty_;
-        g_runtime_initialized = true;
-        g_runtime_rank = rank_;
-        g_runtime_world_size = world_size_;
-        g_runtime_local_mem_size = local_mem_size_;
-        g_runtime_workspace_size = workspace_size_;
-        g_runtime_ip_port = ip_port_;
-        g_runtime_unique_id = unique_id_;
-        g_runtime_bootstrap_key = bootstrap_key_;
-        g_runtime_data_op_engine_type = data_op_engine_type_;
-        g_runtime_use_1g_huge_pages = use_1g_huge_pages_;
-    } else if (g_runtime_shared_jetty || shared_jetty_) {
-        throw std::runtime_error(
-            "V1 shared Jetty supports one active Buffer per process; destroy it before rebuilding");
-    } else if (g_runtime_use_1g_huge_pages || use_1g_huge_pages_) {
-        throw std::runtime_error("1 GiB huge-page mode supports only one active Buffer runtime per process");
-    } else if (g_runtime_rank != rank_ || g_runtime_world_size != world_size_ ||
-               g_runtime_local_mem_size != local_mem_size_ || g_runtime_workspace_size != workspace_size_ ||
-               g_runtime_ip_port != ip_port_ || g_runtime_unique_id != unique_id_ ||
-               g_runtime_bootstrap_key != bootstrap_key_ || g_runtime_data_op_engine_type != data_op_engine_type_ ||
-               g_runtime_shared_jetty != shared_jetty_ || g_runtime_use_1g_huge_pages != use_1g_huge_pages_) {
-        throw std::runtime_error(
-            "CANN SHMEM has already been initialized with incompatible "
-            "rank/world/local_mem_size/workspace_size/ip_port/transport/huge-page mode");
+        bootstrap_keys.emplace(instance_id_, bootstrap_key_);
+        acquired_global_runtime_ = true;
+    } catch (...) {
+        const auto original_error = std::current_exception();
+        // The selected SDK rolls back a failed init itself. Never finalize a
+        // different live instance. A failed finalize retains its reservation.
+        if (!runtime_started || aclshmemx_finalize(instance_id_) == 0) {
+            deepep_release_instance(instance_id_);
+        }
+        try {
+            ReleaseHugePageWorkspace();
+        } catch (...) {
+        }
+        std::rethrow_exception(original_error);
     }
-    ++g_runtime_refcount;
-    acquired_global_runtime_ = true;
 }
 
 void ShmemInstance::Barrier()
@@ -455,7 +506,7 @@ void ShmemInstance::Barrier()
     if (!initialized_) {
         throw std::runtime_error("ShmemInstance is not initialized");
     }
-    aclshmem_barrier_all();
+    deepep_instance_barrier(instance_id_, ffts_addr_);
 }
 
 void ShmemInstance::WaitHandle(aclrtStream stream) const
@@ -463,9 +514,7 @@ void ShmemInstance::WaitHandle(aclrtStream stream) const
     if (!initialized_) {
         throw std::runtime_error("ShmemInstance is not initialized");
     }
-    aclshmem_handle_t handle{};
-    handle.team_id = ACLSHMEM_TEAM_WORLD;
-    aclshmemx_handle_wait(handle, stream);
+    deepep_instance_sync_do(stream, instance_id_, ffts_addr_, true);
 }
 
 void ShmemInstance::Synchronize(aclrtStream stream) const
@@ -487,32 +536,30 @@ void ShmemInstance::DestroyImpl(bool synchronize)
     }
 
     if (initialized_ && synchronize) {
-        aclshmem_barrier_all();
+        deepep_instance_barrier(instance_id_, ffts_addr_);
     }
 
+    if (notify_host_counts_ != nullptr) {
+        // A failed polling call may leave a writer running. Never unmap its target.
+        ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
+        ASCEND_DEEPEP_CHECK_ACL(aclrtHostUnregister(notify_host_counts_));
+        ASCEND_DEEPEP_CHECK_ACL(aclrtFreeHost(notify_host_counts_));
+        notify_host_counts_ = nullptr;
+        notify_device_counts_ = nullptr;
+        notify_count_capacity_ = 0;
+        notify_host_pending_ = false;
+    }
+
+    deepep::InstanceLock lock(deepep::instance_mutex());
+    if (acquired_global_runtime_) {
+        ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_finalize(instance_id_));
+        ReleaseHugePageWorkspace();
+        bootstrap_keys.erase(instance_id_);
+        deepep_release_instance(instance_id_);
+        acquired_global_runtime_ = false;
+    }
     initialized_ = false;
     ffts_addr_ = 0;
-
-    if (acquired_global_runtime_) {
-        std::lock_guard<std::mutex> lock(g_runtime_mutex);
-        --g_runtime_refcount;
-        acquired_global_runtime_ = false;
-        if (g_runtime_refcount == 0 && g_runtime_initialized) {
-            aclshmem_finalize();
-            g_runtime_initialized = false;
-            g_runtime_rank = -1;
-            g_runtime_world_size = -1;
-            g_runtime_local_mem_size = 0;
-            g_runtime_workspace_size = 0;
-            g_runtime_ip_port.clear();
-            g_runtime_unique_id.clear();
-            g_runtime_bootstrap_key.clear();
-            g_runtime_data_op_engine_type = 0;
-            g_runtime_shared_jetty = false;
-            g_runtime_use_1g_huge_pages = false;
-            std::memset(&g_default_flag_uid, 0, sizeof(g_default_flag_uid));
-        }
-    }
     ReleaseHugePageWorkspace();
 }
 
@@ -560,4 +607,58 @@ void* ShmemInstance::WorkspacePtr() const
 bool ShmemInstance::Use1gHugePages() const
 {
     return use_1g_huge_pages_;
+}
+
+void* ShmemInstance::PrepareNotifyHostCounts(std::size_t count)
+{
+    TORCH_CHECK(initialized_, "Notify host counts require an initialized Buffer");
+    TORCH_CHECK(!notify_host_pending_, "previous Notify host-count publication did not complete");
+    if (notify_host_unavailable_) return nullptr;
+    TORCH_CHECK(count > 0 && count <= std::numeric_limits<std::size_t>::max() / sizeof(uint32_t),
+                "invalid Notify host-count capacity");
+    if (count > notify_count_capacity_) {
+        if (notify_host_counts_ != nullptr) {
+            ASCEND_DEEPEP_CHECK_ACL(aclrtHostUnregister(notify_host_counts_));
+            ASCEND_DEEPEP_CHECK_ACL(aclrtFreeHost(notify_host_counts_));
+            notify_host_counts_ = nullptr;
+            notify_device_counts_ = nullptr;
+            notify_count_capacity_ = 0;
+        }
+        ASCEND_DEEPEP_CHECK_ACL(aclrtMallocHost(&notify_host_counts_, count * sizeof(uint32_t)));
+        const auto status = aclrtHostRegister(notify_host_counts_, count * sizeof(uint32_t), ACL_HOST_REGISTER_MAPPED,
+                                              &notify_device_counts_);
+        if (status != ACL_SUCCESS) {
+            ASCEND_DEEPEP_CHECK_ACL(aclrtFreeHost(notify_host_counts_));
+            notify_host_counts_ = nullptr;
+            notify_device_counts_ = nullptr;
+            notify_host_unavailable_ = true;
+            TORCH_WARN("Notify host mapping unavailable (ACL status ", status, "); using count readback");
+            return nullptr;
+        }
+        notify_count_capacity_ = count;
+    }
+    // Zero is not ready; count+1 makes an empty receive distinguishable from it.
+    // The preceding wait consumed every sole-writer store before this reuse.
+    auto* slots = static_cast<uint32_t*>(notify_host_counts_);
+    for (std::size_t i = 0; i < count; ++i) __atomic_store_n(slots + i, 0U, __ATOMIC_RELEASE);
+    notify_host_pending_ = true;
+    return notify_device_counts_;
+}
+
+std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
+{
+    TORCH_CHECK(notify_host_pending_ && count <= notify_count_capacity_, "Notify host counts were not prepared");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    const auto* slots = static_cast<const uint32_t*>(notify_host_counts_);
+    std::vector<int32_t> counts(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        uint32_t value;
+        while ((value = __atomic_load_n(slots + i, __ATOMIC_ACQUIRE)) == 0) {
+            TORCH_CHECK(std::chrono::steady_clock::now() < deadline, "timed out waiting for Notify host counts");
+        }
+        TORCH_CHECK(value - 1U <= uint32_t(std::numeric_limits<int32_t>::max()), "invalid Notify host count");
+        counts[i] = static_cast<int32_t>(value - 1U);
+    }
+    notify_host_pending_ = false;
+    return counts;
 }

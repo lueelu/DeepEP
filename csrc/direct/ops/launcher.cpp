@@ -1,6 +1,8 @@
 #include "launcher.h"
 
 #include <acl/acl.h>
+#include <cstdlib>
+#include <cstring>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
 #include "common/launch.h"
@@ -60,7 +62,7 @@ void LaunchNotifyDispatchKernel(torch::Tensor num_tokens_per_rank, torch::Tensor
 void LaunchCachedNotifyDispatchKernel(const ascend_deepep::DispatchTilingData& tiling, uint64_t ffts_addr)
 {
     aclrtStream stream = GetCurrentAclStream();
-    cached_notify_dispatch_kernel_do(tiling.block_dim, stream, ffts_addr);
+    cached_notify_dispatch_kernel_do(tiling.block_dim, stream, ffts_addr, tiling.instance_id);
 }
 
 void LaunchCachedDispatchPlanKernel(torch::Tensor routes, torch::Tensor plan, torch::Tensor send_head,
@@ -119,13 +121,16 @@ void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
 
     aclrtStream stream = GetCurrentAclStream();
-    // Ordinary UDMA combine resets only its fixed control header, then Begin()
-    // synchronizes every rank/AIV before any payload overwrite. The previous
-    // operation's local consumers and outgoing QPs have completed in stream
-    // order. Keep the separate entry barrier for all other communication paths.
-    const bool has_udma_begin = use_udma && (phase == CombinePhase::Fused || phase == CombinePhase::Communication);
+    // Profiling may separate arrival skew into an all-rank/all-AIV notify.
+    // The benchmark enables this process-local switch only during capture;
+    // every rank must use the same setting. Ordinary V1/V2 UDMA relies on
+    // Begin, which retains its control-header reset and synchronization.
+    const char* profile_notify = std::getenv("DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY");
+    const bool separate_notify = profile_notify && std::strcmp(profile_notify, "1") == 0;
+    const bool has_udma_begin =
+        use_udma && (phase == CombinePhase::Fused || phase == CombinePhase::Communication) && !separate_notify;
     if (!has_udma_begin && phase != CombinePhase::Reduction && phase != CombinePhase::Remaining) {
-        cached_notify_combine_kernel_do(tiling.block_dim, stream, ffts_addr);
+        cached_notify_combine_kernel_do(tiling.block_dim, stream, ffts_addr, tiling.instance_id);
     }
     auto* combine_kernel_do = use_udma ? &v1_combine_udma_kernel_do : &v1_combine_kernel_do;
     if (phase == CombinePhase::Communication) {
@@ -184,8 +189,8 @@ void LaunchAggregateKernel(torch::Tensor x, const c10::optional<torch::Tensor>& 
                         ffts_addr);
 }
 
-void LaunchElasticBarrierKernel(int64_t block_dim, uint64_t ffts_addr)
+void LaunchElasticBarrierKernel(int64_t block_dim, uint64_t ffts_addr, uint32_t instance_id)
 {
     TORCH_CHECK(block_dim > 0, "elastic barrier block_dim must be positive");
-    cached_notify_combine_kernel_do(static_cast<uint32_t>(block_dim), GetCurrentAclStream(), ffts_addr);
+    cached_notify_combine_kernel_do(static_cast<uint32_t>(block_dim), GetCurrentAclStream(), ffts_addr, instance_id);
 }

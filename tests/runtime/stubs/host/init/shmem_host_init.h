@@ -10,10 +10,12 @@ constexpr int ACLSHMEM_DATA_OP_UDMA = 8;
 using data_op_engine_type_t = int;
 constexpr int ACLSHMEMX_INIT_WITH_DEFAULT = 1;
 constexpr int ACLSHMEMX_INIT_WITH_MPI = 2;
+constexpr int ACLSHMEMX_INIT_WITH_UNIQUEID = 4;
 struct aclshmemx_uniqueid_t {
     char bytes[128]{};
 };
 struct aclshmemx_init_attr_t {
+    uint64_t instance_id = 0;
     int my_pe = 0;
     int n_pes = 0;
     uint64_t local_mem_size = 0;
@@ -42,3 +44,7 @@ void* aclshmemx_get_buffer_ptr(const void*);
 int aclshmem_finalize();
 int aclshmemx_set_qp_num(data_op_engine_type_t, uint32_t);
 int aclshmemx_set_shared_jetty(data_op_engine_type_t, bool);
+
+int aclshmemx_instance_ctx_set(uint64_t);
+int aclshmemx_finalize(uint64_t);
+uint64_t shmemx_get_ffts_config();

@@ -48,6 +48,193 @@ METADATA = dict(
 )
 
 
+@pytest.mark.parametrize("op", ["dispatch", "cached-dispatch", "combine_unweighted", "combine_weighted"])
+@pytest.mark.parametrize("flush", [False, True])
+@pytest.mark.parametrize("barrier", ["_Z24barrier_on_stream_kernelim", "cached_notify_combine_kernel"])
+def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush, barrier):
+    from benchmarks.clos.stage_metrics import L2_FLUSH_RANGE, PROFILE_SAMPLE_RANGE, parse_profile
+
+    events, rows = [], []
+    columns = ["Name", "Start Time(us)", "Duration(us)", "Device_id", "Step Id", "Block Num"]
+    names = (
+        ["cached_notify_combine_kernel", "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+        if op.startswith("combine")
+        else (
+            ["dispatch_layout_kernel", "notify_dispatch_kernel"]
+            if op == "dispatch"
+            else ["cached_notify_dispatch_kernel"]
+        )
+        + ["v1_dispatch_udma_kernel"]
+    )
+
+    def linked(name, host, device, task):
+        key = len(events)
+        events.extend(
+            [
+                dict(name=name, ph="X", ts=host, dur=4, pid=1, tid=1),
+                dict(name="torch_to_npu", ph="s", ts=host + 1, pid=1, tid=1, cat="flow", id=key),
+                dict(name="torch_to_npu", ph="f", ts=device, pid=2, tid=1, cat="flow", id=key),
+                dict(name=task, ph="X", ts=device, dur=3, pid=2, tid=1),
+            ]
+        )
+
+    # Include a preceding guard flush, so sample zero must select the nearest
+    # flush instead of accidentally consuming warmup/guard data.
+    for sample in (-1, 0, 1):
+        host, device = 200 + sample * 100, 2000 + sample * 100
+        if flush:
+            linked(L2_FLUSH_RANGE, host, device, "InplaceZero")
+            rows.append(dict(zip(columns, ("InplaceZero", device, 3, 0, 1, 32))))
+        rows.append(dict(zip(columns, (barrier, device + 10, 5, 0, 1, 1))))
+        if sample < 0:
+            linked(f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
+            continue
+        linked(f"{PROFILE_SAMPLE_RANGE}{sample}/start", host + 20, device + 20, "EVENT RECORD")
+        linked(f"{PROFILE_SAMPLE_RANGE}{sample}/end", host + 80, device + 80, "EVENT RECORD")
+        rows.extend(dict(zip(columns, (name, device + 30 + i * 10, 3, 0, 1, 32))) for i, name in enumerate(names))
+    (tmp_path / "profiler_info_0.json").write_text("{}")
+
+    def parse():
+        (tmp_path / "trace_view.json").write_text(json.dumps(events))
+        with (tmp_path / "kernel_details.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+        return parse_profile(
+            tmp_path, op, False, 2, 0, 32, sample_markers=True, flush_l2_cache=flush, all_rank_sync_each_iteration=True
+        )
+
+    result = parse()
+    assert result["kernel_sequence"] == names
+    assert result["sampling"]["all_rank_sync_each_iteration"] is True
+    assert len(result["l2_flush_kernels"]) == (2 if flush else 0)
+    assert all(s["notify_us"] == s["comm_us"] == "3" and s["other_us"] == "0" for s in result["samples"])
+    # Still reject unrelated tasks between samples instead of hiding them as
+    # alignment. Internal barriers inside a sample must remain measured.
+    rows.append(dict(zip(columns, ("unexpected_kernel", 2090, 2, 0, 1, 1))))
+    with pytest.raises(ValueError, match="unassigned kernel"):
+        parse()
+    rows[-1]["Name"] = barrier
+    if barrier == "cached_notify_combine_kernel":
+        rows[-1]["Block Num"] = 32
+        with pytest.raises(ValueError, match="unassigned kernel"):
+            parse()
+        rows[-1]["Block Num"] = 1
+    rows[-1]["Start Time(us)"] = 2025
+    with pytest.raises(ValueError):
+        parse()
+    rows.pop()
+    if flush:
+        original_events = events[:]
+        for timestamp in (200, 300):
+            events[:] = [
+                e for e in original_events if not (e.get("name") == L2_FLUSH_RANGE and e.get("ts") == timestamp)
+            ]
+            with pytest.raises(ValueError, match="missing/ambiguous pre-sample L2 flush"):
+                parse()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_v2_sample_preparation_finishes_flush_before_reused_stream_barrier(enabled):
+    from benchmarks.clos.stage_metrics import prepare_v2_sample
+
+    events = []
+
+    def flush():
+        if enabled:
+            events.extend(["evict", "eviction_complete"])
+
+    def barrier(*, use_comm_stream, with_cpu_sync):
+        assert use_comm_stream and with_cpu_sync
+        if enabled:
+            assert events[-1] == "eviction_complete"
+        events.extend(["existing_stream_barrier", "barrier_complete"])
+
+    # No runtime.barrier method: that path allocates a temporary ACL stream.
+    buffer = SimpleNamespace(barrier=barrier)
+    for _ in range(3):
+        events.clear()
+        prepare_v2_sample(buffer, flush)
+        events.append("sample_start")
+        assert events == (["evict", "eviction_complete"] if enabled else []) + [
+            "existing_stream_barrier",
+            "barrier_complete",
+            "sample_start",
+        ]
+
+
+@pytest.mark.parametrize("previous", [None, "0", "1"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_clos_notify_switch_is_restored_after_capture(monkeypatch, previous, fail):
+    import os
+    from benchmarks.clos.stage_metrics import COMBINE_NOTIFY_ENV, profile_combine_notify
+
+    if previous is None:
+        monkeypatch.delenv(COMBINE_NOTIFY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(COMBINE_NOTIFY_ENV, previous)
+    try:
+        with profile_combine_notify(True):
+            assert os.environ[COMBINE_NOTIFY_ENV] == "1"
+            with profile_combine_notify(False):
+                assert os.environ[COMBINE_NOTIFY_ENV] == "0"
+            assert os.environ[COMBINE_NOTIFY_ENV] == "1"
+            if fail:
+                raise RuntimeError("profiler exit")
+    except RuntimeError:
+        assert fail
+    assert os.environ.get(COMBINE_NOTIFY_ENV) == previous
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+@pytest.mark.parametrize("api", ["v1", "v2"])
+def test_clos_combine_notify_is_separate_and_complete(tmp_path, expanded, api):
+    from benchmarks.clos.stage_metrics import parse_profile
+
+    columns = ["Name", "Start Time(us)", "Duration(us)", "Device_id", "Step Id", "Block Num"]
+    names = (["aggregate_kernel"] if expanded else []) + ["cached_notify_combine_kernel"]
+    names += (
+        ["v1_combine_udma_kernel"] if api == "v1" else ["v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+    )
+    rows = [
+        dict(zip(columns, (name, 100 * sample + 10 * i, 3, 0, 1, 32)))
+        for sample in range(2)
+        for i, name in enumerate(names)
+    ]
+    (tmp_path / "trace_view.json").write_text("{}")
+    (tmp_path / "profiler_info_0.json").write_text("{}")
+
+    def parse(values, required=True):
+        with (tmp_path / "kernel_details.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(values)
+        return parse_profile(
+            tmp_path, "combine_unweighted", expanded, 2, 0, 32, api=api, require_combine_notify=required
+        )
+
+    result = parse(rows)
+    for sample in result["samples"]:
+        assert sample["notify_us"] == "3"
+        if api == "v1":
+            assert sample["comm_us"] is None and sample["reduce_us"] is None
+            assert sample["fused_combine_us"] == "3"
+            assert sample["combine_with_reduce_us"] == ("6" if expanded else "3")
+        else:
+            assert sample["comm_us"] == "3"
+            assert sample["reduce_us"] == "3"
+            assert sample["combine_stage_us"] == ("6" if expanded else "3")
+    missing = [r for r in rows if r["Name"] != "cached_notify_combine_kernel"]
+    with pytest.raises(ValueError, match="kernel counts"):
+        parse(missing)
+    assert parse(missing, required=False)["samples"][0]["notify_us"] == "0"
+    with pytest.raises(ValueError, match="kernel counts"):
+        parse(rows + [dict(rows[names.index("cached_notify_combine_kernel")])])
+    wrong_aiv = [dict(r, **{"Block Num": 1}) if r["Name"] == "cached_notify_combine_kernel" else r for r in rows]
+    with pytest.raises(ValueError, match="AIV count"):
+        parse(wrong_aiv)
+
+
 @pytest.mark.parametrize(
     "change",
     [

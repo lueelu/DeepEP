@@ -1,3 +1,4 @@
+#include "runtime/instances.hpp"
 // Copyright (c) 2026, Lu Lu
 
 #include "ops/device_phase_timing.hpp"
@@ -112,6 +113,7 @@ void bind_notify(py::module_& module)
         [](Session& session, py::object indices, py::dict outputs, int tokens, int topk, int experts,
            uintptr_t stream_address, int chunk_tokens, uint32_t num_cores, py::object rank_dedup) {
             auto t = tiling(session.rank(), session.world(), tokens, topk, experts, chunk_tokens, num_cores);
+            t.instance_id = session.instance_id();
             if (!rank_dedup.is_none()) {
                 if (!py::isinstance<py::bool_>(rank_dedup)) throw py::type_error("rank_dedup must be bool or None");
                 t.rank_dedup = rank_dedup.cast<bool>();
@@ -187,6 +189,8 @@ void bind_notify(py::module_& module)
         py::arg("experts"), py::arg("stream_address"), py::arg("chunk_tokens") = 256,
         py::arg("num_cores") = ascend_deepep::kNotifyCores, py::arg("rank_dedup") = py::none());
     module.def("notify_check_mapping", [](Session& session) {
+        InstanceLock lock(instance_mutex());
+        select_instance(session.instance_id());
         void* workspace = session.workspace();
         for (int peer = 0; peer < session.world(); ++peer) {
             if (aclshmem_ptr(workspace, peer) == nullptr) {
