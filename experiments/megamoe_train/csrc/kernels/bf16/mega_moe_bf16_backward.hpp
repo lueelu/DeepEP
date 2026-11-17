@@ -337,7 +337,15 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::BuildSavedRowMap()
     using namespace MegaMoeBF16Training::Wave;
     // Each entry holds the saved physical row and the remaining contiguous
     // run. This keeps UB and L1 loads segmented without copying payloads in GM.
-    const GmPeerPrefix prefix{reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM)};
+    const uint32_t countElements = worldSize_ * expertPerRank_;
+    LocalTensor<int32_t> prefixUb{TPosition::VECIN, 0, (countElements + 7U) / 8U * 8U};
+    DataCopyPad(prefixUb, cumsumInWorkSpace_,
+                DataCopyExtParams{1U, countElements * uint32_t{sizeof(int32_t)}, 0U, 0U, 0U},
+                DataCopyPadExtParams<int32_t>{false, 0U, 0U, 0U});
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID6);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID6);
+    // Row partitioning repeatedly reads counts; keep that table in private UB.
+    const UbPeerPrefix prefix{prefixUb};
     constexpr uint32_t chunkRows = 1024;
     LocalTensor<uint32_t> scratch{TPosition::VECIN, BW_STAGE_BASE_BYTES, 2U * chunkRows};
     GlobalTensor<uint32_t> mapping;
@@ -345,20 +353,23 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::BuildSavedRowMap()
     const uint32_t groups = params_.tilingData->mGroupsPerWave;
     for (uint32_t expert = 0; expert < expertPerRank_; ++expert) {
         const auto descriptor = DescribePeerExpert(prefix, worldSize_, expertPerRank_, expert, maxOutputSize_, groups);
-        const PeerCounts<GmPeerPrefix> counts{prefix, expertPerRank_, expert, descriptor.rows};
+        const PeerCounts<UbPeerPrefix> counts{prefix, expertPerRank_, expert, descriptor.rows};
         const uint32_t perCore = (descriptor.rows + 2U * blockNum_ - 1U) / (2U * blockNum_);
         const uint32_t begin = aivCoreIdx_ * perCore;
         const uint32_t end = begin + perCore < descriptor.rows ? begin + perCore : descriptor.rows;
         PeerRowCursor cursor(counts, worldSize_, rankId_, groups, descriptor.rows, descriptor.firstSliceRows, begin,
-                             end);
+                             descriptor.rows);
         PeerTransfer transfer{};
-        while (cursor.Next(transfer)) {
+        while (cursor.Next(transfer) && transfer.destinationRow < end) {
+            // Ownership limits writes, while the run spans the full physical segment.
+            const uint32_t ownedRows =
+                transfer.rowCount < end - transfer.destinationRow ? transfer.rowCount : end - transfer.destinationRow;
             const uint64_t sourceBegin =
                 transfer.sourceRank ? prefix.Get((transfer.sourceRank - 1U) * expertPerRank_ + expert) : 0U;
             const uint64_t oldRow = descriptor.base + transfer.destinationRow;
             const uint64_t newRow = descriptor.base + sourceBegin + transfer.sourceOrdinalBegin;
-            for (uint32_t offset = 0; offset < transfer.rowCount; offset += chunkRows) {
-                const uint32_t take = transfer.rowCount - offset < chunkRows ? transfer.rowCount - offset : chunkRows;
+            for (uint32_t offset = 0; offset < ownedRows; offset += chunkRows) {
+                const uint32_t take = ownedRows - offset < chunkRows ? ownedRows - offset : chunkRows;
                 SetFlag<HardEvent::MTE3_S>(EVENT_ID6);
                 WaitFlag<HardEvent::MTE3_S>(EVENT_ID6);
                 for (uint32_t row = 0; row < take; ++row) {

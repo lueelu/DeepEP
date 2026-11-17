@@ -138,6 +138,14 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseWholeRowTopkGrad(uint32_t mode, uint
 {
     return mode == kSaveBf16 && f > 0 && f <= 16384 && f % 64 == 0;
 }
+constexpr uint32_t kWholeRowTopkResultBytes = 8U * 1024U;
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t TopkGradBatchRows(uint32_t columns)
+{
+    if (columns == 0) return 0;
+    const uint32_t capacity = (248U * 1024U - kWholeRowTopkResultBytes) / (columns * 10U);
+    return capacity < 8U ? capacity : 8U;
+}
+
 // CANN's FP32 contiguous AR sum first selects an A tile by core occupancy,
 // then splits R to fit its four input buffers. The rank's complete routed
 // row count is needed: one-row AR can have a different addition tree.

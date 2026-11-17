@@ -253,11 +253,12 @@ __aicore__ inline void GroupMatmulRecompute(BackwardGroupMatmulParam<RowMajor, W
 
 // The saved-mode GM path uses unique output addresses to decouple the AIC
 // producer from AIV UB reuse. Publish one arrival per AIC after the whole
-// expert's Fixpipe writes retire; AIVs use alternating tile ownership.
+// expert's Fixpipe writes retire. Whole-row dP uses AIV1 row ownership;
+// the other paths use alternating tile ownership.
 // There are no per-tile cross-core events here, so an AIC may run ahead without
 // exhausting event credits or waiting for a consumer acknowledgement.
-// dHpBase aliases this expert's Hp plane: each tile has one AIV owner, which
-// loads the complete dHp into UB before replacing it with Hp. All AIC writes
+// dHpBase aliases this expert's Hp plane: each row or tile has one AIV owner,
+// which reads its complete dHp before replacing it with Hp. All AIC writes
 // retire before either lane starts consuming this expert. Other experts use
 // disjoint bands; each expert's dW2 retires before P2 overwrites its dO.
 template <class WeightLayout, typename TopkWeightT>
@@ -311,9 +312,15 @@ __aicore__ inline void GMM2GradSwiGLUGradGM(
             }
         }
         if (MegaMoeBF16Training::UseWholeRowTopkGrad(epilogueOp.SavedMode(), n)) {
-            epilogueOp.ReduceTopkRows(dHpBase, m);
-            // All readers must finish before any tile overwrites dHp with Hp.
-            AscendC::SyncAll<true>();
+            // AIV1 owns whole rows while AIV0 dispatches later experts. Row-local
+            // ownership orders each raw dHp read before its in-place Hp write.
+            if (gmm2Params.subBlockIdx == 1U) {
+                MegaMoeTrainTimerSpanScope timerRows(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD);
+                epilogueOp.SwiGLUGradRows(dHpBase, m, gmm2Params.blockIdx, gmm2Params.blockNum);
+            }
+            nextTargetAiv += first < loops ? (loops - first + gmm2Params.blockNum - 1U) / gmm2Params.blockNum : 0U;
+            startBlockIdx = (startBlockIdx + loops) % gmm2Params.blockNum;
+            return;
         }
     }
     for (uint32_t index = first; index < loops; index += gmm2Params.blockNum, ++nextTargetAiv) {

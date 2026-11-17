@@ -37,6 +37,25 @@ int main()
     static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24258, 3072, 64) == 1536);
     static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24693, 3072, 64) == 1536);
     static_assert(10U * 16384U + 8192U <= 248U * 1024U);
+    for (uint32_t f = 64; f <= 16384; f += 64) {
+        const auto batch = MegaMoeBF16Training::TopkGradBatchRows(f);
+        assert(batch >= 1 && batch <= 8);
+        assert(batch * 10U * f + MegaMoeBF16Training::kWholeRowTopkResultBytes <= 248U * 1024U);
+    }
+    // Row ownership is independent of the 2*AIC lanes used to choose the sum tree.
+    for (uint32_t f : {64U, 3072U, 16384U}) {
+        const auto batch = MegaMoeBF16Training::TopkGradBatchRows(f);
+        for (uint32_t readers : {1U, 32U, 36U}) {
+            for (uint32_t rows : {0U, 1U, 31U, 32U, 33U, 255U, 256U, 257U, 24991U}) {
+                std::vector<uint32_t> visited(rows);
+                for (uint32_t reader = 0; reader < readers; ++reader) {
+                    for (uint32_t begin = reader * batch; begin < rows; begin += readers * batch)
+                        for (uint32_t row = begin; row < std::min(begin + batch, rows); ++row) ++visited[row];
+                }
+                for (auto count : visited) assert(count == 1);
+            }
+        }
+    }
     using Quant = MegaMoeBF16Training::SavedGateUpQuantUbLayoutFor<256, 64, 128>;
     static_assert(Quant::gateData == 2U * 256U * 128U * 2U);
     static_assert(Quant::totalBytesWithClipMasks + 256U * sizeof(float) <= 248U * 1024U);
@@ -144,12 +163,13 @@ int main()
                 for (uint32_t begin = 0; begin < info.rows; begin += 128) {
                     const uint32_t end = std::min(begin + 128, info.rows);
                     PeerRowCursor<PeerCounts<Prefix>> inverse(pc, peers, rank, groups, info.rows, info.firstSliceRows,
-                                                              begin, end);
+                                                              begin, info.rows);
                     MegaMoeImpl::PeerTransfer transfer{};
                     uint32_t next = begin;
-                    while (inverse.Next(transfer)) {
+                    while (inverse.Next(transfer) && transfer.destinationRow < end) {
                         assert(transfer.destinationRow == next);
-                        for (uint32_t j = 0; j < transfer.rowCount; ++j, ++next) {
+                        const uint32_t ownedRows = std::min(transfer.rowCount, end - next);
+                        for (uint32_t j = 0; j < ownedRows; ++j, ++next) {
                             assert(expected[next] == Row(transfer.sourceRank, transfer.sourceOrdinalBegin + j));
                             const uint32_t sourceBase =
                                 transfer.sourceRank ? prefix[(transfer.sourceRank - 1U) * experts + e] : 0U;
@@ -162,6 +182,17 @@ int main()
                     }
                     assert(next == end);
                 }
+                // Runs are independent of the parallel writers' 128-row ownership cuts.
+                std::vector<uint32_t> wholeRuns(info.rows);
+                PeerRowCursor<PeerCounts<Prefix>> whole(pc, peers, rank, groups, info.rows, info.firstSliceRows, 0,
+                                                        info.rows);
+                MegaMoeImpl::PeerTransfer full{};
+                while (whole.Next(full)) {
+                    const uint32_t base = full.sourceRank ? prefix[(full.sourceRank - 1U) * experts + e] : 0U;
+                    for (uint32_t j = 0; j < full.rowCount; ++j)
+                        wholeRuns[base + full.sourceOrdinalBegin + j] = full.rowCount - j;
+                }
+                assert(runs == wholeRuns);
                 auto canonicalOracle = expected;
                 std::sort(canonicalOracle.begin(), canonicalOracle.end());
                 assert(canonical == canonicalOracle);

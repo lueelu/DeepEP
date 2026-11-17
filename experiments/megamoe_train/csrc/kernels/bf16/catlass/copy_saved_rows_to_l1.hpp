@@ -49,8 +49,10 @@ private:
         const uint32_t stride = rowMajor ? tla::get<0>(src.stride()) : tla::get<1>(src.stride());
         for (uint32_t offset = 0; offset < rows;) {
             const uint64_t index = src.data().rowBase + logicalBegin + offset;
-            const uint32_t physical = AscendC::ReadGmByPassDCache(src.data().rowMap + 2U * index);
-            const uint32_t run = AscendC::ReadGmByPassDCache(src.data().rowMap + 2U * index + 1U);
+            const uint64_t entry =
+                AscendC::ReadGmByPassDCache(reinterpret_cast<__gm__ uint64_t*>(src.data().rowMap) + index);
+            const uint32_t physical = static_cast<uint32_t>(entry);
+            const uint32_t run = static_cast<uint32_t>(entry >> 32U);
             const uint32_t take = run < rows - offset ? run : rows - offset;
             AscendC::Nd2NzParams p{};
             p.ndNum = 1;
