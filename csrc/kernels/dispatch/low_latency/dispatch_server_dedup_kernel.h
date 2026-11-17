@@ -21,31 +21,30 @@ public:
                                 GM_ADDR sendCountsOut, GM_ADDR tokenTypeOut, GM_ADDR destinationIndexOut,
                                 GM_ADDR relayReadIndexOut, GM_ADDR sourceMaskOut, GM_ADDR expertScalesOut, uint32_t bs,
                                 uint32_t h, uint32_t topK, uint32_t experts, uint32_t expertTokenNumsType,
-                                EpServerDedupInputMode inputMode, bool e4m3, TPipe* pipe,
+                                EpServerDedupInputMode inputMode, bool e4m3,
                                 GM_ADDR inputScales = nullptr, bool enableDedup = true,
                                 LlReferenceProfile::DeviceProfile* profile = nullptr)
     {
 
         profile_ = profile;
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
-        core_ = GetBlockIdx();
-        sendCores_ = GetBlockNum() / 2U;
-        pipe_ = pipe;
+        core_ = asc_get_block_idx();
+        sendCores_ = asc_get_block_num() / 2U;
 
         if (profile_) profile_->Mark<2>();  // w2: magic_begin
-        const uint32_t magic = RotateDispatchServerDedupMagic(args_, core_, pipe);
+        const uint32_t magic = RotateDispatchServerDedupMagic(args_, core_);
         if (profile_) profile_->Mark<3>();  // w3: magic_end
 
         counts_.Init(commArgs, expertIds, expertTokenNumsOut, sendCountsOut, bs, topK, experts, expertTokenNumsType,
-                     magic, pipe, profile_);
+                     magic, profile_);
         if (profile_) profile_->Mark<4>();  // w4: counts_init_end
 
         if (core_ < sendCores_)
             sender_.Init(args_, x, expertIds, expertScales, sourceMaskOut, expertScalesOut, bs, h, topK, experts,
-                         inputMode, e4m3, pipe, magic, inputScales, enableDedup);
+                         inputMode, e4m3, magic, inputScales, enableDedup);
         else
             receiver_.Init(args_, expandXOut, dynamicScalesOut, tokenTypeOut, destinationIndexOut, relayReadIndexOut,
-                           bs, h, topK, experts, inputMode, pipe, magic, enableDedup);
+                           bs, h, topK, experts, inputMode, magic, enableDedup);
         if (profile_) profile_->Mark<5>();  // w5: role_init_end
     }
 
@@ -61,7 +60,7 @@ public:
         if (core_ < sendCores_) {
 
             if (profile_) profile_->Mark<8>();  // w8: sender_begin
-            sender_.Process(counts_.ScratchPool(), counts_.ReservedBytes(), profile_, counts_.Retirement());
+            sender_.Process(counts_.ReservedBytes(), profile_, counts_.Retirement());
             if (profile_) profile_->Mark<9>();  // w9: sender_end_after_MTE3_S
 
         } else {
@@ -82,7 +81,7 @@ public:
             // CompleteCumsum may still be writing expert counts from its UB.
             // Retire that stage before receiver resets the pipe and reloads GM.
             if (profile_) profile_->Mark<16>();  // w16: count_drain_begin
-            PipeBarrier<PIPE_ALL>();
+            asc_sync_pipe(PIPE_ALL);
             if (profile_) profile_->Mark<17>();  // w17: count_drain_end_PIPE_ALL
 
             if (profile_) profile_->Mark<18>();  // w18: receiver_begin
@@ -115,7 +114,6 @@ private:
     ServerDedupSender<XType, Group> sender_;
     ServerDedupReceiver receiver_;
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
-    TPipe* pipe_ = nullptr;
     uint32_t core_ = 0, sendCores_ = 0;
 };
 }  // namespace DispatchDedup

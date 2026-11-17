@@ -1,4 +1,5 @@
 #pragma once
+#include "ll_compile_attrs.h"
 #include "ll_count_frame_layout.h"
 
 namespace DispatchDedup {
@@ -14,17 +15,14 @@ struct LlCountReadPlan {
     LlCountReadRun runs[kLlCountReadMaxRuns]{};
     uint32_t size = 0;
     uint32_t sourceStrideBlocks = 0; // gap in 32B units, excluding the copied block
+    uint32_t expectedFlagSum = 0;
 };
-#if defined(__CCE__) && defined(__CCE_IS_AICORE__)
-__aicore__ inline
-#else
-inline
-#endif
-bool BuildCountReadPlan(uint32_t experts, uint32_t world, uint32_t countCores,
-                       uint32_t destination, uint32_t first, uint32_t count, LlCountReadPlan& out,
-                       bool directRanks = false)
+__aicore__ __forceinline__ bool BuildCountReadPlan(uint32_t experts, uint32_t world, uint32_t countCores,
+    uint32_t destination, uint32_t first, uint32_t count, LlCountReadPlan& out,
+    bool directRanks = false)
 {
     out.size = 0;
+    out.expectedFlagSum = 0;
     if (world < 32U || world > 256U || experts < world || experts > 1024U || experts % world ||
         !countCores || countCores > 72U || destination >= world || first > experts ||
         count > experts - first || count > 128U) return false;
@@ -38,6 +36,7 @@ bool BuildCountReadPlan(uint32_t experts, uint32_t world, uint32_t countCores,
         const uint32_t length = count - consumed < available ? count - consumed : available;
         const auto frame = CountFrame(experts, world, countCores, destination, source, logical / world, directRanks);
         out.runs[out.size++] = {frame.recordOffset, frame.commitOffset, consumed, length};
+        out.expectedFlagSum += length * frame.flagWords;
         consumed += length;
     }
     return true;

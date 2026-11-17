@@ -5,8 +5,9 @@
 #define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_COUNT_LAYOUT_H
 
 #include "comm_args.h"
+#include "ll_compile_attrs.h"
 #include "ll_core_config.h"
-#include "dispatch_dedup_types.h"
+#include "ll_count_frame_layout.h"
 
 // Count participation threshold is independent of the runtime send/receive split.
 #ifndef DISPATCH_SERVER_DEDUP_ALL_CORE_COUNT_BS_THRESHOLD
@@ -20,7 +21,7 @@ constexpr uint32_t kEpServerDedupAllCoreCountBsThreshold = DISPATCH_SERVER_DEDUP
 constexpr uint32_t kEpServerDedupMaxExperts = 1024U;
 constexpr uint32_t kEpServerDedupCountRecordBytes = 32U;
 constexpr uint32_t kEpServerDedupCountGmStride = 512U;
-constexpr uint32_t kEpServerDedupCountUbBytes = 190U * 1024U;
+constexpr uint32_t kEpServerDedupCountUbBytes = kLlUbBytes;
 // Persistent per-AIV state lives only in window 0's prefix, never in the
 // selected ping-pong bank. Keep identical count offsets in both windows.
 constexpr uint64_t kEpServerDedupMagicStride = 512U;
@@ -36,12 +37,6 @@ constexpr uint64_t kEpServerDedupControlBytes = 2ULL * 1024U * 1024U;
 // window 0 so both windows have identical capacity and shape-independent stride.
 constexpr uint64_t kEpServerDedupWindowUsableBytes =
     kEpServerDedupWindowBytes - DispatchDedup::DISPATCH_DEDUP_FLAG_BUFF_BYTES;
-
-#if DISPATCH_DEDUP_ASCENDC_AICORE_COMPILE
-#define DISPATCH_DEDUP_EP_DEDUP_INLINE FORCE_INLINE_AICORE
-#else
-#define DISPATCH_DEDUP_EP_DEDUP_INLINE inline
-#endif
 
 // Matrix offsets are relative to cntOffset; cntOffset, counterOffset and
 // stateBytes are relative to the selected window. Leading padding is retained.
@@ -61,12 +56,12 @@ struct EpServerDedupCountLayout {
 // cleared and can overlap another split's control flags. All ranks must use the
 // same communicator call order and serialize its kernels
 // on one stream. Count publication (including zeros) protects two-call reuse.
-DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupWindowOffset(int64_t magic)
+__aicore__ __forceinline__ uint64_t DispatchServerDedupWindowOffset(int64_t magic)
 {
     return (uint64_t(magic) % 2U) * kEpServerDedupWindowBytes;
 }
 
-DISPATCH_DEDUP_EP_DEDUP_INLINE EpServerDedupCountLayout DispatchServerDedupCountLayout(uint32_t experts, uint32_t coreNum = kLlDefaultPlanCoreNum)
+__aicore__ __forceinline__ EpServerDedupCountLayout DispatchServerDedupCountLayout(uint32_t experts, uint32_t coreNum = kLlDefaultPlanCoreNum)
 {
     EpServerDedupCountLayout layout{};
     const uint32_t recvCores = coreNum / 2U;
@@ -91,18 +86,18 @@ DISPATCH_DEDUP_EP_DEDUP_INLINE EpServerDedupCountLayout DispatchServerDedupCount
 // frame), and local count records/histogram. Only local records remain reserved.
 // Sender/receive scratch overlays those four buffers and the histogram after
 // filtering; the records remain reserved until the asynchronous writes retire.
-DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupCountSendUbBytes(uint64_t routes, uint32_t experts,
+__aicore__ __forceinline__ uint64_t DispatchServerDedupCountSendUbBytes(uint64_t routes, uint32_t experts,
                                                                             uint32_t countCores,
-                                                                            uint32_t remoteRecords = 0U)
+                                                                            uint32_t remoteRecords = 0U,
+                                                                            bool packedFrames = false)
 {
     const uint64_t routeBytes = (routes * sizeof(int32_t) + 255U) / 256U * 256U;
     const uint32_t records = (experts + countCores - 1U) / countCores;
     const uint32_t alignedRecords = (records + 7U) / 8U * 8U;
     const uint64_t remoteBytes = uint64_t((remoteRecords + 7U) / 8U * 8U) * 32U;
     const uint64_t workBytes = routeBytes < remoteBytes ? remoteBytes : routeBytes;
-    return 3U * routeBytes + workBytes + uint64_t(alignedRecords) * (32U + sizeof(int32_t));
+    const uint64_t localBytes = packedFrames ? CountWireBytes(records) : uint64_t(alignedRecords) * 32U;
+    return 3U * routeBytes + workBytes + localBytes + uint64_t(alignedRecords) * sizeof(int32_t);
 }
-
-#undef DISPATCH_DEDUP_EP_DEDUP_INLINE
 }  // namespace DispatchDedup
 #endif

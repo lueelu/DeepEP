@@ -1,27 +1,13 @@
 #pragma once
 #include <cstdint>
+#include "ll_compile_attrs.h"
 
 namespace LlStageTimer {
 constexpr uint32_t kSchema = 3U;
 constexpr uint64_t kMagic = 0x4c4c5431ULL;
 constexpr uint32_t kSlots = 32U;
 constexpr uint32_t kFields = 8U;
-constexpr uint32_t kWordsPerCore = kSlots * kFields;
 constexpr uint64_t kActive = uint64_t(1) << 62U;
-// Schema 3 retains stage records and reserves a separate submitted-DMA ledger.
-constexpr uint32_t kDataCounterOffset = 208U;
-constexpr uint32_t kDataCounterBuckets = 5U;
-constexpr uint32_t kDataCounterFields = 4U; // bytes, operations, read bytes, read operations
-constexpr uint32_t kDataFlagsOffset = 228U;
-constexpr uint64_t kDataNoComm = 1U;
-#if defined(__CCE__) && defined(__CCE_IS_AICORE__)
-__aicore__ inline
-#else
-inline
-#endif
-constexpr uint32_t DataBucket(uint32_t rank, uint32_t peer, bool forwarding) {
-    return rank == peer ? 0U : (rank / 16U == peer / 16U ? 1U : 3U) + uint32_t(forwarding);
-}
 
 // Schema 2 packs each stage into first/start_or_end/sum/count|active (4 words).
 // Header remains 8 words; the tensor shape and 2048B/core allocation are unchanged.
@@ -113,8 +99,5 @@ constexpr const char* kNames[] = {"header",
                                   "send_mte_write", "send_rdma_stage", "send_rdma_body_post",
                                   "send_rdma_body_wait", "send_rdma_flag_post", "send_rdma_flag_wait",
                                   "send_rdma_restore"};
-static_assert(8U + (StageCount - 1U) * 4U <= kDataCounterOffset, "stage/counter separation");
-static_assert(kDataCounterOffset + kDataCounterBuckets * kDataCounterFields == kDataFlagsOffset, "counter layout");
-static_assert(kDataFlagsOffset < kWordsPerCore, "timer capacity");
 static_assert(sizeof(kNames) / sizeof(kNames[0]) == StageCount, "timer names");
 }  // namespace LlStageTimer

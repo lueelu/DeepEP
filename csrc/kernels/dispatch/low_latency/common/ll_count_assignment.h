@@ -1,30 +1,21 @@
 #pragma once
 #include <cstdint>
+#include "ll_compile_attrs.h"
 #include "ll_group_policy.h"
 
 namespace DispatchDedup {
 struct LlCountAssignment {
     uint32_t first, end, remoteRank, alignedRecords, remoteRecords;
 };
-#if defined(__CCE__) && defined(__CCE_IS_AICORE__)
-__aicore__ inline
-#else
-inline
-#endif
-uint32_t CountRemotePeer(uint32_t rank, uint32_t world, uint32_t task)
+__aicore__ __forceinline__ uint32_t CountRemotePeer(uint32_t rank, uint32_t world, uint32_t task)
 {
     // Compact remote-rank enumeration skips this source's physical host.
     const uint32_t hostFirst = rank / kLlPhysicalRanksPerHost * kLlPhysicalRanksPerHost;
     return task < world - kLlPhysicalRanksPerHost
         ? (task < hostFirst ? task : task + kLlPhysicalRanksPerHost) : world;
 }
-#if defined(__CCE__) && defined(__CCE_IS_AICORE__)
-__aicore__ inline
-#else
-inline
-#endif
-LlCountAssignment CountAssignment(uint32_t rank, uint32_t world, uint32_t experts,
-                                   uint32_t cores, uint32_t core, bool allCore, bool directRanks)
+__aicore__ __forceinline__ LlCountAssignment CountAssignment(uint32_t rank, uint32_t world, uint32_t experts,
+    uint32_t cores, uint32_t core, bool allCore, bool directRanks)
 {
     const uint32_t countCores = allCore ? cores : cores / 2U;
     uint32_t first = 0U, end = 0U;

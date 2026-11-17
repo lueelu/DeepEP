@@ -571,7 +571,7 @@ class ElasticBuffer:
                 except Exception:
                     runtime.notify_failed = True
                     raise
-            event.current_stream_wait(release_handle=True)
+            event.current_stream_wait()
             runtime.notify_inflight = None
             return (out, out_scales) if scales is not None else out, None, None, result, event
 
@@ -669,7 +669,7 @@ class ElasticBuffer:
                 except Exception:
                     runtime.notify_failed = True
                     raise
-            event.current_stream_wait(release_handle=True)
+            event.current_stream_wait()
             runtime.notify_inflight = None
             return tensors["output"], None, event
 

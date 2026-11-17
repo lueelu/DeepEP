@@ -19,7 +19,7 @@ constexpr const char* kNames[kWordsPerCore] = {
     "receive_buffers_ready", "receive_packet_poll_accum_cycles", "receive_load_consume_submit_accum_cycles", "receive_lane_wait_clear_issue_end", "receive_final_PIPE_ALL_end", "receive_task_count", "send_buffers_routes_ready", "send_packets_issue_end",
     "send_metadata_end_after_MTE3_S", "receive_probe_batch_count", "first_packet_ready", "send_route_count", "send_count_first_frame_issued", "send_count_last_frame_issued", "recv_count_first_ready", "recv_count_poll_first_iter_end",
     "receive_first_hop_tokens", "receive_relay_members", "rank", "AIV_core", "EP", "active_aiv", "BS", "schema",
-    "operation", "before_finalize", "valid_mask", "magic", "boundary_mode", "complete", "reserved", "reserved",
+    "operation", "before_finalize", "valid_mask", "magic", "boundary_mode", "complete", "receive_relay_distinct_ranks", "reserved",
     "packet_detail_version", "send_remote_packets", "send_group_packets", "remote_first_begin", "remote_last_put_return", "group_first_begin", "group_last_submit_return", "second_remote_begin",
     "second_remote_enqueue", "second_remote_put_begin", "second_remote_put_return", "second_remote_member_q_ticks", "second_remote_token", "second_remote_k", "second_remote_expert", "second_remote_peer",
     "batch_quiet_ticks", "batch_flush_count", "last_quiet_end", "second_remote_triggered_flush", "remote_first_order", "remote_last_order", "group_first_order", "group_last_order",

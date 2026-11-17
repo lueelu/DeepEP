@@ -11,7 +11,7 @@
 
 #include "../launch.hpp"
 #include "low_latency/dispatch_server_dedup_kernel.h"
-#include "low_latency/common/dispatch_dedup_types.h"
+#include "low_latency/common/comm_args.h"
 #include "low_latency/common/ep_memory_server_dedup_tiling.h"
 #include "low_latency/common/ll_core_config.h"
 #include "low_latency/common/ll_dispatch_variant.h"
@@ -28,7 +28,9 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ser
 {
     (void)timerMode; (void)expertTimer;  // Reserved launch ABI slots; legacy tracing removed.
     const uint64_t referenceEntry = LlReferenceProfile::DeviceProfile::EntryClock(stageTimer);
-    util_set_ffts_config(reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs)->fftsVal);
+    // CANN 9.2.T101 declares asc_set_ffts_base_addr but omits its A5 definition.
+    // Use the compiler's C intrinsic directly; this does not construct an AscendC object.
+    set_ffts_base_addr(reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs)->fftsVal);
     LlReferenceProfile::DeviceProfile profile;
     profile.Init(stageTimer);
     profile.Value<0>(referenceEntry);  // w0: kernel_entry
@@ -37,10 +39,10 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ser
     // Host owns validation; each core reads its configuration once before work.
     const auto* tiling = reinterpret_cast<const __gm__ DispatchDedup::EpServerDedupTilingData*>(tilingData);
     const uint32_t rankSize = uint32_t(reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs)->rankSize);
-    if (!DispatchDedup::LlTilingKeyValid(rankSize, tiling->tilingKey)) { AscendC::Trap(); return; }
+    if (!DispatchDedup::LlTilingKeyValid(rankSize, tiling->tilingKey)) { trap(); return; }
     const uint32_t bs = tiling->bs;
     const uint32_t h = tiling->h;
-    const bool enableDedup = DispatchDedup::EpServerDedupEnabled(tiling->numMaxTokensPerRank, bs, rankSize);
+    const bool enableDedup = DispatchDedup::EpServerDedupEnabled(tiling->numMaxTokensPerRank, rankSize);
     const uint32_t topK = tiling->topK;
     const uint32_t moeExpertNum = tiling->moeExpertNum;
     const uint32_t expertTokenNumsType = tiling->expertTokenNumsType;
@@ -50,11 +52,10 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ser
     const auto inputMode = static_cast<DispatchDedup::EpServerDedupInputMode>(tiling->inputMode);
     const uint32_t inputClass =
         DispatchDedup::LlDispatchInputClass(dtype, quantMode, expandXOutDtype, uint8_t(inputMode));
-    AscendC::TPipe pipe;
 
     // Host chooses the same class from the same tiling builder; the device
     // rechecks it so an unsupported format can never run a different kernel.
-    if (inputClass == DispatchDedup::kLlDispatchInvalidVariant) { AscendC::Trap(); return; }
+    if (inputClass == DispatchDedup::kLlDispatchInvalidVariant) { trap(); return; }
     const bool e4m3 = expandXOutDtype == DispatchDedup::kLlDispatchE4M3;
     const uint32_t group = tiling->tilingKey;
 
@@ -63,7 +64,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ser
         DispatchDedup::DispatchMemoryServerDedupKernel<XType, Group> kernel;                                 \
         kernel.Init(commArgs, x, expertIds, expertScales, expandXOut, dynamicScalesOut, expertTokenNumsOut,   \
                     sendCountsOut, tokenTypeOut, destinationIndexOut, relayReadIndexOut, sourceMaskOut,       \
-                    expertScalesOut, bs, h, topK, moeExpertNum, expertTokenNumsType, inputMode, e4m3, &pipe,  \
+                    expertScalesOut, bs, h, topK, moeExpertNum, expertTokenNumsType, inputMode, e4m3,         \
                     inputScales, enableDedup, &profile);                                                     \
         kernel.Process();                                                                                    \
     }

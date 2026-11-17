@@ -1,46 +1,21 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
-
-#ifndef DISPATCH_SERVER_DEDUP_MAGIC_H
-#define DISPATCH_SERVER_DEDUP_MAGIC_H
-
-#include "kernel_operator.h"
+#pragma once
+#include "ll_dispatch_c_api.h"
 #include "../common/ep_memory_server_dedup_count_layout.h"
 
 namespace DispatchDedup {
-// 中文审计：每轮每核仅调用一次，轮转本地双窗口状态；初值由Host清零，随后按1/0交替。
-// 每核独占本地对称内存中的512B槽，不能作为一个可省略的全局共享计数器处理。
-// All launched AIVs call exactly once per launch, including cores with no count work.
-// The initial Host clear seeds 0; launches use 1, 0, 1, 0, ... without overflow.
-// Each core owns a 512-byte slot in the LOCAL symmetric allocation's fixed
-// prefix. No other core/rank writes it. Both accesses use DataCopy.
-__aicore__ inline uint32_t RotateDispatchServerDedupMagic(const __gm__ CommArgs* args, uint32_t core,
-                                                          AscendC::TPipe* pipe)
+// Each core owns one local 512B magic slot. Retire its 32B scratch before Counts uses UB0.
+__aicore__ inline uint32_t RotateDispatchServerDedupMagic(const __gm__ CommArgs* args, uint32_t core)
 {
-    using namespace AscendC;
-    TBuf<> scratch;
-    pipe->InitBuffer(scratch, 32U);
-    auto state = scratch.Get<uint32_t>();
-    auto* slot =
-        reinterpret_cast<__gm__ uint32_t*>(args->peerMems[args->rank] + uint64_t(core) * kEpServerDedupMagicStride);
-    GlobalTensor<uint32_t> slotGm;
-    slotGm.SetGlobalBuffer(slot);
-    DataCopy(state, slotGm, 8U);
-    const auto readEvent = pipe->FetchEventID(HardEvent::MTE2_S);
-    SetFlag<HardEvent::MTE2_S>(readEvent);
-    WaitFlag<HardEvent::MTE2_S>(readEvent);
-    const uint32_t magic = state.GetValue(0) == 0U ? 1U : 0U;
-    state.SetValue(0, magic);
-    const auto scalarEvent = pipe->FetchEventID(HardEvent::S_MTE3);
-    SetFlag<HardEvent::S_MTE3>(scalarEvent);
-    WaitFlag<HardEvent::S_MTE3>(scalarEvent);
-    DataCopy(slotGm, state, 8U);
-    const auto writeEvent = pipe->FetchEventID(HardEvent::MTE3_S);
-    SetFlag<HardEvent::MTE3_S>(writeEvent);
-    WaitFlag<HardEvent::MTE3_S>(writeEvent);
-    // Retire the write before releasing scratch. Counts gets its full UB budget.
-    pipe->Reset();
+    auto* state = LlDispatchC::Ub<uint32_t>(0U);
+    auto* slot = args->peerMems[args->rank] + uint64_t(core) * kEpServerDedupMagicStride;
+    LlDispatchC::Load(state, slot, 32U);
+    LlDispatchC::Sync<PIPE_MTE2, PIPE_S>();
+    const uint32_t magic = state[0] ? 0U : 1U;
+    state[0] = magic;
+    LlDispatchC::Sync<PIPE_S, PIPE_MTE3>();
+    LlDispatchC::Store(slot, state, 32U);
+    LlDispatchC::Sync<PIPE_MTE3, PIPE_S>();
     return magic;
 }
 }  // namespace DispatchDedup
-#endif

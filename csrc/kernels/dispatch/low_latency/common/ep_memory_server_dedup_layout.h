@@ -32,32 +32,24 @@ struct EpMemoryServerDedupLayout {
     EpServerDedupDataLayout data{};
 };
 
-// Caller-side allocation records only. The public bare-pointer API cannot infer these sizes.
-struct EpServerDedupAllocation {
-    const void* data = nullptr;
-    uint64_t bytes = 0;
-    uint64_t requiredBytes = 0;
-    uint32_t alignment = 1;
-    int32_t deviceId = -1;
-};
-
-// Host-only layout validation; the device entry uses the queried runtime core split.
-int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
-                                   EpMemoryServerDedupLayout* out, bool quantized = false, uint32_t coreNum = kLlDefaultPlanCoreNum);
-int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
-                                   EpMemoryServerDedupLayout* out, EpServerDedupInputMode mode, uint32_t coreNum = kLlDefaultPlanCoreNum);
-int ValidateDispatchServerDedupAllocations(const EpServerDedupAllocation* allocations, std::size_t count,
-                                           int32_t deviceId);
+// Host-only layout builder; throws std::invalid_argument on unsupported shape or topology.
+// The device entry uses the queried runtime core split.
+void BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
+                                    EpMemoryServerDedupLayout* out, bool quantized = false,
+                                    uint32_t coreNum = kLlDefaultPlanCoreNum);
+void BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
+                                    EpMemoryServerDedupLayout* out, EpServerDedupInputMode mode,
+                                    uint32_t coreNum = kLlDefaultPlanCoreNum);
 
 }  // namespace DispatchDedup
 
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 
 #include "comm_args.h"
 #include "ep_memory_server_dedup_protocol.h"
 #include "ep_memory_server_dedup_count_layout.h"
-#include "dispatch_dedup_types.h"
 
 namespace DispatchDedup {
 namespace {
@@ -73,11 +65,11 @@ bool MultiplyBytes(uint64_t lhs, uint64_t rhs, uint64_t* out)
 
 }  // namespace
 
-inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
-                                          EpMemoryServerDedupLayout* out, EpServerDedupInputMode mode, uint32_t coreNum)
+inline void BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
+                                           EpMemoryServerDedupLayout* out, EpServerDedupInputMode mode, uint32_t coreNum)
 {
     if (out == nullptr || !LlCoreCountValid(coreNum)) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        throw std::invalid_argument("LL dispatch layout: null output or invalid core config");
     }
     *out = EpMemoryServerDedupLayout{};
     if ((mode != EpServerDedupInputMode::Plain16 && mode != EpServerDedupInputMode::Quantize16 &&
@@ -86,7 +78,7 @@ inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t 
         rankSize % LlGroupForWorld(uint32_t(rankSize)) != 0 || bs <= 0 || h <= 0 || h > UINT32_MAX || topK <= 0 ||
         topK > kEpServerDedupMaxTopK || moeExpertNum <= 0 || moeExpertNum > kEpServerDedupMaxExperts ||
         topK > moeExpertNum || moeExpertNum % rankSize != 0 || bs > UINT32_MAX / topK) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        throw std::invalid_argument("LL dispatch layout: unsupported rank/shape/expert configuration");
     }
 
     const uint32_t countCores =
@@ -97,9 +89,9 @@ inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t 
     if (rankSize > kLlPhysicalRanksPerHost) minimumCountRecords = uint32_t(moeExpertNum / rankSize) + 1U;
 #endif
     if (DispatchServerDedupCountSendUbBytes(uint64_t(bs) * topK, uint32_t(moeExpertNum), countCores,
-                                          minimumCountRecords) >
+                                          minimumCountRecords, minimumCountRecords != 0U) >
         kEpServerDedupCountUbBytes) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        throw std::invalid_argument("LL dispatch layout: count scratch exceeds UB");
     }
 
     const bool wireFp8 = mode != EpServerDedupInputMode::Plain16;
@@ -112,7 +104,7 @@ inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t 
     next.data = DispatchServerDedupDataLayout(uint32_t(bs), uint32_t(h), uint32_t(topK), uint32_t(moeExpertNum), mode);
     if (next.countStateBytes > kEpServerDedupControlBytes ||
         next.data.requiredBytes > kEpServerDedupWindowUsableBytes) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        throw std::invalid_argument("LL dispatch layout: layout exceeds control or window capacity");
     }
     next.relayReadIndexRowStrideBytes = static_cast<uint64_t>(topK) * 8U;
     uint64_t rowBytes = 0;
@@ -131,45 +123,17 @@ inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t 
         !MultiplyBytes(bs, sizeof(uint32_t), &next.sourceMaskBytes) ||
         // Sparse first-hop indices use the full Dispatch output-row capacity.
         !MultiplyBytes(next.capacityRows, next.relayReadIndexRowStrideBytes, &next.relayReadIndexBytes)) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        throw std::invalid_argument("LL dispatch layout: byte-size overflow");
     }
     *out = next;
-    return DispatchDedup::DISPATCH_DEDUP_SUCCESS;
 }
 
-inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
-                                          EpMemoryServerDedupLayout* out, bool quantized, uint32_t coreNum)
+inline void BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
+                                           EpMemoryServerDedupLayout* out, bool quantized, uint32_t coreNum)
 {
     return BuildDispatchServerDedupLayout(
         rankSize, bs, h, topK, moeExpertNum, out,
         quantized ? EpServerDedupInputMode::Quantize16 : EpServerDedupInputMode::Plain16, coreNum);
-}
-
-inline int ValidateDispatchServerDedupAllocations(const EpServerDedupAllocation* allocations, std::size_t count,
-                                                  int32_t deviceId)
-{
-    if (allocations == nullptr || count == 0 || deviceId < 0) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
-    }
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto& allocation = allocations[i];
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(allocation.data);
-        if (allocation.data == nullptr || allocation.requiredBytes == 0 ||
-            allocation.bytes < allocation.requiredBytes || allocation.deviceId != deviceId ||
-            allocation.alignment == 0 || (allocation.alignment & (allocation.alignment - 1U)) != 0 ||
-            begin % allocation.alignment != 0 || allocation.bytes > std::numeric_limits<uintptr_t>::max() - begin) {
-            return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
-        }
-        const uintptr_t end = begin + allocation.bytes;
-        for (std::size_t j = 0; j < i; ++j) {
-            const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(allocations[j].data);
-            const uintptr_t otherEnd = otherBegin + allocations[j].bytes;
-            if (begin < otherEnd && otherBegin < end) {
-                return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
-            }
-        }
-    }
-    return DispatchDedup::DISPATCH_DEDUP_SUCCESS;
 }
 
 }  // namespace DispatchDedup
@@ -182,8 +146,14 @@ inline bool DispatchDedupPacketUbFits(const EpMemoryServerDedupLayout& layout, i
     if (!LlCoreCountValid(coreNum)) return false;
     const auto align = [](uint64_t n, uint64_t a) { return (n + a - 1) / a * a; };
     const uint64_t cores = b < kEpServerDedupAllCoreCountBsThreshold ? coreNum : coreNum / 2U;
-    const uint64_t reserved =
-        b < kEpServerDedupAllCoreCountBsThreshold ? align((num_experts + cores - 1) / cores, 8) * 32 : 0;
+    bool packedFrames = false;
+#ifdef DEEPEP_LL_RDMA
+    packedFrames = world_size > kLlPhysicalRanksPerHost;
+#endif
+    const uint32_t countRecords = uint32_t((num_experts + cores - 1U) / cores);
+    const uint64_t reserved = b < kEpServerDedupAllCoreCountBsThreshold
+        ? (packedFrames ? CountWireBytes(countRecords) : align(countRecords, 8U) * 32U)
+        : 0U;
     const uint64_t tokens = (b + coreNum / 2U - 1U) / (coreNum / 2U);
     const uint64_t groups = std::min<uint64_t>(world_size / LlGroupForWorld(uint32_t(world_size)) - 1, k / 2);
     const bool needQuantize = layout.inputMode == EpServerDedupInputMode::Quantize16;

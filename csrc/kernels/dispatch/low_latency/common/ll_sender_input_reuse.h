@@ -1,13 +1,8 @@
 #pragma once
 #include <cstdint>
+#include "ll_compile_attrs.h"
 
 namespace DispatchDedup {
-#if defined(__CCE__) && defined(__CCE_IS_AICORE__)
-#define LL_SENDER_INPUT_INLINE __aicore__ inline
-#else
-#define LL_SENDER_INPUT_INLINE inline
-#endif
-
 // Cache one token in the existing input queue (plain/prequantized) or quantBuf
 // (quantizing). Packet tails are mutable, so a cache hit must retire the prior
 // Vector pack read before Scalar changes that tail. A miss retains the original
@@ -17,7 +12,7 @@ class LlSenderInputReuse {
     bool valid_ = false;
 public:
     template <class Operations>
-    LL_SENDER_INPUT_INLINE void Prepare(uint32_t token, Operations& operations) {
+    __aicore__ __forceinline__ void Prepare(uint32_t token, Operations& operations) {
         if (valid_ && token == token_) {
             operations.WaitPackedRead();
             return;
@@ -28,7 +23,7 @@ public:
         valid_ = true;
     }
     template <class Operations>
-    LL_SENDER_INPUT_INLINE void Finish(Operations& operations) {
+    __aicore__ __forceinline__ void Finish(Operations& operations) {
         if (valid_) operations.ReleaseInput();
         valid_ = false;
     }
@@ -46,7 +41,7 @@ struct LlPrequantPadding {
 // last <=31 valid input bytes, which the following MTE2 load overwrites. A
 // masked uint32 Duplicate clears only the partial scale-tail block, then a
 // contiguous Duplicate clears the remaining tail; scale bytes are untouched.
-LL_SENDER_INPUT_INLINE LlPrequantPadding LlPlanPrequantPadding(
+__aicore__ __forceinline__ LlPrequantPadding LlPlanPrequantPadding(
     uint32_t hidden, uint32_t quantCount, uint32_t scaleBytes, uint32_t packedBytes)
 {
     const uint32_t end = quantCount + scaleBytes;
@@ -57,19 +52,4 @@ LL_SENDER_INPUT_INLINE LlPrequantPadding LlPlanPrequantPadding(
             firstWord ? (uint64_t(0xffU) << firstWord) & 0xffU : 0U,
             tail, packedBytes - tail};
 }
-
-// A fresh prequantized payload zeroes unused relay entries. Reusing that input
-// must preserve those defined bytes as a larger first-hop becomes a smaller
-// first-hop or DIRECT. Only previously written entries need clearing; the
-// caller's existing Scalar->Vector dependency also orders these stores.
-template <class Words>
-LL_SENDER_INPUT_INLINE void LlClearStalePrequantTail(Words index, uint32_t previousEntries, uint32_t entries)
-{
-    for (uint32_t stale = entries + 1U; stale <= previousEntries; ++stale) {
-        index.SetValue(stale * 2U, 0U);
-        index.SetValue(stale * 2U + 1U, 0U);
-    }
-}
-
-#undef LL_SENDER_INPUT_INLINE
 }

@@ -9,6 +9,11 @@
 #endif
 
 namespace LlReferenceProfile {
+// Count-boundary micro profiling is independent of the schema-4 reference
+// record. Mode 1 keeps the shared record limited to the parsed 29 stages; the
+// count call sites still compile, so the reference-profile identity and the
+// runtime wheel stay one variant.
+constexpr uint32_t kCountComputeMode = 1U;
 // Reference dispatch style: one clock and one scalar GM store per fixed point.
 // Packet timing stays in local Scalar state. Receiver identities use spare UB
 // and are copied only after business completion; no live lane is removed.
@@ -50,7 +55,7 @@ public:
     }
     template <uint32_t Word> __aicore__ inline void Value(uint64_t value)
     {
-        static_assert(Word <= 21U || (Word >= 24U && Word <= 49U) || Word == 57U,
+        static_assert(Word <= 21U || (Word >= 24U && Word <= 49U) || Word == 57U || Word == 62U,
                       "reference point/counter index");
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
         if (!record_) return;
@@ -64,6 +69,25 @@ public:
         if (record_) Value<Word>(AscendC::GetSystemCycle());
 #endif
     }
+    // Count-call boundaries. The validated schema-4 record has no count
+    // sub-phase storage (its 29 stages come from Marks and the packet detail
+    // words), so mode 1 keeps these as typed no-ops. Keeping the names on the
+    // profile object is what lets the Count C API read the same source in both
+    // wheel identities.
+    __aicore__ inline uint64_t CountClock() const { return Clock(); }
+    __aicore__ inline uint64_t PublishClock() const { return Clock(); }
+    template <uint32_t Word, bool Publish = false> __aicore__ inline void CountBoundary() {}
+    template <uint32_t Word> __aicore__ inline void CompletePublishAdd(uint64_t) {}
+    template <uint32_t Word> __aicore__ inline void PublishAdd(uint64_t) {}
+    __aicore__ inline void CompleteCountCall(bool, uint32_t) {}
+    __aicore__ inline bool CountNeedsCalibration() const { return false; }
+    __aicore__ inline void CountCalibration(uint64_t, uint64_t) {}
+    __aicore__ inline void CountSections(bool, uint32_t, uint64_t, uint64_t, uint64_t,
+                                         uint64_t, uint64_t) {}
+    __aicore__ inline void CountWirePack(uint64_t) {}
+    __aicore__ inline void CountPublish(bool, uint64_t) {}
+    __aicore__ inline void CountPostSV(uint64_t) {}
+    __aicore__ inline void CountRoute(uint64_t) {}
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
     __aicore__ inline void SendBegin(bool remote, bool group, uint32_t token, uint32_t k,
                                     uint32_t expert, uint32_t peer) {

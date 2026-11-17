@@ -1,48 +1,36 @@
 #pragma once
-#include "kernel_operator.h"
+#include <kernel_operator.h>
+
+#include <c_api/asc_simd.h>
 
 namespace DispatchDedup {
-// Same MicroAPI/VF calling convention as pinned SHMEM's GetExpertFreq.
-// Only BIN0 is needed: normalized IDs are in [0, localExperts+1] <= 33.
-static __aicore__ inline void CountHistogramVf(__local_mem__ uint16_t* output,
-                                              __local_mem__ uint8_t* input,
-                                              uint32_t remaining, uint16_t repeats)
-{
-    AscendC::MicroAPI::RegTensor<uint8_t> values;
-    AscendC::MicroAPI::RegTensor<uint16_t> counts;
-    AscendC::MicroAPI::Duplicate(counts, 0);
-    for (uint16_t i = 0; i < repeats; ++i) {
-        auto mask = AscendC::MicroAPI::UpdateMask<uint8_t>(remaining);
-        AscendC::MicroAPI::DataCopy(values, input + uint32_t(i) * 256U);
-        AscendC::MicroAPI::Histograms<uint8_t, uint16_t,
-            AscendC::MicroAPI::HistogramsBinType::BIN0,
-            AscendC::MicroAPI::HistogramsType::FREQUENCY>(counts, values, mask);
+
+/**
+ *  for (int i = 0; i < num_i32_elems; ++ i)
+ *      if (offset <= data[i] and data[i] < offset + num_bins)
+ *          acc[data[i] - offset + 1] ++;
+ */
+__simd_vf__ void histogram_accumulate_u16(__ubuf__ int32_t* data, __ubuf__ uint16_t* acc,
+                                          const int num_i32_elems, const int offset, const int num_bins) {
+    static constexpr int kNumIdsPerVector = sizeof(vector_int32_t) / sizeof(int32_t);
+    vector_bool mask_b16 = asc_create_mask_b16(PAT_ALL);
+    vector_int32_t value_vec;
+    vector_uint16_t count_vec;
+    asc_duplicate_scalar(count_vec, static_cast<uint16_t>(0), mask_b16);
+
+    uint32_t remaining = static_cast<uint32_t>(num_i32_elems);
+    for (int elem_offset = 0; elem_offset < num_i32_elems; elem_offset += kNumIdsPerVector) {
+        uint32_t active_bytes = remaining * static_cast<uint32_t>(sizeof(int32_t));
+        const vector_bool mask_b32 = asc_update_mask_b32(remaining);
+        asc_loadalign(value_vec, data + elem_offset);
+        asc_max_scalar(value_vec, value_vec, offset - 1, mask_b32);
+        asc_min_scalar(value_vec, value_vec, offset + num_bins, mask_b32);
+        asc_add_scalar(value_vec, value_vec, 1 - offset, mask_b32);
+
+        const vector_bool mask_b8 = asc_update_mask_b8(active_bytes);
+        asc_frequency_histogram_bin0(count_vec, (vector_uint8_t&)value_vec, mask_b8);
     }
-    auto outMask = AscendC::MicroAPI::CreateMask<uint16_t>();
-    AscendC::MicroAPI::DataCopy(output, counts, outMask);
+    asc_storealign(acc, count_vec, mask_b16);
 }
 
-__aicore__ inline void CountRankHistogram(AscendC::LocalTensor<int32_t> ids,
-                                         AscendC::LocalTensor<int32_t> normalized,
-                                         AscendC::LocalTensor<uint16_t> histogram,
-                                         uint32_t routes, uint32_t first, uint32_t experts)
-{
-    using namespace AscendC;
-    // Avoid narrowing IDs: clamp before subtracting, so even INT_MIN/MAX are
-    // safe. Valid experts map to 1..experts; outsiders to 0 or experts+1.
-    Maxs(normalized, ids, int32_t(-1), routes);
-    PipeBarrier<PIPE_V>();
-    Mins(normalized, normalized, int32_t(first + experts), routes);
-    PipeBarrier<PIPE_V>();
-    Adds(normalized, normalized, int32_t(1) - int32_t(first), routes);
-    PipeBarrier<PIPE_V>();
-    Maxs(normalized, normalized, int32_t(0), routes);
-    PipeBarrier<PIPE_V>();
-    // Reinterpret nonnegative int32 values as four bytes. Three zero bytes
-    // per ID affect only discarded bin0; bins1..experts are exact, regardless
-    // of byte order. Existing 190KiB count admission bounds 4*routes < 65536.
-    VF_CALL<CountHistogramVf>((__local_mem__ uint16_t*)histogram.GetPhyAddr(),
-        (__local_mem__ uint8_t*)normalized.GetPhyAddr(), routes * 4U,
-        uint16_t((routes * 4U + 255U) / 256U));
-}
-}
+}  // namespace DispatchDedup

@@ -28,21 +28,29 @@ class StoreGroup:
         self._sequence = 0
 
     @classmethod
-    def from_env(cls, timeout=300):
-        """Connect to torchrun's existing TCPStore, without initializing a ProcessGroup."""
+    def from_env(cls, timeout=300, standalone=False, namespace=None):
+        """Connect to torchrun's existing TCPStore, or create it when standalone."""
         from torch.distributed import TCPStore
 
         rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-        # torchrun 的 agent 已监听 MASTER_PORT；worker 只连接，不争抢端口。
-        store = TCPStore(
-            os.environ["MASTER_ADDR"],
-            int(os.environ["MASTER_PORT"]),
-            None,
-            False,
-            timedelta(seconds=timeout),
-            use_libuv=False,
-        )
-        key = "megamoe/session/" + os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")
+        host, port = os.environ["MASTER_ADDR"], int(os.environ["MASTER_PORT"])
+        timeout_delta = timedelta(seconds=timeout)
+        if standalone and rank == 0:
+            # Do not block the master on client joins: rank 0 must publish the
+            # session key first, then StoreGroup.barrier("connect") waits for all.
+            if size == 1:
+                store = TCPStore(host, port, 1, True, timeout_delta,
+                                 wait_for_workers=False, use_libuv=False)
+            else:
+                store = TCPStore(host, port, size - 1, True, timeout_delta,
+                                 wait_for_workers=False, use_libuv=False)
+        else:
+            # torchrun 的 agent 已监听 MASTER_PORT；worker 只连接，不争抢端口。
+            store = TCPStore(host, port, None, False, timeout_delta, use_libuv=False)
+        key = "megamoe/session/"
+        if namespace:
+            key += namespace.strip("/") + "/"
+        key += os.environ.get("TORCHELASTIC_RESTART_COUNT", "0")
         if rank == 0:
             store.set(key, uuid.uuid4().hex)
         session = store.get(key).decode("ascii")
