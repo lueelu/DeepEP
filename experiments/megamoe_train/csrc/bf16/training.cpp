@@ -24,6 +24,7 @@
 #include "csrc/kernels/bf16/common/mega_moe_tiling.hpp"
 #include "csrc/kernels/bf16/layout/mega_moe_layout.hpp"
 #include "csrc/kernels/bf16/layout/mega_moe_saved_meta.hpp"
+#include "csrc/kernels/bf16/schedule/forward_wave_plan.hpp"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 
@@ -41,25 +42,16 @@ void CheckNpuContiguous(const torch::Tensor& tensor, const char* name)
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-torch::Tensor AllocateForwardTransientWorkspace(
-    const MegaMoeBF16Training::ForwardDispatchTileReadyLayout& dispatchReadyLayout, const torch::Tensor& like,
-    const MegaMoeTilingData& tiling)
+torch::Tensor AllocateForwardTransientWorkspace(const torch::Tensor& like, const MegaMoeTilingData& tiling)
 {
-    // The transient payload is overwritten before use. The forward kernel
-    // resets every control flag at the start of each invocation, before its
-    // existing pre-Dispatch SyncAll publishes those resets to consumers.
-    TORCH_CHECK(dispatchReadyLayout.totalBytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
-                "MegaMoe BF16 forward transient workspace exceeds int64 capacity");
-
-    const auto savedMode = MegaMoeBF16Training::ResolveSavedGateUpMode(tiling.savedGateUpMode, tiling.swigluLimit);
-    const uint64_t extraBytes = MegaMoeBF16Training::ForwardSwigluExtraBytes(
-        tiling.n, tiling.maxOutputSize, savedMode, MegaMoeBF16SwigluDecoupled(tiling.k, savedMode));
-    TORCH_CHECK(
-        extraBytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - dispatchReadyLayout.totalBytes,
-        "MegaMoe BF16 decoupled transient workspace exceeds int64 capacity");
-
-    return torch::empty({static_cast<int64_t>(dispatchReadyLayout.totalBytes + extraBytes)},
-                        like.options().dtype(torch::kUInt8));
+    using namespace MegaMoeBF16Training;
+    const ForwardTransientWorkspaceLayout transient(tiling.n, tiling.expertPerRank, tiling.maxOutputSize);
+    const auto saved = ResolveSavedGateUpMode(tiling.savedGateUpMode, tiling.swigluLimit);
+    const Wave::ForwardWorkspaceLayout layout(transient.totalBytes, tiling.maxOutputSize, tiling.expertPerRank,
+                                              tiling.k, tiling.n / 2U, saved == kSaveBf16);
+    const uint64_t bytes = layout.totalBytes;
+    TORCH_CHECK(bytes <= uint64_t(std::numeric_limits<int64_t>::max()), "forward workspace exceeds int64 capacity");
+    return torch::empty({static_cast<int64_t>(bytes)}, like.options().dtype(torch::kUInt8));
 }
 
 struct Bf16WeightLayoutInfo {
@@ -313,7 +305,6 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
     const MegaMoeBF16Training::DispatchOutputLayout dispatchOutputLayout(k, maxRecvTokens, topkWeightBytes);
     const MegaMoeBF16Training::ForwardTransientWorkspaceLayout transientWorkspaceLayout(n, expertPerRank,
                                                                                         maxRecvTokens);
-    const MegaMoeBF16Training::ForwardDispatchTileReadyLayout dispatchTileReadyLayout(n, expertPerRank, maxRecvTokens);
     const uint64_t perRankTokenCountStride =
         MegaMoeBF16Training::AlignUp(worldSize * expertPerRank, MegaMoeBF16Training::kAlignment128);
     const uint64_t legacyTrainingTailBytes = MegaMoeBF16Training::AlignUp(
@@ -331,7 +322,7 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
     auto trainingSavedState = AllocateTrainingSavedState(savedStateLayout, x);
     auto dispatchOutput =
         torch::empty({static_cast<int64_t>(dispatchOutputLayout.totalBytes)}, x.options().dtype(torch::kUInt8));
-    auto forwardTransientWorkspace = AllocateForwardTransientWorkspace(dispatchTileReadyLayout, x, tiling);
+    auto forwardTransientWorkspace = AllocateForwardTransientWorkspace(x, tiling);
     ClearMegaMoeWindowControlRegion(symmetricBuffer, symmetricBufferBytes, worldSize, expertPerRank,
                                     tiling.compactTokenCountExchange != 0);
 

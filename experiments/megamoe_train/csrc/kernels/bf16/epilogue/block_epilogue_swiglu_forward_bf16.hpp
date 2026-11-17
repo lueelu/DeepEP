@@ -3,10 +3,10 @@
 
 /*
  * BF16 SwiGLU epilogue for the DeepEP MegaMoe pipeline. At entry, BF16
- * Gate/Up occupy two UB tiles: the UB handoff path waits for GMM1 Fixpipe,
- * while the GM staging path first fills them through LoadRawTile().
+ * Gate/Up occupy two UB tiles, filled from GMM1's GM output through
+ * LoadRawTile() after its completion flag becomes ready.
  * With R denoting BF16 rounding and Gate/Up clipped as configured,
- * H = SiLU_FP32(gate) * up; the weighted variant produces
+ * H = SiLU_FP32(gate) * up; route weighting produces
  * Hp = R(H * p) before GMM2. Internal arithmetic stays FP32,
  * and dispatched BF16/FP32 route weights are prefetched from GM.
  */
@@ -31,7 +31,14 @@ static constexpr AscendC::Reg::CastTrait kCastFP32ToBF16 = {
     AscendC::Reg::RegLayout::ZERO, AscendC::Reg::SatMode::NO_SAT, AscendC::Reg::MaskMergeMode::ZEROING,
     AscendC::RoundMode::CAST_RINT};
 
-template <typename L0TileShape_, bool ApplyTopkWeight_, typename TopkWeightT = bfloat16_t>
+// BF16 and unsaved activations need no MXFP8 encoding scratch.
+struct NoSavedGateUpQuant {
+    struct Layout {
+        static constexpr uint32_t totalBytesWithClipMasks = 0;
+    };
+};
+
+template <typename L0TileShape_, typename TopkWeightT = bfloat16_t, bool QuantizedSave = false>
 class BlockEpilogueSwigluForwardBF16 {
 public:
     __aicore__ inline void SetTimer(MegaMoeTrainTimerDevice* timer)
@@ -79,15 +86,9 @@ public:
             savedBaseOffset_ = Get<0>(baseOffset);
             outputGlobal_.SetGlobalBuffer((__gm__ bfloat16_t*)params_.yGmAddr + Get<0>(baseOffset));
             // Gate/up use the same packed-row x F coordinates as GMM2 input.
-            if (params_.savedGateGmAddr != nullptr) {
-                savedGateGlobal_.SetGlobalBuffer((__gm__ bfloat16_t*)params_.savedGateGmAddr + Get<0>(baseOffset));
-                savedUpGlobal_.SetGlobalBuffer((__gm__ bfloat16_t*)params_.savedUpGmAddr + Get<0>(baseOffset));
-                // Persisted activations are consumed by a later backward.
-                savedGateGlobal_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-                savedUpGlobal_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-            }
-            groupFlagListGmAddr_ = (__gm__ int32_t*)params_.groupFlagListGmAddr + Get<2>(baseOffset) * INT_CACHELINE;
-            if constexpr (ApplyTopkWeight_) {
+
+            groupFlagListGmAddr_ = (__gm__ int32_t*)params_.groupFlagListGmAddr + Get<5>(baseOffset);
+            {
                 routedTopkWeightGlobal_.SetGlobalBuffer((__gm__ TopkWeightT*)params_.routedTopkWeightGmAddr +
                                                         Get<3>(baseOffset));
                 routedTopkWeightGlobal_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
@@ -114,7 +115,7 @@ public:
         }
 
         const uint32_t tileRow = static_cast<uint32_t>(Get<0>(blockCoord) / outputN_);
-        if constexpr (SaveMode != MegaMoeBF16Training::kSaveNone) {
+        if constexpr (SaveMode == MegaMoeBF16Training::kSaveMxFp8) {
             SaveGateUp<SaveMode>(singleM, singleN, Get<0>(blockCoord));
         }
         ComputeSwigluDirect(singleM, singleN, tileRow);
@@ -129,7 +130,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
-        AscendC::AtomicAdd(groupFlagListGmAddr_, 1);
+        AscendC::AtomicAdd(groupFlagListGmAddr_ + tileRow / params_.baseM, 1);
     }
 
     __aicore__ inline void LoadRawTile(GM_ADDR gate, GM_ADDR up, uint64_t expertOffset, uint16_t mSize, uint16_t nSize,
@@ -154,6 +155,7 @@ private:
     static constexpr uint32_t kTileRows = tla::get<0>(L0TileShape_{});
     static constexpr uint32_t kTileColumns = tla::get<1>(L0TileShape_{});
     static constexpr uint32_t kTileElements = kTileRows * kTileColumns;
+    using QuantSave = std::conditional_t<QuantizedSave, SavedGateUpMxFp8<kTileRows, kTileColumns>, NoSavedGateUpQuant>;
     static_assert(2U * kTileElements * sizeof(bfloat16_t) <= Catlass::Arch::Ascend950::UB_SIZE,
                   "The BF16 SwiGLU input tiles must fit in A5 UB");
 
@@ -168,17 +170,6 @@ private:
                             outputN_, savedBaseOffset_ + offset);
             return;
         }
-        // This BF16 save runs on the UB handoff path, with or without clipping.
-        // The caller's WaitForCube has completed both Fixpipe input tiles.
-        // Save raw BF16 gate/up before clipping, activation, or route weighting.
-        // DataCopyPad uses the same aligned UB row stride as ComputeSwigluDirect.
-        AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopyExtParams copyParams{mSize, static_cast<uint32_t>(nSize * sizeof(bfloat16_t)), 0,
-                                              static_cast<uint32_t>((outputN_ - nSize) * sizeof(bfloat16_t)), 0};
-        AscendC::DataCopyPad(savedGateGlobal_[offset], l0cOutUbFirst_, copyParams);
-        AscendC::DataCopyPad(savedUpGlobal_[offset], l0cOutUbSecond_, copyParams);
-        // MTE3 must finish reading both tiles before vector work overwrites UB.
-        AscendC::SyncFunc<AscendC::HardEvent::MTE3_V>();
     }
 
     __aicore__ inline void ComputeSwigluDirect(uint16_t mSize, uint16_t nSize, uint32_t tileRow)
@@ -193,9 +184,10 @@ private:
         // may still have MTE3 readers. No alias and no early pipeline drain.
         constexpr uint32_t weightBytes = (kTileRows * sizeof(TopkWeightT) + 31) / 32 * 32;
         constexpr uint32_t weightOffset = Catlass::Arch::Ascend950::UB_SIZE - weightBytes;
-        static_assert(weightOffset >= SavedGateUpMxFp8<kTileRows>::Layout::totalBytesWithClipMasks);
+        static_assert(weightOffset >= 2U * kTileElements * sizeof(bfloat16_t));
+        static_assert(weightOffset >= QuantSave::Layout::totalBytesWithClipMasks);
         AscendC::LocalTensor<TopkWeightT> weightUb{AscendC::TPosition::VECIN, weightOffset, kTileRows};
-        if constexpr (ApplyTopkWeight_) {
+        {
             AscendC::SyncFunc<AscendC::HardEvent::V_MTE2>();
             AscendC::DataCopyExtParams p{1, uint32_t(mSize * sizeof(TopkWeightT)), 0, 0, 0};
             AscendC::DataCopyPad(weightUb, routedTopkWeightGlobal_[tileRow], p, {});
@@ -213,7 +205,7 @@ private:
             }
             for (uint16_t row = 0; row < mSize; ++row) {
                 AscendC::Reg::RegTensor<float> weightFp;
-                if constexpr (ApplyTopkWeight_) {
+                {
                     if constexpr (std::is_same_v<TopkWeightT, float>) {
                         AscendC::Reg::DataCopy<float, AscendC::Reg::LoadDist::DIST_BRC_B32>(weightFp, weights + row);
                     } else {
@@ -245,7 +237,7 @@ private:
                     AscendC::Reg::Adds(denom, exp, 1.0F, mask);
                     AscendC::Reg::Div<float, &kDivMode>(silu, gf, denom, mask);
                     AscendC::Reg::Mul(value, silu, uf, mask);
-                    if constexpr (ApplyTopkWeight_) {
+                    {
                         AscendC::Reg::Mul(value, value, weightFp, mask);
                     }
                     // Keep H in FP32 through route weighting; only the GEMM input Hp is BF16.
@@ -261,18 +253,15 @@ private:
     AscendC::LocalTensor<bfloat16_t> l0cOutUbSecond_{AscendC::TPosition::VECIN, kTileElements * sizeof(bfloat16_t),
                                                      kTileElements};
     AscendC::GlobalTensor<bfloat16_t> outputGlobal_;
-    AscendC::GlobalTensor<bfloat16_t> savedGateGlobal_;
-    AscendC::GlobalTensor<bfloat16_t> savedUpGlobal_;
     AscendC::GlobalTensor<TopkWeightT> routedTopkWeightGlobal_;
     __gm__ int32_t* groupFlagListGmAddr_{nullptr};
     Params params_{};
     int64_t outputN_{0};
     int64_t savedBaseOffset_{0};
-    SavedGateUpMxFp8<kTileRows> quantSave_;
-    static_assert(SavedGateUpMxFp8<kTileRows>::Layout::totalBytesWithClipMasks <= Catlass::Arch::Ascend950::UB_SIZE,
+    QuantSave quantSave_;
+    static_assert(QuantSave::Layout::totalBytesWithClipMasks <= Catlass::Arch::Ascend950::UB_SIZE,
                   "Saved gate/up MXFP8 scratch must fit AIV0 UB");
-    static_assert((kTileRows == 128 || kTileRows == 192) && kTileColumns == 256,
-                  "Update saved quant UB for a new tile shape");
+    static_assert(kTileRows == 256 && kTileColumns == 128, "SwiGLU consumes M256 Gate128/Up128 pairs");
 };
 
 }  // namespace MegaMoeBF16Impl

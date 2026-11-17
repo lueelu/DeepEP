@@ -4,6 +4,7 @@
 // Backward-only, Host-zeroed progress suffix: one cacheline per producer.
 #ifndef MEGA_MOE_BF16_BACKWARD_DISPATCH_READY_HPP
 #define MEGA_MOE_BF16_BACKWARD_DISPATCH_READY_HPP
+#include "routing/peer_row_view.hpp"
 namespace MegaMoeBF16BackwardCatlassImpl {
 struct BackwardDispatchReadyView {
     __gm__ int32_t* progressBase{nullptr};
@@ -11,6 +12,7 @@ struct BackwardDispatchReadyView {
     uint32_t sources{0}, producersPerSource{0}, experts{0}, expert{0}, rowLimit{0};
     uint32_t progressSlot{0};
     bool enabled{false};
+    uint32_t peerGroups{0}, peerRank{0}, peerRows{0}, peerFirstSliceRows{0};
     __aicore__ inline __gm__ int32_t* Slot(uint32_t producer) const
     {
         const uint64_t stride = static_cast<uint64_t>(sources) * producersPerSource;
@@ -24,6 +26,29 @@ struct BackwardDispatchReadyView {
     __aicore__ inline void WaitRows(uint32_t row, uint32_t rows) const
     {
         const uint32_t end = row + rows;
+        if (peerGroups != 0U) {
+            using namespace MegaMoeBF16Training::Wave;
+            const PeerCounts<GmPeerPrefix> counts{GmPeerPrefix{cumsum}, experts, expert, peerRows};
+            PeerRowCursor<PeerCounts<GmPeerPrefix>> cursor(counts, sources, peerRank, peerGroups, peerRows,
+                                                           peerFirstSliceRows, row, end);
+            MegaMoeImpl::PeerTransfer transfer{};
+            while (cursor.Next(transfer)) {
+                const uint32_t bandRows =
+                    (counts.Get(transfer.sourceRank) + producersPerSource - 1U) / producersPerSource;
+                uint32_t current = transfer.sourceOrdinalBegin;
+                const uint32_t stop = current + transfer.rowCount;
+                while (current < stop) {
+                    const uint32_t band = current / bandRows;
+                    const uint32_t bandBegin = band * bandRows;
+                    const uint32_t until = stop < bandBegin + bandRows ? stop : bandBegin + bandRows;
+                    while (AscendC::ReadGmByPassDCache(Slot(transfer.sourceRank * producersPerSource + band)) <
+                           static_cast<int32_t>(until - bandBegin)) {
+                    }
+                    current = until;
+                }
+            }
+            return;
+        }
         while (row < end) {
             // Find the first source whose exclusive end exceeds row. Empty
             // sources are skipped. No full-rank traversal per GEMM tile.

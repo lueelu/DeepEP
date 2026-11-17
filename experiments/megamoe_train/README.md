@@ -197,6 +197,31 @@ MegaMoE Train 支持多种激活保存方式。`save_gmm1_output` 控制反向�
 | `mxfp8` | MXFP8 压缩值及 scale；开启裁剪时额外保存三个 mask 位平面 |
 | `auto` | 关闭裁剪时使用 MXFP8，开启时使用 BF16 |
 
+### 前向编排
+
+所有保存模式共用 M256 的 GM 流水及模式0/1编排。
+GMM1 在 GM→L1 时将原 W1 的 Gate128 和 Up128 配成一个 N256 tile，不需要外部权重重排。
+GMM1 与 SwiGLU 按配对任务交接；GMM2 等待所需 M256 行块的全部 Hp 列写回。
+Dispatch 按完整 slice 发布 X 和 TopK weight 就绪；GMM2 的全部生产核确认该 slice 的
+FIX 写回完成后，Combine 搬运其完整 H 列输出行。两种编排采用相同的就绪协议。
+常用 shape 的普通 slice 为768行，专家尾片取实际行数；M256 是计算及 Hp 就绪粒度。
+前反向共用相同的 peer 配额和 packed 行映射。
+
+通过环境变量 `DEEPEP_BF16_FORWARD_SCHEDULE` 选择编排，各 rank 使用相同值：
+
+| 值 | 编排 |
+| --- | --- |
+| `1`（默认） | 每个 AIC 提交完本核全部 GMM1 后进入 GMM2；Dispatch 连续推进，Combine 随完整 slice 就绪执行 |
+| `0` | GMM1 与 GMM2 按 Wave 交错；大 batch 下 GMM2 滞后一波，Dispatch 与已就绪 Combine 交替推进 |
+
+两种编排共用矩阵计算、激活、行映射和通信实现，不改变公开调用及梯度类型。
+阶段切换不增加全核屏障，GMM2 可与 SwiGLU 尾部重叠，Combine 可与后续 GMM2 重叠。
+GM 输出工作区按 `max_recv_tokens * H * 2` 字节分配，另有少量就绪计数。
+`bf16` 直接使用保存的原始 Gate/Up；`none` 和 `mxfp8` 将原始 Gate 临时放在 Hp 区，
+另分配 `max_recv_tokens * F * 2` 字节的临时原始 Up 区。SwiGLU 读完原始值后写回 Hp；
+`mxfp8` 同时按32元素分组保存反向所需的量化 Gate/Up。保存方式不改变前向计算精度。
+通信缓冲与路由元数据按实际维度检查 UB 容量，超过容量时在 Host 报错。
+
 ## 生命周期与使用限制
 
 - 当前接口范围：`2<=EP<=1024`（StoreGroup 自身 size 不超过 128），`1<=E<=32`、`EP*E<=2048`，
@@ -270,10 +295,16 @@ python -m deep_ep_experimental.megamoe_train.timer timer --ranks 0-7 --merge
 专家阶段区间从满足已记录前置依赖后的首个操作开始，到该专家最后操作完成；包含阶段内部的等待和调度间隙。
 主图不显示 `KERNEL_TIMING` 父区间，核总耗时保留在汇总中。
 等待默认隐藏，可用 `--include-wait` 显示专家阶段入口等待，不在主图逐条显示 tile 级等待。
-流水等待完成点先同步到 Scalar 再记录时间戳；普通未采集调用不执行这些计时同步。
+专家流水的等待完成点同步到 Scalar 后记录；普通未采集调用不执行这些计时同步。
 逐 tile、分片及 Gate/Up 保存/恢复明细保存在
 `rank_<r>_<phase>_detail_trace.json` 和原始 CSV 中。前向 GMM1 的一个 tile 覆盖 Gate、Up
-两次矩阵乘，N 坐标按 F 维编号；dW 的 M/N 对应权重梯度矩阵，K 对应路由行。
+两次矩阵乘，N 坐标按 F 维编号；M256 GM 流水的一个 GMM1 任务为一次 Gate128＋Up128 配对投影。
+dW 的 M/N 对应权重梯度矩阵，K 对应路由行。
 
-Timer 仅在显式采集时分配独立缓冲，并在本核确认任务完成。采集开销体现在打点调用中；
+M256 GM 流水的动态事件记录原生下发与已有依赖，不额外排空流水：`AIC_GMM1`、`AIC_GMM2`
+记录任务下发区间，`AIV_SWIGLU` 包含 Hp 写回的原有等待；`AIV_COMBINE_WAIT` 中
+`task_flags=1` 表示本核接收该 slice 的 GMM2 FIX 完成通知。下发区间与完成通知共同用于分析通算重叠。
+`AIV_COMBINE` 中 `task_flags=2` 记录最后双槽搬运的原有排空边界。
+
+Timer 仅在显式采集时分配独立缓冲。采集开销体现在打点调用中；
 正式性能取普通版本的 Event 结果。原始协议带版本、实际核数和容量，溢出或格式不匹配时解析报错。

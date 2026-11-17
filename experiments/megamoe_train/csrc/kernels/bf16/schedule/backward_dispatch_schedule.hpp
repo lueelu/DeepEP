@@ -11,7 +11,9 @@ __aicore__ inline uint32_t ProducerPhaseChunkSize(uint32_t s, uint32_t c)
 }
 __aicore__ inline bool ProducerPhaseSupported(const BackwardDispatchReadyView& v, uint32_t c)
 {
-    return v.enabled && c && v.sources && v.producersPerSource &&
+    // Producer-phase ordering needs contiguous source bands. Peer-balanced
+    // rows retain per-producer progress through the inverse row mapping.
+    return v.enabled && v.peerGroups == 0U && c && v.sources && v.producersPerSource &&
            (v.sources + ProducerPhaseChunkSize(v.sources, c) - 1U) / ProducerPhaseChunkSize(v.sources, c) <= 15U;
 }
 __aicore__ inline uint32_t ProducerPhaseWord(uint32_t phase)

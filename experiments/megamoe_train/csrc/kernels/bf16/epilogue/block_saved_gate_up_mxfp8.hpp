@@ -7,11 +7,11 @@
 #include "layout/mega_moe_layout.hpp"
 
 namespace MegaMoeBF16Impl {
-template <uint32_t RawRows = 128>
+template <uint32_t RawRows = 128, uint32_t Columns = 256>
 class SavedGateUpMxFp8 {
 public:
-    static constexpr uint32_t kChunkRows = RawRows == 192 ? 64 : RawRows;
-    using Layout = MegaMoeBF16Training::SavedGateUpQuantUbLayoutFor<RawRows, kChunkRows>;
+    static constexpr uint32_t kChunkRows = RawRows > 128 ? 64 : RawRows;
+    using Layout = MegaMoeBF16Training::SavedGateUpQuantUbLayoutFor<RawRows, kChunkRows, Columns>;
 
 private:
     using DataTypeOut = fp8_e4m3fn_t;
@@ -43,7 +43,7 @@ public:
                                 GM_ADDR gateHighGm, GM_ADDR upLowGm, GM_ADDR upHighGm, float limit, uint16_t rows,
                                 uint16_t columns, uint32_t width, uint64_t offset)
     {
-        // Keep M192 raw planes intact. Reuse a disjoint 64-row quantization
+        // Keep the raw planes intact. Reuse a disjoint quantization
         // scratch region after all previous chunk stores have completed.
         for (uint16_t row = 0; row < rows; row += kChunkRows) {
             if (row != 0) {

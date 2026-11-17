@@ -52,5 +52,8 @@ struct MegaMoeTilingData {
     uint32_t compactTokenCountExchange{0};
     // TopK weights and their gradients: 0=BF16, 1=FP32. GMM operands stay BF16.
     uint32_t topkWeightType{0};
+    uint32_t mGroupsPerWave{0};
+    // 0: interleave GMM1/GMM2 Waves; 1: finish local GMM1 before GMM2.
+    uint32_t forwardSchedule{1};
 };
 #endif

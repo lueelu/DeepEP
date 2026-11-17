@@ -52,6 +52,10 @@ struct Params {
     ForwardWorkspaceInfo workspaceInfo;
     PeermemInfo peermemInfo;
     MegaMoeTilingData* tilingData;
+    // Rebuilt from the matching launch policy; zero retains source-major rows.
+    GM_ADDR forwardRawGate{nullptr};
+    GM_ADDR forwardRawUp{nullptr};
+    uint32_t peerRowsGroups{0};
 };
 
 __aicore__ inline void NotifyCube(uint16_t value = 0)

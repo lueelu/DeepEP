@@ -133,37 +133,6 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t ResolveSavedGateUpMode(uint32_t mod
 }
 
 // Ordinary forward SwiGLU handoff: 0 forces paired Gate/Up tiles through UB;
-// 1 stages raw Gate/Up in GM; 2 selects either path from hidden and savedMode.
-// The device build explicitly sets 2 in CMake. The fallback below only applies
-// to translation units without that definition, including Host/CPU consumers.
-// Host allocation queries the built device SO instead of using that fallback.
-// This switch does not control the separate UseGmForBackwardDataGrad() saved-mode policy.
-#ifndef DEEPEP_BF16_SWIGLU_DECOUPLE
-#define DEEPEP_BF16_SWIGLU_DECOUPLE 0
-#endif
-static_assert(DEEPEP_BF16_SWIGLU_DECOUPLE >= 0 && DEEPEP_BF16_SWIGLU_DECOUPLE <= 2,
-              "BF16 SwiGLU decoupling must be off(0), on(1), or auto(2)");
-constexpr uint64_t kForwardSwigluAutoBoundary = 3584;
-
-// savedMode must first be resolved by ResolveSavedGateUpMode(). In auto mode,
-// GM is used below 3584, or at 3584 when savedMode is kSaveMxFp8; otherwise UB.
-// The GM path makes raw Gate/Up visible before AIV0 reloads and activates them;
-// the UB path retains the paired AIC/AIV0 producer-consumer handoff.
-MEGA_MOE_BF16_HOST_DEVICE constexpr bool ForwardUsesGmSwiglu(uint64_t hidden, uint32_t savedMode,
-                                                             uint32_t mode = DEEPEP_BF16_SWIGLU_DECOUPLE)
-{
-    return mode == 1 || (mode == 2 && (hidden < kForwardSwigluAutoBoundary ||
-                                       (hidden == kForwardSwigluAutoBoundary && savedMode == kSaveMxFp8)));
-}
-
-MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t ForwardSwigluExtraBytes(uint64_t n, uint64_t maxRecvTokens,
-                                                                     uint32_t savedMode, bool decoupled)
-{
-    // BF16 already owns raw Gate/Up. Other modes reuse Hp for raw Gate;
-    // append only raw Up, after all existing payload and control flags.
-    return decoupled && savedMode != kSaveBf16 ? AlignUp(maxRecvTokens * (n / 2) * kBf16Bytes, kAlignment512) : 0;
-}
-
 // Use the resolved saved mode in both host allocation and device execution.
 // Saved modes use Hp/dO reuse and per-expert readiness; none retains UB.
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseGmForBackwardDataGrad(uint32_t savedMode)
@@ -196,10 +165,10 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr bool SaveGateUpClipMasks(float tilingLimit, 
 }
 
 // AIV0 epilogue only. Dispatch and GMM2 own UB in different phases.
-template <uint32_t RawRows, uint32_t ChunkRows = RawRows>
+template <uint32_t RawRows, uint32_t ChunkRows = RawRows, uint32_t Columns = 256>
 struct SavedGateUpQuantUbLayoutFor {
     static constexpr uint32_t kRows = ChunkRows;
-    static constexpr uint32_t kColumns = 256;
+    static constexpr uint32_t kColumns = Columns;
     static constexpr uint32_t kElements = kRows * kColumns;
     static constexpr uint32_t kGroups = kElements / 32;
     static constexpr uint32_t gateData = 2 * RawRows * kColumns * kBf16Bytes;
@@ -381,98 +350,11 @@ struct BackwardDispatchProgressLayout {
     }
 };
 
-struct ForwardDispatchTileReadyLayout {
-    // Forward computation uses M192; backward GEMMs define their own M128.
-    static constexpr uint64_t kComputeRows = 192;
-    static constexpr uint64_t kMaxReadyExperts = 7;
-    static constexpr uint64_t kReadyRows = 2 * kComputeRows;
-    // Reserve at 256-row granularity to preserve Host/backward allocation;
-    // Ready384 requires no more slots than this capacity.
-    static constexpr uint64_t kReservedRows = 256;
-    // With prepared metadata, each eligible expert uses a distinct word in
-    // every ready-block cache line. Without it, only the first non-empty
-    // expert may use the shared startup counter set, subject to row guards.
-    static constexpr uint64_t kMinReadyRowsPerExpert = 2 * kReadyRows;
-    uint64_t flagSlotsPerExpert;
-    uint64_t flagCount;
-    uint64_t offset;
-    uint64_t bytes;
-    uint64_t totalBytes;
-
-    MEGA_MOE_BF16_HOST_DEVICE constexpr ForwardDispatchTileReadyLayout(uint64_t n, uint64_t expertPerRank,
-                                                                       uint64_t maxRecvTokens)
-        : flagSlotsPerExpert((maxRecvTokens + kReservedRows - 1) / kReservedRows),
-          flagCount(flagSlotsPerExpert),
-          offset(ForwardTransientWorkspaceLayout(n, expertPerRank, maxRecvTokens).totalBytes),
-          bytes(AlignUp(flagCount * kIntCacheline * kInt32Bytes, kAlignment512)),
-          totalBytes(offset + bytes)
-    {
-    }
-
-    // A source-rank/core range can begin inside a ready block. Publish only
-    // its intersection with that block, never rows belonging to the next one.
-    MEGA_MOE_BF16_HOST_DEVICE static constexpr uint32_t FragmentRows(uint32_t expertRow, uint32_t remainingRows)
-    {
-        const uint32_t toBoundary = static_cast<uint32_t>(kReadyRows) - expertRow % static_cast<uint32_t>(kReadyRows);
-        return remainingRows < toBoundary ? remainingRows : toBoundary;
-    }
-
-    // Called for a block containing a valid GMM1 row. Both compute
-    // tiles in the block wait for its full payload, including a partial tail.
-    MEGA_MOE_BF16_HOST_DEVICE static constexpr uint32_t RowsInReadyBlock(uint32_t blockIndex, uint32_t expertRows)
-    {
-        const uint32_t remainingRows = expertRows - blockIndex * static_cast<uint32_t>(kReadyRows);
-        return remainingRows < kReadyRows ? remainingRows : static_cast<uint32_t>(kReadyRows);
-    }
-
-    // Invocation-wide candidate selection. Prepared metadata permits an actual
-    // row-count check for each non-empty expert; without it, only the first
-    // non-empty expert is a candidate. Both paths apply the same minimum rows.
-    MEGA_MOE_BF16_HOST_DEVICE static constexpr bool UseTileReadyForShape(uint64_t m, uint64_t topK,
-                                                                         uint64_t expertPerRank)
-    {
-        if (m == 0 || topK == 0 || expertPerRank == 0 || expertPerRank > kMaxReadyExperts) {
-            return false;
-        }
-        const uint64_t routeRows = m * topK;
-        return routeRows >= expertPerRank * kMinReadyRowsPerExpert;
-    }
-
-    MEGA_MOE_BF16_HOST_DEVICE static constexpr bool UseTileReadyForStartupExpert(bool shapeCandidate,
-                                                                                 bool startupExpertHandled,
-                                                                                 uint64_t expertRows)
-    {
-        return shapeCandidate && !startupExpertHandled && expertRows >= kMinReadyRowsPerExpert;
-    }
-
-    // Estimate the number of complete ready blocks emitted by one balanced
-    // source/core partition. Aligned multi-block partitions use phase-major
-    // ordering; sub-block and irregular partitions use sequential ordering.
-    MEGA_MOE_BF16_HOST_DEVICE static constexpr uint32_t ReadyBlocksPerProducerPartition(uint64_t m, uint64_t topK,
-                                                                                        uint64_t expertPerRank,
-                                                                                        uint64_t epWorldSize,
-                                                                                        uint64_t dispatchBlockNumPerEP)
-    {
-        if (m == 0 || topK == 0 || expertPerRank == 0 || epWorldSize == 0 || dispatchBlockNumPerEP == 0) {
-            return 1;
-        }
-        const uint64_t partitions = expertPerRank * epWorldSize * dispatchBlockNumPerEP;
-        const uint64_t partitionRows = (m * topK + partitions - 1) / partitions;
-        if (partitionRows < kMinReadyRowsPerExpert || partitionRows % kReadyRows != 0) {
-            return 1;
-        }
-        return static_cast<uint32_t>(partitionRows / kReadyRows);
-    }
-};
-
-// Share only the local-expert cutoff with forward. Actual-row guards,
-// compute mapping and explicit diagnostic k overrides remain independent.
+// Backward uses row readiness for up to seven local experts; larger expert counts use whole-expert readiness.
 MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t DefaultBackwardDispatchSplitExperts(uint32_t savedMode,
                                                                                  uint32_t localExperts)
 {
-    return UseGmForBackwardDataGrad(savedMode) && localExperts <= ForwardDispatchTileReadyLayout::kMaxReadyExperts
-               ? localExperts
-               : 0U;
+    return UseGmForBackwardDataGrad(savedMode) && localExperts <= 7U ? localExperts : 0U;
 }
 
 }  // namespace MegaMoeBF16Training

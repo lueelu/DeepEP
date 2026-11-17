@@ -14,6 +14,7 @@
 #include "csrc/kernels/bf16/common/mega_moe_tiling.hpp"
 #include "tiling_impl.hpp"
 #include "csrc/kernels/bf16/layout/mega_moe_layout.hpp"
+#include "csrc/kernels/bf16/schedule/forward_wave_plan.hpp"
 
 namespace {
 
@@ -108,6 +109,16 @@ MegaMoeHostTiling MakeMegaMoeHostTiling(MegaMoeTilingData& tiling, int64_t m, in
     tiling.savedGateUpMode = saveMode;
     TORCH_CHECK(topk_weight_type <= kTopkWeightFp32, "unsupported TopK weight type");
     tiling.topkWeightType = topk_weight_type;
+    tiling.mGroupsPerWave = Wave::GroupsPerWave(aic_num, static_cast<uint32_t>(n / 2), static_cast<uint32_t>(k));
+    TORCH_CHECK(aic_num <= Wave::kMaxCores, "BF16 forward supports at most ", Wave::kMaxCores, " AIC groups");
+    TORCH_CHECK(Wave::ScratchFits(static_cast<uint32_t>(k), static_cast<uint32_t>(world_size),
+                                  static_cast<uint32_t>(expert_per_rank)),
+                "BF16 forward Dispatch/Combine buffers and routing metadata exceed the AIV1 UB budget");
+    const char* forwardSchedule = std::getenv("DEEPEP_BF16_FORWARD_SCHEDULE");
+    TORCH_CHECK(
+        forwardSchedule == nullptr || std::string(forwardSchedule) == "0" || std::string(forwardSchedule) == "1",
+        "DEEPEP_BF16_FORWARD_SCHEDULE must be 0 (Wave) or 1 (staged)");
+    tiling.forwardSchedule = forwardSchedule != nullptr && std::string(forwardSchedule) == "0" ? 0U : 1U;
     tiling.compactTokenCountExchange =
         ResolveCompactTokenCountExchange(bf16_direct_dispatch, world_size, expert_per_rank) ? 1U : 0U;
     const auto workspace_info = optiling::CalcWorkspaceSize(tiling);

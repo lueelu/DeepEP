@@ -30,7 +30,7 @@ __mix__(1, 2) __global__ __aicore__
     op.Init(context, x, topkIds, topkWeights, weight1, weight2, nullptr, nullptr, nullptr, nullptr, yOut,
             expertTokenNumsOut, nullptr, nullptr, nullptr, trainingSavedStateGM, &tilingData,
             forwardTransientWorkspaceGM, dispatchOutputGM);
-    op.EnableDispatchTileReady(forwardTransientWorkspaceGM);
+    op.InitForwardWorkspace(forwardTransientWorkspaceGM);
     op.SetTimer(timer.Enabled() ? &timer : nullptr);
     op.Process();
     if (timer.Enabled()) AscendC::PipeBarrier<PIPE_ALL>();
@@ -75,17 +75,16 @@ extern "C" ASCEND_MEGAMOE_EXPORT void deepep_train_mega_moe_bf16_forward_timer_k
     }
 }
 
-// The Host queries the loaded SO, so changing a build option cannot leave
-// device execution and transient capacity using different policies.
+// Retain the exported capability queries: both schedules stage raw Gate/Up in GM.
 extern "C" ASCEND_MEGAMOE_EXPORT int deepep_train_mega_moe_bf16_swiglu_decoupled(uint64_t hidden)
 {
-    // Legacy Hosts know only hidden. Return the union of saved-mode policies
-    // so they may over-allocate at the boundary, but never under-allocate.
-    return MegaMoeBF16Training::ForwardUsesGmSwiglu(hidden, MegaMoeBF16Training::kSaveMxFp8) ? 1 : 0;
+    (void)hidden;
+    return 1;
 }
-
 extern "C" ASCEND_MEGAMOE_EXPORT int deepep_train_mega_moe_bf16_swiglu_decoupled_for_saved_mode(uint64_t hidden,
                                                                                                 uint32_t savedMode)
 {
-    return MegaMoeBF16Training::ForwardUsesGmSwiglu(hidden, savedMode) ? 1 : 0;
+    (void)hidden;
+    (void)savedMode;
+    return 1;
 }

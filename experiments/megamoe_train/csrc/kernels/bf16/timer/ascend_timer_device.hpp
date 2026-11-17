@@ -134,6 +134,33 @@ private:
 };
 using MegaMoeTrainTimerSpanScope = BasicAscendTimerSpanScope<MegaMoeTrainTimerDevice>;
 
+// Timed scopes on the GM pipeline retain its native asynchronous dependencies.
+class MegaMoeTrainTimerPassiveScope {
+public:
+    __aicore__ inline MegaMoeTrainTimerPassiveScope(MegaMoeTrainTimerDevice* timer,
+                                                    MegaMoeTrainTimer::DynamicTimingType type, uint32_t expert,
+                                                    uint32_t row, uint32_t rows, uint32_t n = static_cast<uint32_t>(-1),
+                                                    uint32_t tileM = 256, uint32_t tileN = 256, uint32_t depth = 0,
+                                                    uint32_t columns = 0, uint32_t flags = 0, int source = -1)
+        : timer_(timer != nullptr && timer->Enabled() && rows != 0U ? timer : nullptr), type_(type)
+    {
+        if (timer_ == nullptr) return;
+        timer_->SetSlice(expert, row, rows);
+        timer_->SetTaskShape(tileM, tileN, 0, depth, columns);
+        timer_->SetTaskContext(source, flags);
+        index_ = timer_->BeginPassiveInterval(type_, n, tileN);
+    }
+    __aicore__ inline ~MegaMoeTrainTimerPassiveScope()
+    {
+        if (timer_ != nullptr) timer_->EndPassiveInterval(type_, index_);
+    }
+
+private:
+    MegaMoeTrainTimerDevice* timer_;
+    MegaMoeTrainTimer::DynamicTimingType type_;
+    int index_ = -1;
+};
+
 class MegaMoeTrainTimerWaitScope {
 public:
     __aicore__ inline MegaMoeTrainTimerWaitScope(MegaMoeTrainTimerDevice* timer,

@@ -34,15 +34,11 @@ set(train_include "${CMAKE_CURRENT_SOURCE_DIR}"
     "${ASCEND_HOME_PATH}/aarch64-linux/asc/include"
     "${ASCEND_HOME_PATH}/compiler/tikcpp" "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw"
     "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/interface" "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/impl")
-# Training uses adaptive GMM1 scheduling and automatic SwiGLU handoff by default.
-# Forward SwiGLU only: 0 = force UB handoff, 1 = force GM staging, 2 = auto.
-# Host queries the built device SO for workspace sizing; the shared header's
-# fallback value 0 is not the default of this device build, which uses 2 below.
+# Both forward schedules use M256 GEMMs, paired Gate/Up and native slice readiness.
 set(train_device_flags -O2 -std=c++17 -fPIC -xasc --npu-arch=dav-3510
     --cce-auto-infer-kernel-type=false -Xhost-start -ftrapv -D__ASC_NPU_HOST__ -Xhost-end
     -DCATLASS_ARCH=3510 -DL2_CACHE_HINT
-    -DDEEPEP_BF16_FORCE_EXPERT_READY=${train_force_expert_ready}
-    -DDEEPEP_BF16_SWIGLU_DECOUPLE=2)
+    -DDEEPEP_BF16_FORCE_EXPERT_READY=${train_force_expert_ready})
 if(DEEPEP_MEGAMOE_TIMER)
     list(APPEND train_device_flags -DDEEPEP_MEGAMOE_TIMER=1)
 endif()
@@ -51,8 +47,8 @@ foreach(path IN LISTS train_include)
     list(APPEND train_device_flags "-I${path}")
 endforeach()
 file(GLOB_RECURSE train_headers CONFIGURE_DEPENDS "csrc/*.hpp")
-file(GLOB_RECURSE shared_timer_headers CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/csrc/kernels/common/timer/*.hpp")
-list(APPEND train_headers ${shared_timer_headers})
+file(GLOB_RECURSE train_shared_headers CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/csrc/kernels/common/*.hpp")
+list(APPEND train_headers ${train_shared_headers})
 set(train_objects)
 foreach(source mega_moe_bf16_forward mega_moe_bf16_backward)
     set(object "${CMAKE_CURRENT_BINARY_DIR}/${source}.o")

@@ -95,6 +95,19 @@ public:
         EndRaw(static_cast<int>(type), index, AscendC::GetSystemCycle());
     }
 
+    // Observe native issue/completion boundaries without inserting a pipeline drain.
+    __aicore__ inline int BeginPassiveInterval(typename Schema::DynamicTimingType type, uint32_t n, uint32_t tileN)
+    {
+        if (!Enabled()) return -1;
+        nStart_ = n;
+        nTile_ = n == static_cast<uint32_t>(-1) ? -1 : static_cast<int>(n / tileN);
+        return BeginRaw(static_cast<int>(type), AscendC::GetSystemCycle());
+    }
+    __aicore__ inline void EndPassiveInterval(typename Schema::DynamicTimingType type, int index)
+    {
+        if (Enabled() && index >= 0) EndRaw(static_cast<int>(type), index, AscendC::GetSystemCycle());
+    }
+
     // 由调度层指定实际服务的 Wave，不能从本核任务序号反推。
     __aicore__ inline void SetWave(int64_t waveId)
     {
