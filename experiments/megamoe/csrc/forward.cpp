@@ -481,6 +481,28 @@ struct UrmaWorkspace {
         args_.systemWorkspace = Address(system_workspace_);
     }
 
+    // Rebuild only the active URMA configuration. All local tensors and the
+    // symmetric layout remain allocated for max_tokens, so changing BS/CV does
+    // not retire a previous device workspace or require a host wait.
+    void reconfigure(int64_t bs, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
+                     int64_t max_tokens, int64_t rank, int64_t shared_experts, int64_t shared_intermediate,
+                     int64_t num_experts, int64_t topk_weights_type)
+    {
+        const int64_t max_recv_rows = world * max_tokens * topk;
+        args_.config = UrmaLayout(world, max_tokens, topk, args_.config.hidden, max_recv_rows, cv_rows,
+                                  topk_weights_type);
+        // The route/flag backing storage is max-capacity. Keep the active
+        // chunk stride proportional to this call's BS for scheduling paths.
+        args_.config.maxPeerChunks = static_cast<uint32_t>((bs * topk + cv_rows - 1) / cv_rows);
+        args_.config.bs = static_cast<uint32_t>(bs);
+        args_.config.intermediate = static_cast<uint32_t>(intermediate);
+        args_.config.localExperts = static_cast<uint32_t>(num_experts / world);
+        args_.config.rank = static_cast<uint32_t>(rank);
+        args_.config.gmm1AheadMGroups = 12U;
+        args_.sharedExperts = static_cast<uint32_t>(shared_experts);
+        args_.sharedIntermediate = shared_experts ? static_cast<uint32_t>(shared_intermediate) : 0U;
+    }
+
     template <class Visitor>
     void for_each_tensor(Visitor&& visit) const
     {
@@ -640,14 +662,13 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     CheckTensor(weight_scales1, 4, "weight_scales1");
     CheckTensor(weight_scales2, 4, "weight_scales2");
     const int64_t bs = x.size(0), h = x.size(1), hidden = 2 * intermediate_;
-    TORCH_CHECK(x.device() == example_.device() && bs == example_.size(0) && h == example_.size(1),
-                "Input shape/device differs from prepared plan");
+    TORCH_CHECK(x.device() == example_.device() && bs > 0 && bs <= max_tokens_ && h == example_.size(1),
+                "Input shape/device exceeds prepared plan capacity");
     TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_ids.sizes() == torch::IntArrayRef({bs, topk_}),
                 "topk_ids must be int32 [BS,TopK]");
     TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32 && topk_weights.sizes() == topk_ids.sizes(),
                 "topk_weights must be FP32 [BS,TopK]");
     TORCH_CHECK(activation_clamp >= 0.0F, "activation_clamp must be nonnegative and not NaN");
-    tiling_.clampLimit = std::min(activation_clamp, std::numeric_limits<float>::max());
     const bool prequantized = x_scales.has_value();
     TORCH_CHECK(!urma || prequantized, "URMA requires prequantized FP8 input with E8M0 scales");
     TORCH_CHECK(x.scalar_type() == (prequantized ? c10::ScalarType::Float8_e4m3fn : torch::kBFloat16),
@@ -738,21 +759,32 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     if (urma) {
         TORCH_CHECK(generation > last_generation_ && generation < (1LL << 31),
                     "URMA generation must be positive and increase across the Buffer lifetime");
-        if (!urma_ || shared_intermediate_ != shared_i) {
-            if (urma_) ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeStream(stream.stream()));
-            urma_.reset();
-            urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, SelectCv(world_, bs),
+        TORCH_CHECK(!urma_ || shared_intermediate_ == shared_i,
+                    "Shared intermediate hidden cannot change after Plan creation");
+        if (!urma_) {
+            // Allocate the backing workspace for the worst CV stride. EP16
+            // may switch between CV128 and CV256 as the active BS changes.
+            const int64_t workspace_cv = world_ == 16 ? 128 : 256;
+            urma_ = std::make_unique<UrmaWorkspace>(example_, world_, intermediate_, topk_, workspace_cv,
                                                     max_tokens_, aclshmem_my_pe(), ffts_, symmetric_address_,
                                                     shared_experts_, shared_i, world_ * experts_, platform_, topk_weights_type_);
             shared_intermediate_ = shared_i;
         }
-        urma_->args_.config.bs = bs;
+        urma_->reconfigure(bs, world_, intermediate_, topk_, SelectCv(world_, bs), max_tokens_, aclshmem_my_pe(),
+                           shared_experts_, shared_i, world_ * experts_, topk_weights_type_);
         // Invocation flags are reset by AIV workers before the first route join.
         if (timer) {
             ASCEND_DEEPEP_CHECK_ACL(
                 aclrtMemsetAsync(timer->data_ptr(), timer->nbytes(), 0, timer->nbytes(), stream.stream()));
         }
     }
+    if (!urma) {
+        // Workspace/context capacity was prepared for max_tokens_. Recompute
+        // only BS-dependent scheduling fields on the host for this launch.
+        tiling_ = MakeTiling(bs, h, hidden, topk_, experts_, world_, max_tokens_, 0, is_a8w4_, shared_experts_,
+                             platform_, topk_weights_type_);
+    }
+    tiling_.clampLimit = std::min(activation_clamp, std::numeric_limits<float>::max());
     // Common dispatch stage; only the device argument representation differs.
     auto ptr = [](const torch::Tensor& t) { return static_cast<uint8_t*>(t.data_ptr()); };
     auto opt = [&](const c10::optional<torch::Tensor>& t) { return t ? ptr(*t) : nullptr; };

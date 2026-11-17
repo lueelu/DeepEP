@@ -287,7 +287,7 @@ def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16)
     assert stats.streams == [b._runtime.stream, b._runtime.stream]
     assert b.workspace_bytes == 4096 and b.symmetric_buffer_bytes == 2 << 20
     b.prepare(1)
-    assert b._plan.bs == 1 and b._plan_bs == 1
+    assert b._plan.bs == 17 and b._plan_bs == 17
 
 
 def test_output_and_stats_aliases_rejected_before_launch(backend):
@@ -390,7 +390,7 @@ def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
         selected = w1.select(bs <= 256)
         assert launch[4] is selected[0] and launch[6] is selected[1]
-        assert b._plan.bs == bs  # actual BS, not max capacity or per-expert M
+        assert b._plan.bs == 4096  # one plan owns the configured maximum capacity
     assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts
     with pytest.raises(ValueError, match="keep its returned l1 pair intact"):
         api.fp8_fp4_mega_moe(Tensor(np.zeros((257, 1024)), "bfloat16"), tuple(w1), w2, b)
@@ -512,7 +512,7 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan is None and backend.buffer._plan_bs is None
     backend.ext.Plan = plan_type
     backend.buffer.prepare(17)
-    assert backend.buffer._plan_bs == 17
+    assert backend.buffer._plan_bs == backend.buffer.num_max_tokens_per_rank
 
 
 @pytest.mark.parametrize("board,expected", [(0x44, "urma"), (7, "mte"), (3, "mte"), (None, "mte"), (0x6C, "mte")])
@@ -570,7 +570,7 @@ def test_urma_uses_unified_plan_and_generation_survives_bs_changes(backend, monk
             plans.append(b._plan)
             np.testing.assert_array_equal(y.data, 3)
         assert generations == [1, 2, 3, 4, 5]
-        assert len({id(plan) for plan in plans}) > 1  # generation belongs to the owner, not a replaced plan.
+        assert len({id(plan) for plan in plans}) == 1  # generation advances on one reused max-capacity plan.
         np.testing.assert_array_equal(stats.data, [17, 26])
         assert stats.streams == [b._runtime.stream] * 5
         assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts_before

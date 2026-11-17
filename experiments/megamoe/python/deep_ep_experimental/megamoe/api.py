@@ -183,20 +183,13 @@ class SymmBuffer:
 
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
-        if self._plan_bs == bs:
+        if self._plan is not None:
             return
-        if self._backend_name == "urma":
-            # Resource changes retire prior network sources before reusing the
-            # fixed control regions. Exchange shape metadata, never route data.
-            self._runtime.stream.synchronize()
-            collective_check(self.group, "plan configuration", None, (bs, self._backend_name))
-        # Keep only the current shape's plan; owner generation survives rebuilds.
-        self._plan = self._plan_bs = None
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
         self._plan = ext.Plan(
-            self.x[:bs],
+            self.x,
             self.intermediate_hidden,
             self.num_topk,
             self.num_experts // self._world_size,
@@ -211,7 +204,9 @@ class SymmBuffer:
             backend=self._backend_name,
             topk_weights_type=self.topk_weights_type,
         )
-        self._plan_bs = bs
+        # The plan owns capacity for num_max_tokens_per_rank; each forward
+        # supplies its active BS without retiring the device workspace.
+        self._plan_bs = self.num_max_tokens_per_rank
 
     def prepare(self, bs: int) -> SymmBuffer:
         """Collectively prepare/reuse one BS before timing; all ranks must call together."""
