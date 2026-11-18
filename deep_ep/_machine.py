@@ -181,7 +181,7 @@ def detect_physical(physical, rootinfo_path=None):
         topo, topo_hash = read_json(topo_path)
         kind = classify_root(root, topo, physical)
         if kind == "mesh_and_clos":
-            if board_id(physical) not in (3, 7):
+            if board_id(physical) not in (3, 7, 0x44):
                 raise ValueError("Mesh+Clos board is not validated; specify machine_type")
             kind = "mesh_clos"
         elif kind == "mesh4":
@@ -198,7 +198,7 @@ def detect_physical(physical, rootinfo_path=None):
     if rootinfo_path is not None:
         raise ValueError(f"explicit rootinfo is missing: {path}")
     board = board_id(physical)
-    if board not in (3, 7, 0x6C):
+    if board not in (3, 7, 0x44, 0x6C):
         raise ValueError(f"no rootinfo and no validated rule for board 0x{board:02x}; specify machine_type")
     return {
         "machine_type": "mesh_pcie" if board == 0x6C else "mesh_clos",

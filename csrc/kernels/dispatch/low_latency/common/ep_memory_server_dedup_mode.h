@@ -5,20 +5,17 @@
 #define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_MODE_H
 
 #include <cstdint>
+#include "ll_compile_attrs.h"
 
 namespace DispatchDedup {
 // The dedup resource layout is fixed for the lifetime of the binary. The
 // execution path is chosen at runtime from the per-rank capacity instead.
-constexpr bool kEpServerDedupEnable = true;
 constexpr uint32_t kEpServerDedupDedupThreshold = 32U;
-#if defined(__CCE__) && defined(__CCE_IS_AICORE__)
-__aicore__ inline
-#endif
-    constexpr bool
-    EpServerDedupEnabled(uint32_t numMaxTokensPerRank, uint32_t actualBs = 32U, uint32_t world = 16U)
+// Only the per-rank capacity and communicator size select the execution path;
+// the actual launch B no longer participates.
+constexpr __aicore__ __forceinline__ bool EpServerDedupEnabled(uint32_t numMaxTokensPerRank, uint32_t world = 16U)
 {
-    (void)actualBs;  // Preserve callers; cross-host dedup no longer depends on actual B.
-    return (world > 16U) || (numMaxTokensPerRank > kEpServerDedupDedupThreshold);
+    return world > 16U || numMaxTokensPerRank > kEpServerDedupDedupThreshold;
 }
 }  // namespace DispatchDedup
 #endif

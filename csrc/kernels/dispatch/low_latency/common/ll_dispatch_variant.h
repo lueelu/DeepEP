@@ -1,6 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 #pragma once
 #include <cstdint>
+#include "ll_compile_attrs.h"
 
 namespace DispatchDedup {
 // Internal dispatch classification, independent of the shared-memory
@@ -27,13 +28,8 @@ constexpr uint32_t kLlDispatchInputBf16 = 1U;
 // Returns the compile-time kernel class for a tiling format, or
 // kLlDispatchInvalidVariant when the format is not admitted. Host and device
 // evaluate the same table before launching or running the kernel.
-#if defined(__CCE__) && defined(__CCE_IS_AICORE__)
-__aicore__ inline
-#else
-inline
-#endif
-constexpr uint32_t LlDispatchInputClass(uint8_t dtype, uint8_t quantMode,
-                                        uint8_t expandXOutDtype, uint8_t inputMode)
+constexpr __aicore__ __forceinline__ uint32_t LlDispatchInputClass(uint8_t dtype, uint8_t quantMode,
+    uint8_t expandXOutDtype, uint8_t inputMode)
 {
     if (dtype == kLlDispatchE4M3 && quantMode == 4U &&
         expandXOutDtype == kLlDispatchE4M3 && inputMode == kLlDispatchPrequantized) {

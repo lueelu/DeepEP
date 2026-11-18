@@ -4,15 +4,11 @@
 #ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_DATA_LAYOUT_H
 #define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_DATA_LAYOUT_H
 
+#include "ll_compile_attrs.h"
 #include "ep_memory_server_dedup_count_layout.h"
 #include "ep_memory_server_dedup_input.h"
 
 namespace DispatchDedup {
-#if DISPATCH_DEDUP_ASCENDC_AICORE_COMPILE
-#define DISPATCH_DEDUP_EP_DATA_INLINE FORCE_INLINE_AICORE
-#else
-#define DISPATCH_DEDUP_EP_DATA_INLINE inline
-#endif
 
 struct EpServerDedupDataLayout {
     uint64_t quantCount = 0;
@@ -29,7 +25,7 @@ struct EpServerDedupDataLayout {
     uint64_t relayOffset = 0, relayBytes = 0, requiredBytes = 0;
 };
 
-DISPATCH_DEDUP_EP_DATA_INLINE uint64_t DispatchDedupAlign(uint64_t value, uint64_t alignment)
+__aicore__ __forceinline__ uint64_t DispatchDedupAlign(uint64_t value, uint64_t alignment)
 {
     return (value + alignment - 1U) / alignment * alignment;
 }
@@ -37,7 +33,7 @@ DISPATCH_DEDUP_EP_DATA_INLINE uint64_t DispatchDedupAlign(uint64_t value, uint64
 // Host validates positive uint32 shapes and the count UB bound before calling;
 // E<=1024, BS*K<2^14 and H<2^32 bound the entire domain below 2^59 bytes.
 // Public buffer products are also checked against size_t by the Host builder.
-DISPATCH_DEDUP_EP_DATA_INLINE EpServerDedupDataLayout DispatchServerDedupDataLayout(uint32_t bs, uint32_t h,
+__aicore__ __forceinline__ EpServerDedupDataLayout DispatchServerDedupDataLayout(uint32_t bs, uint32_t h,
                                                                                     uint32_t topK, uint32_t experts,
                                                                                     EpServerDedupInputMode mode)
 {
@@ -74,7 +70,7 @@ DISPATCH_DEDUP_EP_DATA_INLINE EpServerDedupDataLayout DispatchServerDedupDataLay
 }
 
 // Compatibility for existing plain/internal-quantization callers.
-DISPATCH_DEDUP_EP_DATA_INLINE EpServerDedupDataLayout DispatchServerDedupDataLayout(uint32_t bs, uint32_t h,
+__aicore__ __forceinline__ EpServerDedupDataLayout DispatchServerDedupDataLayout(uint32_t bs, uint32_t h,
                                                                                     uint32_t topK, uint32_t experts,
                                                                                     bool quantized)
 {
@@ -82,7 +78,7 @@ DISPATCH_DEDUP_EP_DATA_INLINE EpServerDedupDataLayout DispatchServerDedupDataLay
         bs, h, topK, experts, quantized ? EpServerDedupInputMode::Quantize16 : EpServerDedupInputMode::Plain16);
 }
 
-DISPATCH_DEDUP_EP_DATA_INLINE uint64_t DispatchServerDedupDispatchOffset(const EpServerDedupDataLayout& layout,
+__aicore__ __forceinline__ uint64_t DispatchServerDedupDispatchOffset(const EpServerDedupDataLayout& layout,
                                                                          uint32_t source, uint32_t destination,
                                                                          uint32_t localExpert, uint32_t q,
                                                                          uint32_t ranks, uint32_t localExperts,
@@ -91,7 +87,5 @@ DISPATCH_DEDUP_EP_DATA_INLINE uint64_t DispatchServerDedupDispatchOffset(const E
     return layout.dispatchOffset +
            (((uint64_t(source) + destination) % ranks * localExperts + localExpert) * bs + q) * layout.tokenStride;
 }
-
-#undef DISPATCH_DEDUP_EP_DATA_INLINE
 }  // namespace DispatchDedup
 #endif

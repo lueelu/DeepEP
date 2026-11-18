@@ -11,6 +11,7 @@
 #if CATLASS_ARCH == 3510
 #include "low_latency/combine_server_dedup_kernel.h"
 #include "low_latency/ep_memory_server_dedup_combine_tiling.h"
+#include "low_latency/ll_transport_tensor_compat.h"
 #include "../dispatch/low_latency/device/dispatch_server_dedup_magic.h"
 #include "low_latency/launch.hpp"
 
@@ -20,11 +21,9 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_serv
 {
     const auto* args = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
     util_set_ffts_config(args->fftsVal);
-    uint32_t magic;
-    {
-        AscendC::TPipe pipe;
-        magic = DispatchDedup::RotateDispatchServerDedupMagic(args, AscendC::GetBlockIdx(), &pipe);
-    }
+    // Raw C API: the magic rotates through one local 512B slot per core and
+    // no longer borrows a TPipe scratch buffer.
+    const uint32_t magic = DispatchDedup::RotateDispatchServerDedupMagic(args, AscendC::GetBlockIdx());
     const auto* td = reinterpret_cast<const volatile __gm__ CombineDedup::EpServerDedupCombineTilingData*>(tilingData);
     const bool enableDedup = DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank);
     CombineDedup::CombineMemoryServerDedupKernel kernel;

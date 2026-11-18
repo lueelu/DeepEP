@@ -4,21 +4,20 @@
 #ifndef DISPATCH_SERVER_DEDUP_RECEIVE_TASKS_H
 #define DISPATCH_SERVER_DEDUP_RECEIVE_TASKS_H
 
-#include "kernel_operator.h"
+#include "ll_dispatch_c_api.h"
 #include "../common/ep_memory_server_dedup_data_layout.h"
 
 namespace DispatchDedup {
-using namespace AscendC;
 
 // R05-01/R05-02: stable physical slot positions and a compact pending list.
 // The caller supplies the complete, ready prefix in localExpert/source order.
 // Both tables remain in UB until this core has finished clearing its slots.
 class ServerDedupReceiveTasks {
 public:
-    __aicore__ inline void Build(LocalTensor<int32_t> prefix, uint32_t rank, uint32_t ranks, uint32_t experts,
-                                 uint32_t bs, uint32_t receiver, TPipe* pipe, uint32_t recvCores)
+    __aicore__ inline void Build(__ubuf__ int32_t* prefix, uint32_t rank, uint32_t ranks, uint32_t experts,
+                                 uint32_t bs, uint32_t receiver, LlDispatchC::UbLayout& layout, uint32_t recvCores)
     {
-        const uint32_t total = uint32_t(prefix.GetValue(experts - 1U));
+        const uint32_t total = uint32_t(prefix[experts - 1U]);
         // 交错分配：receiver 核拥有全局行号 {receiver, receiver+recvCores, ...}。
         // 这样每个核同时拿到早到源与晚到源的 token，relay 转发量也随 token 摊平，
         // 不会再整段继承单个源的到达时刻；输出行由首行和步长直接还原。
@@ -29,10 +28,8 @@ public:
         if (count_ == 0U) return;
 
         const uint32_t bytes = uint32_t(DispatchDedupAlign(uint64_t(count_) * sizeof(uint32_t), 32U));
-        pipe->InitBuffer(tokenPosBuf_, bytes);
-        pipe->InitBuffer(pendingIdxBuf_, bytes);
-        tokenPos_ = tokenPosBuf_.Get<uint32_t>();
-        pendingIdx_ = pendingIdxBuf_.Get<uint32_t>();
+        tokenPos_ = layout.Allocate<uint32_t>(bytes);
+        pendingIdx_ = layout.Allocate<uint32_t>(bytes);
 
         const uint32_t localExperts = experts / ranks;
         uint32_t record = 0U;
@@ -42,18 +39,18 @@ public:
             uint32_t low = record, high = experts;
             while (low < high) {
                 const uint32_t middle = low + (high - low) / 2U;
-                if (uint32_t(prefix.GetValue(middle)) <= row)
+                if (uint32_t(prefix[middle]) <= row)
                     low = middle + 1U;
                 else
                     high = middle;
             }
             record = low;
-            const uint32_t previous = record == 0U ? 0U : uint32_t(prefix.GetValue(record - 1U));
+            const uint32_t previous = record == 0U ? 0U : uint32_t(prefix[record - 1U]);
             const uint32_t source = record % ranks;
             const uint32_t localExpert = record / ranks;
             const uint32_t region = ((source + rank) % ranks) * localExperts + localExpert;
-            tokenPos_.SetValue(j, region * bs + row - previous);
-            pendingIdx_.SetValue(j, j);
+            tokenPos_[j] = region * bs + row - previous;
+            pendingIdx_[j] = j;
         }
     }
 
@@ -76,11 +73,11 @@ public:
     }
     __aicore__ inline uint32_t Position(uint32_t j)
     {
-        return tokenPos_.GetValue(j);
+        return tokenPos_[j];
     }
     __aicore__ inline uint32_t PendingIndex(uint32_t p)
     {
-        return pendingIdx_.GetValue(p);
+        return pendingIdx_[p];
     }
 
     // Call only after every required write for PendingIndex(p) has been issued.
@@ -88,13 +85,12 @@ public:
     __aicore__ inline void RemovePending(uint32_t p)
     {
         --pendingCount_;
-        pendingIdx_.SetValue(p, pendingIdx_.GetValue(pendingCount_));
+        pendingIdx_[p] = pendingIdx_[pendingCount_];
     }
 
 private:
     uint32_t begin_ = 0U, stride_ = 1U, count_ = 0U, pendingCount_ = 0U;
-    TBuf<> tokenPosBuf_, pendingIdxBuf_;
-    LocalTensor<uint32_t> tokenPos_, pendingIdx_;
+    __ubuf__ uint32_t *tokenPos_ = nullptr, *pendingIdx_ = nullptr;
 };
 }  // namespace DispatchDedup
 

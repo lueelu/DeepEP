@@ -6,7 +6,7 @@
 
 #include "kernel_operator.h"
 #include "ep_memory_server_dedup_combine_config.h"
-#include "../../dispatch/low_latency/common/dispatch_dedup_types.h"
+#include "../../dispatch/low_latency/common/comm_args.h"
 
 namespace CombineDedup {
 using namespace AscendC;

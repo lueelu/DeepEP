@@ -249,7 +249,15 @@ def build_configuration(environment=None):
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
-    result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
+    ll_reference_profile = env.get("DEEPEP_LL_REFERENCE_PROFILE", "OFF")
+    ll_stage_timer = env.get("DEEPEP_LL_STAGE_TIMER", "OFF")
+    if ll_reference_profile not in {"ON", "OFF"} or ll_stage_timer not in {"ON", "OFF"}:
+        raise RuntimeError("LL reference/stage diagnostic options accept ON or OFF only")
+    if ll_reference_profile == "ON" and ll_stage_timer == "ON":
+        raise RuntimeError("The reference profile requires legacy LL stage tracing OFF")
+    result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine(),
+              "ll_reference_profile": ll_reference_profile == "ON",
+              "ll_stage_timer": ll_stage_timer == "ON"}
     default_shmem = ROOT / "third-party/shmem/install/shmem"
 
     result["build_type"] = env.get("DEEPEP_BUILD_TYPE", "RelWithDebInfo" if lineinfo else "Release")
@@ -304,6 +312,9 @@ def build_configuration(environment=None):
     # Record actual inputs so replacing an unpinned SDK invalidates the build cache.
     result["shmem"] = {
         "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
+        # The validated SDK identity travels with the installed wheel so a
+        # one-click run can reject a wheel built against another SDK revision.
+        "build": sdk.get("build", {}) if isinstance(sdk, dict) else {},
         "sha256": {
             path.relative_to(manifest.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in files
@@ -520,6 +531,8 @@ class CMakeBuild(build_ext):
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
+            f"-DDEEPEP_LL_REFERENCE_PROFILE={'ON' if configuration.get('ll_reference_profile', False) else 'OFF'}",
+            f"-DDEEPEP_LL_STAGE_TIMER={'ON' if configuration.get('ll_stage_timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
