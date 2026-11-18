@@ -131,6 +131,22 @@ V2 的 `get_buffer_size_hint(..., machine_type=...)` 也须选择同一后端；
 非 collective，不增加跨 rank 同步。直接让构造函数按 shape 计算可避免选错 hint。
 Mesh+Clos 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `shmem_ip_port` 方式。
 
+## 全 Clos 超时配置
+
+在创建 Buffer 前为各 rank 设置环境变量。两个变量均接受正整数，单位为秒。
+
+| 环境变量 | 默认值 | 等待范围 |
+|---|---:|---|
+| `DEEPEP_NPU_TIMEOUT_SECONDS` | 10 | Dispatch/Combine 接收 completion flag、Dispatch FP8 scale ready、流水 Combine aggregate ready |
+| `DEEPEP_CPU_TIMEOUT_SECONDS` | 120 | Fresh Notify 后，CPU 等待映射到 Host 的接收计数 |
+
+设备超时直接打印阶段、rank、`aiv_core_idx`、等待对象、`timeout_s` 和 `elapsed_us`，
+随后触发设备异常。Ascend950 的 `elapsed_us` 由系统计数器差值除以 1000 得到。
+CPU 超时直接向 stderr 打印第一个未就绪的计数槽位和耗时，随后抛出异常。
+
+CPU 阈值适用于默认 Host polling 路径。`DEEPEP_CLOS_NOTIFY_HOST_POLL=0` 或映射不可用时，
+计数回读走同步拷贝，不使用这个阈值。这两个阈值也不覆盖 SHMEM 内部等待或硬件同步指令。
+
 ## 全 Clos 精度与带宽测试
 
 Clos 提供以下精度与带宽测试入口：

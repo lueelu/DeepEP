@@ -40,9 +40,17 @@ __aicore__ inline void WaitPackedScaleReady(const DispatchTilingData& td, uint32
         flag.SetGlobalBuffer(address);
         while (true) {
             dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(address));
-            if (flag.GetValue(0) == 1U) break;
-            if (static_cast<uint64_t>(AscendC::GetSystemCycle()) - started >= kIncomingTimeoutCycles) {
-                AscendC::printf("[CLOS_SCALE_TIMEOUT] rank=%u core=%u producer=%u\n", td.rank, core, producer);
+            const uint64_t value = flag.GetValue(0);
+            if (value == 1U) break;
+            const uint64_t elapsed = static_cast<uint64_t>(AscendC::GetSystemCycle()) - started;
+            if (elapsed >= td.npu_timeout_cycles) {
+                AscendC::printf(
+                    "[CLOS_SCALE_TIMEOUT] op=dispatch stage=scale_ready rank=%u aiv_core_idx=%u "
+                    "producer_aiv_core_idx=%u instance_id=%u cached=%u expected=1 observed=%llu "
+                    "elapsed_us=%llu timeout_s=%u\n",
+                    td.rank, core, producer, td.instance_id, td.cached_mode, static_cast<unsigned long long>(value),
+                    static_cast<unsigned long long>(elapsed / kNpuSystemCyclesPerUs),
+                    static_cast<uint32_t>(td.npu_timeout_cycles / kNpuSystemCyclesPerSecond));
                 trap(); return;
             }
         }
@@ -148,7 +156,7 @@ __aicore__ inline void DispatchRemoteImpl(
         }
     }
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
-    WaitIncoming<true>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores, td.udma_workers_per_peer * Qps);
+    WaitIncoming<true>(workspace, td, core, cores, td.udma_workers_per_peer * Qps);
     sender.Quiet();
     // SO markers cover payload only. Metadata AIVs can still be doing remote
     // SIMT stores on another rank; all ranks/cores must join before outputs are
