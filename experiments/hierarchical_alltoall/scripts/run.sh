@@ -12,6 +12,16 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:$ASCEND_HOME_PATH/lib64:${LD_LIBRARY_PAT
 NODE_RANK=${NODE_RANK:-0}
 NNODES=${NNODES:-2}
 QP_NUM=${QP_NUM:-1}
+TEST_MODE=${TEST_MODE:-check}
+WARMUP=${WARMUP:-5}
+ITERATIONS=${ITERATIONS:-50}
+test_args=()
+case "$TEST_MODE" in
+    check) ;;
+    perf) test_args=("$WARMUP" "$ITERATIONS");;
+    *) echo 'TEST_MODE must be check or perf' >&2; exit 1;;
+esac
+export TEST_MODE WARMUP ITERATIONS
 M=${M:-257}
 N=${N:-1024}
 WINDOW_M=${WINDOW_M:-64}
@@ -35,11 +45,16 @@ def require(condition, message):
     if not condition:
         raise SystemExit(message)
 values = {}
-for key in ('QP_NUM','M','N','WINDOW_M','PORT'):
+keys = ['QP_NUM', 'M', 'N', 'WINDOW_M', 'PORT']
+if os.environ['TEST_MODE'] == 'perf':
+    keys += ['WARMUP', 'ITERATIONS']
+for key in keys:
     text = os.environ[key]
     if not text.isascii() or not text.isdecimal() or int(text) > 0xffffffff:
         raise SystemExit('Invalid unsigned integer: ' + key)
     values[key] = int(text)
+if os.environ['TEST_MODE'] == 'perf':
+    require(values['WARMUP'] <= 10000 and 0 < values['ITERATIONS'] <= 10000, 'Invalid WARMUP/ITERATIONS')
 require(values['QP_NUM'] in (1,2,4), 'QP_NUM must be 1/2/4')
 require(values['M'] > 0 and values['N'] > 0 and values['N'] % 32 == 0 and values['WINDOW_M'] > 0, 'Invalid M/N/WINDOW_M')
 require(0 < values['PORT'] < 65536, 'Invalid PORT')
@@ -61,7 +76,7 @@ pids=()
 for ((local_rank=0; local_rank<local_size; ++local_rank)); do
     rank=$((NODE_RANK * local_size + local_rank))
     "$BUILD_DIR/hierarchical_alltoall" "$world" "$rank" "tcp://${RANK0_IP}:${PORT}" \
-        "$M" "$N" "$WINDOW_M" "${devices[$local_rank]}" "$QP_NUM" \
+        "$M" "$N" "$WINDOW_M" "${devices[$local_rank]}" "$QP_NUM" "${test_args[@]}" \
         > "$case_dir/rank${rank}.log" 2>&1 &
     pids+=("$!")
 done

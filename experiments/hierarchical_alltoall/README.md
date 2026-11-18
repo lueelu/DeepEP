@@ -3,7 +3,7 @@
 本样例独立构建 C++/AscendC 可执行程序，不依赖 PyTorch、DeepEP wheel、dispatch/combine。
 调用仓内 `csrc/comm` 的公共 block、tile 和 kernel 模板，底层继续使用 Catlass TileSwizzle 与 SHMEM。
 当前实现支持一个通信域，或两个等大的通信域，最大双机 32 卡，`QP_NUM=1/2/4`。
-这是功能样例，不输出带宽或计算掩盖度。
+默认执行单次功能校验；也可运行独立 AllToAll 带宽测试。
 
 ## 数据与多轮划分
 
@@ -186,6 +186,57 @@ NNODES=1 NODE_RANK=0 DEVICES=0,1 QP_NUM=4 UDMA_NET_LAYER=0 \
 
 `UDMA_NET_LAYER=0` 选择直连层，`UDMA_NET_LAYER=1` 选择 CLOS 层。设置该选项需要使用启用了
 `-multi_link` 的 SHMEM SDK，同一次运行的所有 rank 使用相同配置。省略时由 SHMEM 自动选路。
+
+## 带宽测试
+
+沿用上面的构建命令，默认预热 5 次、计时 50 次。通信大小沿用 bench 的口径：每个 peer 的
+MXFP8 **data** 为下表大小，E8M0 scale 随同发送，额外占 data 的 1/32。每个 case 仍校验最后一次输出。
+
+| M × N（每个 peer） | data | scale |
+| --- | ---: | ---: |
+| 4 × 1024 | 4 KiB | 128 B |
+| 64 × 1024 | 64 KiB | 2 KiB |
+| 1024 × 1024 | 1 MiB | 32 KiB |
+| 2048 × 1024 | 2 MiB | 64 KiB |
+| 4096 × 1024 | 4 MiB | 128 KiB |
+
+单机双卡示例（设备须同域且空闲；此例指定 UDMA 直连）：
+
+```bash
+NNODES=1 NODE_RANK=0 DEVICES=0,1 UDMA_NET_LAYER=0 QP_NUM=4 \
+  RUN_ID=perf-2card-qp4 PORT=8666 bash experiments/hierarchical_alltoall/scripts/perf.sh
+```
+
+双机 32 卡沿用上一节的环境变量，在两端用相同的 `RUN_ID`、`PORT`、`QP_NUM`、
+`WARMUP`、`ITERATIONS` 和 `WINDOW_M`，分别在各自机器执行：
+
+```bash
+# 第一台（沿用 NNODES=2、RANK0_IP、DEVICES 等）
+NODE_RANK=0 RUN_ID=perf-32card-qp1 bash experiments/hierarchical_alltoall/scripts/perf.sh
+
+# 第二台
+NODE_RANK=1 RUN_ID=perf-32card-qp1 bash experiments/hierarchical_alltoall/scripts/perf.sh
+```
+
+默认 `WINDOW_M=256`，可覆盖；连续使用 `PORT` 到 `PORT+4` 五个端口。
+单机自动生成 `$BUILD_DIR/logs/$RUN_ID/summary.csv`。双机把两端的 sweep 日志目录收集到同一台机器后汇总：
+
+```bash
+python3 experiments/hierarchical_alltoall/scripts/perf_summary.py \
+  node0/perf-32card-qp1 node1/perf-32card-qp1 > summary.csv
+```
+
+参考 CatCCOS 融合样例将各段分开测量的思路，这里用同一设备 stream 上的 ACL 时间戳事件打点：
+数据 kernel 之前、数据 kernel 之后、完成 barrier 之后。分别记录 kernel 和完整完成耗时，不计输入准备、
+ready 清零、起跑 barrier 或校验。每次迭代先取所有 rank 的最大耗时，再算均值和完成延迟分位数，
+不跨设备相减时间戳。带宽以完整完成耗时为分母：
+
+```text
+有效发送 GB/s/rank = (world - 1) × (data_peer_bytes + scale_peer_bytes) / complete_mean_us / 1000
+```
+
+这个值只计发给其他 rank 的逻辑字节，包含同域 UDMA 和跨域 RDMA，不计本卡 MTE、接收字节、padding 或 flag，
+不能当作某条链路的物理带宽。改变 QP 数时使用新的 RUN_ID。
 
 ## 文件
 

@@ -94,7 +94,12 @@ void Validate(
 
 int Run(int argc, char** argv)
 {
-    Require(argc == 9, "Usage: hierarchical_alltoall WORLD RANK tcp://IP:PORT M N WINDOW_M DEVICE QP_NUM");
+    Require(argc == 9 || argc == 11,
+            "Usage: hierarchical_alltoall WORLD RANK tcp://IP:PORT M N WINDOW_M DEVICE QP_NUM [WARMUP ITERATIONS]");
+    const bool perf = argc == 11;
+    const uint32_t warmup = perf ? Number(argv[9]) : 0;
+    const uint32_t iterations = perf ? Number(argv[10]) : 1;
+    Require(warmup <= 10000 && iterations > 0 && iterations <= 10000, "Invalid WARMUP/ITERATIONS");
     const uint32_t rankSize = Number(argv[1]);
     const uint32_t rankIdx = Number(argv[2]);
     const uint32_t m = Number(argv[4]);
@@ -213,23 +218,59 @@ int Run(int argc, char** argv)
         const uint32_t epoch = commIdx + 1;
         std::memcpy(signals.data() + GetReadyValueOffset(rankSize, qpNum, commIdx), &epoch, sizeof(epoch));
     }
-    Upload(control, signals);
     const uint64_t ffts = shmemx_get_ffts_config();
-    LaunchBarrier(rankIdx, rankSize, 1, barrier, stream, ffts);
-    Check(aclrtSynchronizeStream(stream), "input-ready barrier");
     const LaunchArgs args{
         m, n, rankIdx, rankSize, commSizeM, qpNum, reinterpret_cast<uintptr_t>(input), reinterpret_cast<uintptr_t>(output),
         reinterpret_cast<uintptr_t>(inputScale), reinterpret_cast<uintptr_t>(outputScale),
         reinterpret_cast<uintptr_t>(control)};
-    LaunchAllToAll(args, blocks, stream, ffts);
-    Check(aclrtSynchronizeStream(stream), "multi-round AllToAll");
-    // Wait for every sender's final drain before validation/free/finalize.
-    LaunchBarrier(rankIdx, rankSize, 2, barrier, stream, ffts);
-    Check(aclrtSynchronizeStream(stream), "output-ready barrier");
+    aclrtEvent begin = nullptr, kernelDone = nullptr, complete = nullptr;
+    if (perf) {
+        Check(aclrtCreateEventWithFlag(&begin, ACL_EVENT_TIME_LINE), "create begin event");
+        Check(aclrtCreateEventWithFlag(&kernelDone, ACL_EVENT_TIME_LINE), "create kernel event");
+        Check(aclrtCreateEventWithFlag(&complete, ACL_EVENT_TIME_LINE), "create completion event");
+        std::printf("PERF_CONFIG rank=%u world=%u m=%u n=%u window_m=%u qp=%u warmup=%u iterations=%u "
+                    "data_peer_bytes=%llu scale_peer_bytes=%llu udma_layer=%s\n",
+            rankIdx, rankSize, m, n, commSizeM, qpNum, warmup, iterations,
+            static_cast<unsigned long long>(peerBytes), static_cast<unsigned long long>(scalePeerBytes),
+            udmaNetLayerEnv && *udmaNetLayerEnv ? udmaNetLayerEnv : "auto");
+    }
+    uint32_t barrierEpoch = 0;
+    for (uint32_t step = 0; step < warmup + iterations; ++step) {
+        // Previous completion barrier ensures all ranks stopped writing old ready slots.
+        // Reset locally, then wait for every rank's reset before sending new flags.
+        Upload(control, signals);
+        if (perf && step + 1 == warmup + iterations) {
+            // A stale output from warmup must not mask an incomplete final transfer.
+            Check(aclrtMemset(output, dataBytes, kPadding, dataBytes), "reset data output");
+            Check(aclrtMemset(outputScale, scaleBytes, kPadding, scaleBytes), "reset scale output");
+        }
+        LaunchBarrier(rankIdx, rankSize, ++barrierEpoch, barrier, stream, ffts);
+        Check(aclrtSynchronizeStream(stream), "input-ready barrier");
+        const bool measure = perf && step >= warmup;
+        if (measure) Check(aclrtRecordEvent(begin, stream), "record begin");
+        LaunchAllToAll(args, blocks, stream, ffts);
+        if (measure) Check(aclrtRecordEvent(kernelDone, stream), "record kernel completion");
+        // The same stream orders the barrier after the local senders' final drain.
+        LaunchBarrier(rankIdx, rankSize, ++barrierEpoch, barrier, stream, ffts);
+        if (measure) Check(aclrtRecordEvent(complete, stream), "record world completion");
+        Check(aclrtSynchronizeStream(stream), "AllToAll and output-ready barrier");
+        if (measure) {
+            float kernelMs = 0, completeMs = 0;
+            Check(aclrtEventElapsedTime(&kernelMs, begin, kernelDone), "measure kernel");
+            Check(aclrtEventElapsedTime(&completeMs, begin, complete), "measure completion");
+            std::printf("PERF_SAMPLE rank=%u sample=%u kernel_us=%.3f complete_us=%.3f\n",
+                rankIdx, step - warmup, kernelMs * 1000.0, completeMs * 1000.0);
+        }
+    }
+    if (perf) {
+        Check(aclrtDestroyEvent(complete), "destroy completion event");
+        Check(aclrtDestroyEvent(kernelDone), "destroy kernel event");
+        Check(aclrtDestroyEvent(begin), "destroy begin event");
+    }
     Validate(Download(output, dataBytes), rankIdx, rankSize, peerStrideBytes, peerBytes, false);
     Validate(Download(outputScale, scaleBytes), rankIdx, rankSize, scalePeerStrideBytes, scalePeerBytes, true);
     // All participants must finish checking before collective teardown.
-    LaunchBarrier(rankIdx, rankSize, 3, barrier, stream, ffts);
+    LaunchBarrier(rankIdx, rankSize, ++barrierEpoch, barrier, stream, ffts);
     Check(aclrtSynchronizeStream(stream), "validation barrier");
     aclshmem_free(barrier);
     aclshmem_free(control);
