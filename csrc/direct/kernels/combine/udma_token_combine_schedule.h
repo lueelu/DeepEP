@@ -86,8 +86,7 @@ __aicore__ inline void CombineTokenRemote(
             }
         }
     if constexpr (Phase != 1) {
-        WaitIncoming<false>(
-            workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, td.block_dim, workers);
+        WaitIncoming<false>(workspace, td, core, td.block_dim, workers);
     }
     // WaitIncoming's all-core barrier includes drained local self copies.
 }

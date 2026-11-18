@@ -37,6 +37,7 @@ public:
     // Serialized fresh dispatches may publish counts before Notify finishes.
     void* PrepareNotifyHostCounts(std::size_t count);
     std::vector<int32_t> WaitNotifyHostCounts(std::size_t count);
+    uint64_t NpuTimeoutCycles() const { return npu_timeout_cycles_; }
     std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
                                          int64_t workers, int64_t qps);
 
@@ -94,6 +95,9 @@ public:
     }
 
 private:
+    uint64_t npu_timeout_cycles_ = 0;
+    uint32_t notify_host_timeout_seconds_ = 0;
+
     void InitRuntime();
     void AllocateHugePageWorkspace();
     void ReleaseHugePageWorkspace();
