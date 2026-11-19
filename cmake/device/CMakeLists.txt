@@ -80,3 +80,18 @@ set_source_files_properties(
     "${_direct}/kernels/dispatch/dispatch.cpp" "${_direct}/kernels/dispatch/dispatch_udma.cpp"
     "${_direct}/kernels/combine/combine.cpp" "${_direct}/kernels/combine/combine_udma.cpp"
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+
+# PR #1016's installed header selects the metadata ABI. Each final device
+# library must own its module symbol and register it before SHMEM init.
+file(STRINGS "${SHMEM_ROOT}/include/host_device/shmem_common_macros.h"
+    _deepep_dynamic_meta REGEX "^#define ACLSHMEM_DYNAMIC_META 1$")
+if(_deepep_dynamic_meta)
+    unset(SHMEM_DEVICE_LIBRARY CACHE)
+    find_library(SHMEM_DEVICE_LIBRARY NAMES shmem_device
+        PATHS "${SHMEM_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
+    foreach(_device_target deepep_kernels deepep_clos_kernels)
+        target_compile_options(${_device_target} PRIVATE -dc)
+        target_link_options(${_device_target} PRIVATE --npu-arch=dav-3510)
+        target_link_libraries(${_device_target} PRIVATE "${SHMEM_DEVICE_LIBRARY}" shmem)
+    endforeach()
+endif()
