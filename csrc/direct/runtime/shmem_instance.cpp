@@ -27,10 +27,12 @@ namespace {
 constexpr uint64_t kDeviceLargePageBytes = 2ULL * 1024ULL * 1024ULL;
 constexpr uint64_t kDeviceHugePage1gBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr uint32_t kUdmaQpCount = 2;
+constexpr uint64_t kMicrosecondsPerSecond = 1000000;
 aclshmemx_uniqueid_t g_default_flag_uid{};
 std::map<uint32_t, std::string> bootstrap_keys;
 
-uint32_t ReadTimeoutSeconds(const char* name, uint32_t default_seconds)
+uint32_t ReadTimeoutSeconds(const char* name, uint32_t default_seconds,
+                            uint32_t max_seconds = std::numeric_limits<uint32_t>::max())
 {
     const char* value = std::getenv(name);
     if (value == nullptr) return default_seconds;
@@ -38,8 +40,8 @@ uint32_t ReadTimeoutSeconds(const char* name, uint32_t default_seconds)
     uint32_t seconds = 0;
     const char* end = value + std::strlen(value);
     const auto result = std::from_chars(value, end, seconds);
-    TORCH_CHECK(result.ec == std::errc{} && result.ptr == end && seconds > 0,
-                name, " must be a positive integer number of seconds in [1, 4294967295]");
+    TORCH_CHECK(result.ec == std::errc{} && result.ptr == end && seconds > 0 && seconds <= max_seconds, name,
+                " must be a positive integer number of seconds in [1, ", max_seconds, "]");
     return seconds;
 }
 
@@ -49,19 +51,15 @@ void FillInitAttributes(int rank, int world_size, uint64_t local_mem_size, const
     if (attributes == nullptr) {
         throw std::invalid_argument("attributes must not be null");
     }
-    std::memset(attributes, 0, sizeof(*attributes));
-
     const std::size_t ip_len = std::min(ip_port.size(), static_cast<std::size_t>(ACLSHMEM_MAX_IP_PORT_LEN - 1));
     std::copy_n(ip_port.data(), ip_len, attributes->ip_port);
     attributes->ip_port[ip_len] = '\0';
 
-    const int attr_version = (1 << 16) + static_cast<int>(sizeof(aclshmemx_init_attr_t));
-
     attributes->my_pe = rank;
     attributes->n_pes = world_size;
     attributes->local_mem_size = local_mem_size;
-    attributes->option_attr = {attr_version, static_cast<data_op_engine_type_t>(data_op_engine_type), DEFAULT_TIMEOUT,
-                               DEFAULT_TIMEOUT, DEFAULT_TIMEOUT};
+    // Preserve the SDK's layout version so it reads runtime_config.
+    attributes->option_attr.data_op_engine_type = static_cast<data_op_engine_type_t>(data_op_engine_type);
     attributes->comm_args = reinterpret_cast<void*>(&g_default_flag_uid);
 }
 
@@ -274,7 +272,11 @@ void ShmemInstance::Init()
     }
 
     if ((data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0) {
-        npu_timeout_cycles_ = ReadTimeoutSeconds("DEEPEP_NPU_TIMEOUT_SECONDS", ascend_deepep::kDefaultNpuTimeoutSeconds) *
+        constexpr uint32_t kMaxSyncTimeoutSeconds = ACLSHMEM_SYNC_TIMEOUT_MAX_US / kMicrosecondsPerSecond;
+        const uint32_t seconds = ReadTimeoutSeconds("DEEPEP_NPU_TIMEOUT_SECONDS", 0, kMaxSyncTimeoutSeconds);
+        // Zero is the SDK's inherit/default sentinel and is never a device-polling deadline.
+        shmem_sync_timeout_us_ = static_cast<uint32_t>(seconds * kMicrosecondsPerSecond);
+        npu_timeout_cycles_ = (seconds == 0 ? ascend_deepep::kDefaultNpuTimeoutSeconds : seconds) *
                               ascend_deepep::kNpuSystemCyclesPerSecond;
         notify_host_timeout_seconds_ = ReadTimeoutSeconds("DEEPEP_CPU_TIMEOUT_SECONDS", 120);
     }
@@ -482,6 +484,7 @@ void ShmemInstance::InitRuntime()
             init_flags = ACLSHMEMX_INIT_WITH_UNIQUEID;
         }
 
+        attributes.runtime_config.sync_timeout_us = shmem_sync_timeout_us_;
         attributes.instance_id = instance_id_;
         deepep::InstanceEndpoint endpoint(attributes);
         {

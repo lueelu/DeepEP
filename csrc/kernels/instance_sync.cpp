@@ -9,7 +9,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__
     if (wait_handle)
         aclshmemi_handle(ACLSHMEM_TEAM_WORLD);
     else
-        aclshmemx_barrier_all_vec();
+        aclshmemx_sync_vec_all();
 }
 
 extern "C" __attribute__((visibility("default"))) void deepep_instance_sync_do(void* stream, uint32_t instance_id,

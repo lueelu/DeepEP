@@ -49,7 +49,7 @@ __aicore__ inline void Begin(
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
     }
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 }
 
 struct PeerQueue {

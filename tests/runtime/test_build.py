@@ -13,6 +13,52 @@ import zipfile
 import pytest
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_shmem_metadata_identity(build, tmp_path, dynamic):
+    import hashlib
+
+    header = "host_device/shmem_common_macros.h"
+    fixed = b"#define ACLSHMEM_DYNAMIC_META 0\n"
+    enabled = fixed.replace(b"META 0", b"META 1")
+    expected = {
+        "revision": "pinned",
+        "header_sha256_lf": {header: hashlib.sha256(fixed).hexdigest()},
+        "dynamic_header_sha256_lf": {header: hashlib.sha256(enabled).hexdigest()},
+    }
+    files = {"include/" + header: enabled if dynamic else fixed, "lib/libshmem.so": b"runtime"}
+    if dynamic:
+        files.update({"lib/libshmem_device.a": b"archive", "src/host_device/shmem_device_symbol.h": b"anchor"})
+    for relative, data in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    mode = "dynamic" if dynamic else "fixed"
+    identity = {
+        "revision": "pinned",
+        "metadata_mode": mode,
+        "sha256": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()},
+    }
+    manifest = tmp_path / "deepep-sdk.json"
+    manifest.write_text(json.dumps(identity))
+    assert build.validate_shmem_sdk(tmp_path, expected)["metadata_mode"] == mode
+    assert build.shmem_metadata_mode(tmp_path) == mode
+    identity["metadata_mode"] = "fixed" if dynamic else "dynamic"
+    manifest.write_text(json.dumps(identity))
+    with pytest.raises(RuntimeError, match="metadata mode"):
+        build.validate_shmem_sdk(tmp_path, expected)
+    if dynamic:
+        identity["metadata_mode"] = mode
+        identity["sha256"].pop("lib/libshmem_device.a")
+        manifest.write_text(json.dumps(identity))
+        with pytest.raises(RuntimeError, match="device archive"):
+            build.validate_shmem_sdk(tmp_path, expected)
+        identity["sha256"]["lib/libshmem_device.a"] = hashlib.sha256(b"archive").hexdigest()
+        manifest.write_text(json.dumps(identity))
+        (tmp_path / "lib/libshmem_device.a").write_bytes(b"replaced")
+        with pytest.raises(RuntimeError, match="checksum mismatch"):
+            build.validate_shmem_sdk(tmp_path, expected)
+
+
 @pytest.mark.parametrize(
     "old", ["backends/clos/buffer.py", "backends/pod/elastic.py", "_clos_adapter.py", "_card_adapter.py"]
 )

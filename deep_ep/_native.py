@@ -21,6 +21,29 @@ _SHMEM_LIBRARIES = (
 )
 _shmem_lock = RLock()
 _shmem_handles = {}  # Keep successfully loaded objects alive, including after a partial failure.
+_device_handles = {}
+
+
+def _preload_dynamic_device_libraries(directory, info):
+    if info.get("shmem", {}).get("metadata_mode", "fixed") != "dynamic":
+        return
+    import ctypes
+
+    with _shmem_lock:
+        libraries = [directory / name for name in ("libdeepep_kernels.so", "libdeepep_clos_kernels.so")]
+        for path in libraries:
+            if not path.is_file():
+                raise ImportError(f"Missing dynamic SHMEM device library: {path}; rebuild DeepEP")
+        # Load only device libraries, not the other backend's Python module.
+        # Registration must precede the first Buffer/SHMEM initialization.
+        # Keep successful handles even if loading a subsequent library fails.
+        for path in libraries:
+            key = str(path)
+            if key not in _device_handles:
+                try:
+                    _device_handles[key] = ctypes.CDLL(key, mode=ctypes.RTLD_LOCAL)
+                except OSError as exc:
+                    raise ImportError(f"Cannot preload dynamic SHMEM device library {path}: {exc}") from exc
 
 
 def _loaded_shmem_paths():
@@ -116,6 +139,7 @@ def _load_native():
     directory = Path(__file__).resolve().parent
     info = json.loads((directory / "_build_info.json").read_text(encoding="utf-8"))
     bundle = _load_bundled_shmem(directory, info)
+    _preload_dynamic_device_libraries(directory, info)
     try:
         module = importlib.import_module("deep_ep._C")
     except ImportError as exc:

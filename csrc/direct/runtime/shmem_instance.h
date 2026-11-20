@@ -96,6 +96,7 @@ public:
 
 private:
     uint64_t npu_timeout_cycles_ = 0;
+    uint32_t shmem_sync_timeout_us_ = 0;
     uint32_t notify_host_timeout_seconds_ = 0;
 
     void InitRuntime();

@@ -100,7 +100,7 @@ __aicore__ inline void DispatchTokenRemote(
         }
     WaitIncoming<true>(workspace, td, core, cores, workers);
     // Also includes the parallel SIMT metadata writers on every rank.
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 }
 #endif
 } // namespace ascend_deepep::udma

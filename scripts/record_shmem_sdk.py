@@ -11,6 +11,10 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from build_support import shmem_sdk_inputs, validate_shmem_headers, validate_shmem_sdk
 
 
 def record(sdk, revision, *, build_info=None):
@@ -19,12 +23,10 @@ def record(sdk, revision, *, build_info=None):
     expected = lock["shmem"]
     if revision != expected["revision"]:
         raise ValueError("SDK source revision must match dependencies.lock.json")
-    for relative, digest in expected["header_sha256_lf"].items():
-        header = sdk / "include" / relative
-        normalized = header.read_bytes().replace(b"\r\n", b"\n")
-        if hashlib.sha256(normalized).hexdigest() != digest:
-            raise ValueError(f"SDK public header mismatch: {relative}")
-    files = sorted((sdk / "include").rglob("*.h")) + [sdk / "lib/libshmem.so"]
+    metadata_mode = validate_shmem_headers(sdk, expected)
+    if build_info is not None and build_info.get("metadata_mode", metadata_mode) != metadata_mode:
+        raise ValueError("Installed SHMEM metadata mode differs from requested build")
+    files = shmem_sdk_inputs(sdk)
     hashes = {}
     for path in files:
         if not path.resolve().is_relative_to(sdk) or not path.is_file():
@@ -33,7 +35,7 @@ def record(sdk, revision, *, build_info=None):
     manifest = sdk / "deepep-sdk.json"
     if manifest.exists():
         raise FileExistsError("SDK manifest already exists; do not overwrite an existing SDK identity")
-    identity = {"revision": revision, "sha256": hashes}
+    identity = {"revision": revision, "metadata_mode": metadata_mode, "sha256": hashes}
     if build_info is not None:
         identity["build"] = build_info
     manifest.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
@@ -45,23 +47,10 @@ def check(sdk):
     sdk = Path(sdk).resolve()
     lock = json.loads((Path(__file__).resolve().parents[1] / "dependencies.lock.json").read_text())["shmem"]
     manifest = sdk / "deepep-sdk.json"
-    recorded = json.loads(manifest.read_text())
-    if recorded.get("revision") != lock["revision"]:
-        raise ValueError("SDK source revision must match dependencies.lock.json")
-    for relative, expected in lock["header_sha256_lf"].items():
-        data = (sdk / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
-        if hashlib.sha256(data).hexdigest() != expected:
-            raise ValueError(f"SDK public header mismatch: {relative}")
-    hashes = recorded.get("sha256", {})
+    recorded = validate_shmem_sdk(sdk, lock)
     required = {"lib/libshmem.so", *("include/" + name for name in lock["header_sha256_lf"])}
-    if not required.issubset(hashes):
+    if not required.issubset(recorded["sha256"]):
         raise ValueError("SDK manifest must cover the locked headers and libshmem.so")
-    for relative, expected in hashes.items():
-        path = (sdk / relative).resolve()
-        if not path.is_relative_to(sdk) or not path.is_file():
-            raise ValueError(f"Invalid SDK manifest path: {relative}")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            raise ValueError(f"SDK checksum mismatch: {relative}")
     return manifest
 
 
