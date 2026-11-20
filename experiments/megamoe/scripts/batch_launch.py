@@ -47,6 +47,7 @@ def parse_args(argv=None):
     parser.add_argument("--input", choices=("fp8", "bf16"), default="fp8")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--mode", choices=("perf", "accuracy"), default="perf")
+    parser.add_argument("--perf-method", choices=("legacy", "shmem"), default="legacy")
     parser.add_argument("--no-timer", action="store_true", help="Disable timer collection and parsing")
     timer_parse = parser.add_mutually_exclusive_group()
     timer_parse.add_argument(
@@ -98,6 +99,8 @@ def make_plan(args):
         raise ValueError("Master/SHMEM ports must be distinct unprivileged TCP ports")
     if args.timeout <= 0 or (args.parse_timer and args.no_timer):
         raise ValueError("Invalid timeout or --parse-timer with --no-timer")
+    if args.perf_method == "shmem" and args.mode == "accuracy" and args.no_timer:
+        raise ValueError("--perf-method shmem requires perf or timer collection")
     user, auth = os.environ.get("REMOTE_USER", getpass.getuser()), os.environ.get("SSH_AUTH", "key")
     if not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]*", user) or auth not in {"key", "password"}:
         raise ValueError("Invalid REMOTE_USER or SSH_AUTH (key/password)")
@@ -120,6 +123,7 @@ def make_plan(args):
         input=args.input,
         routing=args.routing,
         mode=args.mode,
+        perf_method=args.perf_method,
         timer=not args.no_timer,
         parse_timer=not args.no_timer and args.parse_timer is not False,
         wheel=wheel,

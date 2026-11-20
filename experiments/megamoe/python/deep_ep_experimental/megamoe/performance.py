@@ -6,14 +6,17 @@
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 import csv
-import re
 import math
+import re
 from pathlib import Path
 import statistics
 
 
-# 用于对齐各 rank 测试排队的默认前置计算，不在算子/计时区间内。
+# 整批开始前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
 DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=20)
+PERF_METHODS = ("legacy", "legacy-read", "legacy-zero", "shmem")
+# Match DeepGEMM-Ascend bench_msprof's device delay (system counter ticks).
+SLEEP_CYCLES = 20_000_000
 
 
 def alignment_config(config):
@@ -30,19 +33,45 @@ def flush_l2_before_call():
     flush_l2_cache(True)
 
 
-def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None):
+def enqueue_batch(
+    call,
+    torch,
+    prefix,
+    alignment,
+    iterations,
+    timer=None,
+    *,
+    method="legacy",
+    barrier=None,
+    sleep=None,
+    flush_buffer=None,
+    sum_out=None,
+):
     """No host barriers, synchronize, or D2H between collective launches."""
-    for _ in range(alignment["repeats"]):
-        torch.exp(prefix, out=prefix)
+    if method not in PERF_METHODS:
+        raise ValueError(f"Unknown performance method: {method}")
+    if method == "shmem" and (barrier is None or sleep is None or flush_buffer is None):
+        raise ValueError("shmem method requires a device barrier, sleep and L2 flush buffer")
+    if method.startswith("legacy"):
+        for _ in range(alignment["repeats"]):
+            torch.exp(prefix, out=prefix)
     for iteration in range(iterations):
-        flush_l2_before_call()
+        if method == "legacy-read":
+            torch.sum(flush_buffer, dim=(0,), dtype=torch.int32, out=sum_out)
+        elif method == "legacy-zero":
+            flush_buffer.zero_()
+        elif method == "shmem":
+            flush_buffer.zero_()
+            sleep(SLEEP_CYCLES)
+            barrier()
         # 所有 rank 排入同样次数；只在最后一轮、选中的 rank 上打点。
         call(timer if iteration + 1 == iterations else None)
 
 
-def read_kernel_samples(directory, iterations):
+def read_kernel_samples(directory, iterations, *, require_read_sum=False):
     """Read only this rank/case's fresh profiler export; never subtract device clocks."""
     samples = []
+    read_sequence = []
     paths = sorted(Path(directory).rglob("kernel_details*.csv"))
     for path in paths:
         with path.open(newline="", encoding="utf-8-sig") as stream:
@@ -50,7 +79,9 @@ def read_kernel_samples(directory, iterations):
             for index, row in enumerate(reader):
                 row = {key.strip(): value for key, value in row.items() if key is not None}
                 name = " ".join(row.get(key, "") for key in ("Name", "Type", "Kernel Name"))
-                if "megamoe" not in name.replace("_", "").lower():
+                normalized = name.replace("_", "").lower()
+                is_moe = "megamoe" in normalized
+                if not is_moe and not (require_read_sum and "reducesum" in normalized):
                     continue
                 try:
                     start, duration = (float(row[key]) for key in ("Start Time(us)", "Duration(us)"))
@@ -58,6 +89,10 @@ def read_kernel_samples(directory, iterations):
                     raise ValueError(f"Invalid MegaMoE profiler row {path}:{index + 2}: {row}") from error
                 if not math.isfinite(start) or not math.isfinite(duration) or duration <= 0:
                     raise ValueError(f"Nonfinite/nonpositive MegaMoE timing: {path}:{index + 2}")
+                if require_read_sum:
+                    read_sequence.append((start, start + duration, is_moe, row.get("Device_id")))
+                if not is_moe:
+                    continue
                 samples.append(
                     dict(
                         start_us=start,
@@ -78,6 +113,16 @@ def read_kernel_samples(directory, iterations):
             f"{directory}: expected {iterations} MegaMoE kernels, found {len(samples)} "
             f"in {len(paths)} kernel_details CSV files; inspect the raw profiler export"
         )
+    if require_read_sum:
+        pairs = sorted(read_sequence)
+        if (
+            [entry[2] for entry in pairs] != [False, True] * iterations
+            or len({entry[3] for entry in pairs}) != 1
+            or any(left[1] > right[0] + 1e-6 for left, right in zip(pairs, pairs[1:]))
+        ):
+            raise ValueError(
+                f"{directory}: expected {iterations} alternating serial ReduceSum/MegaMoE pairs on one device"
+            )
     return samples
 
 
@@ -105,6 +150,8 @@ def summarize_rounds(per_rank, ranks_per_node=None):
         median_us=statistics.median(minimum),
         min_us=min(minimum),
         max_us=max(minimum),
+        rank0_mean_us=statistics.mean(per_rank[0]),
+        all_rank_mean_us=statistics.mean(value for row in per_rank for value in row),
         rank_max_mean_us=statistics.mean(maximum),
         rank_min_rounds_us=minimum,
         rank_max_rounds_us=maximum,
@@ -126,7 +173,7 @@ def summarize_rounds(per_rank, ranks_per_node=None):
     return report
 
 
-def collect_profile(call, group, torch, config, prefix, directory, bs):
+def collect_profile(call, group, torch, config, prefix, directory, bs, **batch_options):
     import torch_npu
 
     profiler = torch_npu.profiler
@@ -147,13 +194,15 @@ def collect_profile(call, group, torch, config, prefix, directory, bs):
         with_modules=False,
         experimental_config=experimental,
     ) as prof:
-        # profiler 本身可能初始化很慢，必须在进入后对齐；不能逐轮打断设备队列。
+        # 两种方法都只在整批边界 Host 会合；逐轮同步由 SHMEM 设备任务完成。
         torch.npu.synchronize()
         group.barrier(f"profiler ready BS={bs}")
-        enqueue_batch(call, torch, prefix, config["alignment"], config["iters"])
+        enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], **batch_options)
         torch.npu.synchronize()
         print(f"[PROFILE] BS={bs} batch complete; exporting {directory}", flush=True)
         prof.step()
+    if batch_options.get("method") == "legacy-read":
+        return read_kernel_samples(directory, config["iters"], require_read_sum=True)
     return read_kernel_samples(directory, config["iters"])
 
 

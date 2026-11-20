@@ -29,6 +29,7 @@ class _MegaMoEProfile(NamedTuple):
 
 
 _MEGAMOE_PROFILES = {
+    "ep32": _MegaMoEProfile(1 << 30, False, False, (32,)),
     "mte": _MegaMoEProfile(1 << 30, False, False, None),
     "urma": _MegaMoEProfile(32 << 30, True, True, (4, 8, 16)),
 }
@@ -84,6 +85,7 @@ class Runtime:
 
     _megamoe = False
     _megamoe_backend = "mte"
+    _ranks_per_node = 0
 
     def __init__(
         self,
@@ -176,11 +178,12 @@ class Runtime:
         npu = npu_api()
         self.device = npu.current_device()
         self.group = group
-        self.host_coordinated = self.ll_backend == "rdma"
+        self.use_roce = self._megamoe and self._megamoe_backend == "ep32"
+        self.host_coordinated = self.ll_backend == "rdma" or self.use_roce
         self.coordination_failed = False
         if self.host_coordinated and group is None:
             raise ValueError("NDR requires Host coordination: pass a ProcessGroup or a StoreGroup")
-        if self.host_coordinated and not store_group and backend != "hccl":
+        if self.ll_backend == "rdma" and not store_group and backend != "hccl":
             raise ValueError("NDR requires an HCCL ProcessGroup for Host coordination")
         self.low_latency_comm_args = None
         self.closed = False
@@ -203,6 +206,9 @@ class Runtime:
                             digest(host_id) if host_id else 0,
                             digest(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
                             self.device,
+                            self._ranks_per_node,
+                            {"XSCALE": 1, "HNS_1825": 2}.get(getattr(native, "shmem_rdma_backend", "NONE"), 0)
+                            if getattr(native, "shmem_sdk_matches", False) else 0,
                         ]
                     )
                 local_values.append(
@@ -213,6 +219,8 @@ class Runtime:
                     + 16 * int(debug_collectives)
                     + 32 * int(self.ll_backend == "rdma")
                     + 64 * int(profile is not None and profile.peer_access_check)
+                    + 128 * int(self.use_roce)
+                    + ((int(getattr(native, "megamoe_combine_qps", 0)) << 8) if self.use_roce else 0)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -238,6 +246,8 @@ class Runtime:
                         "debug_collectives or MegaMoE backend profile"
                     )
                 if self._megamoe:
+                    if any(value[7] != values[0][7] for value in values):
+                        raise ValueError("Ranks disagree on ranks_per_node")
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
                         raise RuntimeError(
@@ -258,7 +268,23 @@ class Runtime:
                                 f"{peer_rank} use local device {value[6]} on the same Linux host"
                             )
                         devices[key] = peer_rank
-                if self.host_coordinated:
+                    if self._ranks_per_node == 16:
+                        if size not in (16, 32):
+                            raise ValueError("MegaMoE with ranks_per_node=16 supports EP16 or two-host EP32")
+                        host_ranks = [[i for i, value in enumerate(values) if value[4] == host] for host in hosts]
+                        expected = [list(range(start, start + 16)) for start in range(0, size, 16)]
+                        if sorted(host_ranks) != expected:
+                            raise ValueError("ranks_per_node=16 requires contiguous groups of 16 ranks per Linux host")
+                    if self.use_roce:
+                        backends = {value[8] for value in values}
+                        if 0 not in backends and len(backends) > 1:
+                            raise ValueError("Ranks disagree on SHMEM RDMA backend")
+                        if backends != {2}:
+                            raise RuntimeError(
+                                "MegaMoE cross-host ranks_per_node=16 requires HNS_1825 SHMEM SDK "
+                                "matching the wheel; rebuild SHMEM with --rdma-backend and rebuild the wheel"
+                            )
+                if self.ll_backend == "rdma":
                     topology = [None] * size
                     mapping = tuple(os.environ.get(key, "") for key in (
                         "ASCEND_RT_VISIBLE_DEVICES", "ASCEND_VISIBLE_DEVICES",
@@ -319,17 +345,54 @@ class Runtime:
     def ensure_alive(self):
         if self.closed:
             raise RuntimeError("Buffer runtime has been destroyed")
+        if getattr(self, "roce_failed", False):
+            raise RuntimeError("RoCE runtime synchronization or cleanup failed; restart the distributed job")
         if getattr(self, "coordination_failed", False):
             raise RuntimeError("NDR coordination failed; restart the distributed job")
         if npu_api().current_device() != self.device:
             raise RuntimeError("Use Buffer on its creating NPU device")
+
+    def _roce_collective(self, operation):
+        # MegaMoE senders quiet QP1 before returning. Complete all compute and
+        # communication streams before any rank can release symmetric memory.
+        # The generic SHMEM WORLD barrier directly reads remote GM and cannot
+        # synchronize peers reachable only over RoCE.
+        stage = f"RoCE runtime {operation}"
+        try:
+            error = None
+            try:
+                self.ensure_alive()
+                npu_api().synchronize(self.device)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            packet = [stage, error]
+            if isinstance(self.group, StoreGroup):
+                peers = self.group.all_gather(packet, stage)
+            else:
+                import torch.distributed as dist
+
+                peers = [None] * self.world_size
+                dist.all_gather_object(peers, packet, group=self.group)
+            if any(peer[0] != stage for peer in peers):
+                raise RuntimeError(f"RoCE runtime collective order mismatch: {peers}")
+            errors = [(rank, peer[1]) for rank, peer in enumerate(peers) if peer[1] is not None]
+            if errors:
+                raise RuntimeError(f"{stage}: device synchronization failed on ranks {errors}")
+            getattr(self.native, operation)(host_coordinated=True)
+        except Exception as exc:
+            self.roce_failed = True
+            if isinstance(self.group, StoreGroup):
+                self.group.abort(exc)
+            raise
 
     def close(self):
         global _OWNER
         with getattr(self, "notify_lock", nullcontext()), _LOCK:
             if self.closed:
                 return
-            if getattr(self, "host_coordinated", False):
+            if getattr(self, "use_roce", False):
+                self._roce_collective("close")
+            elif getattr(self, "host_coordinated", False):
                 self._host_collective("close")
             else:
                 self.ensure_alive()
@@ -341,6 +404,10 @@ class Runtime:
             _OWNER = None
 
     def barrier(self):
+        if getattr(self, "use_roce", False):
+            with self.notify_lock:
+                self._roce_collective("barrier")
+            return
         if getattr(self, "host_coordinated", False):
             with self.notify_lock:
                 self._host_collective("barrier")

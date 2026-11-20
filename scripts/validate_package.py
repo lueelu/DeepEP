@@ -75,11 +75,15 @@ def inspect_wheel(path):
                 "deep_ep_experimental/megamoe/configs/smoke.json",
                 "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
                 "deep_ep_experimental/megamoe/libmegamoe_urma_kernel.so",
+                "deep_ep_experimental/megamoe/libmegamoe_ep32_kernel.so",
+                "deep_ep_experimental/megamoe/weights.py",
+                "deep_ep_experimental/megamoe/_platform_api.py",
             }
             extensions = [
                 n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_C.") and n.endswith(".so")
             ]
-            if len(extensions) != 1 or not required.issubset(names):
+            ep32_extensions = [n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_ep32_C.") and n.endswith(".so")]
+            if len(extensions) != 1 or len(ep32_extensions) != 1 or not required.issubset(names):
                 raise RuntimeError("Incomplete MegaMoE Beta wheel")
             if not any(name.endswith("cann.LICENSE") for name in names):
                 raise RuntimeError("Missing CANN license for MegaMoE")

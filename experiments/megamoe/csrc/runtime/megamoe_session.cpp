@@ -3,6 +3,7 @@
 
 #include "runtime/megamoe_session.hpp"
 
+#include "common/megamoe_combine_config.hpp"
 #include <cstdlib>
 #include <stdexcept>
 
@@ -16,7 +17,8 @@ SessionOptions options_for(const std::string& backend)
 {
     SessionOptions options;
     options.megamoe = true;
-    if (backend == "mte") {
+    if (backend == "mte" || backend == "ep32") {
+        if (backend == "ep32") options.roce_qps = 1U + megamoe_config::COMBINE_QPS;
         options.maximum_bytes = 1ULL << 30;
         return options;
     }

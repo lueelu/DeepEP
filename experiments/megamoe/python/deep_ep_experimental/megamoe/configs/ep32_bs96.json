@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "model": {
+    "hidden": 5120,
+    "intermediate_hidden": 2304,
+    "num_experts": 416,
+    "num_topk": 6,
+    "num_shared_experts": 1
+  },
+  "bs_values": [
+    96
+  ],
+  "warmup": 20,
+  "iters": 30,
+  "seed": 20261029,
+  "activation_clamp": 10,
+  "shared_dtype": "fp8",
+  "weight_mode": "list"
+}

@@ -97,3 +97,43 @@ target_link_options(megamoe_ext PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 install(TARGETS megamoe_ext LIBRARY DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${urma_kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
+
+# Hierarchical EP32 has a separate tiling and plan ABI.
+set(ep32_include "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
+set(ep32_flags ${kernel_flags})
+list(REMOVE_ITEM ep32_flags -Wl,-soname,libmegamoe_kernel.so)
+list(PREPEND ep32_flags "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
+list(APPEND ep32_flags -Wl,-Bsymbolic-functions -Wl,-soname,libmegamoe_ep32_kernel.so -DDEEPEP_MEGAMOE_ROCE=1
+    -DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1 "-DACLSHMEMI_HNS_1825_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP}")
+set(ep32_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_ep32_kernel.so")
+file(GLOB_RECURSE ep32_headers CONFIGURE_DEPENDS "csrc_ep32/kernels/*.hpp")
+add_custom_command(OUTPUT "${ep32_library}"
+    COMMAND "${BISHENG}" ${ep32_flags} csrc_ep32/kernels/mega_moe/mega_moe.cpp
+        "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
+        -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
+        -o "${ep32_library}"
+    DEPENDS csrc_ep32/kernels/mega_moe/mega_moe.cpp csrc_ep32/kernel_launch.hpp ${ep32_headers}
+        "${PROJECT_SOURCE_DIR}/csrc/common/megamoe_combine_config.hpp"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
+add_custom_target(megamoe_ep32_device DEPENDS "${ep32_library}")
+pybind11_add_module(megamoe_ep32_ext csrc_ep32/bindings.cpp csrc_ep32/forward.cpp)
+set_target_properties(megamoe_ep32_ext PROPERTIES OUTPUT_NAME _ep32_C
+    INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
+target_include_directories(megamoe_ep32_ext PRIVATE ${ep32_include} ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include"
+    "${PROJECT_SOURCE_DIR}/csrc")
+target_compile_options(megamoe_ep32_ext PRIVATE ${torch_flags} -O2 -fstack-protector-strong)
+target_compile_definitions(megamoe_ep32_ext PRIVATE CATLASS_ARCH=3510 DEEPEP_MEGAMOE_ROCE=1
+    ACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1 ACLSHMEMI_HNS_1825_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP})
+if(DEEPEP_MEGAMOE_TIMER)
+    target_compile_definitions(megamoe_ep32_ext PRIVATE DEEPEP_MEGAMOE_TIMER=1)
+endif()
+add_library(megamoe_ep32_kernel SHARED IMPORTED)
+set_target_properties(megamoe_ep32_kernel PROPERTIES IMPORTED_LOCATION "${ep32_library}")
+add_dependencies(megamoe_ep32_ext megamoe_ep32_device)
+target_link_libraries(megamoe_ep32_ext PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIBRARY}"
+    "${TORCH_NPU_LIBRARY}" megamoe_ep32_kernel shmem ascendcl)
+target_link_directories(megamoe_ep32_ext PRIVATE "${ASCEND_HOME_PATH}/lib64")
+target_link_libraries(megamoe_ep32_ext PRIVATE platform tiling_api)
+target_link_options(megamoe_ep32_ext PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
+install(TARGETS megamoe_ep32_ext LIBRARY DESTINATION ../deep_ep_experimental/megamoe)
+install(FILES "${ep32_library}" DESTINATION ../deep_ep_experimental/megamoe)

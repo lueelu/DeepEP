@@ -73,6 +73,20 @@ def test_master_override_and_default(configuration):
         launcher.select_hosts({"hosts": hosts}, 32, "192.0.2.99")
 
 
+@pytest.mark.parametrize("method", ["legacy", "shmem"])
+def test_perf_method_survives_plan_and_remote_command(configuration, tmp_path, monkeypatch, method):
+    # Use host-native absolute paths so this command-only test also runs on Windows.
+    monkeypatch.setenv("CONDA_BASE", str(tmp_path))
+    monkeypatch.setenv("ASCEND_ENV", str(tmp_path / "set_env.sh"))
+    plan = launcher.make_plan(launcher.parse_args([*configuration, "--perf-method", method]))
+    assert plan["perf_method"] == method
+    spec = importlib.util.spec_from_file_location("batch_node_perf_test", SCRIPTS / "batch_node.py")
+    node = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(node)
+    command = node.benchmark_command(plan, tmp_path, 0, 32)
+    assert command[command.index("--perf-method") + 1] == method
+
+
 @pytest.mark.parametrize("entry", ["build.py", "batch_node.py", "batch_launch.py"])
 def test_relocated_entrypoints_work_in_isolated_python(entry):
     result = subprocess.run([sys.executable, "-I", str(SCRIPTS / entry), "--help"], capture_output=True, text=True)

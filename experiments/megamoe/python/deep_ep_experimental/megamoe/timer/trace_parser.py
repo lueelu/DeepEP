@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from statistics import median
 
-from .protocol import CYCLE_TO_US
+from .protocol import COMBINE_PROGRESS_FIXED_NAMES, CYCLE_TO_US, STARTUP_FIXED_NAMES
 
 SYNC_ANCHOR_EVENT = "AIV_INPUT_CROSS_RANK_SYNC"
 
@@ -78,10 +78,17 @@ def apply_input_sync_mode(events, mode):
     return result
 
 
+RELAY_WAITS = {"packet_wait", "route_complete", "source_wait", "table_wait", "dispatch_backoff"}
+
+
 def apply_wait_mode(events, include_wait):
     if include_wait:
         return events
-    return [event for event in events if "WAIT" not in event["name"]]
+    return [
+        event
+        for event in events
+        if "WAIT" not in event["name"] and event.get("task", {}).get("relay_step") not in RELAY_WAITS
+    ]
 
 
 def raw_events_for_rank(path: Path, rank: int):
@@ -173,7 +180,12 @@ def trace_events(
     for event in selected:
         task = event.get("task", {})
         granularity = task.get("granularity")
+        family = event_family(event["name"])
         display_name = event["name"]
+        lane = f"group_{event['group_id']}_{event['core_type']}_{event['sub_id']}"
+        category = (
+            "dependency_wait" if "WAIT" in event["name"] else ("aic_op" if event["core_type"] == "AIC" else "aiv_op")
+        )
         wave_metadata = {}
         if "wave_id" in event:
             wave_id = event["wave_id"]
@@ -188,14 +200,79 @@ def trace_events(
                 "raw_event_name": event["name"],
                 "display_index_semantics": "per_core_per_family_per_wave_task_or_interval",
             }
+        if granularity == "rdma":
+            family = event_family(event["name"])
+            display_name = f"{family}_{task['phase']}_{task['kind']}_peer{task['peer_rank']}_{task['bytes']}B"
+            # Progress can run inside a compute tile. Use its own lane to avoid
+            # overlapping X events on the compute track; clocks stay unchanged.
+            if task.get("qp"):
+                display_name += f"_qp{task['qp']}"
+            lane += "/RDMA"
+            category = "rdma_wait" if "WAIT" in family else "rdma_post"
+            wave_metadata["display_index_semantics"] = "per_core_rdma_operation"
+        if family in STARTUP_FIXED_NAMES or granularity == "startup_dependency":
+            lane += "/STARTUP"
+            category = "startup_wait" if "WAIT" in family else "startup"
+            display_name = family
+            if granularity == "startup_dependency" and "source_rank" in task:
+                display_name += f"_source{task['source_rank']}_gateway{task['gateway_rank']}_seq{task['sequence']}"
+            wave_metadata["display_index_semantics"] = "per_core_startup_phase_or_dependency"
+        if granularity == "relay_step":
+            lane += "/RELAY"
+            category = "relay_wait" if task["relay_step"] in RELAY_WAITS else "relay"
+            display_name = f"RELAY_{task['relay_step']}"
+            if "source_rank" in task:
+                display_name += f"_source{task['source_rank']}"
+            if "first_expert" in task:
+                display_name += f"_experts{task['first_expert']}+{task['expert_count']}"
+            if "source_host" in task:
+                display_name += f"_host{task['source_host']}"
+            if "source_ranks" in task:
+                display_name += (
+                    f"_rank{task['consumer_rank']}_{len(task['source_ranks'])}sources_{task['row_count']}rows"
+                )
+            elif "consumer_rank" in task:
+                display_name += f"_rank{task['consumer_rank']}_rows{task['row_start']}+{task['row_count']}"
+            wave_metadata["display_index_semantics"] = "per_core_relay_step"
+        if granularity == "combine_run":
+            lane += "/COMBINE_RUN"
+            category = "combine_run"
+            display_name = (
+                f"COMBINE_{task['decision']}_rows{task['run_start']}+{task['run_rows']}_{task['stop_reason']}"
+            )
+            wave_metadata["display_index_semantics"] = "per_core_combine_run"
+        if granularity == "combine_async":
+            # Lifetime includes delayed software retirement; it is not exact
+            # hardware DMA duration. Separate slots make overlap readable.
+            phase = {"row_lifetime": "ASYNC", "issue": "ISSUE", "reuse_wait": "REUSE_WAIT"}[task["scope"]]
+            lane += f"/COMBINE_{phase}"
+            if phase == "ASYNC" and "buffer_slot" in task:
+                lane += f"/slot{task['buffer_slot']}"
+            category = f"combine_{task['scope']}"
+            display_name = f"COMBINE_{phase}_expert{task['expert_id']}_row{task['row_start']}"
+        if granularity == "combine_ready":
+            lane += "/COMBINE_READY"
+            category = "combine_ready_snapshot"
+            display_name = f"COMBINE_READY_qp{task['qp_index']}_token{task['token_index']}"
+        if granularity == "combine_sync":
+            lane += "/COMBINE_SYNC"
+            category = "combine_sync_marker"
+            display_name = f"COMBINE_SYNC_qp{task['qp_index']}_{task['sync_phase']}"
+        if family in COMBINE_PROGRESS_FIXED_NAMES or granularity in ("combine_progress", "combine_drain"):
+            lane += "/COMBINE_PROGRESS"
+            category = "combine_wait" if "WAIT" in family else "combine_progress"
+            if family in COMBINE_PROGRESS_FIXED_NAMES:
+                display_name = family
+            # Progress encloses scan/control and RDMA posts; Drain encloses
+            # child progress calls and backoff. Initialization is independent.
+            # Parent elapsed time is not additive with its child intervals.
+            wave_metadata["display_index_semantics"] = "per_core_combine_phase_or_call"
         result.append(
             {
                 "ph": "X",
-                "cat": "dependency_wait"
-                if "WAIT" in event["name"]
-                else ("aic_op" if event["core_type"] == "AIC" else "aiv_op"),
+                "cat": category,
                 "pid": f"rank{event['rank']}",
-                "tid": (f"group_{event['group_id']}_{event['core_type']}_{event['sub_id']}"),
+                "tid": lane,
                 "name": display_name,
                 "ts": round((event["start_cycle"] - base_cycle) / CYCLE_TO_US, 6),
                 "dur": round(
@@ -224,6 +301,200 @@ def trace_events(
 def event_family(name: str) -> str:
     name = re.sub(r"^wave_(?:\d+|global)_", "", name)
     return re.sub(r"_\d+$", "", name)
+
+
+def write_startup_breakdown(raw_by_rank, path: Path):
+    """Retain WAIT and parent envelopes; overlapping rows must not be summed."""
+    detail_fields = [
+        "initial_missing_mask",
+        "initial_missing_lanes",
+        "poll_rounds",
+        "lane_count",
+        "relay_step",
+        "source_host",
+        "consumer_rank",
+        "source_ranks",
+        "row_start",
+        "row_count",
+        "items",
+        "bytes",
+        "packets",
+        "first_expert",
+        "expert_count",
+        "snapshot_attempts",
+        "snapshot_retries",
+        "snapshot_bytes",
+        "snapshot_dma_us",
+        "snapshot_check_us",
+        "snapshot_backoff_us",
+        "successful_snapshot_dma_us",
+        "successful_snapshot_check_us",
+        "diagnostic_us",
+        "last_failed_stale_words",
+        "failed_snapshot_available",
+        "last_failed_sources",
+        "last_failed_source_rank",
+        "last_failed_local_expert_id",
+        "last_failed_observed_epoch",
+        "expected_epoch",
+        "source_mask_overflow",
+    ]
+    fields = [
+        "rank",
+        "group_id",
+        "core_type",
+        "sub_id",
+        "event_family",
+        "scope",
+        "start_us",
+        "duration_us",
+        "source_rank",
+        "gateway_rank",
+        "sequence",
+    ] + detail_fields
+    parents = {"AIC_MOE_STARTUP", "AIV_MOE_STARTUP", "AIV_COUNT_TABLE_PREPARE", "AIV_GATEWAY_PAYLOAD_CHECK"}
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for rank, events in sorted(raw_by_rank.items()):
+            base = first_start_cycle(events)
+            for event in sorted(events, key=lambda e: (e["group_id"], e["core_type"], e["sub_id"], e["start_cycle"])):
+                family = event_family(event["name"])
+                if family not in STARTUP_FIXED_NAMES and family not in (
+                    "AIC_WAIT_INPUT_PREP",
+                    "AIV_GATEWAY_PAYLOAD_WAIT",
+                    "AIV_PAYLOAD_ALL_LANES_WAIT",
+                    "AIV_RELAY_STEP",
+                ):
+                    continue
+                task = event.get("task", {})
+                writer.writerow(
+                    dict(
+                        rank=rank,
+                        group_id=event["group_id"],
+                        core_type=event["core_type"],
+                        sub_id=event["sub_id"],
+                        event_family=family,
+                        scope="envelope"
+                        if family in parents or task.get("relay_step") in {"local_route", "dispatch_retry", "mesh_copy"}
+                        else "phase",
+                        start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
+                        duration_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
+                        **{key: task.get(key, "") for key in ("source_rank", "gateway_rank", "sequence")},
+                        **{
+                            key: json.dumps(task[key]) if isinstance(task.get(key), list) else task.get(key, "")
+                            for key in detail_fields
+                        },
+                    )
+                )
+
+
+def write_combine_progress_breakdown(raw_by_rank, path: Path):
+    """Keep waits and envelopes; elapsed, child RDMA and scan times are not additive."""
+    phases = {
+        "AIV_COMBINE_INIT": "init",
+        "AIV_HOST_COMBINE_BARRIER_WAIT": "host_barrier_wait",
+        "AIV_COMBINE_PROGRESS": "progress",
+        "AIV_COMBINE_DRAIN": "drain",
+        "AIV_COMBINE_RUN": "run",
+        "AIV_COMBINE_REDUCE": "reduce",
+        "AIV_COMBINE_ASYNC": "async_row_lifetime",
+        "AIV_COMBINE_READY": "ready_snapshot",
+        "AIV_COMBINE_SYNC": "sync_marker",
+    }
+    fields = [
+        "rank",
+        "group_id",
+        "core_type",
+        "sub_id",
+        "wave_id",
+        "event_family",
+        "phase",
+        "scope",
+        "start_us",
+        "elapsed_us",
+        "scan_control_cycles",
+        "scan_control_us",
+        "pending_before",
+        "pending_after",
+        "posts",
+        "scanned_rows",
+        "run_start",
+        "run_rows",
+        "decision",
+        "stop_reason",
+        "next_pending",
+        "already_deferred",
+        "qp_index",
+        "token_index",
+        "pending_topk_mask",
+        "observed_ready_mask",
+        "token_ready",
+        "sync_phase",
+        "pending_rows",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for rank, events in sorted(raw_by_rank.items()):
+            base = first_start_cycle(events)
+            for event in sorted(events, key=lambda e: (e["group_id"], e["core_type"], e["sub_id"], e["start_cycle"])):
+                family = event_family(event["name"])
+                if family not in phases:
+                    continue
+                task = event.get("task", {})
+                metrics = {}
+                for key in (
+                    "qp_index",
+                    "token_index",
+                    "pending_topk_mask",
+                    "observed_ready_mask",
+                    "token_ready",
+                    "sync_phase",
+                    "pending_rows",
+                ):
+                    if key in task:
+                        metrics[key] = task[key]
+                if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN"):
+                    metrics.update({key: task.get(key, "") for key in ("pending_before", "pending_after")})
+                if family == "AIV_COMBINE_PROGRESS":
+                    metrics.update(
+                        {
+                            key: task.get(key, "")
+                            for key in ("scan_control_cycles", "scan_control_us", "posts", "scanned_rows")
+                        }
+                    )
+                if family == "AIV_COMBINE_RUN":
+                    metrics.update(
+                        {
+                            key: task.get(key, "")
+                            for key in (
+                                "run_start",
+                                "run_rows",
+                                "decision",
+                                "stop_reason",
+                                "next_pending",
+                                "already_deferred",
+                            )
+                        }
+                    )
+                writer.writerow(
+                    dict(
+                        rank=rank,
+                        group_id=event["group_id"],
+                        core_type=event["core_type"],
+                        sub_id=event["sub_id"],
+                        wave_id=event.get("wave_id", ""),
+                        event_family=family,
+                        phase=phases[family],
+                        scope=task.get(
+                            "scope", "envelope" if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN") else "phase"
+                        ),
+                        start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
+                        elapsed_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
+                        **metrics,
+                    )
+                )
 
 
 def write_summary(events, path: Path) -> None:
@@ -342,6 +613,8 @@ def main():
     )
     summary_output = args.output_dir / "timer_summary.csv"
     write_summary(merged_raw, summary_output)
+    write_startup_breakdown(raw_by_rank, args.output_dir / "startup_breakdown.csv")
+    write_combine_progress_breakdown(raw_by_rank, args.output_dir / "combine_progress_breakdown.csv")
     print(f"[TIMER] merged {len(merged_trace)} events -> {merged_output}")
     print(f"[TIMER] summary -> {summary_output}")
 

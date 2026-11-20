@@ -122,6 +122,8 @@ bash experiments/megamoe/scripts/build.sh
 
 脚本准备依赖并构建、安装启用 MegaMoE 和 timer 的 wheel，日常重编复用已校验的 SHMEM。直接使用 `pip wheel` 时默认不构建 MegaMoE。多机配置和验证步骤见 [MegaMoE 使用说明](experiments/megamoe/README.md)；设备编译、精度与性能仍待验收。
 
+双机 EP32（每机 16 卡）的 W4A8 Decode 通过 `ranks_per_node=16` 选择机内 MTE 和跨机 HNS_1825 RoCE，支持每卡实际 BS 1～256、逐专家权重列表和共享对称内存的多配置视图。构建前设置 `CATLASS_ROOT`，设备精度与性能需在目标服务器验证。
+
 ## 接口与示例
 
 ---

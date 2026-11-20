@@ -51,6 +51,7 @@ Thumbs.db
 .vscode/
 
 # User-owned MegaMoE deployment configuration
+/.megamoe-bs32/
 /experiments/megamoe/hosts*.json
 /experiments/megamoe/clusters*.json
 /.test-deps/

@@ -174,18 +174,144 @@ def test_balanced_routes_require_valid_ep_and_rank(world, rank):
         inputs(config, rank, 96, world=world)
 
 
-def test_early_weight_clamp_order_and_zero_negative_routes():
-    rng = np.random.default_rng(41)
-    x = rng.normal(size=(4, 64)).astype(np.float32)
-    w1 = rng.normal(size=(128, 64)).astype(np.float32)
-    w2 = rng.normal(size=(64, 64)).astype(np.float32)
-    weights = np.array([0, -0.37, 0.21, 1], np.float32)
-    gate, up = np.split(bf16(x @ w1.T), 2, axis=-1)
-    gate, up = np.minimum(gate, 0.25), np.clip(up, -0.25, 0.25)
-    activated = bf16((gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up) * weights[:, None])
-    expected = bf16(dequantize_input(*quantize_input(activated)) @ w2.T)
-    early = expert_forward(x, w1, w2, 0.25, weights)
-    np.testing.assert_array_equal(early, expected)
-    np.testing.assert_array_equal(early[0], 0)
-    late = expert_forward(x, w1, w2, 0.25) * weights[:, None]
-    assert error_metrics(early, late)["relative_rmse"] > 1e-3
+def test_mixed_shared_fp8_uses_the_same_logical_values_and_scales():
+    from deep_ep_experimental.megamoe.reference import FP4, fp4_to_fp8, fp8_decode
+
+    packed = np.arange(256, dtype=np.uint8)
+    values = fp8_decode(fp4_to_fp8(packed))
+    np.testing.assert_array_equal(values[::2], FP4[packed & 15])
+    np.testing.assert_array_equal(values[1::2], FP4[packed >> 4])
+
+
+@pytest.mark.parametrize("limit", [None, 0, 2, 5, 10])
+def test_activation_clamp_applies_asymmetrically_before_swiglu(limit):
+    from deep_ep_experimental.megamoe.reference import bf16, dequantize_input, expert_forward, quantize_input
+
+    x = np.eye(32, dtype=np.float32)
+    gate = np.resize(np.array([-12, -4, 4, 12], np.float32), (32, 32))
+    up = np.resize(np.array([-15, 9, -6, 20], np.float32), (32, 32))
+    w1 = np.concatenate((gate, up), axis=1).T
+    w2 = np.eye(32, dtype=np.float32)
+    g = gate if limit is None else np.minimum(gate, limit)
+    u = up if limit is None else np.clip(up, -limit, limit)
+    golden = bf16(dequantize_input(*quantize_input(bf16(u * (g / (1 + np.exp(-g)))))))
+    np.testing.assert_array_equal(expert_forward(x, w1, w2, limit), golden)
+
+
+@pytest.mark.parametrize("bf16", [False, True])
+def test_eplb_replay_driver_rebinds_slots_and_alternates_views(monkeypatch, bf16):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from deep_ep_experimental.megamoe import api, benchmark, validation, weights
+
+    torch = pytest.importorskip("torch")
+    recording = []
+    replays = []
+
+    class Graph:
+        def replay(self):
+            replays.append(self.view)
+            self.run()
+
+    @contextmanager
+    def capture(graph):
+        recording.append(graph)
+        yield
+        recording.pop()
+
+    class Owner:
+        def __init__(self, slots, prepared=False):
+            self.count = len(slots)
+            self.tables = {f: torch.empty((4, self.count), dtype=torch.int64) for f in (False, True)}
+            self.l1 = self.l2 = SimpleNamespace(owner=self)
+            values = [int(pair[0]) for pair in slots] if prepared else slots
+            self.bind(values)
+
+        def bind(self, values):
+            def projection():
+                return tuple([torch.tensor(v) for v in values] for _ in range(2))
+
+            self.planar, self.fused, self.second = (projection() for _ in range(3))
+            for f, table in self.tables.items():
+                first = self.fused if f else self.planar
+                table.copy_(
+                    torch.tensor(
+                        [
+                            [t.data_ptr() for t in group]
+                            for group in (first[0], self.second[0], first[1], self.second[1])
+                        ]
+                    )
+                )
+
+        def select(self, fused):
+            return None, None, self.tables[fused]
+
+        def expert_views(self, *, layout):
+            return self.fused if layout == "fused" else self.planar, self.second
+
+        def update_experts(self, indices, l1, l2, *, replace, input_layout="nd", planar_l1=None):
+            assert list(indices) == list(range(self.count)) and replace
+            if input_layout == "prepared":
+                assert planar_l1 is not None
+                self.bind([int(t) for t in l1[0]])
+            else:
+                assert l1 == l2 == [20, 30, 10]
+                self.bind(l1)
+
+        def refresh_gmm1(self, slots, *, source_layout):
+            assert slots == list(range(self.count)) and source_layout == "planar"
+            for destinations, sources in zip(self.fused, self.planar):
+                for dst, src in zip(destinations, sources):
+                    dst.copy_(src)
+
+        def release_retired(self):
+            pass
+
+    owner = Owner([10, 20, 30])
+
+    def launch(y, l1, l2, view, *, x, cumulative_local_expert_recv_stats, **kwargs):
+        def run():
+            ids = view.topk_idx.long()
+            values = torch.stack(l1.owner.fused[0])[ids]
+            y.copy_((x if bf16 else view.x) + (values * view.topk_weights).sum(-1, keepdim=True))
+            cumulative_local_expert_recv_stats.add_(torch.bincount(ids.flatten(), minlength=3))
+
+        if recording:
+            recording[-1].run = run
+            recording[-1].view = view._view_id
+        else:
+            run()
+
+    def check(group, stage, error):
+        assert error is None, stage
+
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(graph=capture, NPUGraph=Graph, synchronize=lambda: None), raising=False
+    )
+    monkeypatch.setattr(api, "fp8_fp4_mega_moe", launch)
+    monkeypatch.setattr(weights, "prepare_weights_for_mega_moe", lambda l1, l2, **kw: Owner(l1, prepared=True))
+    monkeypatch.setattr(validation, "collective_check", check)
+
+    def view(n, index):
+        return SimpleNamespace(
+            _view_id=index,
+            x=torch.ones(n, 4),
+            x_sf=torch.ones(n, 1),
+            topk_idx=torch.zeros(n, 2, dtype=torch.int32),
+            topk_weights=torch.ones(n, 2),
+        )
+
+    target, draft = view(8, 0), view(4, 1)
+    act = target.x.clone() if bf16 else None
+    y, stats = torch.zeros_like(target.x), torch.zeros(3, dtype=torch.int32)
+    graph = Graph()
+    with capture(graph):
+        launch(y, owner.l1, owner.l2, target, x=act, cumulative_local_expert_recv_stats=stats)
+    config = dict(seed=42, model=dict(num_experts=3, num_topk=2, hidden=4))
+    benchmark._check_eplb_replays(
+        None, config, 0, 1, target, draft, (owner.l1, owner.l2), act, {}, (graph, y, stats), [[10, 20, 30]] * 2
+    )
+    assert replays == [0, 1] * 4 and [int(t) for t in owner.fused[0]] == [10, 20, 30]
+    for obj, n, pattern in ((target, 8, "balanced"), (draft, 4, "skewed")):
+        ids = benchmark.inputs(config, 0, n, pattern, world=1)[1]
+        np.testing.assert_array_equal(obj.topk_idx.numpy(), (ids - 1) % 3)

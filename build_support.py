@@ -178,6 +178,19 @@ def checked_run(argv, **kwargs):
     subprocess.run([str(arg) for arg in argv], check=True, timeout=1800, **kwargs)
 
 
+def shmem_rdma_backend(sdk):
+    """Use the SDK provider's build identity, never infer the NIC from card count."""
+    build = sdk.get("build", {})
+    if not isinstance(build, dict) or build.get("rdma_backend", "NONE") not in ("NONE", "XSCALE", "HNS_1825"):
+        raise RuntimeError("SHMEM SDK rdma_backend must be NONE, XSCALE or HNS_1825")
+    if build.get("rdma_backend") == "HNS_1825":
+        mode = build.get("hns_1825_pi_on_chip")
+        if type(mode) is not int or mode not in (0, 1):
+            raise RuntimeError("HNS_1825 SDK must record hns_1825_pi_on_chip as integer 0 or 1")
+    return build.get("rdma_backend", "NONE")
+
+
+
 def validate_shmem_sdk(root, expected):
     manifest = Path(root) / "deepep-sdk.json"
     if not manifest.is_file():
@@ -197,6 +210,7 @@ def validate_shmem_sdk(root, expected):
             raise RuntimeError(f"SHMEM SDK checksum mismatch: {relative}")
     if "lib/libshmem.so" not in sdk["sha256"] or not any(key.startswith("include/") for key in sdk["sha256"]):
         raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
+    shmem_rdma_backend(sdk)
     return sdk
 
 
@@ -280,6 +294,7 @@ def build_configuration(environment=None):
             raise RuntimeError("SHMEM SDK has no deepep-sdk.json")
         sdk = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(sdk, dict):
+            sdk = {}
             raise ValueError("Invalid SHMEM SDK manifest")
         if sdk.get("revision") != lock["shmem"]["revision"]:
             raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
@@ -311,6 +326,7 @@ def build_configuration(environment=None):
     files.append(library)
     # Record actual inputs so replacing an unpinned SDK invalidates the build cache.
     result["shmem"] = {
+        "rdma_backend": shmem_rdma_backend(sdk),
         "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
         # The validated SDK identity travels with the installed wheel so a
         # one-click run can reject a wheel built against another SDK revision.
@@ -527,6 +543,7 @@ class CMakeBuild(build_ext):
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
+            f"-DDEEPEP_HOST_PROCESSOR={configuration.get('machine', platform.machine())}",
             f"-DASCEND_HOME_PATH={configuration['ASCEND_HOME_PATH']}",
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
