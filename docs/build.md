@@ -9,6 +9,26 @@ wheel 包含 Host 运行时、Notify 及 HT/LL dispatch/combine kernel。输入�
 MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说明。
 包名为 `ascend-deepep`，导入名仍为 `deep_ep`；不要与其他提供 `deep_ep` 的包装在同一环境。
 
+## 可选动态 SHMEM metadata
+
+默认仍使用固定 metadata 地址。需要动态地址时，先构建锁定的 SHMEM：
+
+```bash
+git submodule update --init --recursive
+python scripts/build_shmem.py --enable-device-symbol
+```
+
+已有 SDK 要切换模式时，停止使用该 SDK 的进程后加 `--rebuild`，然后重新构建并安装
+DeepEP wheel。切回固定模式时不传 `--enable-device-symbol`。模式参与 SDK 身份和构建缓存，
+不能只替换 `libshmem.so`。使用外部动态 SDK 时，先用 `scripts/record_shmem_sdk.py`
+登记与锁定提交一致的安装包；动态模式要求同包的 `libshmem_device.a` 和设备头文件。
+
+DeepEP 根据安装头文件自动选择编译方式，不需要额外定义 `ACLSHMEM_DYNAMIC_META`。
+动态模式会在首次原生后端使用时、创建 Buffer 前加载两个主要 kernel 库，并保持模块驻留；
+普通 `import deep_ep` 仍不加载驱动或设备库。应用中的其他 SHMEM 算子也必须在第一次
+SHMEM 初始化前加载，且使用同模式的 SDK 编译。运行时须提供 `aclrtGetSymbolAddress`，
+同时满足本仓 CANN/芯片要求。此次接入范围不包含可选 MegaMoE。
+
 ## 前置条件
 
 - Linux、Python ≥3.11、C++17 编译器、CMake ≥3.20，以及 Make 或 Ninja；构建工具须在 PATH 中。
