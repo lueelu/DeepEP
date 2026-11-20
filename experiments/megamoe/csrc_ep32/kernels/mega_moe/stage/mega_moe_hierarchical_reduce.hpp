@@ -199,7 +199,7 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
     if constexpr (g_coreType == AIC) {
         return false;
     }
-    if (!UseHierarchicalCombineReduction(params.tilingData) || lane >= HIERARCHICAL_COMBINE_QPS || maxPosts == 0U) {
+    if (!UseHierarchicalCombineReduction(params.tilingData) || lane >= HierarchicalCombineOwnerCount(params.tilingData) || maxPosts == 0U) {
         return false;
     }
     InitializeHierarchicalReducedCombine(common, params, progress, lane, timer);

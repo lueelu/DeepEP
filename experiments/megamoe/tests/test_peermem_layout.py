@@ -9,8 +9,8 @@ import subprocess
 import pytest
 
 
-@pytest.fixture(scope="module")
-def production_layout_binary(tmp_path_factory):
+@pytest.fixture(scope="module", params=[False, True], ids=["baseline", "bf16-bs96"])
+def production_layout_binary(tmp_path_factory, request):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("Production layout compilation requires g++ or clang++")
@@ -21,6 +21,8 @@ def production_layout_binary(tmp_path_factory):
         [
             compiler,
             "-std=c++17",
+            *(["-DDEEPEP_MEGAMOE_BF16_BS96=1"] if request.param else []),
+            "-DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1",
             "-Wall",
             "-Wextra",
             "-Werror",

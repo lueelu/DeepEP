@@ -132,7 +132,7 @@ void check_combine_owner_policy()
         base.blockAivNum = cores * 2;
         auto check = [](const MegaMoeTilingData& t, bool odd) {
             const bool hierarchical = t.topoType == TOPO_TYPE_MTE_ROCE;
-            const uint32_t lanes = std::min(16U, static_cast<uint32_t>(t.aicNum));
+            const uint32_t lanes = std::min(t.bf16Bs96 ? 24U : 16U, static_cast<uint32_t>(t.aicNum));
             const auto jobs = t.blockAivNum - (hierarchical ? lanes : 0U);
             assert(UnpermuteJobCount(&t) == jobs);
             assert(UseAiv0CombineOwners(&t) == (hierarchical && !odd));
@@ -152,6 +152,13 @@ void check_combine_owner_policy()
                                (odd ? i % lanes == lane : i >= rows * lane / lanes && i < rows * (lane + 1U) / lanes));
         };
         check(base, true);
+        auto candidate = base;
+        candidate.bf16Bs96 = UseBf16Bs96(&base, false);
+        assert(!UseBf16Bs96(&base, true));
+        assert(candidate.bf16Bs96 == (cores == 28 && HIERARCHICAL_COMBINE_QPS == 24));
+        check(candidate, true);
+        assert(UseInputEarlyClosure(&candidate, false) == candidate.bf16Bs96);
+        if (candidate.bf16Bs96) assert(UnpermuteJobCount(&candidate) == 32);
         auto variant = [&](auto field, auto value) {
             auto t = base;
             t.*field = value;
@@ -217,7 +224,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     assert(hybrid.gatewayPayloadReadyPtr - hybrid.hierarchicalControlPtr ==
            static_cast<int64_t>(HierarchicalSignal::Count) * 512);
     assert(hybrid.combinePartialSendPtr - hybrid.gatewayPayloadReadyPtr == 16 * 512);
-    assert(base + size - hybrid.combineReduceCommitPtr == 16 * 512);
+    assert(base + size - hybrid.combineReduceCommitPtr == HIERARCHICAL_COMBINE_QPS * 512);
     assert(hybrid.quantTokenScalePtr - routeBase == 2 * CalcRailTopkIdsSlotBytes(&t));
     assert(routeBase - hybrid.expertCountRecvPtr == CalcMteExpertCountRecvSize(t.moeExpertPerRank, 32));
     assert(CalcSendMaskExpertCapacity(&t, 46) >= 16 * t.moeExpertPerRank);
@@ -340,7 +347,7 @@ void check_packet_gateway_layout(uint8_t mode)
             for (uint64_t row = 0; row < rows; ++row)
                 assert(reinterpret_cast<uintptr_t>(info.gatewayCombinePtr + row * rowBytes) % 512U == 0U);
 
-            auto* end = info.combineReduceCommitPtr + 16U * 512U;
+            auto* end = info.combineReduceCommitPtr + HIERARCHICAL_COMBINE_QPS * 512U;
             assert(end == base + bytes);
             for (uint32_t bs : {1U, 32U, 64U}) {
                 t.bs = bs;

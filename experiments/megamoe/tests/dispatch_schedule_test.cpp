@@ -53,6 +53,7 @@ struct MoeSyncWorkspaceLayout {
 };
 struct Tiling {
     bool hierarchical = true;
+    bool bf16Bs96 = false;
     uint32_t bs = 32, h = 3584, hiddenDim = 2560, moeExpertPerRank = 12, topK = 8, sharedExpertNum = 0;
     uint32_t epWorldSize = 32, combineQuantMode = 0;
 };
@@ -217,6 +218,9 @@ struct Fixture {
     } gmmExecutionConfig_;
     int countWorkspace_ = 0;
     uint32_t mGroupsPerWave_ = 2;
+    uint32_t ReverseWaveStart(uint32_t gmm1Cursor, uint32_t actualGroups, uint32_t columns, uint32_t cores) const
+    { /* REVERSE_START */ }
+    uint32_t WaveGroups(uint64_t wave) const { /* WAVE_GROUPS */ }
     TokenDispatchScratch<int> tokenDispatchScratch_;
     GM_ADDR g_winRankAddr_[4]{};
     struct {
@@ -317,6 +321,29 @@ Result Run(bool hierarchical, uint32_t bs, uint32_t capacity)
 }
 int main()
 {
+    Fixture f;
+    f.tiling.bf16Bs96 = true;
+    f.mGroupsPerWave_ = 5;
+    uint32_t remaining = 13, wave = 0, cursor = 0;
+    for (uint32_t groups : {5U, 6U, 2U}) {
+        assert(std::min(f.WaveGroups(wave++), remaining) == groups);
+        remaining -= groups;
+        cursor = (cursor + groups * 18U) % 28U;
+        const uint32_t start = f.ReverseWaveStart(cursor, groups, 20, 28);
+        std::vector<uint32_t> assigned(groups * 20U);
+        for (uint32_t core = 0; core < 28; ++core) {
+            for (uint32_t tile = (27U - core + 28U - start) % 28U; tile < assigned.size(); tile += 28U) {
+                assert(core == (cursor + assigned.size() - 1U - tile) % 28U);
+                ++assigned[tile];
+            }
+        }
+        for (auto count : assigned) assert(count == 1);
+    }
+    f.mGroupsPerWave_ = 4;
+    assert(f.WaveGroups(1) == 4);
+    f.mGroupsPerWave_ = 5;
+    f.tiling.bf16Bs96 = false;
+    assert(f.WaveGroups(1) == 5);
     for (bool hierarchical : {false, true})
         for (uint32_t bs : {1U, 32U, 256U})
             for (uint32_t capacity : {0U, 1U, 24U, 300U, 4096U}) Run(hierarchical, bs, capacity);

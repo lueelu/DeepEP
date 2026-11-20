@@ -30,7 +30,7 @@ inline int64_t LayoutArena(int64_t world, int64_t experts, int64_t tokens, int64
     out.commit = reserve(roce ? HIERARCHICAL_COMBINE_QPS * 512 : 0) - dump;
     out.compact = reserve(roce ? (1 + 2 * tokens) * 4 : 0) - dump;
     out.gather = reserve(roce ? world * CalcRailTopkIdsSlotDataBytes(tokens, topk) : 0) - dump;
-    out.closure = reserve(roce ? (64 + 2 * 16 + 2) * 512 : 0) - dump;
+    out.closure = reserve(roce ? PLAN_FLAG_SLOTS * HIERARCHICAL_FLAG_BYTES : 0) - dump;
     const int64_t stride = offset;
     const int64_t origin = domain * stride + dump;
     offset = stride * configs;

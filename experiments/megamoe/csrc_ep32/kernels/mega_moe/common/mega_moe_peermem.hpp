@@ -71,6 +71,10 @@ constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
 constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 256U;
 constexpr uint32_t DISPATCH_PROBE_ROWS = 8U;  // One delivery bitmap byte per window.
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
+constexpr uint32_t CLOSURE_SLOT_COUNT = 64U + 2U * HIERARCHICAL_RANKS_PER_HOST + 2U;
+constexpr uint32_t BF16_GMM1_READY_SLOT = CLOSURE_SLOT_COUNT;
+constexpr uint32_t PLAN_FLAG_SLOTS = deepep::megamoe_config::PROTOCOL == 5U ? BF16_GMM1_READY_SLOT + 28U
+                                                                           : CLOSURE_SLOT_COUNT;
 // The QP backend uses the first 256B; startup consumers reuse this reservation
 // for a single strided snapshot of sixteen 32B flag heads (512B total).
 constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = HIERARCHICAL_RANKS_PER_HOST * 32U;
@@ -155,18 +159,29 @@ HOST_DEVICE uint32_t HierarchicalPayloadTokenBegin(uint32_t tokens, uint32_t lan
 
 HOST_DEVICE uint32_t HierarchicalCombineOwnerCount(const MegaMoeTilingData* t)
 {
-    return t->aicNum != 0U && t->aicNum < HIERARCHICAL_COMBINE_QPS ? t->aicNum : HIERARCHICAL_COMBINE_QPS;
+    const uint32_t lanes = t->bf16Bs96 ? HIERARCHICAL_COMBINE_QPS : 16U;
+    return t->aicNum != 0U && t->aicNum < lanes ? t->aicNum : lanes;
+}
+
+HOST_DEVICE bool IsDsv96CombineShape(const MegaMoeTilingData* t)
+{
+    return t->bs == 96U && t->h == 5120U && t->hiddenDim == 4608U && t->moeExpertPerRank == 13U &&
+           t->topK == 6U && t->sharedExpertNum == 1U && t->sharedFp8 &&
+           t->dispatchRanksPerNode == HIERARCHICAL_RANKS_PER_HOST &&
+           t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 && t->combineQuantMode == COMBINE_NO_QUANT &&
+           t->topkWeightsPrefetch == 0 && t->epWorldSize == 32U && t->aicNum >= 16U && t->aicNum <= 32U &&
+           t->blockAivNum == 2U * t->aicNum;
 }
 
 HOST_DEVICE bool UseAiv0CombineOwners(const MegaMoeTilingData* t)
 {
-    const bool dsv96 = t->bs == 96U && t->h == 5120U && t->hiddenDim == 4608U && t->moeExpertPerRank == 13U &&
-                       t->topK == 6U && t->sharedExpertNum == 1U && t->sharedFp8 &&
-                       t->dispatchRanksPerNode == HIERARCHICAL_RANKS_PER_HOST &&
-                       t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 && t->combineQuantMode == COMBINE_NO_QUANT &&
-                       t->topkWeightsPrefetch == 0 && t->epWorldSize == 32U && t->aicNum >= 16U && t->aicNum <= 32U &&
-                       t->blockAivNum == 2U * t->aicNum;
-    return UseHierarchicalRoce(t) && !dsv96;
+    return UseHierarchicalRoce(t) && !IsDsv96CombineShape(t);
+}
+
+HOST_DEVICE bool UseBf16Bs96(const MegaMoeTilingData* t, bool prequantized)
+{
+    return deepep::megamoe_config::PROTOCOL == 5U && !prequantized && UseHierarchicalRoce(t) &&
+           IsDsv96CombineShape(t) && t->aicNum == 28U;
 }
 
 // Each active Combine QP has one physical owner. The input barrier closes Dispatch's use of QP1..8.
@@ -194,6 +209,11 @@ HOST_DEVICE bool UseEarlyClosure(const MegaMoeTilingData* t)
     (void)t;
     return false;
 #endif
+}
+
+HOST_DEVICE bool UseInputEarlyClosure(const MegaMoeTilingData* t, bool hasInputScales)
+{
+    return (hasInputScales || t->bf16Bs96) && UseEarlyClosure(t);
 }
 
 HOST_DEVICE bool IsHierarchicalCombineOwner(const MegaMoeTilingData* t, uint32_t physicalJob)

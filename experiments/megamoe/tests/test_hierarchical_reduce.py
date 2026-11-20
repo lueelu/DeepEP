@@ -52,6 +52,8 @@ def test_production_weighted_gateway_reduction_and_unpermute(tmp_path, dispatch_
     relay_scope = timer[timer.index("class AscendTimerRelayScope {") : timer.index("class AscendTimerFixedScope {")]
     fixture = fixture.replace("/* DISPATCH_RELAY_SCOPE */", relay_scope)
     fixture = fixture.replace("/* DISPATCH_ROW_TYPES */", row_types).replace("/* PRODUCTION_DISPATCH_QUEUE */", queue)
+    send_mask = (kernel / "stage/mega_moe_send_mask.hpp").read_text(encoding="utf-8")
+    fixture = fixture.replace("/* BF16_PACKER */", function_source(send_mask, "PackBf16Bs96RailMetadata"))
     source = tmp_path / "hierarchical_reduce.cpp"
     source.write_text(
         fixture.replace("/* PRODUCTION_WEIGHT_PACKER */", function_source(dispatch, "PackHierarchicalCombineWeights")),

@@ -509,7 +509,8 @@ template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, typen
           typename Config, typename ActualShape>
 __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQuantOp, TensorC& l0cOutGm,
                                                 const GMMAddrInfo& gmmAddrInfo, const Config& config,
-                                                const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc)
+                                                const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc,
+                                                bool packShortTile = false)
 {
     if (Get<M_VALUE>(actualShape) == 0U) {
         return;
@@ -530,8 +531,16 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
     auto tensorBlockUbFirst = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetFirst), layoutL0cUb);
     auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);
     auto copyGm2Ub = AscendC::Te::MakeCopy(AscendC::Te::CopyGM2UB{});
-    AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
-    AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+    const bool packed = packShortTile && Config::FUSED_GATE_UP && Get<N_VALUE>(actualShape) * 2 == L1_TILE_N &&
+                        Get<M_VALUE>(actualShape) <= L1_TILE_M_128;
+    if (packed) {
+        auto pair = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
+                                   Te::MakeShape(Get<M_VALUE>(actualShape), 2 * Get<N_VALUE>(actualShape)));
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, pair);
+    } else {
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+    }
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
     Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape),
@@ -545,7 +554,7 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
         0,
         0};
     AscendC::SetCtrlSpr<60, 60>(0);
-    activationQuantOp(epilogueShape, epilogueOffset);
+    activationQuantOp(epilogueShape, epilogueOffset, 0U, packed);
     NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
@@ -924,7 +933,7 @@ template <typename ElementA, typename ElementB, typename ElementC, typename Elem
 __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
     ActivationQuantOp& activationQuantOp, const ProblemShape& problemShape, const GMMAddrInfo& gmmAddrInfo,
     const BlockJobContext& blockJob, uint32_t loopIdx, uint32_t expertBeforeCnt,
-    AscendTimer::DynamicTimingType timingType = AscendTimer::AIV_SWIGLU)
+    AscendTimer::DynamicTimingType timingType = AscendTimer::AIV_SWIGLU, bool packShortTile = false)
 {
     using GmmConfig = GmmKernel::Config<true, 0, ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, false,
                                         TopkWeightsPrefetch, false, false, false, true, FuseGateUp>;
@@ -949,7 +958,7 @@ __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
             activationQuantOp, gmC, meta, gmmAddrInfo, config, shape, m, n, expertBeforeCnt);
     } else {
         GmmKernel::Gmm1Aiv1EpilogueTileA8W4<ElementC, typename GmmConfig::MakeLayoutC, true>(
-            activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n);
+            activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n, packShortTile);
     }
 }
 

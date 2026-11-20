@@ -8,6 +8,8 @@ import subprocess
 
 import pytest
 
+from test_combine_owner import function_body
+
 
 def aiv1_priority_source(production_source=None):
     directory = Path(__file__).parent
@@ -25,6 +27,7 @@ def aiv1_priority_source(production_source=None):
     # Keep the actual scheduler control flow; the C++ fixture only supplies
     # ready/not-ready stage operations and observes their externally visible order.
     fixture = (directory / "aiv1_priority_test.cpp").read_text(encoding="utf-8")
+    fixture = fixture.replace("/* WAVE_GROUPS */", function_body(production_source, "uint32_t WaveGroups("))
     return fixture.replace("/* PRODUCTION_SCHEDULER_BODY */", production_source[opening:end])
 
 

@@ -284,6 +284,7 @@ void CheckCase(uint32_t hidden, uint32_t sequence, uint32_t rank)
     stores = sends = mte3ScalarWaits = 0U;
     MegaMoeTilingData t{};
     t.h = hidden;
+    t.bf16Bs96 = hidden == 5120U;
     t.topK = 4U;
     t.hierarchicalSequence = sequence;
     t.topoType = TOPO_TYPE_MTE_ROCE;
@@ -331,6 +332,8 @@ void CheckCase(uint32_t hidden, uint32_t sequence, uint32_t rank)
         pipeline.IssueSlice(common, params, {i / 2U, i / 2U * 2U}, i % 2U, {0U, 1U}, timer);
         // Two rows from different calls remain in flight simultaneously.
         if (i == 1U) assert(!inFlight[0].empty() && !inFlight[1].empty());
+        if (t.bf16Bs96 && i == 3U)
+            for (uint32_t slot = 0; slot < 4U; ++slot) assert(!inFlight[slot].empty());
         if (i % 7U == 5U) {
             pipeline.Drain(timer);
             for (const auto& pending : inFlight) assert(pending.empty());

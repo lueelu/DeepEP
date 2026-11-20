@@ -28,6 +28,7 @@ PYBIND11_MODULE(_ep32_C, module)
         .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t, uint64_t,
                       uint64_t, int64_t, std::array<int64_t, 4>, uint32_t, uint32_t>())
         .def("set_wave", &Plan::set_wave)
+        .def_property_readonly("bf16_bs96_active", &Plan::bf16_bs96_active)
         .def_property_readonly("effective_wave", &Plan::effective_wave)
         .def("forward", &Plan::forward)
         .def_property_readonly("workspace_bytes", &Plan::workspace_bytes);

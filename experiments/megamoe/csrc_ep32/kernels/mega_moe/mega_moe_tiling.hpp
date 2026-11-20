@@ -224,6 +224,7 @@ struct MegaMoeTilingData {
     bool isPerExpertWeightTensor;
     bool sharedFp8;
     bool sharedWeightList;
+    bool bf16Bs96;
     // 全卡一致的单卡 token 数上界（attr num_max_tokens_per_rank；attr=0 时 host 置为 bs）。
     // 跨卡窗口布局、mask 槽几何与收发批网格一律用该上界，bs 仅描述本卡真实 token 数。
     uint32_t numMaxTokensPerRank;

@@ -332,6 +332,38 @@ __aicore__ inline void LoadRailTopkIdsBatch(const SendMaskConfig& config, SendMa
     SyncFuncStatic<AscendC::HardEvent::MTE2_V, SYNC_EVENT_ID1>();
 }
 
+// The BS96 packer owns its stage UB until LocalRailPacked. The RoCE reservation is untouched.
+__aicore__ inline void PackBf16Bs96RailMetadata(const MoeStageCommonConfig& common, const Params& params)
+{
+    constexpr uint32_t items = 96U * 6U;
+    constexpr uint32_t full = items / RAIL_PACKET_DATA_WORDS;
+    constexpr uint32_t tail = items % RAIL_PACKET_DATA_WORDS;
+    constexpr uint32_t bytes = (full + 1U) * RAIL_PACKET_BYTES;
+    LocalTensor<int32_t> packets(TPosition::VECCALC, 0, bytes / sizeof(int32_t));
+    LocalTensor<float> weights(TPosition::VECCALC, bytes, items);
+    GlobalTensor<int32_t> ids, rail;
+    GlobalTensor<float> coefficients, prefix;
+    ids.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdxGmAddr));
+    coefficients.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.probsGmAddr));
+    auto* record = params.peermemInfo.railTopkIdsRecvPtr +
+                   HierarchicalHost(common.rankId) * CalcRailTopkIdsSlotBytes(params.tilingData);
+    rail.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(record));
+    prefix.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(record - HierarchicalMetadataPrefixBytes(params.tilingData)));
+    DataCopy(weights, coefficients, items);
+    DataCopyPadExtParams<int32_t> pad{true, 0U, 0U, 0U};
+    DataCopyPad(packets, ids, {full, RAIL_PACKET_DATA_WORDS * sizeof(int32_t), 0U, 0U, 0U}, pad);
+    DataCopyPad(packets[full * RAIL_PACKET_WORDS], ids[full * RAIL_PACKET_DATA_WORDS],
+                {1U, tail * sizeof(int32_t), 0U, 0U, 0U}, pad);
+    SyncFuncStatic<HardEvent::MTE2_S, SYNC_EVENT_ID0>();
+    for (uint32_t p = 0; p <= full; ++p) {
+        packets.SetValue(p * RAIL_PACKET_WORDS + RAIL_PACKET_DATA_WORDS, params.tilingData->hierarchicalSequence);
+    }
+    SyncFuncStatic<HardEvent::S_MTE3, SYNC_EVENT_ID3>();
+    DataCopy(prefix, weights, items);
+    DataCopy(rail, packets, bytes / sizeof(int32_t));
+    SyncFuncStatic<HardEvent::MTE3_S, SYNC_EVENT_ID3>();
+}
+
 /*
  * 每个目标 server 一个发送核。每个 512B 包携带本轮标记：普通 MTE 为 epoch/length，
  * 两机路径为完整32位 sequence，长度由全 rank 一致的实际 B 和 Top-k 确定。

@@ -24,14 +24,15 @@ int64_t GetSystemCycle()
 }  // namespace AscendC
 
 struct Fixture {
-    struct { void* inputScaleGmAddr = nullptr; int tilingData = 0; } params_;
+    struct Tiling { bool bf16Bs96 = false; } tiling;
+    struct { void* inputScaleGmAddr; Tiling* tilingData; } params_{nullptr, &tiling};
     struct { uint32_t blockIdx = 0; } countWorkspace_;
     int hierarchicalCombine_ = 0;
     void ProgressGatewayHint() {}
-    bool UseEarlyClosure(int) const { return false; }
-    bool UseAiv0CombineOwners(int) const { return true; }
-    bool IsHierarchicalCombineOwner(int, uint32_t) const { return false; }
-    int HierarchicalCombineLane(int, uint32_t) const { return 0; }
+    bool UseInputEarlyClosure(Tiling*, bool) const { return false; }
+    bool UseAiv0CombineOwners(Tiling*) const { return true; }
+    bool IsHierarchicalCombineOwner(Tiling*, uint32_t) const { return false; }
+    int HierarchicalCombineLane(Tiling*, uint32_t) const { return 0; }
     template <class... T> int HierarchicalRoceScratch(T&&...) { return 0; }
     template <class... T> void PublishCoreClosure(T&&...) { assert(false); }
     template <class... T> bool TryProgressHierarchicalReducedCombine(T&&...) { assert(false); return false; }
@@ -75,6 +76,7 @@ struct Fixture {
     } timer_;
     uint32_t sharedExpertNum_ = 0;
     uint32_t mGroupsPerWave_ = 2;
+    uint32_t WaveGroups(uint64_t wave) const /* WAVE_GROUPS */
 
     // Each activation plan is {first physical tile, exclusive tile bound}.
     std::vector<std::pair<uint32_t, uint32_t>> activationPlans;

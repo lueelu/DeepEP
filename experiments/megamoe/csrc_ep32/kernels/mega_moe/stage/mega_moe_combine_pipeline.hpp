@@ -23,7 +23,9 @@ public:
                                       AscendTimerDevice& timer)
     {
         if (!initialized_) {
-            buffers_ = InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch_, true);
+            slots_ = params.tilingData->bf16Bs96 ? 4U : 2U;
+            buffers_ = slots_ == 4U ? InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 4U>(common, scratch_, true)
+                                    : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch_, true);
             initialized_ = true;
         }
         GlobalTensor<bfloat16_t> source;
@@ -46,16 +48,13 @@ public:
                                                           scratch_.metaInfoTensor, slot);
             active_[slot] = true;
             timer.EndCombineRow(issue);
-            nextSlot_ = (slot + 1U) % 2U;
+            nextSlot_ = (slot + 1U) % slots_;
         }
     }
 
     __aicore__ inline void Drain(AscendTimerDevice& timer)
     {
-        // Retire oldest first when both slots are occupied. Every completion
-        // event is consumed exactly once, including a one-row tail.
-        Retire(nextSlot_, timer);
-        Retire((nextSlot_ + 1U) % 2U, timer);
+        for (uint32_t i = 0; i < slots_; ++i) Retire((nextSlot_ + i) % slots_, timer);
         nextSlot_ = 0U;
     }
 
@@ -63,12 +62,13 @@ private:
     WaveCombineBufferConfig buffers_{};
     WaveCombineScratch scratch_{};
     bool initialized_ = false;
-    bool active_[2] = {false, false};
+    uint32_t slots_ = 2U;
+    bool active_[4]{};
     uint32_t nextSlot_ = 0U;
-    uint32_t expert_[2]{};
-    uint32_t row_[2]{};
-    int64_t wave_[2]{};
-    int lifetime_[2] = {-1, -1};
+    uint32_t expert_[4]{};
+    uint32_t row_[4]{};
+    int64_t wave_[4]{};
+    int lifetime_[4]{};
 
     __aicore__ inline void Retire(uint32_t slot, AscendTimerDevice& timer)
     {

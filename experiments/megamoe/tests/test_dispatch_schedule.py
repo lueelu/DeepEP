@@ -19,6 +19,8 @@ def test_dispatch14_preserves_rows_and_ready_publication(tmp_path):
     utils = (kernel / "common/mega_moe_utils.hpp").read_text(encoding="utf-8")
     source = (directory / "dispatch_schedule_test.cpp").read_text(encoding="utf-8")
     for marker, text, name in [
+        ("REVERSE_START", wave, "uint32_t ReverseWaveStart("),
+        ("WAVE_GROUPS", wave, "uint32_t WaveGroups("),
         ("DISPATCH_STEP", wave, "::DispatchNextExpertSlice("),
         ("DISPATCH_RANGE", dispatch, "void DispatchTokenRange("),
         ("DISPATCH_OWNED", dispatch, "void DispatchOwnedExpertRows("),

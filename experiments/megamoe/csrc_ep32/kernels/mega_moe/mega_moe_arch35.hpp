@@ -138,7 +138,7 @@ protected:
     {
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
         if constexpr (g_coreType == AIC) return;
-        if (params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData) && aivJob_.jobIndex == 1U)
+        if (UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr) && aivJob_.jobIndex == 1U)
             ProgressHostClosure(params_, rankId_, false, hostClosure_);
         if (UseHierarchicalRoce(params_.tilingData))
             FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr,
@@ -982,9 +982,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PackOrPostRailMetadata(
         AscendTimerRelayScope pack(timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RelayStep::MetaPack, rankId_, 0U,
                                    commonConfig_.tokenNum);
 #endif
-        PackHierarchicalCombineWeights(commonConfig_, params_);
-        SendTopkIdsToRailServer(commonConfig_, g_winRankAddr_, sendMaskConfig_, params_, sendMaskScratch_,
-                                HierarchicalHost(rankId_), aivJob_.jobIndex);
+        if (params_.tilingData->bf16Bs96) {
+            PackBf16Bs96RailMetadata(commonConfig_, params_);
+        } else {
+            PackHierarchicalCombineWeights(commonConfig_, params_);
+            SendTopkIdsToRailServer(commonConfig_, g_winRankAddr_, sendMaskConfig_, params_, sendMaskScratch_,
+                                    HierarchicalHost(rankId_), aivJob_.jobIndex);
+        }
         PublishHierarchicalLocalSignal(params_, HierarchicalSignal::LocalRailPacked);
     } else if (aivJob_.jobIndex == HierarchicalSendJob()) {
         PostHierarchicalDispatch(commonConfig_, params_, sendMaskConfig_, timer_.Enabled() ? &timer_ : nullptr);
@@ -1028,10 +1032,20 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     }
     QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
         aivJob_, commonConfig_, params_, quantProcessConfig_, quantScratch_);
-    if constexpr (g_coreType == AIV) {
+    if (params_.tilingData->bf16Bs96) {
+        // Only quant/packet stores precede this mixed barrier. Routing and count work can overlap GMM1.
+        if constexpr (g_coreType == AIV) PipeBarrier<PIPE_ALL>();
+        SyncAll<false>();
+        if constexpr (g_coreType == AIC) {
+            // The local packer published the device epoch before quant. The captured host epoch is stale on replay.
+            const auto sequence = ReadGmByPassDCache(
+                HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence));
+            SharedFp8Projection(true, false);
+            SyncFuncStatic<HardEvent::FIX_S, SYNC_EVENT_ID0>();
+            WriteGmByPassDCache(ClosureSlot(params_, BF16_GMM1_READY_SLOT + blockIdx_), sequence);
+        }
+    } else if constexpr (g_coreType == AIV) {
         if (decodeInputReady_) {
-            // Route/count owners differ from quant owners. Count readiness must
-            // certify every local token/scale before any remote reader proceeds.
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
         }
@@ -1069,8 +1083,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
                                                   timer_.Enabled() ? &timer_ : nullptr);
         }
     }
-    if (sharedExpertNum_ > 0 && !(params_.tilingData->sharedFp8 && params_.inputScaleGmAddr &&
-                                  commonConfig_.tokenNum <= 128U && CombineQuantMode == COMBINE_NO_QUANT)) {
+    if (sharedExpertNum_ > 0 && !params_.tilingData->bf16Bs96 &&
+        !(params_.tilingData->sharedFp8 && params_.inputScaleGmAddr && commonConfig_.tokenNum <= 128U &&
+          CombineQuantMode == COMBINE_NO_QUANT)) {
         PrepareSharedExpertInput<ActivationType, QuantScaleOutType, A_ELEMS_PER_BYTE>(
             aivJob_, commonConfig_, params_, quantProcessConfig_, sharedExpertPrepareScratch_);
     }
@@ -1099,6 +1114,15 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                              commonConfig_.tokenNum <= 128U && CombineQuantMode == COMBINE_NO_QUANT;
     if (earlyShared) SharedFp8Projection(true, true);
     ProcessInputPreparationStage();
+    if constexpr (g_coreType == AIV && ENABLE_A8W4) {
+        if (params_.tilingData->bf16Bs96 && GetSubBlockIdx() == 0U) {
+            // Each shared activation tile has the same physical owner as its GMM1 tile.
+            WaitUntilGmFlagEquals(ClosureSlot(params_, BF16_GMM1_READY_SLOT + blockIdx_),
+                                  params_.tilingData->hierarchicalSequence);
+            PipeBarrier<PIPE_ALL>();
+            ProcessSharedExpertActivation();
+        }
+    }
     if constexpr (g_coreType == AIV) {
         timer_.StartUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
         PipeBarrier<PIPE_ALL>();
@@ -1113,7 +1137,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     }
 
     if constexpr (g_coreType == AIV) {
-        // All reset DMAs and the builder's count exports precede this barrier.
+        // The barrier retired both reset DMAs and the BF16 shared activation stores.
+        if (params_.tilingData->bf16Bs96 && GetSubBlockIdx() == 0U)
+            WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSharedActivationDonePtr) +
+                                    blockIdx_ * INT_CACHELINE, 1);
         if (countWorkspace_.shared && aivJob_.jobIndex == 0U)
             WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr),
                                 1);
@@ -1128,7 +1155,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     }
 
     int32_t gmm1TileReadySequence = 0;
-    if (sharedExpertNum_ > 0U) {
+    if (sharedExpertNum_ > 0U && !params_.tilingData->bf16Bs96) {
         // Shared AIC/AIV0 start GMM1; AIV1 enters count/Dispatch (decode) or Route/handshake (prefill).
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::SHARED_EXPERT_GMM1);
         if (params_.tilingData->sharedFp8) {
@@ -1184,7 +1211,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         ProcessSharedExpertTail();
     }
     if constexpr (g_coreType == AIV) {
-        const bool early = params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData);
+        const bool early = UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr);
         if (early) {
             if (GetSubBlockIdx() == 1U) PublishCoreClosure(params_, blockIdx_, true);
             if (aivJob_.jobIndex == 1U) CloseHost(params_, rankId_, false, hostClosure_);
@@ -1250,7 +1277,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                     TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
                                                      timer_.Enabled() ? &timer_ : nullptr, 3U);
                 }
-                if (params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData)) {
+                if (UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr)) {
                     if (!owner)
                         WaitUntilGmFlagEquals(ClosureSlot(params_, 97U), params_.tilingData->hierarchicalSequence);
                     AdvanceInputEpochLocally(params_.peermemInfo.rankSyncInWorldPtr, aivJob_);
@@ -1266,7 +1293,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                 auto* scratch = HierarchicalRoceScratch(params_);
                 auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
                 const uint32_t lane = HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex);
-                const bool posted = params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData);
+                const bool posted = UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr);
                 if (!posted)
                     DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_, lane, scratch,
                                                     rdmaTimer);
@@ -1283,7 +1310,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                AscendTimer::RdmaPhase::Combine, HierarchicalGateway(rankId_), scratch, lane + 1U);
             }
             PipeBarrier<PIPE_ALL>();
-            if (!(params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData) && params_.tilingData->aicNum == 28))
+            if (!(UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr) && params_.tilingData->aicNum == 28))
                 SyncAll<true>();
         } else {
             CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);

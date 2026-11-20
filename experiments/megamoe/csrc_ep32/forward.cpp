@@ -549,6 +549,11 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         default_wave_ = tiling_.mGroupsPerWave;
     }
     tiling_.sharedFp8 = has_shared && shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn;
+    const bool bf16Bs96 = MegaMoeImpl::UseBf16Bs96(&tiling_, prequantized);
+    if (tiling_.bf16Bs96 != bf16Bs96) {
+        tiling_.bf16Bs96 = bf16Bs96;
+        SetUnpermuteConfigs(tiling_, tiling_.roceScratchUbOffset);
+    }
     tiling_.mGroupsPerWave = default_wave_;
     if (is_a8w4 && bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
         const auto tiles = CeilDiv(tiling_.hiddenDim / 2U, MegaMoeImpl::GMM1_FUSED_TILE_N);

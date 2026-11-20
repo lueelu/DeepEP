@@ -135,6 +135,24 @@ python "$SCRIPT" compare --bank "$CASE/bank" --reference "$CASE/reference" --rep
 
 输入目录保存 routed FP4、原生 shared FP8、两者的 E8M0 scale、各轮物理路由及系数。`bf16` 保存激活的原始位模式并传给 BF16 入口，`fp8` 保存预量化值及其 scale。两种输入分别生成 golden 和报告。原生 shared 权重直接生成 E4M3 字节，`--shared-fixture fp4-subset` 可复验旧数据分布。候选预热 20 次，捕获一次，每轮清零计数并读回完整输出，最后用 8 次交替 eager/replay 复查已知输入。比较器核对 160 轮摘要、逐元素输出、各 rank 实际物理路由汇总的计数、首轮 CPU golden，以及 159 对相邻输出。若有跨版本差异，用候选环境另起双机作业，将 `replay` 子命令改为 `candidate-eager` 并写入新目录；再次 `compare` 时增加 `--candidate-eager "$CASE/candidate-eager"` 和新的 `--out`。逐 rank 报告同时保留两版 eager 与候选图的差异。
 
+#### EP32 BS96 BF16 候选构建
+
+构建两端相同的候选 wheel 时设置 `DEEPEP_MEGAMOE_BF16_BS96=ON`，计时用 `DEEPEP_MEGAMOE_TIMER=OFF`。默认构建保留协议 4。候选构建使用协议 5，SHMEM 分配 25 个 QP，Dispatch 使用 1–8，目标形状的 24 个 Combine owner 使用 1–24。仅在 BF16、BS96、H5120、2I4608、K6、每卡 13 个 routed FP4 专家、一个 native FP8 shared 专家、双机 2×16 和 28 AIC/56 AIV 的分层路径上启用新调度。
+
+在两端从源码树外运行同一份新版脚本，共用上面生成的 bank。每次更换 wheel 后重新启动作业。
+
+```bash
+# 基线 wheel（协议 4）
+"${launch[@]}" "$SCRIPT" candidate-eager --revision "$BASE_REV" --bank "$CASE/bank" --out "$CASE/base-eager"
+# 候选 wheel（协议 5）
+"${launch[@]}" "$SCRIPT" candidate-eager --revision "$CANDIDATE_REV" --bank "$CASE/bank" --out "$CASE/candidate-eager"
+"${launch[@]}" "$SCRIPT" replay --default-wave --revision "$CANDIDATE_REV" --bank "$CASE/bank" --out "$CASE/replay"
+python "$SCRIPT" compare --bank "$CASE/bank" --baseline-eager "$CASE/base-eager" \
+    --candidate-eager "$CASE/candidate-eager" --replay "$CASE/replay" --out "$CASE/report"
+```
+
+`run.json` 记录实际协议、加载库摘要、wave 基数及候选 plan 的 `bf16_bs96_active`。BF16 候选的正确性验证会在同一缓冲区交替调用 BF16 和预量化 FP8，核对调度、输出和专家计数，并记录 `mixed_input_checked`。独立 FP8 bank 可用于核对 FP8 回退的 golden 输出。正式计时按基线、候选、候选、基线依次运行下节的 `candidate-eager --fixed-perf`，四次使用独立输出目录。比较时用 `--baseline-eager` 指向对应基线目录。
+
 #### 固定 BF16 输入的双机 A/B
 
 使用上面 BF16 bank 的第 0 轮。两台机器均用 `npu-smi info` 确认各自的 16 张卡空闲。参考和候选依次使用各自的 timer-off wheel，从源码树外运行同一份脚本。将下列命令中的 `CASE` 指向上面生成的 BF16 目录。
@@ -148,7 +166,7 @@ python "$SCRIPT" compare --fixed-perf --bank "$CASE/bank" --reference "$CASE/ref
     --candidate-eager "$CASE/candidate-fixed" --out "$CASE/fixed-report"
 ```
 
-权重和 scale 在 CPU 按 gate128/up128 排列，routed W1 另保留 planar 版本。双机在计时前通过公开 prepared 接口导入。预热 20 次并确认实际 wave 为 5，批次前用 20 次 100000×30000 FP32 Exp 对齐。每轮以 int32 ReduceSum 读取约两倍 L2 的数据，再测 MegaMoE。每个作业输出目录下的 `fixed_perf.json` 保留 32×30 个样本，以及后 15 轮的 rank 0 均值和逐轮最慢 rank 的均值。`fixed-report/summary.json` 汇总完整输出逐位对比、物理专家计数及首轮 CPU golden。
+权重和 scale 在 CPU 按 gate128/up128 排列，routed W1 另保留 planar 版本。双机在计时前通过公开 prepared 接口导入。预热 20 次并确认实际 wave 为 5，批次前用 20 次 100000×30000 FP32 Exp 对齐。每轮以 int32 ReduceSum 读取 256 MiB 的设备数据，再测 MegaMoE。每个作业输出目录下的 `fixed_perf.json` 保留 32×30 个样本，以及后 15 轮的 rank 0 均值和逐轮最慢 rank 的均值。`fixed-report/summary.json` 汇总完整输出逐位对比、物理专家计数及首轮 CPU golden。
 
 附件对照环境为 CANN 9.2.1、Python 3.12.16、Torch 2.10.0+cpu、torch_npu 2.10.0.post7、HNS_1825，PI_ON_CHIP=0。分阶段测量时依次构建 CANN 兼容基线、提前 drain、提前元数据三个提交，复用同一 bank 并为每次运行指定新目录。阶段 trace 单独使用 timer-on wheel，以同一 owner 的记录检查 Reduce、export、host barrier 与 commit 的顺序。
 

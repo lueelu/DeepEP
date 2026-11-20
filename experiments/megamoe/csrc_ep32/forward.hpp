@@ -46,6 +46,11 @@ public:
         return tiling_.mGroupsPerWave;
     }
 
+    bool bf16_bs96_active() const
+    {
+        return tiling_.bf16Bs96;
+    }
+
     int64_t workspace_bytes() const
     {
         return workspace_.numel();

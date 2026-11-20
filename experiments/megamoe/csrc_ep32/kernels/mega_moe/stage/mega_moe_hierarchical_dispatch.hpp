@@ -174,6 +174,21 @@ __aicore__ inline void GatherRouteStripes(const AivJobContext& job, const MoeSta
     for (uint32_t pass = 0; pass < 2; ++pass) {
         const uint32_t sourceHost = pass ^ host;
         auto* ids = params.peermemInfo.railTopkIdsRecvPtr + sourceHost * config.railTopkIdsSlotBytes;
+        if (pass && params.tilingData->bf16Bs96) {
+            // Four independent workers each broadcast the gateway record to one local mesh.
+            if (job.jobIndex >= 16U && job.jobIndex < 20U) {
+                const uint32_t targetMesh = job.jobIndex - 16U;
+                auto* marker = reinterpret_cast<__gm__ int32_t*>(ids + bytes) - 1;
+                RoceWaitCommit(marker, params.tilingData->hierarchicalSequence, timer,
+                               AscendTimer::RdmaPhase::DispatchMeta, HierarchicalGateway(common.rankId));
+                AcquireRoutePackets(ids, bytes / RAIL_PACKET_BYTES, params.tilingData->hierarchicalSequence,
+                                    scratch.topkIndexTensor);
+                const uint32_t index = RouteGatherSlot(sourceHost * 16U + local);
+                BroadcastRouteBlock(peers, offset + index * bytes, ids, bytes, host * 16U + targetMesh * 4U,
+                                    1U, 4U, params);
+            }
+            continue;
+        }
         if (job.jobIndex == 0U) {
             if (pass) {
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)

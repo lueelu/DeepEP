@@ -186,7 +186,9 @@ def compiled_configuration(core, extension, reference):
     compiled = {key: getattr(extension, key, None) for key in fields}
     protocol = core.megamoe_combine_reduce_version
     compiled["core_combine_reduce_version"] = protocol
-    if protocol != (2 if reference else 4) or (not reference and compiled["combine_reduce_version"] != 4):
+    if (reference and protocol != 2) or (not reference and (
+        protocol not in (4, 5) or compiled["combine_reduce_version"] != protocol
+    )):
         raise ValueError(f"Unexpected compiled EP32 configuration {compiled}")
     return compiled
 
@@ -218,7 +220,8 @@ def run(args, group, torch, torch_npu):
     reference = args.mode == "reference"
     buf = SymmBuffer(group, ranks_per_node=16, num_max_tokens_per_rank=BS, num_max_configs=16, **MODEL)
     buf.prepare(BS)
-    set_wave(buf, reference)
+    if not args.default_wave:
+        set_wave(buf, reference)
     compiled = compiled_configuration(core, _C, reference)
     y = torch.empty((BS, MODEL["hidden"]), device="npu", dtype=torch.bfloat16)
     stats = torch.zeros(LOCAL, device="npu", dtype=torch.int32)
@@ -237,12 +240,12 @@ def run(args, group, torch, torch_npu):
         buf.topk_idx[:BS].copy_(ids)
         buf.topk_weights[:BS].copy_(coeff)
 
-    def forward(counts=stats):
+    def forward(counts=stats, x=activation):
         fp8_fp4_mega_moe(
             y,
             *routed,
             buf,
-            x=activation,
+            x=x,
             shared_l1_weights=shared[0],
             shared_l2_weights=shared[1],
             activation_clamp=10,
@@ -258,8 +261,35 @@ def run(args, group, torch, torch_npu):
             forward(None if args.fixed_perf else stats)
         stream.synchronize()
         wave = effective_wave(buf, reference)
+        bf16_bs96_active = getattr(getattr(buf, "_plan", None), "bf16_bs96_active", None)
+        if compiled["core_combine_reduce_version"] == 5 and bf16_bs96_active != (kind == "bf16"):
+            raise ValueError(f"Unexpected BS96 schedule for {kind} input: {bf16_bs96_active}")
         if wave != WAVE:
             raise ValueError(f"Unexpected effective wave {wave}")
+        mixed_input_checked = bf16_bs96_active is True and not args.fixed_perf
+        if mixed_input_checked:
+            from deep_ep_experimental.megamoe.reference import quantize_input
+
+            bits = inputs[0][0].astype(np.uint32) << 16
+            codes, scales = quantize_input(bits.view(np.float32))
+            seen = {}
+            valid = True
+            for use_bf16 in (True, False, True, False, True):
+                if not use_bf16:
+                    buf.x[:BS].copy_(torch.from_numpy(codes).view(torch.float8_e4m3fn))
+                    buf.x_sf[:BS].copy_(torch.from_numpy(scales).view(torch.float8_e8m0fnu))
+                y.fill_(float("nan"))
+                stats.zero_()
+                forward(x=activation if use_bf16 else None)
+                output = y.float().cpu().numpy()
+                valid &= buf._plan.bf16_bs96_active == use_bf16
+                valid &= np.isfinite(output).all() and np.array_equal(stats.cpu().numpy(), expected_counts[0])
+                if use_bf16 in seen:
+                    valid &= np.array_equal(output.view(np.uint32), seen[use_bf16])
+                else:
+                    seen[use_bf16] = output.view(np.uint32).copy()
+            if not all(group.all_gather(bool(valid), "mixed BF16/FP8 schedule and outputs")):
+                raise ValueError("Mixed BF16/FP8 calls changed schedule, output, or counts on the same buffer")
         if replay:
             graph = torch.npu.NPUGraph()
             with torch.npu.graph(graph, stream=stream):
@@ -307,6 +337,7 @@ def run(args, group, torch, torch_npu):
         args.mode,
         args.revision,
         compiled,
+        bf16_bs96_active,
         wave,
         sorted(libraries.values()),
         platform.python_version(),
@@ -330,8 +361,11 @@ def run(args, group, torch, torch_npu):
             clamp=10,
             input=kind,
             fixed_perf=args.fixed_perf,
+            default_wave=args.default_wave,
             timer_enabled=bool(_C.timer_enabled),
             compiled=compiled,
+            bf16_bs96_active=bf16_bs96_active,
+            mixed_input_checked=mixed_input_checked,
             hashes=bank_meta["hashes"],
             routed=rh,
             shared=sh,
@@ -364,10 +398,7 @@ def profile_fixed(torch, group, forward, dest):
     alignment = helpers["DEFAULT_ALIGNMENT"]
     prefix = torch.zeros((alignment["rows"], alignment["cols"]), device="npu", dtype=torch.float32)
     torch.exp(prefix, out=prefix)
-    l2 = int(torch.npu.get_device_properties(torch.npu.current_device()).L2_cache_size)
-    if l2 <= 0:
-        raise ValueError("Missing device L2 size")
-    flush = torch.zeros((2 * l2 + 3) // 4, device="npu", dtype=torch.int32)
+    flush = torch.zeros((256 * 1024**2) // 4, device="npu", dtype=torch.int32)
     total = torch.empty((), device="npu", dtype=torch.int32)
     torch.sum(flush, dim=(0,), dtype=torch.int32, out=total)
     samples = helpers["collect_profile"](
@@ -412,6 +443,8 @@ def differences(actual, expected, shape):
             mismatched=int(different.sum()),
             nonfinite=int((~finite).sum()),
             max_abs=float(np.max(np.abs(actual[finite] - expected[finite]))) if finite.any() else None,
+            relative_rmse=float(np.linalg.norm(actual[finite].astype(np.float64) - expected[finite]) /
+                                max(np.linalg.norm(expected[finite].astype(np.float64)), 1e-30)) if finite.any() else None,
         )
     return {}
 
@@ -420,10 +453,12 @@ def compare_rank(args, rank):
     from deep_ep_experimental.megamoe.golden import compare as cpu_compare
 
     bank_dir = args.bank / f"rank_{rank}"
+    baseline = getattr(args, "baseline_eager", None)
+    oracle = "baseline-eager" if baseline else "reference"
     runs = {
         name: directory / f"rank_{rank}"
         for name, directory in (
-            ("reference", args.reference),
+            (oracle, baseline or args.reference),
             ("replay", args.replay),
             ("candidate-eager", args.candidate_eager),
         )
@@ -435,10 +470,23 @@ def compare_rank(args, rank):
     fixed = args.fixed_perf
     shape = (BS, MODEL["hidden"])
     failures = []
-    first = meta["reference"]
+    first = meta[oracle]
     for key, record in meta.items():
+        if baseline:
+            protocol, lanes = (4, 16) if key == oracle else (5, 24)
+            expected = (protocol, protocol, lanes, 8, 14)
+            fields = ("core_combine_reduce_version", "combine_reduce_version", "combine_qps",
+                      "dispatch_qps", "dispatch_workers")
+            if tuple(record.get("compiled", {}).get(f) for f in fields) != expected:
+                failures.append(dict(reason="compiled protocol or QP mismatch", run=key))
+            if key != oracle and record.get("bf16_bs96_active") != (record["input"] == "bf16"):
+                failures.append(dict(reason="effective BF16 schedule mismatch", run=key))
+            if key == "replay" and "candidate-eager" in meta:
+                eager = meta["candidate-eager"]
+                if any(record.get(f) != eager.get(f) for f in ("revision", "libraries", "compiled")):
+                    failures.append(dict(reason="candidate eager and replay builds differ", run=key))
         if (
-            record["mode"] != key
+            record["mode"] != ("candidate-eager" if key == "baseline-eager" else key)
             or record["rank"] != rank
             or record.get("fixed_perf", False) != fixed
             or record["input"] != bank_meta.get("input", "fp8")
@@ -475,7 +523,7 @@ def compare_rank(args, rank):
                 failures.append(dict(reason=f"different {field}", run=key))
     counts = {key: np.load(p / "physical_counts.npy") for key, p in runs.items()}
     for key, value in counts.items():
-        if value.shape != (1 if fixed else STEPS, LOCAL) or not np.array_equal(value, counts["reference"]):
+        if value.shape != (1 if fixed else STEPS, LOCAL) or not np.array_equal(value, counts[oracle]):
             raise ValueError(f"Invalid physical counts rank={rank} run={key}")
     with np.load(bank_dir / "golden.npz") as gold:
         gold_y, gold_counts = gold["output"], gold["counts"]
@@ -483,6 +531,7 @@ def compare_rank(args, rank):
         raise ValueError("First-round Golden checksum mismatch")
     previous = None
     stale_detected = 0
+    adjacent_changes = []
     for index, step in enumerate((0,) if fixed else [*range(STEPS), *TAIL]):
         results = {}
         for key, folder in runs.items():
@@ -511,14 +560,16 @@ def compare_rank(args, rank):
                     failures.append(
                         dict(step=0, run=key, cpu=cpu, golden_counts=gold_counts.tolist(), counts=stats.tolist())
                     )
-        ref = results["reference"]
+        ref = results[oracle]
         if index < STEPS:
-            if previous is not None and previous.shape == shape and ref.shape == shape and np.any(previous != ref):
-                stale_detected += 1
+            if previous is not None and previous.shape == shape and ref.shape == shape:
+                changed = int(np.count_nonzero(previous != ref))
+                adjacent_changes.append(changed)
+                stale_detected += int(changed > 0)
             previous = ref
-        comparisons = [] if fixed else [("replay", "reference")]
+        comparisons = [] if fixed else [("replay", oracle)]
         if "candidate-eager" in runs:
-            comparisons.append(("candidate-eager", "reference"))
+            comparisons.append(("candidate-eager", oracle))
             if not fixed:
                 comparisons.append(("replay", "candidate-eager"))
         for left, right in comparisons:
@@ -533,6 +584,7 @@ def compare_rank(args, rank):
         rounds=1 if fixed else STEPS,
         alternate=0 if fixed else len(TAIL),
         stale_detected=stale_detected,
+        adjacent_changed_elements=adjacent_changes,
         failures=failures,
     )
 
@@ -556,14 +608,19 @@ def main():
             )
             cmd.add_argument("--out", type=Path, required=True)
             if mode == "compare":
-                cmd.add_argument("--reference", type=Path, required=True)
+                oracle = cmd.add_mutually_exclusive_group(required=True)
+                oracle.add_argument("--reference", type=Path)
+                oracle.add_argument("--baseline-eager", type=Path, help="Protocol 4 candidate-eager output from the base wheel")
                 cmd.add_argument("--replay", type=Path)
                 cmd.add_argument("--candidate-eager", type=Path)
             else:
+                cmd.add_argument("--default-wave", action="store_true", help="Keep the public API wave selection")
                 cmd.add_argument("--revision", required=True, help="Git revision used to build the installed wheel")
     args = parser.parse_args()
     if args.mode == "replay" and args.fixed_perf:
         parser.error("Use reference or candidate-eager for fixed profiling")
+    if args.mode == "compare" and args.baseline_eager and not args.candidate_eager:
+        parser.error("--baseline-eager requires --candidate-eager for the candidate wheel")
     if args.mode == "compare" and (
         (args.fixed_perf and (not args.candidate_eager or args.replay)) or (not args.fixed_perf and not args.replay)
     ):

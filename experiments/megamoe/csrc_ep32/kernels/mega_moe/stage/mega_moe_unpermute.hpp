@@ -153,7 +153,7 @@ __aicore__ inline void AccumulateHierarchicalReducedToken(const TokenUnpermuteCo
     // may still be reading that output. Return the slot event before normal use.
     uint32_t localMask = 0U;
     bool hasRemote = false;
-    if (params.inputScaleGmAddr && UseEarlyClosure(params.tilingData) && params.tilingData->aicNum == 28) {
+    if (UseInputEarlyClosure(params.tilingData, params.inputScaleGmAddr != nullptr) && params.tilingData->aicNum == 28) {
         localMask = scratch.localMasks[tokenIdx - scratch.firstOutput];
         hasRemote = scratch.incomingQp[tokenIdx - scratch.firstOutput] >= 0;
     } else {
@@ -215,7 +215,7 @@ __aicore__ inline void AccumulateHierarchicalReducedToken(const TokenUnpermuteCo
     // At least one remote expert exists here. Its received sum already includes
     // every remote weight. The per-QP commit join precedes this whole stage.
     WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-    if (params.inputScaleGmAddr && UseEarlyClosure(params.tilingData) && params.tilingData->aicNum == 28) {
+    if (UseInputEarlyClosure(params.tilingData, params.inputScaleGmAddr != nullptr) && params.tilingData->aicNum == 28) {
         const uint32_t qp = scratch.incomingQp[tokenIdx - scratch.firstOutput];
         if ((scratch.acquiredQps & (1U << qp)) == 0) {
             auto* commit = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.combineReduceCommitPtr +
@@ -395,7 +395,7 @@ __aicore__ inline void UnpermuteTokens(const TokenUnpermuteConfig& context, cons
     if (tokenRange.count == 0U) {
         return;
     }
-    if (params.inputScaleGmAddr && UseEarlyClosure(params.tilingData) && params.tilingData->aicNum == 28) {
+    if (UseInputEarlyClosure(params.tilingData, params.inputScaleGmAddr != nullptr) && params.tilingData->aicNum == 28) {
         // Borrow a full FP32 input slot before output DMA starts. Both masks and
         // the dense ID snapshot fit into H words for the three gated shapes.
         auto ids = scratch.dataResFp32Tensor[bufferConfig.fp32SlotElementCount].template ReinterpretCast<uint32_t>();

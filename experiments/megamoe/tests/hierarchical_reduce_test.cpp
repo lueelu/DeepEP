@@ -579,6 +579,7 @@ inline void WaitUntilGmFlagEquals(int32_t* address, int32_t expected)
 
 namespace MegaMoeImpl {
 /* PRODUCTION_WEIGHT_PACKER */
+/* BF16_PACKER */
 /* DISPATCH_ROW_TYPES */
 struct TokenDispatchConfig {
     uint32_t quantTokenScaleAlignBytes;
@@ -927,12 +928,21 @@ void CheckCase(uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t top
     Params sourceParams{&t, source, reinterpret_cast<uint8_t*>(weights.data()), reinterpret_cast<uint8_t*>(ids.data()),
                         reinterpret_cast<uint8_t*>(output.data())};
     // Execute the production weight packer, then model one combined metadata Put.
-    PackHierarchicalCombineWeights(srcCommon, sourceParams);
+    const bool batched = bs == 96 && topk == 6;
+    if (batched) PackBf16Bs96RailMetadata(srcCommon, sourceParams);
+    else PackHierarchicalCombineWeights(srcCommon, sourceParams);
     const uint64_t slot = sourceHost * CalcRailTopkIdsSlotBytes(&t);
     auto* sourceRail = reinterpret_cast<int32_t*>(source.railTopkIdsRecvPtr + slot);
-    for (uint32_t row = 0; row < bs * topk; ++row) sourceRail[(row / 127U) * 128U + row % 127U] = ids[row];
-    for (uint32_t packet = 0; packet < (bs * topk + 126U) / 127U; ++packet)
-        sourceRail[packet * 128U + 127U] = static_cast<int32_t>(sequence);
+    for (uint32_t row = 0; row < bs * topk; ++row) {
+        auto& id = sourceRail[(row / 127U) * 128U + row % 127U];
+        if (batched) Check(id == ids[row], "packed ID changed");
+        else id = ids[row];
+    }
+    for (uint32_t packet = 0; packet < (bs * topk + 126U) / 127U; ++packet) {
+        auto& marker = sourceRail[packet * 128U + 127U];
+        if (batched) Check(static_cast<uint32_t>(marker) == sequence, "stale rail packet");
+        else marker = static_cast<int32_t>(sequence);
+    }
     const uint64_t prefix = HierarchicalMetadataPrefixBytes(&t);
     const uint64_t bytes = prefix + CalcRailTopkIdsSlotDataBytes(bs, topk);
     std::memcpy(gateway.railTopkIdsRecvPtr + slot - prefix, source.railTopkIdsRecvPtr + slot - prefix, bytes);
@@ -1294,6 +1304,7 @@ int main()
                 CheckCase(rank, 7U, 32U, 1U, 1024U, pattern, 0xffffffffU, true);
                 CheckCase(rank, 1U, 8U, 32U, 8192U, pattern, 129U, false);
             }
+        CheckCase(21U, 96U, 96U, 6U, 5120U, 2U, 0x80000201U, true);
         CheckCase(0U, 256U, 256U, 32U, 1024U, 2U, 257U, true);
         CheckCase(0U, 3U, 8U, 7U, 1024U, 2U, 3U, false);
         CheckCase(16U, 37U, 64U, 7U, 1024U, 2U, 3U, false);

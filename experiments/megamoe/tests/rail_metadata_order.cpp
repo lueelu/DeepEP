@@ -15,8 +15,9 @@ struct AscendTimer {
 };
 template <int g_coreType>
 struct Stage {
+    struct Tiling { bool hierarchical; bool bf16Bs96; } tiling;
     struct {
-        bool tilingData;
+        Tiling* tilingData;
         const void* inputScaleGmAddr;
     } params_;
     struct {
@@ -25,9 +26,9 @@ struct Stage {
     AscendTimer timer_;
     std::string events;
     int commonConfig_{}, g_winRankAddr_{}, sendMaskConfig_{}, sendMaskScratch_{}, rankId_{};
-    bool UseHierarchicalRoce(bool enabled)
+    bool UseHierarchicalRoce(Tiling* t)
     {
-        return enabled;
+        return t->hierarchical;
     }
     int HierarchicalPackJob()
     {
@@ -60,6 +61,8 @@ struct Stage {
         events += 'W';
     }
     template <class... T>
+    void PackBf16Bs96RailMetadata(T&&...) { events += 'B'; }
+    template <class... T>
     void SendTopkIdsToRailServer(T&&...)
     {
         events += 'I';
@@ -87,15 +90,18 @@ void check()
 #endif
     for (bool hierarchical : {false, true}) {
         for (bool fp8 : {false, true}) {
+            for (bool candidate : {false, true})
             for (int role : {0, 1, 2}) {
                 Stage<core> stage{};
-                stage.params_ = {hierarchical, fp8 ? &stage : nullptr};
+                stage.tiling = {hierarchical, hns && hierarchical && !fp8 && candidate};
+                stage.params_ = {&stage.tiling, fp8 ? &stage : nullptr};
                 stage.aivJob_.jobIndex = role;
                 stage.ProcessInputPreparationStage();
                 std::string expected = "F";
                 if (core == AIV && hierarchical) {
                     const bool early = hns && !fp8;
                     if (role == 1) expected = early ? "USWILF" : "FSWIL";
+                    if (role == 1 && stage.tiling.bf16Bs96) expected = "USBLF";
                     if (role == 2) expected = early ? "PF" : "FP";
                 }
                 assert(stage.events == expected);

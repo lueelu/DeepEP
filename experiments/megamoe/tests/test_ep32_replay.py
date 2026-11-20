@@ -94,6 +94,17 @@ def test_compare_all_calls_counts_and_independent_oracles(tmp_path, monkeypatch)
         np.save(folders[key] / "physical_counts.npy", physical[:1])
     fixed = replay.compare_rank(args, rank)
     assert fixed["passed"] and fixed["rounds"] == 1 and fixed["alternate"] == 0
+    args.baseline_eager, args.reference = args.reference, None
+    for key, protocol, lanes in (("reference", 4, 16), ("candidate_eager", 5, 24)):
+        path = folders[key] / "run.json"
+        record = dict(json.loads(path.read_text()), mode="candidate-eager", bf16_bs96_active=protocol == 5,
+                      compiled=dict(core_combine_reduce_version=protocol, combine_reduce_version=protocol,
+                                    combine_qps=lanes, dispatch_qps=8, dispatch_workers=14))
+        replay.put_json(path, record)
+    assert replay.compare_rank(args, rank)["passed"]
+    record["compiled"]["combine_qps"] = 16
+    replay.put_json(path, record)
+    assert not replay.compare_rank(args, rank)["passed"]
     np.savez(folders["candidate_eager"] / "result_0.npz", output=-out[0], counts=physical[0])
     assert replay.compare_rank(args, rank)["failures"][-1]["mismatched"] == 8
     assert replay.differences(np.array([np.nan]), np.array([np.nan]), (1,))["nonfinite"] == 1
@@ -164,6 +175,8 @@ def test_runtime_protocol_matches_each_wheel():
         (2, 1, True, True),
         (1, 2, True, False),
         (4, 4, False, True),
+        (5, 5, False, True),
+        (5, 4, False, False),
         (4, 1, False, False),
         (2, 4, False, False),
     ):

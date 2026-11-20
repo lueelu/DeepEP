@@ -261,6 +261,9 @@ def build_configuration(environment=None):
         raise RuntimeError("MegaMoE build options accept ON or OFF only")
     if timer == "ON" and beta != "ON":
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
+    bf16_bs96 = enabled("DEEPEP_MEGAMOE_BF16_BS96", env)
+    if bf16_bs96 and beta != "ON":
+        raise RuntimeError("BF16 BS96 requires DEEPEP_BUILD_MEGAMOE=ON")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     ll_reference_profile = env.get("DEEPEP_LL_REFERENCE_PROFILE", "OFF")
@@ -363,7 +366,7 @@ def build_configuration(environment=None):
     }
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
-    result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
+    result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON", "bf16_bs96": bf16_bs96}
     if beta == "ON":
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
@@ -447,6 +450,8 @@ class VariantBuild(ConfiguredBuild):
         beta = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
         timer = os.environ.get("DEEPEP_MEGAMOE_TIMER", "OFF") == "ON"
         variant = "megamoe-timer" if beta and timer else ("megamoe" if beta else "core")
+        if enabled("DEEPEP_MEGAMOE_BF16_BS96"):
+            variant += "-bf16-bs96"
         self.build_base = str(Path(self.build_base) / variant)
         super().finalize_options()
 
@@ -547,6 +552,7 @@ class CMakeBuild(build_ext):
             f"-DASCEND_HOME_PATH={configuration['ASCEND_HOME_PATH']}",
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
+            f"-DDEEPEP_MEGAMOE_BF16_BS96={'ON' if megamoe.get('bf16_bs96', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DDEEPEP_LL_REFERENCE_PROFILE={'ON' if configuration.get('ll_reference_profile', False) else 'OFF'}",
             f"-DDEEPEP_LL_STAGE_TIMER={'ON' if configuration.get('ll_stage_timer', False) else 'OFF'}",

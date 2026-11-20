@@ -207,6 +207,16 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
         auto xOutBytesTensor = xOutTensor.template ReinterpretCast<uint8_t>();
         DataCopyPad(dstGlobalTensor[static_cast<uint64_t>(index) * config.quantTokenScaleAlignBytes], xOutBytesTensor,
                     xCopyOutParams);
+        if (params.tilingData->bf16Bs96) {
+            const uint32_t row = tokenRange.start + index;
+            GlobalTensor<uint8_t> sharedData, sharedScales;
+            sharedData.SetGlobalBuffer(params.workspaceInfo.sharedExpertInputDataPtr);
+            sharedScales.SetGlobalBuffer(params.workspaceInfo.sharedExpertInputScalePtr);
+            const uint32_t scaleBytes = config.quantScaleNumAlignPerToken;
+            DataCopyPad(sharedData[row * hiddenDim], xOutBytesTensor, {1U, hiddenDim, 0U, 0U, 0U});
+            DataCopyPad(sharedScales[row * scaleBytes], xOutBytesTensor[config.quantTokenAlignBytes],
+                        {1U, scaleBytes, 0U, 0U, 0U});
+        }
         StoreDispatchPackets(xOutBytesTensor, xInTensor, params, tokenRange.start + index,
                              config.quantTokenScaleAlignBytes);
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
