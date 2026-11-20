@@ -8,6 +8,7 @@
 #include "kernels/dispatch/dispatch_recv_copy.h"
 #include "kernels/common/v2_handle.h"
 #include "common/launch.h"
+#include "common/dispatch_trace_layout.h"
 #include "common/types.h"
 #include "kernels/dispatch/udma_dispatch_schedule.h"
 #include "kernels/dispatch/udma_token_dispatch_schedule.h"
@@ -35,7 +36,36 @@ __aicore__ inline uint32_t DispatchAlignUp32(uint32_t value)
     return (value + 31U) / 32U * 32U;
 }
 
+// The trace reuses the first 32 UB bytes before the first staging writer
+// and after the final reader. MTE3_S drains each publication before UB reuse.
+__aicore__ inline void PublishTraceTick(uint64_t address, LocalTensor<uint64_t> scratch, uint64_t tick)
+{
+    GlobalTensor<uint64_t> output;
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(address), 4);
+    output.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    scratch.SetValue(0, tick);
+    for (uint32_t i = 1; i < 4; ++i) scratch.SetValue(i, 0);
+    SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    DataCopy(output, scratch, 4);
+    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+}
 } // namespace
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_trace_clock(GM_ADDR output)
+{
+    const auto tick = GetSystemCycle();
+    TPipe pipe;
+    TBuf<TPosition::VECOUT> scratch;
+    pipe.InitBuffer(scratch, 32);
+    PublishTraceTick(reinterpret_cast<uint64_t>(output), scratch.Get<uint64_t>(), tick);
+}
+
+extern "C" ASCEND_DEEPEP_EXPORT void dispatch_trace_clock_do(void* stream, uint8_t* output)
+{
+    dispatch_trace_clock<<<1, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(32), stream>>>(output);
+}
 
 __aicore__ inline void V1DispatchUdmaKernelImpl(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
@@ -56,6 +86,10 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
 
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const int32_t core_num = get_block_num() * get_subblockdim();
+    // Slot capacity and Host completion both use the launched AIV count.
+    const bool traced = tiling.dispatch_trace_slot && uint32_t(core_num) == tiling.block_dim;
+    const uint64_t trace_start = traced ? AscendC::GetSystemCycle() : 0;
+    const auto trace_line = tiling.dispatch_trace_slot + uint64_t(core_idx) * ascend_deepep::trace::kCoreBytes;
     const int32_t rank = static_cast<int32_t>(tiling.rank);
     const int32_t world_size = static_cast<int32_t>(tiling.world_size);
     const int32_t hidden = static_cast<int32_t>(tiling.hidden);
@@ -114,6 +148,8 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     const uint32_t staging_capacity = kDispatchStageBytes;
     const int32_t staging_buffer_mask = staging_buffer_stride * 2U <= staging_capacity ? 1 : 0;
     ascend_deepep::UbWorkspace resource;
+    if (traced)
+        PublishTraceTick(trace_line, resource.GetBufferByByte<uint64_t>(0), trace_start);
     if (overlap_scales)
         ascend_deepep::udma::StorePackedScaleReady(resource, tiling, uint32_t(core_idx), 0U);
     auto staging_pingpong_ub = resource.template GetBufferByByte<uint8_t>(0);
@@ -356,6 +392,10 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
+    }
+    if (traced) {
+        PublishTraceTick(trace_line + ascend_deepep::trace::kLineBytes,
+                         resource.GetBufferByByte<uint64_t>(0), GetSystemCycle());
     }
 }
 

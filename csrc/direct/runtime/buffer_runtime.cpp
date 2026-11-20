@@ -169,6 +169,7 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
     try {
         AllocateCommMeta();
         AllocateWorkspace();
+        if (transport_ == "udma") dispatch_trace_ = trace::DispatchTrace::Open();
     } catch (...) {
         DestroyNoThrow();
         throw;
@@ -240,6 +241,7 @@ void BufferRuntime::ReleaseResources(bool synchronize)
     if (synchronize && shmem_ != nullptr) {
         shmem_->Barrier();
     }
+    dispatch_trace_.reset();
     FreeResources();
     initialized_ = false;
     shmem_.reset();
@@ -392,7 +394,8 @@ BufferRuntime::IntranodeDispatchWithHandle(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan);
+        cached_dispatch_plan, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan,
+        dispatch_trace_.get());
     symmetric_workspace_active_ = true;
     return {result, public_handle};
 }
