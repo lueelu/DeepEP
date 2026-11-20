@@ -115,7 +115,7 @@ __aicore__ inline void CombineRemoteImpl(
                 CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
             }
         }
-        WaitIncoming<false>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, td.block_dim, td.udma_workers_per_peer * Qps);
+        WaitIncoming<false>(workspace, td, core, td.block_dim, td.udma_workers_per_peer * Qps);
         sender.Quiet();
         // UDMA SO markers do not cover SIMT stores issued by other AIVs.
         // Match Dispatch's full-rank completion before Reduce/workspace reuse.

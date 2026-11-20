@@ -33,6 +33,11 @@ struct int_with_bits<64> {
 
 using topk_idx_t = int_with_bits<EP_NUM_TOPK_IDX_BITS>::type;
 
+// Ascend950 GetSystemCycle() uses a 1 GHz system counter.
+inline constexpr uint64_t kNpuSystemCyclesPerUs = 1000;
+inline constexpr uint64_t kNpuSystemCyclesPerSecond = 1000000 * kNpuSystemCyclesPerUs;
+inline constexpr uint32_t kDefaultNpuTimeoutSeconds = 10;
+
 struct alignas(8) DispatchLayoutTilingData {
     uint32_t rank;
     uint32_t world_size;
@@ -102,6 +107,7 @@ struct alignas(8) DispatchTilingData {
     // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
     uint64_t notify_host_counts = 0;
     uint32_t instance_id = 0;
+    uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
 };
 
 struct alignas(8) CombineTilingData {
@@ -144,6 +150,7 @@ struct alignas(8) CombineTilingData {
     uint32_t udma_self_copy_after_submit = 0;
     uint32_t udma_weight_mode = 0;  // 0 legacy, 1 UDMA, 2 SIMT if spare AIVs exist.
     uint32_t instance_id = 0;
+    uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
 };
 
 struct alignas(8) ExpandTilingData {

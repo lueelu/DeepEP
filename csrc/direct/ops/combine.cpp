@@ -295,6 +295,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                 "early single-source combine requires expanded UDMA inputs and an epilogue");
     ascend_deepep::CombineTilingData tiling{};
     tiling.instance_id = shmem.InstanceId();
+    if (use_udma) tiling.npu_timeout_cycles = shmem.NpuTimeoutCycles();
     if (expanded_x.has_value()) {
         TORCH_CHECK(use_udma && epilogue != nullptr, "single-source combine requires the UDMA V2 path");
         CheckNpuContiguous(*expanded_x, "expanded_x");

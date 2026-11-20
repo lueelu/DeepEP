@@ -98,7 +98,7 @@ __aicore__ inline void DispatchTokenRemote(
             sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core);
             sender.Quiet(); // Drain every physical SQ state before reusing this window.
         }
-    WaitIncoming<true>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores, workers);
+    WaitIncoming<true>(workspace, td, core, cores, workers);
     // Also includes the parallel SIMT metadata writers on every rank.
     aclshmemi_sync_npu_v4<true>(0);
 }
