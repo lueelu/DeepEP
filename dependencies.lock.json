@@ -3,8 +3,8 @@
   "cann_version": "9.2.0",
   "shmem": {
     "repository": "https://gitcode.com/cann/shmem",
-    "ref": "refs/merge-requests/1035/head",
-    "revision": "e308e85116d9161fdbcbd7f2bfb0c126ef54d4cd",
+    "ref": "refs/heads/dev",
+    "revision": "7af7bf48410abca964a5edd246d243600d634b66",
     "distribution": "pinned third-party/shmem submodule or external SDK; headers and library recorded by record_shmem_sdk.py",
     "header_sha256_lf": {
       "host/shmem_host_def.h": "3a4110a09669a859fd42075279fd9b9c2ae77d93ea464dd8d3d80b3f000687e2",
