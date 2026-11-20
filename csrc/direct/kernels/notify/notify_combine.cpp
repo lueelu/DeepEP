@@ -6,7 +6,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
 {
     aclshmemx_instance_ctx_set(instance_id);
     util_set_ffts_config(ffts_addr);
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_combine_kernel_do(

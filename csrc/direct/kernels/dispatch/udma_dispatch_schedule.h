@@ -161,7 +161,7 @@ __aicore__ inline void DispatchRemoteImpl(
     // SO markers cover payload only. Metadata AIVs can still be doing remote
     // SIMT stores on another rank; all ranks/cores must join before outputs are
     // read or the workspace is reused. The collective includes local sync.
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 }
 template <class Resource>
 __aicore__ inline void DispatchRemote(

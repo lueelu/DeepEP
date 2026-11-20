@@ -120,7 +120,7 @@ __aicore__ inline void CombineRemoteImpl(
         // UDMA SO markers do not cover SIMT stores issued by other AIVs.
         // Match Dispatch's full-rank completion before Reduce/workspace reuse.
         if (simt_weights)
-            aclshmemi_sync_npu_v4<true>(0);
+            aclshmemx_sync_vec_all();
         else
             AscendC::SyncAll<true>();
     }

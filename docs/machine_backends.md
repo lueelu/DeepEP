@@ -1,7 +1,7 @@
 # Mesh+PCIe、Mesh+Clos 与 Global Clos
 
-一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM
-`a5e55f750d506d0fcfe01b5959299cbf019f762a`。Mesh+Clos 保留本仓已有的 HT、LL、
+一个安装包包含两个独立实现，共用 `dependencies.lock.json` 固定的 CANN SHMEM。
+Mesh+Clos 保留本仓已有的 HT、LL、
 实验组件和接口限制。Direct 实现包含 V1 Buffer、V2 ElasticBuffer、
 MTE/UDMA、fresh/cached、FP8/BF16、expand/aggregate 以及资源接口。
 各实现继续使用自己的 kernel、工作区、QP 调度和 handle，功能范围不互相推导。
@@ -133,19 +133,25 @@ Mesh+Clos 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `sh
 
 ## 全 Clos 超时配置
 
-在创建 Buffer 前为各 rank 设置环境变量。两个变量均接受正整数，单位为秒。
+在创建 Buffer 前为各 rank 设置相同的环境变量。两个变量均接受正整数，单位为秒。
 
 | 环境变量 | 默认值 | 等待范围 |
 |---|---:|---|
-| `DEEPEP_NPU_TIMEOUT_SECONDS` | 10 | Dispatch/Combine 接收 completion flag、Dispatch FP8 scale ready、流水 Combine aggregate ready |
+| `DEEPEP_NPU_TIMEOUT_SECONDS` | DeepEP 轮询 10 秒，SHMEM 首次初始化 60 秒 | Dispatch/Combine completion flag、FP8 scale ready、流水 Combine aggregate ready，以及 SHMEM 集合和本卡软件同步 |
 | `DEEPEP_CPU_TIMEOUT_SECONDS` | 120 | Fresh Notify 后，CPU 等待映射到 Host 的接收计数 |
+
+`DEEPEP_NPU_TIMEOUT_SECONDS` 显式设置时接受 1–4294 秒，DeepEP 和 SHMEM 使用同一阈值，
+各自从进入等待时开始计时。SHMEM 在首次成功初始化时锁定进程级阈值，活跃实例存在时
+不接受不同的显式配置。变量未设置时，后续 SHMEM 实例继承进程中已锁定的阈值。
 
 设备超时直接打印阶段、rank、`aiv_core_idx`、等待对象、`timeout_s` 和 `elapsed_us`，
 随后触发设备异常。Ascend950 的 `elapsed_us` 由系统计数器差值除以 1000 得到。
-CPU 超时直接向 stderr 打印第一个未就绪的计数槽位和耗时，随后抛出异常。
+SHMEM 同步超时通过 `SHMEM_SYNC_TIMEOUT` 打印对应 PE、核、等待阶段及信号值后触发设备异常。
+CPU 超时向 stderr 打印第一个未就绪的计数槽位和耗时，随后抛出异常。
 
 CPU 阈值适用于默认 Host polling 路径。`DEEPEP_CLOS_NOTIFY_HOST_POLL=0` 或映射不可用时，
-计数回读走同步拷贝，不使用这个阈值。这两个阈值也不覆盖 SHMEM 内部等待或硬件同步指令。
+计数回读走同步拷贝，不使用这个阈值。NPU 阈值不覆盖硬件同步指令或 SHMEM 的独立 quiet。
+同步超时后，由作业管理器停止失败通信组的所有 worker，并在新进程中重建通信组和 Buffer。
 
 ## 全 Clos 精度与带宽测试
 
