@@ -270,7 +270,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            bool use_udma, ShmemInstance& shmem, void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
            c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
            c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
-           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan)
+           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan,
+           trace::DispatchTrace* trace_sink)
 {
     const auto udma_launch =
         shmem.ResolveLaunch(launch_plan, false, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
@@ -715,7 +716,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
                            num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
                            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
-                           send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+                           send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma,
+                           !capturing && !cached_mode && public_handle ? trace_sink : nullptr);
     return {recv_x,
             recv_x_scales,
             recv_topk_idx,

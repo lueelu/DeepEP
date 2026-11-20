@@ -20,7 +20,7 @@ set(_direct_root "${CMAKE_SOURCE_DIR}/csrc/direct")
 pybind11_add_module(_clos_C NO_EXTRAS
     "${_direct_root}/bindings/pybind.cpp" "${_direct_root}/bindings/torch_classes.cpp"
     "${_direct_root}/ops/launcher.cpp" "${_direct_root}/runtime/shmem_instance.cpp"
-    "${_direct_root}/runtime/buffer_runtime.cpp"
+    "${_direct_root}/runtime/buffer_runtime.cpp" "${_direct_root}/runtime/dispatch_trace.cpp"
     "${_direct_root}/ops/aggregate.cpp" "${_direct_root}/ops/combine.cpp"
     "${_direct_root}/ops/dispatch.cpp" "${_direct_root}/ops/expand.cpp")
 target_include_directories(_clos_C PRIVATE "${_direct_root}" "${CMAKE_SOURCE_DIR}/csrc"

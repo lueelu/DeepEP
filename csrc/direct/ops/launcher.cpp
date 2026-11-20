@@ -2,6 +2,8 @@
 
 #include <acl/acl.h>
 #include <cstdlib>
+#include <chrono>
+#include "runtime/dispatch_trace.h"
 #include <cstring>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
@@ -82,21 +84,40 @@ void LaunchV1DispatchKernel(
     const c10::optional<torch::Tensor>& recv_topk_weights, torch::Tensor rank_prefix_matrix,
     torch::Tensor channel_prefix_matrix, torch::Tensor recv_channel_prefix_matrix, torch::Tensor recv_src_idx,
     torch::Tensor send_head, const c10::optional<torch::Tensor>& dispatch_plan,
-    const ascend_deepep::DispatchTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr, bool use_udma)
+    ascend_deepep::DispatchTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr, bool use_udma,
+    ascend_deepep::trace::DispatchTrace* trace_sink)
 {
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
 
     aclrtStream stream = GetCurrentAclStream();
     if (use_udma) {
-        v1_dispatch_udma_plan_kernel_do(
-            tiling.block_dim, stream, BytePtr(x.data_ptr()), OptionalTensorPtr(x_scales), OptionalTensorPtr(topk_idx),
-            OptionalTensorPtr(topk_weights), OptionalTensorPtr(num_tokens_per_rank),
-            BytePtr(is_token_in_rank.data_ptr()), OptionalTensorPtr(num_tokens_per_expert), BytePtr(symmetric_buffer),
-            BytePtr(recv_x.data_ptr()), OptionalTensorPtr(recv_x_scales), OptionalTensorPtr(recv_topk_idx),
-            OptionalTensorPtr(recv_topk_weights), BytePtr(rank_prefix_matrix.data_ptr()),
-            BytePtr(channel_prefix_matrix.data_ptr()), BytePtr(recv_channel_prefix_matrix.data_ptr()),
-            BytePtr(recv_src_idx.data_ptr()), BytePtr(send_head.data_ptr()), OptionalTensorPtr(dispatch_plan),
-            reinterpret_cast<uint8_t*>(const_cast<ascend_deepep::DispatchTilingData*>(&tiling)), ffts_addr);
+        const auto ticket = trace_sink ? trace_sink->Reserve(tiling.rank, tiling.instance_id, tiling.block_dim)
+                                       : ascend_deepep::trace::DispatchTrace::Ticket{};
+        tiling.dispatch_trace_slot = ticket.address;
+        int64_t launch_ns = 0;
+        if (ticket.address) {
+            launch_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+        try {
+            v1_dispatch_udma_plan_kernel_do(
+                tiling.block_dim, stream, BytePtr(x.data_ptr()), OptionalTensorPtr(x_scales), OptionalTensorPtr(topk_idx),
+                OptionalTensorPtr(topk_weights), OptionalTensorPtr(num_tokens_per_rank),
+                BytePtr(is_token_in_rank.data_ptr()), OptionalTensorPtr(num_tokens_per_expert), BytePtr(symmetric_buffer),
+                BytePtr(recv_x.data_ptr()), OptionalTensorPtr(recv_x_scales), OptionalTensorPtr(recv_topk_idx),
+                OptionalTensorPtr(recv_topk_weights), BytePtr(rank_prefix_matrix.data_ptr()),
+                BytePtr(channel_prefix_matrix.data_ptr()), BytePtr(recv_channel_prefix_matrix.data_ptr()),
+                BytePtr(recv_src_idx.data_ptr()), BytePtr(send_head.data_ptr()), OptionalTensorPtr(dispatch_plan),
+                reinterpret_cast<uint8_t*>(const_cast<ascend_deepep::DispatchTilingData*>(&tiling)), ffts_addr);
+        } catch (...) {
+            if (ticket.address) trace_sink->Submit(ticket, launch_ns, -1);
+            throw;
+        }
+        if (ticket.address) {
+            const auto status = aclrtGetLastError(ACL_RT_THREAD_LEVEL);
+            trace_sink->Submit(ticket, launch_ns, status);
+            TORCH_CHECK(status == ACL_SUCCESS, "dispatch submission reported ACL status ", status);
+        }
     } else {
         v1_dispatch_kernel_do(
             tiling.block_dim, stream, BytePtr(x.data_ptr()), OptionalTensorPtr(x_scales), OptionalTensorPtr(topk_idx),

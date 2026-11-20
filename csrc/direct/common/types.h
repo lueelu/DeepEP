@@ -101,6 +101,7 @@ struct alignas(8) DispatchTilingData {
     uint64_t packed_scale_ready = 0;
     // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
     uint64_t notify_host_counts = 0;
+    uint64_t dispatch_trace_slot = 0;
     uint32_t instance_id = 0;
 };
 

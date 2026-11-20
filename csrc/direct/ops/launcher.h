@@ -24,6 +24,8 @@ void LaunchCachedNotifyDispatchKernel(const ascend_deepep::DispatchTilingData& t
 void LaunchCachedDispatchPlanKernel(torch::Tensor routes, torch::Tensor plan, torch::Tensor send_head,
                                     const ascend_deepep::DispatchTilingData& tiling, uint64_t ffts_addr);
 
+namespace ascend_deepep::trace { class DispatchTrace; }
+
 void LaunchV1DispatchKernel(
     torch::Tensor x, const c10::optional<torch::Tensor>& x_scales, const c10::optional<torch::Tensor>& topk_idx,
     const c10::optional<torch::Tensor>& topk_weights, const c10::optional<torch::Tensor>& num_tokens_per_rank,
@@ -32,7 +34,8 @@ void LaunchV1DispatchKernel(
     const c10::optional<torch::Tensor>& recv_topk_weights, torch::Tensor rank_prefix_matrix,
     torch::Tensor channel_prefix_matrix, torch::Tensor recv_channel_prefix_matrix, torch::Tensor recv_src_idx,
     torch::Tensor send_head, const c10::optional<torch::Tensor>& dispatch_plan,
-    const ascend_deepep::DispatchTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr, bool use_udma);
+    ascend_deepep::DispatchTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr, bool use_udma,
+    ascend_deepep::trace::DispatchTrace* trace_sink);
 
 enum class CombinePhase { Fused, Communication, Reduction, EarlySingles, Remaining, Pipeline };
 

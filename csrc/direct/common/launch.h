@@ -20,6 +20,8 @@
 
 extern "C" {
 
+ASCEND_DEEPEP_EXPORT void dispatch_trace_clock_do(void* stream, uint8_t* mapped);
+
 ASCEND_DEEPEP_EXPORT void dispatch_layout_kernel_do(
     uint32_t block_dim,
     void* stream,
