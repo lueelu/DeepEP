@@ -29,6 +29,50 @@ DeepEP 根据安装头文件自动选择编译方式，不需要额外定义 `AC
 SHMEM 初始化前加载，且使用同模式的 SDK 编译。运行时须提供 `aclrtGetSymbolAddress`，
 同时满足本仓 CANN/芯片要求。此次接入范围不包含可选 MegaMoE。
 
+### Host 地址占用回归
+
+`tests/clos/source/test_metadata_address.py` 在每个 rank 创建 `ElasticBuffer` 前，
+用 Linux `mmap(MAP_FIXED_NOREPLACE)` 精确保留旧 metadata 的 32 MiB 地址区间，
+持续到 Buffer 销毁。使用 `PROT_NONE` 只占虚拟地址，不消耗对应物理内存；
+不使用普通 NumPy 分配，因为后者不能保证命中目标地址。已有映射不会被覆盖，
+注入失败或返回地址不符直接报错。
+
+在已分配的双卡 Linux 环境中，分别构建并安装 **fixed / dynamic 两套完整 SDK 和 wheel**，
+每组用新进程运行。四组预期如下：
+
+| SDK / wheel 模式 | 占用旧地址 | 预期 |
+| --- | --- | --- |
+| fixed | 否 | 初始化、设备 barrier、销毁成功 |
+| fixed | 是 | 原生 SHMEM 初始化报错，复现冲突 |
+| dynamic | 否 | 初始化、设备 barrier、销毁成功 |
+| dynamic | 是 | 初始化、设备 barrier、销毁成功 |
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
+set -o pipefail
+
+# 安装 fixed SDK/wheel 后，先跑正常对照，再注入地址冲突。
+python tests/clos/source/test_metadata_address.py --metadata-mode fixed \
+  --expect-init success --output-dir /tmp/meta-fixed-control 2>&1 | tee /tmp/meta-fixed-control.log
+python tests/clos/source/test_metadata_address.py --metadata-mode fixed \
+  --occupy-old-meta --expect-init failure --output-dir /tmp/meta-fixed-collision 2>&1 | tee /tmp/meta-fixed-collision.log
+
+# 切换为 dynamic SDK，重建并安装 DeepEP wheel 后，在新进程运行。
+python tests/clos/source/test_metadata_address.py --metadata-mode dynamic \
+  --expect-init success --output-dir /tmp/meta-dynamic-control 2>&1 | tee /tmp/meta-dynamic-control.log
+python tests/clos/source/test_metadata_address.py --metadata-mode dynamic \
+  --occupy-old-meta --expect-init success --output-dir /tmp/meta-dynamic-collision 2>&1 | tee /tmp/meta-dynamic-collision.log
+```
+
+设备和端口需替换为已分配资源；输出目录必须全新。默认 EP2、单机，
+`--first-device` 设置进程可见的起始设备号，`--dist-init-method` 设置 HCCL 建组端口，
+`--timeout` 为每个 rank 的整体超时（默认 180 秒）。
+每个 rank 保存实际 wheel 构建信息、占用地址、执行阶段和结果到 JSON。
+负例只接受原生 `aclshmemx_init_attr*` 返回的错误，导入失败、设备崩溃或超时均不算通过；
+仍需结合 fixed 正常对照和 SHMEM 原始日志确认是地址冲突，而非其他初始化错误。
+此用例验证初始化及设备 barrier，不替代 dispatch/combine 精度回归。
+
 ## 前置条件
 
 - Linux、Python ≥3.11、C++17 编译器、CMake ≥3.20，以及 Make 或 Ninja；构建工具须在 PATH 中。
