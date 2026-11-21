@@ -20,8 +20,16 @@
 
 #include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 #include "../common/mega_moe_peer_rows.hpp"
+#ifdef DEEPEP_MEGAMOE_ROCE
+#include "csrc_ep32/kernels/mega_moe/common/mega_moe_roce.hpp"
+#include "kernels/mega_moe_common/common/ascend_timer_v2_device.hpp"
+#endif
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
+#ifdef DEEPEP_MEGAMOE_ROCE
+#include "csrc_ep32/kernels/mega_moe/stage/mega_moe_gateway_readiness.hpp"
+#include "csrc_ep32/kernels/mega_moe/stage/mega_moe_route_histogram.hpp"
+#endif
 
 namespace MegaMoeImpl {
 
@@ -42,6 +50,13 @@ struct TokenDispatchConfig {
 
 template <typename ActivationType>
 struct TokenDispatchScratch {
+#ifdef DEEPEP_MEGAMOE_ROCE
+#ifdef DEEPEP_MEGAMOE_TIMER
+    AscendTimerDevice* trace = nullptr;
+    uint32_t traceRank = 0;
+#endif
+    uint32_t gatewayReady = 0;
+#endif
     PeerRowLimitsCache peerRowLimitsCache{};  // 标量对象状态；与可复用的 UB Tensor 内容分离。
     GlobalTensor<int32_t> expertRevNumsGlobalTensor;
     GlobalTensor<int32_t> cumsumInfoGlobalTensor;
@@ -55,6 +70,53 @@ struct TokenDispatchScratch {
     int64_t revScaleElemCnt;
 };
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename ActivationType>
+__aicore__ inline void LoadGatheredRouteCounts(const MoeStageCommonConfig& common, const Params& params,
+                                               TokenDispatchScratch<ActivationType>& scratch)
+{
+    const uint32_t items = common.tokenNum * common.topK;
+    const uint32_t packets = (items + RAIL_PACKET_DATA_WORDS - 1U) / RAIL_PACKET_DATA_WORDS;
+    const uint32_t bytes = packets * RAIL_PACKET_BYTES;
+    // cumsum occupies the UB prefix. Before Dispatch there are no live row
+    // buffers. Collect one source host at a time in the following aligned space.
+    const uint32_t base = (common.worldSize * common.moeExpertPerRank * 4U + 255U) / 256U * 256U;
+    LocalTensor<uint32_t> ids(TPosition::VECCALC, base, 16U * bytes / 4U);
+    LocalTensor<uint16_t> bins(TPosition::VECCALC, base + 16U * bytes, 16U * 128U);
+    GlobalTensor<uint32_t> records;
+    records.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(params.peermemInfo.gatherPtr));
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        const uint32_t first = 16U * (HierarchicalHost(common.rankId) ^ pass);
+        auto snapshot = ids.template ReinterpretCast<int32_t>();
+        {
+#ifdef DEEPEP_MEGAMOE_TIMER
+            AscendTimerRelayScope wait(scratch.trace, AscendTimer::RelayStep::TableWait, first / 16U, 0U,
+                                       16U * packets);
+#endif
+            AcquireRoutePackets(params.peermemInfo.gatherPtr + first * bytes, 16U * packets,
+                                params.tilingData->hierarchicalSequence, snapshot);
+        }
+#ifdef DEEPEP_MEGAMOE_TIMER
+        AscendTimerRelayScope histogram(scratch.trace, AscendTimer::RelayStep::Histogram, first / 16U, 0U, 16U * items);
+#endif
+        for (uint32_t i = 0; i < 16; ++i) {
+            DataCopyPad<uint32_t, PaddingMode::Compact>(
+                ids[i * bytes / 4U], records[RouteGatherSlot(first + i) * bytes / 4U],
+                {static_cast<uint16_t>(packets), RAIL_PACKET_DATA_WORDS * 4U, 4U, 0U, 0U}, {false, 0U, 0U, 0U});
+        }
+        SyncFuncStatic<HardEvent::MTE2_V, SYNC_EVENT_ID2>();
+        asc_vf_call<CountRouteSourceVF>(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                                        reinterpret_cast<__ubuf__ uint16_t*>(bins.GetPhyAddr()), items,
+                                        common.rankId * common.moeExpertPerRank, 16U, bytes / 4U);
+        PipeBarrier<PIPE_V>();
+        asc_vf_call<TransposeRouteBinsVF>(reinterpret_cast<__ubuf__ uint32_t*>(bins.GetPhyAddr()),
+                                          reinterpret_cast<__ubuf__ uint32_t*>(scratch.cumsumInfoTensor.GetPhyAddr()),
+                                          first, common.moeExpertPerRank);
+        SyncFuncStatic<HardEvent::V_MTE2, SYNC_EVENT_ID2>();
+    }
+}
+
+#endif
 // 当前物理 AIV1 在单个专家内负责的左闭右开 row 区间。
 struct ExpertDispatchCoreRange {
     uint32_t expertGlobalRowBegin;
@@ -63,6 +125,14 @@ struct ExpertDispatchCoreRange {
 };
 
 // 状态仅活到当前专家的 owner 范围结束；发布 ready 前必须排空，不能带入 SwiGLU 的 UB。
+#ifdef DEEPEP_MEGAMOE_ROCE
+struct DispatchRow {
+    uint32_t source;
+    int32_t route;
+    int32_t destination;
+};
+
+#endif
 struct DispatchCopyProgress {
     uint32_t issuedRows = 0U;
     int32_t pendingRow = -1;
@@ -75,8 +145,30 @@ struct DispatchRouteSegment {
     int32_t rowCount;
 };
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+struct DispatchProbeRow {
+    DispatchRow copy;
+    uint8_t* deliveredWindow;
+    uint8_t deliveredBit;
+};
+
+struct DispatchSourceRange {
+    uint32_t source;
+    int32_t firstOrdinal;
+    int32_t destination;
+    int32_t count;
+};
+
+#endif
 struct DispatchRouteBatch {
+#ifdef DEEPEP_MEGAMOE_ROCE
+    // Both source traversals visit each peer once per expert/worker range, before splitting the index DMA.
+    DispatchSourceRange deferred[HIERARCHICAL_RANKS_PER_HOST];
+    uint32_t deferredSources = 0U;
+    DispatchRouteSegment segments[HIERARCHICAL_RANKS_PER_HOST];
+#else
     DispatchRouteSegment segments[MAX_DISPATCH_BUFFER_COUNT];
+#endif
     uint32_t count = 0U;
     uint32_t usedItems = 0U;
 };
@@ -102,18 +194,35 @@ __aicore__ inline LocalTensor<ActivationType> GetDispatchCopyBuffer(const TokenD
                                                                     const TokenDispatchScratch<ActivationType>& scratch,
                                                                     int32_t bufferIdx)
 {
+#ifdef DEEPEP_MEGAMOE_ROCE
+    return LocalTensor<ActivationType>(
+        TPosition::VECCALC,
+        scratch.copyTmpBaseAddr + static_cast<uint32_t>(bufferIdx) * context.bufferConfig.copyBufferBytes,
+        context.bufferConfig.copyBufferBytes / sizeof(ActivationType));
+#else
     return LocalTensor<ActivationType>(
         TPosition::VECCALC,
         scratch.copyTmpBaseAddr + static_cast<uint32_t>(bufferIdx) * context.quantTokenScaleAlignBytes,
         context.quantTokenScaleAlignBytes / sizeof(ActivationType));
+#endif
 }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <bool IsBufferReuse, bool TopkWeightsPrefetch, typename ActivationType>
+__aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& context, const Params& params,
+                                                     TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
+                                                     int32_t topkIndex, int32_t remoteRankIdx,
+                                                     GlobalTensor<ActivationType>& remoteRankGlobalTensor,
+                                                     GM_ADDR packetPayload)
+{
+#else
 template <bool IsBufferReuse, bool TopkWeightsPrefetch, typename ActivationType>
 __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& context, const Params& params,
                                                      TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
                                                      int32_t topkIndex, int32_t remoteRankIdx,
                                                      GlobalTensor<ActivationType>& remoteRankGlobalTensor)
 {
+#endif
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     LocalTensor<ActivationType> copyTmpTensor = GetDispatchCopyBuffer(context, scratch, bufferIdx);
     int32_t tokenIndex = topkIndex / static_cast<int32_t>(params.tilingData->topK);
@@ -122,7 +231,18 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     if constexpr (IsBufferReuse) {
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    if (packetPayload != nullptr) {
+        const uint32_t packets = DispatchPacketCount(context.quantTokenScaleAlignBytes);
+        const uint32_t rowOffset = tokenIndex * packets * RAIL_PACKET_BYTES;
+        DataCopy(copyTmpTensor, remoteRankGlobalTensor[rowOffset],
+                 DataCopyParams{static_cast<uint16_t>(packets), 15U, 1U, 0U});
+    } else {
+        DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+    }
+#else
     DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+#endif
     SetFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
 
     if constexpr (IsBufferReuse) {
@@ -179,6 +299,73 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
 }
 
 // 环形槽持续跨 peer 使用：先发起下一行读，再写出上一行，避免每个小 peer 段都排空 MTE。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
+__aicore__ inline void IssueDispatchRow(const TokenDispatchConfig& context, const Params& params, GM_ADDR* winRankAddr,
+                                        TokenDispatchScratch<ActivationType>& scratch, DispatchCopyProgress& progress,
+                                        const DispatchRow& row)
+{
+#ifdef DEEPEP_MEGAMOE_TIMER
+    AscendTimerRelayScope copy(scratch.trace, AscendTimer::RelayStep::PayloadCopy, row.source, row.destination, 1U);
+#endif
+    const int32_t bufferCount = context.bufferConfig.bufferCount;
+    GlobalTensor<ActivationType> remoteRankGlobalTensor;
+    GM_ADDR payload;
+    GM_ADDR packetPayload = nullptr;
+    if (UseHierarchicalRoce(params.tilingData) && winRankAddr[row.source] == nullptr) {
+        const uint64_t relayOffset = params.peermemInfo.relayPayloadPtr - params.peermemInfo.rankSyncInWorldPtr;
+        payload = winRankAddr[HierarchicalGateway(row.source)] + relayOffset;
+        packetPayload = payload;
+    } else {
+        payload = winRankAddr[row.source] + context.quantWinOffset;
+    }
+    remoteRankGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ ActivationType*>(payload));
+    if (bufferCount == 1 && progress.pendingRow >= 0) {
+        StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, 0,
+                                                                                           progress.pendingRow);
+        progress.pendingRow = -1;
+    }
+    int32_t issueBufferIdx = progress.issuedRows % bufferCount;
+    if (progress.issuedRows < static_cast<uint32_t>(bufferCount)) {
+        FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx, row.route,
+                                                                  row.source, remoteRankGlobalTensor, packetPayload);
+    } else {
+        FetchDispatchTokenAndMetaInfo<true, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx, row.route,
+                                                                 row.source, remoteRankGlobalTensor, packetPayload);
+    }
+    if (progress.pendingRow >= 0) {
+        StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+            context, params, scratch, (progress.issuedRows - 1U) % bufferCount, progress.pendingRow);
+    }
+    progress.pendingRow = row.destination;
+    ++progress.issuedRows;
+}
+
+template <typename ActivationType>
+__aicore__ inline void ObserveDispatchGateway(const Params& params, uint32_t source,
+                                              TokenDispatchScratch<ActivationType>& scratch)
+{
+    const uint32_t slot = source % HIERARCHICAL_RANKS_PER_HOST;
+    const uint32_t bit = 1U << slot;
+    if (scratch.gatewayReady & bit) return;
+    auto* hint =
+        reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.gatewayPayloadReadyPtr + slot * HIERARCHICAL_FLAG_BYTES);
+    if (static_cast<uint32_t>(ReadGmByPassDCache(hint)) == params.tilingData->hierarchicalSequence) {
+#ifdef DEEPEP_MEGAMOE_TIMER
+        const auto start = scratch.trace ? GetSystemCycle() : 0;
+#endif
+        SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+        scratch.gatewayReady |= bit;
+#ifdef DEEPEP_MEGAMOE_TIMER
+        if (scratch.trace) {
+            const uint64_t ranks = (static_cast<uint64_t>(source + 1U) << 32) | (HierarchicalGateway(source) + 1U);
+            scratch.trace->RecordDetail(AscendTimer::AIV_GATEWAY_PAYLOAD_WAIT, start, GetSystemCycle(), ranks,
+                                        params.tilingData->hierarchicalSequence);
+        }
+#endif
+    }
+}
+#else
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& context, const Params& params,
                                                     GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
@@ -215,12 +402,21 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
         ++progress.issuedRows;
     }
 }
+#endif
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
+__aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& context, const Params& params,
+                                                TokenDispatchScratch<ActivationType>& scratch,
+                                                DispatchCopyProgress& progress)
+{
+#else
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& context, const Params& params,
                                                 TokenDispatchScratch<ActivationType>& scratch,
                                                 const DispatchCopyProgress& progress)
 {
+#endif
     uint32_t bufferCount = context.bufferConfig.bufferCount;
     if (progress.pendingRow >= 0) {
         StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
@@ -232,6 +428,10 @@ __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& conte
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
         WaitFlag<AscendC::HardEvent::MTE3_S>(eventId);
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    progress.issuedRows = 0U;
+    progress.pendingRow = -1;
+#endif
 }
 
 // 发布一个 source-rank 段覆盖到的 GMM1 tile ready 计数。
@@ -258,6 +458,63 @@ __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLa
     }
 }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+// Each lane keeps its own gateway and route even when a batch spans sources.
+template <typename ActivationType>
+__aicore__ inline uint32_t ReadyDispatchRows(const TokenDispatchConfig& context, const Params& params, GM_ADDR* peers,
+                                             TokenDispatchScratch<ActivationType>& scratch,
+                                             const DispatchProbeRow* rows, uint32_t n)
+{
+    uint32_t acquired = 0U;
+    for (uint32_t j = 0; j < n; ++j) {
+        const uint32_t source = rows[j].copy.source;
+        // Rows from each source are consecutive. One hint read also covers its following lanes.
+        if (j == 0U || rows[j - 1U].copy.source != source) ObserveDispatchGateway(params, source, scratch);
+        if (scratch.gatewayReady & (1U << (source % HIERARCHICAL_RANKS_PER_HOST))) acquired |= 1U << j;
+    }
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    const uint32_t pending = ((1U << n) - 1U) & ~acquired;
+    if (!pending) return acquired;
+#ifdef DEEPEP_MEGAMOE_TIMER
+    uint32_t sources = 0U, probed = 0U;
+    for (uint32_t j = 0; j < n; ++j) {
+        if (pending & (1U << j)) {
+            sources |= 1U << rows[j].copy.source;
+            ++probed;
+        }
+    }
+    AscendTimerRelayScope check(scratch.trace, AscendTimer::RelayStep::FlagCheck, scratch.traceRank, sources,
+                                0x80000000U | probed);
+#endif
+    const uint32_t packets = DispatchPacketCount(context.quantTokenScaleAlignBytes);
+    const uint64_t offset = params.peermemInfo.relayPayloadPtr - params.peermemInfo.rankSyncInWorldPtr;
+    const uint32_t base = params.tilingData->roceScratchUbOffset + HIERARCHICAL_ROCE_UB_BYTES;
+    LocalTensor<uint32_t> snapshot(TPosition::VECCALC, base, DISPATCH_PROBE_ROWS * packets * 8U + 8U);
+    auto result = snapshot[DISPATCH_PROBE_ROWS * packets * 8U];
+    for (uint32_t j = 0; j < n; ++j) {
+        if (!(pending & (1U << j))) continue;
+        const DispatchRow& row = rows[j].copy;
+        auto* payload = peers[HierarchicalGateway(row.source)] + offset;
+        const uint32_t token = static_cast<uint32_t>(row.route) / params.tilingData->topK;
+        GlobalTensor<uint32_t> tail;
+        tail.SetGlobalBuffer(
+            reinterpret_cast<__gm__ uint32_t*>(payload + (token * packets + 1U) * RAIL_PACKET_BYTES - 32U));
+        DataCopy(snapshot[j * packets * 8U], tail, DataCopyParams{static_cast<uint16_t>(packets), 1U, 15U, 0U});
+    }
+    SyncFuncStatic<HardEvent::MTE2_V, MEGAMOE_ROCE_EVENT_ID>();
+    asc_vf_call<CheckGatewayCombinePacketsVF>(reinterpret_cast<__ubuf__ uint32_t*>(snapshot.GetPhyAddr()),
+                                              reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()), packets, n,
+                                              pending, params.tilingData->hierarchicalSequence);
+    SyncFuncStatic<HardEvent::V_S, MEGAMOE_ROCE_EVENT_ID>();
+    const uint32_t ready = result.GetValue(0);
+    SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+    return acquired | (ready & pending);
+#else
+    return acquired;
+#endif
+}
+
+#endif
 // route-index 使用独立的 MTE2_S 事件 6，避免与持续存活的 token 槽 0..5 冲突。
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void FlushDispatchRouteBatch(const TokenDispatchConfig& context, const Params& params,
@@ -268,15 +525,53 @@ __aicore__ inline void FlushDispatchRouteBatch(const TokenDispatchConfig& contex
         return;
     }
     SyncFuncStatic<AscendC::HardEvent::MTE2_S, MAX_DISPATCH_BUFFER_COUNT>();
+#ifdef DEEPEP_MEGAMOE_ROCE
+    for (uint32_t i = 0; i < batch.count; ++i) {
+#else
     for (uint32_t i = 0U; i < batch.count; ++i) {
+#endif
         const auto& segment = batch.segments[i];
+#ifdef DEEPEP_MEGAMOE_ROCE
+        for (int32_t j = 0; j < segment.rowCount; ++j) {
+            DispatchRow row{segment.sourceRank, scratch.validTopkIndexTensor.GetValue(segment.indexOffset + j),
+                            segment.dstRow + j};
+            IssueDispatchRow<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
+                                                                                  progress, row);
+        }
+#else
         CopyTokensAndMetaForDispatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
             context, params, winRankAddr, scratch, segment.dstRow, segment.sourceRank, segment.indexOffset,
             segment.rowCount, progress);
+#endif
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    SyncFuncStatic<HardEvent::S_MTE2, MAX_DISPATCH_BUFFER_COUNT>();
+#endif
     batch.count = 0U;
     batch.usedItems = 0U;
+#ifdef DEEPEP_MEGAMOE_ROCE
 }
+
+template <typename ActivationType>
+__aicore__ inline void LoadDispatchIndices(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+                                           const Params& params, TokenDispatchScratch<ActivationType>& scratch,
+                                           uint32_t localExpertId, uint32_t source, uint32_t ordinal, uint32_t take,
+                                           uint32_t offset)
+{
+    const uint64_t slotOffset =
+        (static_cast<uint64_t>(localExpertId) * common.worldSize + source) * context.routeIndexAlignSize;
+    GlobalTensor<int32_t> remoteRouteIndexGlobal;
+    remoteRouteIndexGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
+        params.peermemInfo.maskRecvPtr + slotOffset + static_cast<uint64_t>(ordinal) * sizeof(int32_t)));
+#ifdef DEEPEP_MEGAMOE_TIMER
+    AscendTimerRelayScope route(scratch.trace, AscendTimer::RelayStep::RouteRead, source, ordinal, take);
+#endif
+    DataCopyPad(scratch.validTopkIndexTensor[offset], remoteRouteIndexGlobal,
+                {1U, take * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+}
+#else
+}
+#endif
 
 /*
  * 保持 Prefill 的 peer 选择、源 ordinal 和目标行不变，只合并多个 peer 的索引读取屏障。
@@ -295,6 +590,16 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
     const uint32_t capacity = static_cast<uint32_t>(context.bufferConfig.routeItemsPerBatch);
     int32_t processed = 0;
     const int32_t rowCount = segmentMatchOrdinalEnd - segmentMatchOrdinalBegin;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    if (UseHierarchicalRoce(params.tilingData) && !winRankAddr[remoteRankIdx]) {
+        ObserveDispatchGateway(params, remoteRankIdx, scratch);
+        if (!(scratch.gatewayReady & (1U << (remoteRankIdx % HIERARCHICAL_RANKS_PER_HOST)))) {
+            batch.deferred[batch.deferredSources++] = {remoteRankIdx, segmentMatchOrdinalBegin,
+                                                       expertGlobalRowBegin + destinationRowBegin, rowCount};
+            return rowCount;
+        }
+    }
+#endif
     while (processed < rowCount) {
         const uint32_t remaining = static_cast<uint32_t>(rowCount - processed);
         const uint32_t take = remaining < capacity ? remaining : capacity;
@@ -303,6 +608,10 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
             FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr,
                                                                                          scratch, batch, progress);
         }
+#ifdef DEEPEP_MEGAMOE_ROCE
+        LoadDispatchIndices(context, common, params, scratch, localExpertId, remoteRankIdx,
+                            segmentMatchOrdinalBegin + processed, take, batch.usedItems);
+#else
         const uint64_t slotOffset =
             (static_cast<uint64_t>(localExpertId) * common.worldSize + remoteRankIdx) * context.routeIndexAlignSize;
         GlobalTensor<int32_t> remoteRouteIndexGlobal;
@@ -311,13 +620,151 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
             static_cast<uint64_t>(segmentMatchOrdinalBegin + processed) * sizeof(int32_t)));
         DataCopyPad(scratch.validTopkIndexTensor[batch.usedItems], remoteRouteIndexGlobal,
                     {1U, take * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+#endif
         batch.segments[batch.count++] = {remoteRankIdx, expertGlobalRowBegin + destinationRowBegin + processed,
                                          batch.usedItems, static_cast<int32_t>(take)};
         batch.usedItems += padded;
         processed += static_cast<int32_t>(take);
     }
     return processed;
+#ifdef DEEPEP_MEGAMOE_ROCE
 }
+
+template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
+__aicore__ inline void SubmitDispatchProbe(const TokenDispatchConfig& context, const Params& params, GM_ADDR* peers,
+                                           TokenDispatchScratch<ActivationType>& scratch, DispatchCopyProgress& progress,
+                                           const DispatchProbeRow* candidates, uint32_t& count, uint32_t& remaining,
+                                           uint32_t& waitingSource)
+{
+    if (!count) return;
+    const uint32_t ready = ReadyDispatchRows(context, params, peers, scratch, candidates, count);
+    for (uint32_t j = 0; j < count; ++j) {
+        const auto& candidate = candidates[j];
+        if (ready & (1U << j)) {
+            IssueDispatchRow<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, peers, scratch,
+                                                                                  progress, candidate.copy);
+            *candidate.deliveredWindow |= candidate.deliveredBit;
+            --remaining;
+        } else {
+            waitingSource = candidate.copy.source;
+        }
+    }
+    count = 0U;
+}
+
+template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
+__aicore__ inline void DispatchDeferredSources(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+                                               const Params& params, GM_ADDR* peers,
+                                               TokenDispatchScratch<ActivationType>& scratch, uint32_t expert,
+                                               DispatchRouteBatch& batch, DispatchCopyProgress& progress)
+{
+    constexpr uint32_t window = DISPATCH_PROBE_ROWS;
+    // A BS<=256 source contributes at most one row per token to this expert.
+    uint8_t delivered[HIERARCHICAL_RANKS_PER_HOST][HIERARCHICAL_MAX_TOKENS / window]{};
+    uint32_t extent = 0U, remaining = 0U;
+    for (uint32_t i = 0; i < batch.deferredSources; ++i) {
+        const auto& range = batch.deferred[i];
+        batch.segments[i] = {range.source, range.destination, extent, range.count};
+        remaining += range.count;
+        extent += Ops::Base::CeilAlign(static_cast<uint32_t>(range.count), window);
+    }
+    const bool resident = extent <= static_cast<uint32_t>(context.bufferConfig.routeItemsPerBatch);
+    if (resident) {
+        for (uint32_t i = 0; i < batch.deferredSources; ++i) {
+            const auto& r = batch.deferred[i];
+            LoadDispatchIndices(context, common, params, scratch, expert, r.source, r.firstOrdinal, r.count,
+                                batch.segments[i].indexOffset);
+        }
+        SyncFuncStatic<HardEvent::MTE2_S, MAX_DISPATCH_BUFFER_COUNT>();
+    }
+#ifdef DEEPEP_MEGAMOE_TIMER
+    AscendTimerRelayScope retry(scratch.trace, AscendTimer::RelayStep::Retry, scratch.traceRank, 0U, remaining);
+#endif
+    RoceWaitState wait{};
+    while (remaining) {
+        const uint32_t before = remaining;
+        uint32_t waitingSource = 0U;
+        DispatchProbeRow candidates[window];
+        uint32_t count = 0U;
+        for (uint32_t i = 0; i < batch.deferredSources; ++i) {
+            const auto& r = batch.deferred[i];
+            const uint32_t rows = static_cast<uint32_t>(r.count);
+            for (uint32_t first = 0; first < rows; first += window) {
+                const uint32_t n = rows - first < window ? rows - first : window;
+                auto& done = delivered[i][first / window];
+                const uint32_t pending = ((1U << n) - 1U) & ~done;
+                if (!pending) continue;
+                uint32_t offset = batch.segments[i].indexOffset + first;
+                if (!resident) {
+                    // Reuse a single aligned window and revisit every source on every sweep.
+                    offset = 0U;
+                    LoadDispatchIndices(context, common, params, scratch, expert, r.source, r.firstOrdinal + first, n,
+                                        offset);
+                    SyncFuncStatic<HardEvent::MTE2_S, MAX_DISPATCH_BUFFER_COUNT>();
+                }
+                for (uint32_t j = 0; j < n; ++j) {
+                    if (!(pending & (1U << j))) continue;
+                    const uint32_t ordinal = first + j;
+                    candidates[count++] = {{r.source, scratch.validTopkIndexTensor.GetValue(offset + j),
+                                            r.destination + static_cast<int32_t>(ordinal)},
+                                           &done, static_cast<uint8_t>(1U << j)};
+                    if (count == window) {
+                        SubmitDispatchProbe<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                            context, params, peers, scratch, progress, candidates, count, remaining, waitingSource);
+                    }
+                }
+                if (!resident) {
+                    SubmitDispatchProbe<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                        context, params, peers, scratch, progress, candidates, count, remaining, waitingSource);
+                    SyncFuncStatic<HardEvent::S_MTE2, MAX_DISPATCH_BUFFER_COUNT>();
+                }
+            }
+        }
+        SubmitDispatchProbe<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+            context, params, peers, scratch, progress, candidates, count, remaining, waitingSource);
+        if (remaining == before) {
+#ifdef DEEPEP_MEGAMOE_TIMER
+            AscendTimerRelayScope backoff(scratch.trace, AscendTimer::RelayStep::Backoff, scratch.traceRank, 0U,
+                                          remaining);
+#endif
+            DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch,
+                                                                                          progress);
+            RoceCheckWait(wait, waitingSource, nullptr, RoceWaitKind::LocalReadiness,
+                          params.tilingData->hierarchicalSequence, 0U);
+            const auto start = GetSystemCycle();
+            while (GetSystemCycle() - start < GM_FLAG_POLL_BACKOFF_CYCLES) {
+            }
+        } else {
+            wait = {};
+        }
+    }
+    if (resident) SyncFuncStatic<HardEvent::S_MTE2, MAX_DISPATCH_BUFFER_COUNT>();
+}
+
+template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
+__aicore__ inline void FinishDispatchSources(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+                                             const Params& params, GM_ADDR* peers,
+                                             TokenDispatchScratch<ActivationType>& scratch, uint32_t expert,
+                                             DispatchRouteBatch& batch, DispatchCopyProgress& progress)
+{
+    FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, peers, scratch, batch,
+                                                                                 progress);
+    if (batch.deferredSources) {
+        // Retire the last ready payload and metadata before waiting for any slow source.
+        DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch,
+                                                                                      progress);
+        DispatchDeferredSources<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, common, params, peers,
+                                                                                     scratch, expert, batch, progress);
+    }
+#ifdef DEEPEP_MEGAMOE_TIMER
+    AscendTimerRelayScope drain(scratch.trace, AscendTimer::RelayStep::Drain, scratch.traceRank, 0U,
+                                progress.issuedRows);
+#endif
+    DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
+}
+#else
+}
+#endif
 
 /*
  * 在当前专家的 source-rank 累计行数中二分查找 globalRowIdx 所属的首个 rank。
@@ -360,7 +807,11 @@ __aicore__ inline void DispatchOwnedExpertRows(const TokenDispatchConfig& contex
     // prefix 单调递增，二分找到与本核首行相交的第一个 source rank，避免从 rank 0 线性扫描。
     uint32_t sourceRankIdx = FindDispatchSourceRank(common, scratch, localExpertId, coreGlobalRowBegin);
     int32_t dispatchedRowCount = 0;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    DispatchRouteBatch batch;
+#else
     DispatchRouteBatch batch{};
+#endif
     DispatchCopyProgress progress{};
 
     while (sourceRankIdx < common.worldSize) {
@@ -386,9 +837,19 @@ __aicore__ inline void DispatchOwnedExpertRows(const TokenDispatchConfig& contex
         }
         ++sourceRankIdx;
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    FinishDispatchSources<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, common, params, winRankAddr,
+                                                                               scratch, localExpertId, batch, progress);
+#ifdef DEEPEP_MEGAMOE_TIMER
+    AscendTimerRelayScope publish(scratch.trace, AscendTimer::RelayStep::TilePublish, common.rankId,
+                                  coreRange.localExpertRowBegin,
+                                  coreRange.localExpertRowEnd - coreRange.localExpertRowBegin);
+#endif
+#else
     FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
                                                                                  batch, progress);
     DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
+#endif
     // 所有 source-rank 子段完成后统一发布本核贡献；GMM1 按 tile 累计到完整行数后即可启动。
     PublishGmm1TileReady(syncLayout, params, localExpertId, gmm1TileRowCount,
                          static_cast<int32_t>(coreRange.localExpertRowBegin),
@@ -416,7 +877,11 @@ __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& conte
                                                 uint32_t expertIdx, const ExpertDispatchCoreRange& coreRange,
                                                 uint32_t sliceBegin, uint32_t sliceEnd)
 {
+#ifdef DEEPEP_MEGAMOE_ROCE
+    DispatchRouteBatch batch;
+#else
     DispatchRouteBatch batch{};
+#endif
     DispatchCopyProgress progress{};
     DispatchPeerCounts counts{scratch.cumsumInfoTensor, expertIdx * common.worldSize};
 #if MEGAMOE_PREFILL_PEER_FAST_PATH
@@ -469,9 +934,19 @@ __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& conte
             break;
         }
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    FinishDispatchSources<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, common, params, winRankAddr,
+                                                                               scratch, expertIdx, batch, progress);
+#ifdef DEEPEP_MEGAMOE_TIMER
+    AscendTimerRelayScope publish(scratch.trace, AscendTimer::RelayStep::TilePublish, common.rankId,
+                                  coreRange.localExpertRowBegin,
+                                  coreRange.localExpertRowEnd - coreRange.localExpertRowBegin);
+#endif
+#else
     FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
                                                                                  batch, progress);
     DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
+#endif
     // 每个 owner 仍独占连续目标行；本核所有 peer 段落地后按目标行发布一次贡献。
     PublishGmm1TileReady(syncLayout, params, expertIdx, static_cast<int32_t>(PipelineTileM),
                          static_cast<int32_t>(coreRange.localExpertRowBegin),
@@ -558,10 +1033,18 @@ __aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, co
     }
 }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename ActivationType>
+__aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, const Params& params,
+                                           TokenDispatchScratch<ActivationType>& scratch, uint32_t expectedEpoch,
+                                           AscendTimerDevice* timer = nullptr)
+{
+#else
 template <typename ActivationType>
 __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, const Params& params,
                                            TokenDispatchScratch<ActivationType>& scratch, uint32_t expectedEpoch)
 {
+#endif
     const uint32_t stride = static_cast<uint32_t>(CalcMteExpertCountRankStride(common.moeExpertPerRank));
     const uint32_t wireWords = common.worldSize * stride;
     const auto& buffers = params.tilingData->dispatchBufferConfig;
@@ -570,15 +1053,48 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
     __gm__ int32_t* wire = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.expertCountRecvPtr);
     if (static_cast<uint64_t>(wireWords) * sizeof(int32_t) <= availableBytes) {
         const uint32_t stagingAddr = static_cast<uint32_t>(scratch.validTopkIndexTensor.GetPhyAddr());
+#ifndef DEEPEP_MEGAMOE_ROCE
         LocalTensor<int32_t> snapshot(TPosition::VECCALC, stagingAddr, wireWords);
+#endif
         GlobalTensor<int32_t> global;
         global.SetGlobalBuffer(wire);
         uint32_t stale = 0;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        uint32_t snapshotAddr = stagingAddr;
+#ifdef DEEPEP_MEGAMOE_TIMER
+        using namespace AscendTimer;
+        const bool profile = timer != nullptr && timer->Enabled();
+        uint64_t stats[COUNT_DIAGNOSTIC_COUNT]{};
+        stats[COUNT_PROFILE_VALID] = 1;
+        stats[COUNT_EXPECTED_EPOCH] = expectedEpoch;
+        stats[COUNT_SNAPSHOT_BYTES] = wireWords * sizeof(int32_t);
+        stats[COUNT_SNAPSHOT_SOURCES] = common.worldSize;
+        stats[COUNT_SNAPSHOT_EXPERTS] = common.moeExpertPerRank;
+        // Reuse the idle Dispatch copy buffers. Alternating snapshots preserves
+        // the last failed poll without extra DMA, vector calls or barriers.
+        const bool preserveFailure =
+            profile && wireWords <= COUNT_SNAPSHOT_MAX_WORDS && 2U * stats[COUNT_SNAPSHOT_BYTES] <= availableBytes;
+        uint32_t failedAddr = stagingAddr;
+#else
+        (void)timer;
+#endif
+#endif
         do {
+#ifdef DEEPEP_MEGAMOE_ROCE
+            LocalTensor<int32_t> snapshot(TPosition::VECCALC, snapshotAddr, wireWords);
+#ifdef DEEPEP_MEGAMOE_TIMER
+            const int64_t dmaStart = profile ? AscendC::GetSystemCycle() : 0;
+#endif
+#endif
             SyncFuncStatic<AscendC::HardEvent::V_MTE2, SYNC_EVENT_ID2>();
             DataCopyPad(snapshot, global, {1U, static_cast<uint32_t>(wireWords * sizeof(int32_t)), 0U, 0U, 0U},
                         {false, 0U, 0U, 0U});
             SyncFuncStatic<AscendC::HardEvent::MTE2_V, SYNC_EVENT_ID2>();
+#ifdef DEEPEP_MEGAMOE_ROCE
+#ifdef DEEPEP_MEGAMOE_TIMER
+            const int64_t dmaEnd = profile ? AscendC::GetSystemCycle() : 0;
+#endif
+#endif
             asc_vf_call<CheckTransposeExpertCountsVF>(
                 reinterpret_cast<__ubuf__ uint32_t*>(snapshot.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.cumsumInfoTensor.GetPhyAddr()),
@@ -586,12 +1102,60 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
                 common.moeExpertPerRank, stride, expectedEpoch);
             SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
             stale = static_cast<uint32_t>(scratch.expertTokenNumsOutTensor.GetValue(0));
+#ifdef DEEPEP_MEGAMOE_ROCE
+#ifdef DEEPEP_MEGAMOE_TIMER
+            if (profile) {
+                const int64_t checkEnd = AscendC::GetSystemCycle();
+                ++stats[COUNT_SNAPSHOT_ATTEMPTS];
+                stats[COUNT_DMA_CYCLES] += dmaEnd - dmaStart;
+                stats[COUNT_CHECK_CYCLES] += checkEnd - dmaEnd;
+                if (stale == 0U) {
+                    stats[COUNT_SUCCESS_DMA_CYCLES] = dmaEnd - dmaStart;
+                    stats[COUNT_SUCCESS_CHECK_CYCLES] = checkEnd - dmaEnd;
+                } else {
+                    ++stats[COUNT_SNAPSHOT_FAILURES];
+                    stats[COUNT_LAST_STALE_WORDS] = stale;
+                    failedAddr = snapshotAddr;
+                    if (preserveFailure) {
+                        snapshotAddr =
+                            snapshotAddr == stagingAddr ? stagingAddr + wireWords * sizeof(int32_t) : stagingAddr;
+                    }
+                }
+            }
+#endif
+#endif
             if (stale != 0U) {
                 int64_t startCycle = AscendC::GetSystemCycle();
                 while (AscendC::GetSystemCycle() - startCycle < GM_FLAG_POLL_BACKOFF_CYCLES) {
                 }
+#ifdef DEEPEP_MEGAMOE_ROCE
+#ifdef DEEPEP_MEGAMOE_TIMER
+                if (profile) {
+                    stats[COUNT_BACKOFF_CYCLES] += AscendC::GetSystemCycle() - startCycle;
+                }
+#endif
+#endif
             }
         } while (stale != 0U);
+#ifdef DEEPEP_MEGAMOE_ROCE
+#ifdef DEEPEP_MEGAMOE_TIMER
+        if (profile) {
+            if (preserveFailure && stats[COUNT_SNAPSHOT_FAILURES] != 0U) {
+                const int64_t captureStart = AscendC::GetSystemCycle();
+                LocalTensor<int32_t> failed(TPosition::VECCALC, failedAddr, wireWords);
+                GlobalTensor<int32_t> captured;
+                captured.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(timer->CountSnapshotAddress()));
+                SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
+                DataCopyPad(captured, failed, {1U, static_cast<uint32_t>(stats[COUNT_SNAPSHOT_BYTES]), 0U, 0U, 0U});
+                // Complete the one diagnostic copy before Dispatch reuses this UB.
+                SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID2>();
+                stats[COUNT_CAPTURED_SNAPSHOT_WORDS] = wireWords;
+                stats[COUNT_DIAGNOSTIC_CYCLES] += AscendC::GetSystemCycle() - captureStart;
+            }
+            timer->WriteCountDiagnostics(stats);
+        }
+#endif
+#endif
         return;
     }
     // Unusual small-token-buffer / large-expert-table shapes retain a bounded-UB path.
@@ -612,28 +1176,61 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
 
 // Wave 进入逐专家流水前一次准备完整 count 表；每个物理 block 只发布一次 ready。
 // W4 Wave-ahead 路径同时将 prefix 持久化到 GM，避免后续 Activation 覆盖 UB 后丢失 Dispatch 状态。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <bool NeedCumsumReload = false, typename ActivationType>
+__aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfig& common,
+                                                       const BlockWorkspaceContext& countWorkspace,
+                                                       const Params& params,
+                                                       TokenDispatchScratch<ActivationType>& scratch,
+                                                       AscendTimerDevice* timer = nullptr)
+{
+#else
 template <bool NeedCumsumReload = false, typename ActivationType>
 __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfig& common,
                                                        const BlockWorkspaceContext& countWorkspace,
                                                        const Params& params,
                                                        TokenDispatchScratch<ActivationType>& scratch)
 {
+#endif
     if constexpr (g_coreType == AIC) {
         return;
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    if (countWorkspace.shared ? (GetSubBlockIdx() != 0U || countWorkspace.blockIdx != 0U) : GetSubBlockIdx() != 1U)
+        return;
+#else
     if (GetSubBlockIdx() != 1U) {
         return;
     }
+#endif
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    AscendTimerFixedScope preparation(timer, AscendTimer::AIV_COUNT_TABLE_PREPARE);
+#endif
     uint32_t rawCountElementCount = common.worldSize * common.moeExpertPerRank;
     // 每次重新准备输入路由都失效缓存。不能仅靠 expertId，否则重复 launch 可能复用旧计数。
     scratch.peerRowLimitsCache = {};
     __gm__ int32_t* launchCountSlot0 =
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.rankSyncInWorldPtr + RANK_SYNC_COUNTER_OFFSET_BYTES);
     int32_t expectEpoch = (ReadGmByPassDCache(launchCountSlot0) & 0x7F) | 0x80;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    if (countWorkspace.shared) {
+        LoadGatheredRouteCounts(common, params, scratch);
+    } else if (UseDecodeRailRouting(params.tilingData)) {
+        {
+            // Includes DMA snapshots, epoch validation and any poll/backoff;
+            // it is readiness acquisition time, not pure network latency.
+            AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);
+            LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch), timer);
+        }
+#else
     if (UseDecodeRailRouting(params.tilingData)) {
         LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch));
+#endif
     } else {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);
+#endif
         GlobalTensor<int32_t> expertCountGlobal;
         expertCountGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.expertCountRecvPtr));
         DataCopyPad(scratch.cumsumInfoTensor, expertCountGlobal,
@@ -667,6 +1264,32 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             }
         }
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    {
+        AscendTimerFixedScope prefix(timer, AscendTimer::AIV_COUNT_PREFIX_BUILD);
+        SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID2>();
+        ComputeExpertCountTables(scratch.cumsumInfoTensor, scratch.expertTokenNumsOutTensor, common.moeExpertPerRank,
+                                 common.worldSize, params.tilingData->maxOutputSize);
+        SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
+    }
+    {
+        AscendTimerFixedScope publish(timer, AscendTimer::AIV_COUNT_TABLE_PUBLISH);
+        uint64_t countOffset = GetExpertCountWorkspaceOffset(countWorkspace, common.moeExpertPerRank, 0U, true);
+        SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
+        DataCopyPad(scratch.expertRevNumsGlobalTensor[countOffset], scratch.expertTokenNumsOutTensor,
+                    {1U, common.moeExpertPerRank * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U});
+        if constexpr (NeedCumsumReload) {
+            DataCopyPad(scratch.cumsumInfoGlobalTensor, scratch.cumsumInfoTensor,
+                        {1U, rawCountElementCount * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U});
+        }
+        SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID2>();
+
+        __gm__ int32_t* countTableReady =
+            reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagSendCntCalToUpdParamsPtr) +
+            static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
+        if (!countWorkspace.shared) WriteGmByPassDCache(countTableReady, static_cast<int32_t>(1));
+    }
+#else
     SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID2>();
 
     ComputeExpertCountTables(scratch.cumsumInfoTensor, scratch.expertTokenNumsOutTensor, common.moeExpertPerRank,
@@ -686,6 +1309,7 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
         reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagSendCntCalToUpdParamsPtr) +
         static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
     WriteGmByPassDCache(countTableReady, static_cast<int32_t>(1));
+#endif
 }
 
 /*

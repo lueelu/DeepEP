@@ -3,8 +3,8 @@
 #ifndef MEGA_MOE_HIERARCHICAL_DISPATCH_H
 #define MEGA_MOE_HIERARCHICAL_DISPATCH_H
 
-#include "../common/mega_moe_roce.hpp"
-#include "mega_moe_send_mask.hpp"
+#include "csrc_ep32/kernels/mega_moe/common/mega_moe_roce.hpp"
+#include "kernels/mega_moe/stage/mega_moe_send_mask.hpp"
 
 namespace MegaMoeImpl {
 

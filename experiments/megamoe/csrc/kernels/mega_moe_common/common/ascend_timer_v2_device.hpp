@@ -14,6 +14,9 @@ public:
 #ifdef DEEPEP_MEGAMOE_TIMER
         timerAddr_ = timerAddr;
 #else
+#ifdef DEEPEP_MEGAMOE_ROCE
+        (void)timerAddr;
+#endif
         timerAddr_ = nullptr;
         coreId_ = -1;
         return;
@@ -26,6 +29,9 @@ public:
         activeType_ = activeIndex_ = waitType_ = waitIndex_ = -1;
         expert_ = -1;
         tileActive_ = false;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        startupActive_ = false;
+#endif
         int blockId = AscendC::GetBlockIdx();
         int taskRatio = AscendC::GetTaskRation();
         if (taskRatio <= 0) {
@@ -46,7 +52,15 @@ public:
         }
         for (int typeId = 0; typeId < DEEPEP_MEGAMOE_TIMER_NAMESPACE::DYNAMIC_TYPE_COUNT; ++typeId) {
             dynamicCounts_[typeId] = 0;
+#ifdef DEEPEP_MEGAMOE_ROCE
         }
+        if (Enabled()) {
+            WriteValue(DEEPEP_MEGAMOE_TIMER_NAMESPACE::COUNT_DIAGNOSTIC_OFFSET + coreId_ * DEEPEP_MEGAMOE_TIMER_NAMESPACE::COUNT_DIAGNOSTIC_COUNT,
+                       0);  // A later launch may take a non-snapshot count path.
+        }
+#else
+        }
+#endif
     }
 
     __aicore__ inline bool Enabled() const
@@ -87,6 +101,11 @@ public:
     {
         if (!Enabled() || expert_ < 0) {
             return false;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        }
+        if (type == DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIC_GMM1) {
+            EndStartup();
+#endif
         }
         tileActive_ = true;
         rowStart_ = sliceRow_ + m;
@@ -134,6 +153,41 @@ public:
         WriteEnd(timingId, AscendC::GetSystemCycle());
     }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    // Observe existing synchronization without adding a pipeline drain. Fixed
+    // slots are used only once per invocation and do not touch tile/span state.
+    __aicore__ inline void StartUnfenced(DEEPEP_MEGAMOE_TIMER_NAMESPACE::FixedTiming type)
+    {
+        if (Enabled()) {
+            WriteWave(static_cast<int>(type), DEEPEP_MEGAMOE_TIMER_NAMESPACE::NO_WAVE);
+            WriteStart(static_cast<int>(type), AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline void EndUnfenced(DEEPEP_MEGAMOE_TIMER_NAMESPACE::FixedTiming type)
+    {
+        if (Enabled()) {
+            WriteEnd(static_cast<int>(type), AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline void BeginStartup()
+    {
+        if (Enabled()) {
+            startupActive_ = true;
+            StartUnfenced(coreId_ % 3 == 0 ? DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIC_MOE_STARTUP : DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_MOE_STARTUP);
+        }
+    }
+
+    __aicore__ inline void EndStartup()
+    {
+        if (Enabled() && startupActive_) {
+            EndUnfenced(coreId_ % 3 == 0 ? DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIC_MOE_STARTUP : DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_MOE_STARTUP);
+            startupActive_ = false;
+        }
+    }
+
+#endif
     // 每次 slice 独立记录；依赖等待会把当前执行段拆成真实的前后两段。
     __aicore__ inline void StartSpan(DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type)
     {
@@ -141,6 +195,11 @@ public:
             return;
         }
         AscendC::PipeBarrier<PIPE_ALL>();
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (type == DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_DISPATCH || type == DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_GMM1_PROLOGUE) {
+            EndStartup();
+        }
+#endif
         activeType_ = static_cast<int>(type);
         activeWaveId_ = waveId_;
         activeIndex_ = BeginRaw(activeType_, AscendC::GetSystemCycle());
@@ -201,6 +260,145 @@ public:
         }
     }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    // RDMA may progress inside a compute tile/span. Keep its handle independent
+    // of activeType_/waitType_ and never drain a pipeline just for timestamps.
+    __aicore__ inline int BeginRdma(DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type, DEEPEP_MEGAMOE_TIMER_NAMESPACE::RdmaPhase phase, uint32_t peer,
+                                    uint32_t bytes, bool isCommit, uint32_t qp = 0U, uint32_t rowStart = 0U,
+                                    uint32_t rowCount = 0U)
+    {
+        return BeginIndependent(
+            type, (static_cast<uint64_t>(peer + 1) << 32) | (rowCount << 8) | (static_cast<uint32_t>(phase) + 1),
+            (static_cast<uint64_t>(rowStart) << 48) | (static_cast<uint64_t>(qp) << 40) |
+                (static_cast<uint64_t>(isCommit) << 32) | bytes);
+    }
+
+    __aicore__ inline void EndRdma(DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type, int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(static_cast<int>(type), index, AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline int BeginGatewayWait(uint32_t source, uint32_t gateway, uint32_t sequence)
+    {
+        return BeginIndependent(DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_GATEWAY_PAYLOAD_WAIT,
+                                (static_cast<uint64_t>(source + 1) << 32) | (gateway + 1), sequence);
+    }
+
+    __aicore__ inline void EndGatewayWait(int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_GATEWAY_PAYLOAD_WAIT, index, AscendC::GetSystemCycle());
+        }
+    }
+
+    // Independent row handles retain the originating wave across expert/wave
+    // boundaries. Lifetime ends when software observes retirement, not at a
+    // hardware-exact DMA timestamp. No timer-only synchronization is added.
+    __aicore__ inline int BeginCombineRow(uint32_t expert, uint32_t row, uint32_t slot,
+                                          DEEPEP_MEGAMOE_TIMER_NAMESPACE::CombineRowPhase phase)
+    {
+        return BeginCombineRowAtWave(expert, row, slot, phase, waveId_);
+    }
+
+    __aicore__ inline int64_t CurrentWave() const
+    {
+        return waveId_;
+    }
+
+    __aicore__ inline int BeginCombineRowAtWave(uint32_t expert, uint32_t row, uint32_t slot,
+                                                DEEPEP_MEGAMOE_TIMER_NAMESPACE::CombineRowPhase phase, int64_t wave)
+    {
+        return BeginIndependent(DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_ASYNC, (static_cast<uint64_t>(expert + 1U) << 32) | row,
+                                (static_cast<uint64_t>(slot + 1U) << 32) | static_cast<uint32_t>(phase), wave);
+    }
+
+    __aicore__ inline void EndCombineRow(int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_ASYNC, index, AscendC::GetSystemCycle());
+        }
+    }
+
+    // Progress can surround RDMA calls while a compute tile/span or wait is
+    // active. Capture the scheduler's wave without changing any active handle.
+    __aicore__ inline int BeginCombineProgress(DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type)
+    {
+        if (type != DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_PROGRESS && type != DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_DRAIN) {
+            return -1;
+        }
+        return BeginIndependent(type, 0, 0, waveId_);
+    }
+
+    __aicore__ inline void EndCombineProgress(DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type, int index, uint32_t pendingBefore,
+                                              uint32_t pendingAfter, uint32_t posts, uint32_t scannedRows,
+                                              uint64_t scanControlCycles)
+    {
+        if (!Enabled() || index < 0 || index >= DEEPEP_MEGAMOE_TIMER_NAMESPACE::MAX_DYNAMIC_ITER ||
+            (type != DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_PROGRESS && type != DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_DRAIN)) {
+            return;
+        }
+        int64_t cycle = AscendC::GetSystemCycle();
+        if (type == DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_DRAIN) {
+            posts = scannedRows = 0;
+            scanControlCycles = 0;
+        }
+        // Scheduler counters are bounded by 1024. Masks keep the wire fields
+        // independent even if a caller supplies an invalid wider value.
+        uint64_t counts =
+            static_cast<uint64_t>(pendingBefore & 0xffffU) | (static_cast<uint64_t>(pendingAfter & 0xffffU) << 16) |
+            (static_cast<uint64_t>(posts & 0xffffU) << 32) | (static_cast<uint64_t>(scannedRows & 0xffffU) << 48);
+        int typeId = static_cast<int>(type);
+        int offset = DEEPEP_MEGAMOE_TIMER_NAMESPACE::TASK_METADATA_OFFSET +
+                     ((coreId_ * DEEPEP_MEGAMOE_TIMER_NAMESPACE::DYNAMIC_TYPE_COUNT + typeId) * DEEPEP_MEGAMOE_TIMER_NAMESPACE::MAX_DYNAMIC_ITER + index) * 2;
+        WriteValue(offset, static_cast<int64_t>(counts));
+        WriteValue(offset + 1, static_cast<int64_t>(scanControlCycles));
+        EndRaw(typeId, index, cycle);
+    }
+
+    // Deferred writes keep detailed timing out of active tile/wait state and
+    // add no synchronization. The caller samples only existing phase edges.
+    __aicore__ inline void RecordDetail(DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type, int64_t start, int64_t end, uint64_t first,
+                                        uint64_t second)
+    {
+        if (!Enabled() || end <= start) {
+            return;
+        }
+        const int typeId = static_cast<int>(type);
+        const int index = dynamicCounts_[typeId]++;
+        if (index >= DEEPEP_MEGAMOE_TIMER_NAMESPACE::MAX_DYNAMIC_ITER) {
+            return;
+        }
+        const int offset =
+            DEEPEP_MEGAMOE_TIMER_NAMESPACE::TASK_METADATA_OFFSET +
+            ((coreId_ * DEEPEP_MEGAMOE_TIMER_NAMESPACE::DYNAMIC_TYPE_COUNT + typeId) * DEEPEP_MEGAMOE_TIMER_NAMESPACE::MAX_DYNAMIC_ITER + index) * 2;
+        WriteValue(offset, static_cast<int64_t>(first));
+        WriteValue(offset + 1, static_cast<int64_t>(second));
+        const int timing = DynamicTimingIndex(typeId, index);
+        WriteWave(timing, waveId_);
+        WriteStart(timing, start);
+        WriteEnd(timing, end);
+    }
+
+    __aicore__ inline GM_ADDR CountSnapshotAddress() const
+    {
+        return timerAddr_ + sizeof(int64_t) * (DEEPEP_MEGAMOE_TIMER_NAMESPACE::COUNT_SNAPSHOT_OFFSET +
+                                               coreId_ * DEEPEP_MEGAMOE_TIMER_NAMESPACE::COUNT_SNAPSHOT_SLOTS_PER_CORE);
+    }
+
+    __aicore__ inline void WriteCountDiagnostics(const uint64_t* values)
+    {
+        if (!Enabled()) {
+            return;
+        }
+        for (int i = 0; i < DEEPEP_MEGAMOE_TIMER_NAMESPACE::COUNT_DIAGNOSTIC_COUNT; ++i) {
+            WriteValue(DEEPEP_MEGAMOE_TIMER_NAMESPACE::COUNT_DIAGNOSTIC_OFFSET + coreId_ * DEEPEP_MEGAMOE_TIMER_NAMESPACE::COUNT_DIAGNOSTIC_COUNT + i,
+                       static_cast<int64_t>(values[i]));
+        }
+    }
+
+#endif
     __aicore__ inline void FlushDynamicCounts()
     {
         if (!Enabled()) {
@@ -224,11 +422,36 @@ private:
     int waitType_ = -1;
     int waitIndex_ = -1;
     bool tileActive_ = false;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    bool startupActive_ = false;
+#endif
     int expert_ = -1;
     int nTile_ = -1;
     uint32_t sliceRow_ = 0;
     uint32_t rowStart_ = 0;
     uint32_t rows_ = 0;
+#ifdef DEEPEP_MEGAMOE_ROCE
+
+    __aicore__ inline int BeginIndependent(DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type, uint64_t first, uint64_t second,
+                                           int64_t waveId = DEEPEP_MEGAMOE_TIMER_NAMESPACE::NO_WAVE)
+    {
+        if (!Enabled()) {
+            return -1;
+        }
+        int typeId = static_cast<int>(type);
+        int index = dynamicCounts_[typeId]++;
+        if (index >= DEEPEP_MEGAMOE_TIMER_NAMESPACE::MAX_DYNAMIC_ITER) {
+            return -1;
+        }
+        int offset = DEEPEP_MEGAMOE_TIMER_NAMESPACE::TASK_METADATA_OFFSET +
+                     ((coreId_ * DEEPEP_MEGAMOE_TIMER_NAMESPACE::DYNAMIC_TYPE_COUNT + typeId) * DEEPEP_MEGAMOE_TIMER_NAMESPACE::MAX_DYNAMIC_ITER + index) * 2;
+        WriteValue(offset, static_cast<int64_t>(first));
+        WriteValue(offset + 1, static_cast<int64_t>(second));
+        WriteWave(DynamicTimingIndex(typeId, index), waveId);
+        WriteStart(DynamicTimingIndex(typeId, index), AscendC::GetSystemCycle());
+        return index;
+    }
+#endif
 
     __aicore__ inline void WriteMetadata(int typeId, int index)
     {
@@ -306,6 +529,174 @@ private:
     }
 };
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+class AscendTimerRelayScope {
+public:
+    __aicore__ inline AscendTimerRelayScope(DEEPEP_MEGAMOE_TIMER_DEVICE* timer, DEEPEP_MEGAMOE_TIMER_NAMESPACE::RelayStep step, uint32_t source,
+                                            uint32_t firstExpert, uint32_t expertCount)
+        : timer_(timer && timer->Enabled() ? timer : nullptr),
+          first_((static_cast<uint64_t>(step) << 32) | (source + 1U)),
+          second_((static_cast<uint64_t>(firstExpert) << 32) | expertCount)
+    {
+        if (timer_) {
+            start_ = AscendC::GetSystemCycle();
+        }
+    }
+    __aicore__ inline ~AscendTimerRelayScope()
+    {
+        if (timer_) {
+            const int64_t end = AscendC::GetSystemCycle();
+            timer_->RecordDetail(DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_RELAY_STEP, start_, end, first_, second_);
+        }
+    }
+
+private:
+    DEEPEP_MEGAMOE_TIMER_DEVICE* timer_;
+    uint64_t first_;
+    uint64_t second_;
+    int64_t start_ = 0;
+};
+
+class AscendTimerFixedScope {
+public:
+    __aicore__ inline AscendTimerFixedScope(DEEPEP_MEGAMOE_TIMER_DEVICE* timer, DEEPEP_MEGAMOE_TIMER_NAMESPACE::FixedTiming type)
+        : timer_(timer), type_(type)
+    {
+        if (timer_ != nullptr) {
+            timer_->StartUnfenced(type_);
+        }
+    }
+    __aicore__ inline ~AscendTimerFixedScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndUnfenced(type_);
+        }
+    }
+
+private:
+    DEEPEP_MEGAMOE_TIMER_DEVICE* timer_;
+    DEEPEP_MEGAMOE_TIMER_NAMESPACE::FixedTiming type_;
+};
+
+// The first routed Dispatch/prologue/tile closes this envelope. Empty-work
+// cores close it at stage exit, so they retain a visible startup interval too.
+class AscendTimerStartupScope {
+public:
+    __aicore__ inline explicit AscendTimerStartupScope(DEEPEP_MEGAMOE_TIMER_DEVICE* timer) : timer_(timer)
+    {
+        if (timer_ != nullptr) {
+            timer_->BeginStartup();
+        }
+    }
+    __aicore__ inline ~AscendTimerStartupScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndStartup();
+        }
+    }
+
+private:
+    DEEPEP_MEGAMOE_TIMER_DEVICE* timer_;
+};
+
+class AscendTimerGatewayWaitScope {
+public:
+    __aicore__ inline AscendTimerGatewayWaitScope(DEEPEP_MEGAMOE_TIMER_DEVICE* timer, uint32_t source, uint32_t gateway,
+                                                  uint32_t sequence)
+        : timer_(timer), index_(timer ? timer->BeginGatewayWait(source, gateway, sequence) : -1)
+    {
+    }
+    __aicore__ inline ~AscendTimerGatewayWaitScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndGatewayWait(index_);
+        }
+    }
+
+private:
+    DEEPEP_MEGAMOE_TIMER_DEVICE* timer_;
+    int index_;
+};
+
+class AscendTimerRdmaScope {
+public:
+    __aicore__ inline AscendTimerRdmaScope(DEEPEP_MEGAMOE_TIMER_DEVICE* timer, DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type,
+                                           DEEPEP_MEGAMOE_TIMER_NAMESPACE::RdmaPhase phase, uint32_t peer, uint32_t bytes, bool isCommit,
+                                           uint32_t qp = 0U, uint32_t rowStart = 0U, uint32_t rowCount = 0U)
+        : timer_(timer),
+          type_(type),
+          index_(timer ? timer->BeginRdma(type, phase, peer, bytes, isCommit, qp, rowStart, rowCount) : -1)
+    {
+    }
+    __aicore__ inline ~AscendTimerRdmaScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndRdma(type_, index_);
+        }
+    }
+
+private:
+    DEEPEP_MEGAMOE_TIMER_DEVICE* timer_;
+    DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type_;
+    int index_;
+};
+
+// Bounded progress constructs after its separately timed initialization. Fused
+// route-run completion includes route discovery in this scope. Progress covers
+// scan/post work; drain surrounds child progress calls and backoff. Scan
+// segments exclude RocePutBytes and paused backoff. Each segment includes the
+// call-boundary and timestamp overhead between its StartScan and StopScan cycle
+// reads; bookkeeping after the StopScan read and work while paused are excluded.
+// Timing never determines whether scheduler work executes, and adds no barrier.
+class AscendTimerCombineProgressScope {
+public:
+    __aicore__ inline AscendTimerCombineProgressScope(DEEPEP_MEGAMOE_TIMER_DEVICE* timer, DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type)
+        : timer_(timer), type_(type), index_(timer ? timer->BeginCombineProgress(type) : -1)
+    {
+    }
+    __aicore__ inline ~AscendTimerCombineProgressScope()
+    {
+        // Early exits still close the envelope. Normal callers supply counters
+        // explicitly; no scheduler state is read or changed by this fallback.
+        Finish(0, 0, 0, 0);
+    }
+
+    __aicore__ inline void StartScan()
+    {
+        if (index_ >= 0 && timer_->Enabled() && type_ == DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_COMBINE_PROGRESS && !scanActive_) {
+            scanStart_ = AscendC::GetSystemCycle();
+            scanActive_ = true;
+        }
+    }
+
+    __aicore__ inline void StopScan()
+    {
+        if (index_ >= 0 && timer_->Enabled() && scanActive_) {
+            scanControlCycles_ += static_cast<uint64_t>(AscendC::GetSystemCycle()) - scanStart_;
+            scanActive_ = false;
+        }
+    }
+
+    __aicore__ inline void Finish(uint32_t pendingBefore, uint32_t pendingAfter, uint32_t posts, uint32_t scannedRows)
+    {
+        if (index_ < 0) {
+            return;
+        }
+        StopScan();
+        timer_->EndCombineProgress(type_, index_, pendingBefore, pendingAfter, posts, scannedRows, scanControlCycles_);
+        index_ = -1;
+    }
+
+private:
+    DEEPEP_MEGAMOE_TIMER_DEVICE* timer_;
+    DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType type_;
+    int index_;
+    bool scanActive_ = false;
+    uint64_t scanStart_ = 0;
+    uint64_t scanControlCycles_ = 0;
+};
+
+#endif
 class DEEPEP_MEGAMOE_TIMER_TILE_SCOPE {
 public:
     __aicore__ inline DEEPEP_MEGAMOE_TIMER_TILE_SCOPE(DEEPEP_MEGAMOE_TIMER_DEVICE* timer,

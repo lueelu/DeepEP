@@ -93,6 +93,38 @@ public:
         k_ = AscendC::Std::get<2>(shape);
     }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    __aicore__ inline void ComputeShared(GM_ADDR a, GM_ADDR b, GM_ADDR sa, GM_ADDR sb, GM_ADDR y, uint32_t rows,
+                                         uint32_t cols, bool bypass)
+    {
+        AscendC::GlobalTensor<A> ga;
+        AscendC::GlobalTensor<B> gb;
+        AscendC::GlobalTensor<SA> gsa;
+        AscendC::GlobalTensor<SB> gsb;
+        AscendC::GlobalTensor<C> gy;
+        ga.SetGlobalBuffer(reinterpret_cast<__gm__ A*>(a));
+        gb.SetGlobalBuffer(reinterpret_cast<__gm__ B*>(b));
+        gsa.SetGlobalBuffer(reinterpret_cast<__gm__ SA*>(sa));
+        gsb.SetGlobalBuffer(reinterpret_cast<__gm__ SB*>(sb));
+        gy.SetGlobalBuffer(reinterpret_cast<__gm__ C*>(y));
+        if (bypass) gb.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        const uint32_t scaleK = ::CeilDiv(k_, 64U) * 2U;
+        auto av = tla::MakeTensor(ga, tla::MakeLayout<A, Row>(rows, k_), Catlass::Arch::PositionGM{});
+        auto bv = tla::MakeTensor(gb, tla::MakeLayout<B, Col>(k_, cols), Catlass::Arch::PositionGM{});
+        auto sav =
+            tla::MakeTensor(gsa, tla::MakeMxScaleLayout<SA, Row, false>(rows, scaleK), Catlass::Arch::PositionGM{});
+        auto sbv =
+            tla::MakeTensor(gsb, tla::MakeMxScaleLayout<SB, Col, true>(scaleK, cols), Catlass::Arch::PositionGM{});
+        auto cv = tla::MakeTensor(gy, tla::MakeLayout<C, Row>(rows, n_), Catlass::Arch::PositionGM{});
+        auto at = tla::GetTile(av, tla::MakeCoord(0, 0), tla::MakeShape(rows, k_));
+        auto bt = tla::GetTile(bv, tla::MakeCoord(0, 0), tla::MakeShape(k_, cols));
+        auto sat = tla::GetTile(sav, tla::MakeCoord(0, 0), tla::MakeShape(rows, scaleK));
+        auto sbt = tla::GetTile(sbv, tla::MakeCoord(0, 0), tla::MakeShape(scaleK, cols));
+        auto ct = tla::GetTile(cv, tla::MakeCoord(0, 0), tla::MakeShape(rows, cols));
+        block_(at, bt, ct, Catlass::GemmCoord{rows, cols, k_}, sat, sbt);
+    }
+
+#endif
     template <class TA, class TB, class TSA, class TSB, class TBias, class TC>
     __aicore__ inline void operator()(TA& a, TB& b, TSA& sa, TSB& sb, TBias&, TC& c, const BlockShape& shape)
     {

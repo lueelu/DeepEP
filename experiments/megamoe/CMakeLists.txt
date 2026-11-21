@@ -98,14 +98,15 @@ install(TARGETS megamoe_ext LIBRARY DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${urma_kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
 
-# Hierarchical EP32 has a separate tiling and plan ABI.
-set(ep32_include "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
+# Build the same compute headers for the two plan ABIs. Only the EP32 host
+# and device targets select the RoCE transport and its symmetric window layout.
+set(ep32_include "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
 set(ep32_flags ${kernel_flags})
 if(DEEPEP_MEGAMOE_BF16_BS96)
     list(APPEND ep32_flags -DDEEPEP_MEGAMOE_BF16_BS96=1)
 endif()
 list(REMOVE_ITEM ep32_flags -Wl,-soname,libmegamoe_kernel.so)
-list(PREPEND ep32_flags "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
+list(PREPEND ep32_flags "-I${CMAKE_CURRENT_SOURCE_DIR}" "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
 list(APPEND ep32_flags -Wl,-Bsymbolic-functions -Wl,-soname,libmegamoe_ep32_kernel.so -DDEEPEP_MEGAMOE_ROCE=1
     -DACLSHMEMI_RDMA_K_BACKEND_HNS_1825=1 "-DACLSHMEMI_HNS_1825_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP}")
 set(ep32_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_ep32_kernel.so")
@@ -115,7 +116,7 @@ add_custom_command(OUTPUT "${ep32_library}"
         "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
         -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
         -o "${ep32_library}"
-    DEPENDS csrc_ep32/kernels/mega_moe/mega_moe.cpp csrc_ep32/kernel_launch.hpp ${ep32_headers}
+    DEPENDS csrc_ep32/kernels/mega_moe/mega_moe.cpp csrc_ep32/kernel_launch.hpp ${ep32_headers} ${kernel_headers}
         "${PROJECT_SOURCE_DIR}/csrc/common/megamoe_combine_config.hpp"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 add_custom_target(megamoe_ep32_device DEPENDS "${ep32_library}")

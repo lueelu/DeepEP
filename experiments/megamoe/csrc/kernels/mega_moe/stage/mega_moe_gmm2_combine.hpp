@@ -30,6 +30,9 @@
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../mc2_common/mc2_kernel_utils.hpp"
 #include "../mc2_common/quantize_functions.hpp"
+#ifdef DEEPEP_MEGAMOE_ROCE
+#include "csrc_ep32/kernels/mega_moe/stage/mega_moe_combine_packet.hpp"
+#endif
 
 namespace MegaMoeImpl {
 
@@ -83,13 +86,24 @@ __aicore__ inline void CombineTokens(uint32_t nLoc, uint32_t n, LocalTensor<int3
 }
 
 // 发送一行完整的 Combine 数据，BF16 与 FP8 记录复用相同的定长搬运流程。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename Element>
+__aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemoteBaseOffset,
+                                           LocalTensor<int32_t>& metaInfoTensor, LocalTensor<Element>& rowTensor,
+                                           const Params& params, uint32_t rankId)
+{
+#else
 template <typename Element>
 __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemoteBaseOffset,
                                            LocalTensor<int32_t>& metaInfoTensor, LocalTensor<Element>& rowTensor,
                                            const Params& params)
 {
+#endif
     CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, 0U);
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    (void)rankId;
+#endif
     GlobalTensor<Element> gmRemoteD;
     gmRemoteD.SetGlobalBuffer(
         reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
@@ -260,10 +274,18 @@ constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
 
 // 非 layered 路径统一使用的 Combine 行环。常规 Wave 只有 AIV1 建立并使用这些 UB 视图；
 // 最后一轮不再与 GMM1/SwiGLU 并行时，调用方才为 AIV0 补充初始化。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <uint8_t CombineMode, bool IncludeAiv0 = false, uint32_t MaxRowBufferCount = WAVE_COMBINE_MAX_ROW_BUFFER_COUNT>
+__aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageCommonConfig& common,
+                                                                 WaveCombineScratch& scratch,
+                                                                 bool packetGateway = false)
+{
+#else
 template <uint8_t CombineMode, bool IncludeAiv0 = false, uint32_t MaxRowBufferCount = WAVE_COMBINE_MAX_ROW_BUFFER_COUNT>
 __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageCommonConfig& common,
                                                                  WaveCombineScratch& scratch)
 {
+#endif
     static_assert(MaxRowBufferCount > 0U && MaxRowBufferCount <= WAVE_COMBINE_MAX_ROW_BUFFER_COUNT,
                   "invalid Combine row buffer count");
     WaveCombineBufferConfig bufferConfig{};
@@ -277,6 +299,13 @@ __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageC
     bufferConfig.rowStrideBytes = static_cast<uint32_t>(
         Ops::Base::CeilAlign(static_cast<uint64_t>(bufferConfig.rowBytes), static_cast<uint64_t>(ALIGN_32)));
     bufferConfig.slotStrideBytes = bufferConfig.rowStrideBytes;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    if constexpr (CombineMode == COMBINE_NO_QUANT) {
+        if (packetGateway) {
+            bufferConfig.slotStrideBytes = CalcGatewayCombinePacketRowBytes(common.tokenHiddenDim);
+        }
+    }
+#endif
     if constexpr (CombineMode != COMBINE_NO_QUANT) {
         uint32_t nScale = Ops::Base::CeilDiv(common.tokenHiddenDim, static_cast<uint32_t>(MXFP_SCALE_GROUP_NUM));
         uint32_t tokenStorageBytes = Ops::Base::CeilAlign(common.tokenHiddenDim, static_cast<uint32_t>(ALIGN_256));
@@ -315,15 +344,27 @@ __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageC
 
 // 默认由 AIV1 复用既有配置，仅为 AIV0 绑定最终 Combine 的 UB 视图。steady Wave 使用较小行环，
 // 调用方排空旧行环后通过 ReinitializeAllAiv 让两个 AIV 都恢复最终 Wave 的最大容量。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <uint8_t CombineMode, bool ReinitializeAllAiv = false>
+__aicore__ inline WaveCombineBufferConfig PrepareFinalWaveCombineBuffers(
+    const MoeStageCommonConfig& common, const WaveCombineBufferConfig& currentBufferConfig, WaveCombineScratch& scratch,
+    bool packetGateway = false)
+{
+#else
 template <uint8_t CombineMode, bool ReinitializeAllAiv = false>
 __aicore__ inline WaveCombineBufferConfig PrepareFinalWaveCombineBuffers(
     const MoeStageCommonConfig& common, const WaveCombineBufferConfig& currentBufferConfig, WaveCombineScratch& scratch)
 {
+#endif
     if constexpr (g_coreType == AIC) {
         return currentBufferConfig;
     }
     if (ReinitializeAllAiv || GetSubBlockIdx() == 0U) {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        return InitWaveCombineBuffers<CombineMode, true>(common, scratch, packetGateway);
+#else
         return InitWaveCombineBuffers<CombineMode, true>(common, scratch);
+#endif
     }
     return currentBufferConfig;
 }
@@ -407,14 +448,45 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
     }
     uint32_t slotElementOffset = slot * bufferConfig.slotStrideBytes / sizeof(bfloat16_t);
     LocalTensor<bfloat16_t> rowUb = scratch.rowBufferTensor[slotElementOffset];
+#ifdef DEEPEP_MEGAMOE_ROCE
+    if constexpr (CombineMode == COMBINE_NO_QUANT) {
+        if (UsePacketizedGatewayCombine(params.tilingData)) {
+            const auto route = CombineImpl::LoadCombineTokenRoute(tokenMetaInfo, 0U);
+            if (HierarchicalHost(route.dstRankId) != HierarchicalHost(common.rankId)) {
+                GlobalTensor<uint32_t> source, target;
+                source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(gmm2OutGm.GetPhyAddr(0U)) +
+                                       static_cast<uint64_t>(tokenLocal) * (bufferConfig.rowBytes / sizeof(uint32_t)));
+                auto packed = rowUb.template ReinterpretCast<uint32_t>();
+                PackGatewayCombineRow(packed, source, bufferConfig.rowBytes, params.tilingData->hierarchicalSequence,
+                                      eventId);
+                const uint64_t gatewayOffset =
+                    params.peermemInfo.gatewayCombinePtr - params.peermemInfo.rankSyncInWorldPtr;
+                target.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
+                    GetRankWinAddrWithOffset(HierarchicalGateway(route.dstRankId), gatewayOffset)));
+                const uint32_t packedBytes = CalcGatewayCombinePacketRowBytes(common.tokenHiddenDim);
+                const uint64_t row = CombineImpl::GetCombineDstRowIndex(route, params);
+                DataCopyPad(target[row * (packedBytes / sizeof(uint32_t))], packed, {1U, packedBytes, 0U, 0U, 0U});
+                // The ring still drains before yielding UB to another stage.
+                // No per-row remote scalar ready store or MTE3_S wait is needed.
+                SetFlag<HardEvent::MTE3_MTE2>(eventId);
+                return;
+            }
+        }
+    }
+#endif
     DataCopyExtParams gm2UbParams{1U, bufferConfig.rowBytes, 0U, 0U, 0U};
     DataCopyPadExtParams<bfloat16_t> gm2UbPad{false, 0U, 0U, 0U};
     DataCopyPad(rowUb, gmm2OutGm[static_cast<uint64_t>(tokenLocal) * common.tokenHiddenDim], gm2UbParams, gm2UbPad);
     if constexpr (CombineMode == COMBINE_NO_QUANT) {
         SetFlag<HardEvent::MTE2_MTE3>(eventId);
         WaitFlag<HardEvent::MTE2_MTE3>(eventId);
+#ifdef DEEPEP_MEGAMOE_ROCE
+        CombineImpl::SendCombineTokenRow<bfloat16_t>(common.tokenHiddenDim, gmRemoteBaseOffset, tokenMetaInfo, rowUb,
+                                                     params, common.rankId);
+#else
         CombineImpl::SendCombineTokenRow<bfloat16_t>(common.tokenHiddenDim, gmRemoteBaseOffset, tokenMetaInfo, rowUb,
                                                      params);
+#endif
     } else {
         LocalTensor<bfloat16_t> quantUb =
             scratch.rowBufferTensor[slotElementOffset + bufferConfig.rowStrideBytes / sizeof(bfloat16_t)];
@@ -425,8 +497,13 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
         WaitFlag<HardEvent::V_MTE3>(eventId);
         using Fp8Type = typename std::conditional<CombineMode == MXFP8_E4M3_COMM_QUANT, fp8_e4m3fn_t, fp8_e5m2_t>::type;
         LocalTensor<Fp8Type> quantSendUb = quantUb.template ReinterpretCast<Fp8Type>();
+#ifdef DEEPEP_MEGAMOE_ROCE
+        CombineImpl::SendCombineTokenRow<Fp8Type>(bufferConfig.quantRowElements, gmRemoteBaseOffset, tokenMetaInfo,
+                                                  quantSendUb, params, common.rankId);
+#else
         CombineImpl::SendCombineTokenRow<Fp8Type>(bufferConfig.quantRowElements, gmRemoteBaseOffset, tokenMetaInfo,
                                                   quantSendUb, params);
+#endif
     }
     SetFlag<HardEvent::MTE3_MTE2>(eventId);
 }
@@ -1014,12 +1091,21 @@ __aicore__ inline void UpdateSharedExpertGmm2GlobalBuffer(const MoeStageCommonCo
         sharedExpertTokenStartIndex * activationOutputWidth / activationElementsPerByte * sizeof(ActivationType);
     gmmAddrInfo.aScaleGlobal = workspace.sharedExpertActivationScalePtr +
                                sharedExpertTokenStartIndex * activationScaleWidth * sizeof(QuantScaleType);
+#ifdef DEEPEP_MEGAMOE_ROCE
+    gmmAddrInfo.bGlobal = GetExpertWeightAddr<WeightType>(
+        weights.weight2, gmmConfig.sharedWeightList, sharedExpertIdx,
+        static_cast<uint64_t>(sharedExpertIdx) * tokenHiddenDim * activationOutputWidth / weightElementsPerByte);
+    gmmAddrInfo.bScaleGlobal = GetExpertWeightAddr<QuantScaleType>(
+        weights.weightScales2, gmmConfig.sharedWeightList, sharedExpertIdx,
+        static_cast<uint64_t>(sharedExpertIdx) * tokenHiddenDim * activationScaleWidth);
+#else
     gmmAddrInfo.bGlobal = GetExpertWeightAddr<WeightType>(
         weights.weight2, gmmConfig.isPerExpertWeightTensor, sharedExpertIdx,
         static_cast<uint64_t>(sharedExpertIdx) * tokenHiddenDim * activationOutputWidth / weightElementsPerByte);
     gmmAddrInfo.bScaleGlobal = GetExpertWeightAddr<QuantScaleType>(
         weights.weightScales2, gmmConfig.isPerExpertWeightTensor, sharedExpertIdx,
         static_cast<uint64_t>(sharedExpertIdx) * tokenHiddenDim * activationScaleWidth);
+#endif
     uint32_t tokenGroupCount = Ops::Base::CeilDiv(commonConfig.tokenNum, Gmm1TileM);
     gmmAddrInfo.sharedExpertGmm2TileCounter =
         reinterpret_cast<__gm__ int32_t*>(workspace.sharedExpertGmm2TileCounterPtr) +
@@ -1183,11 +1269,20 @@ __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32
 // 按完整 token 行发送当前专家 slice；调用方传入的 job 已包含所需的通信 owner 轮换。
 // InputReadyChecked=true 仅供已探测同一 slice 就绪的优先级调度器使用。
 // 其他调用保留一次阻塞等待；输出 metadata、发送目的地及 timer 协议不变。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <bool InputReadyChecked = false>
+__aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, const AivJobContext& job,
+                                            const Params& params, const ExpertLoopState& state, uint32_t rowStart,
+                                            uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch,
+                                            const WorkRange* assigned = nullptr)
+{
+#else
 template <bool InputReadyChecked = false>
 __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, const AivJobContext& job,
                                             const Params& params, const ExpertLoopState& state, uint32_t rowStart,
                                             uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch)
 {
+#endif
     if constexpr (g_coreType == AIC) {
         return;
     }
@@ -1195,15 +1290,27 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
         return;
     }
     uint64_t globalRowStart = static_cast<uint64_t>(state.globalTokenStartIndex) + rowStart;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    WorkRange owned = assigned != nullptr ? *assigned : GetWaveCombineOwnedRange(job, rowCount, globalRowStart);
+#else
     WorkRange owned = GetWaveCombineOwnedRange(job, rowCount, globalRowStart);
+#endif
     if (owned.count == 0U) {
         return;
     }
     // 按实际单卡 BS 选择，不能用专家 slice 行数：Prefill 恢复两槽以限制并发搬运，Decode 保留六槽。
     // AIV1 任务不抢占；Dispatch/Combine 均排空后才交还 UB 和事件 0..5。
+#ifdef DEEPEP_MEGAMOE_ROCE
+    auto buffers =
+        common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
+            ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch, UsePacketizedGatewayCombine(params.tilingData))
+            : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch,
+                                                                  UsePacketizedGatewayCombine(params.tilingData));
+#else
     auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
                        ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
                        : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
+#endif
     GM_ADDR sliceOutput =
         params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t rowSequence = 0U;

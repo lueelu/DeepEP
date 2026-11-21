@@ -2,7 +2,7 @@
 #ifndef MEGA_MOE_COMBINE_PIPELINE_H
 #define MEGA_MOE_COMBINE_PIPELINE_H
 
-#include "mega_moe_gmm2_combine.hpp"
+#include "kernels/mega_moe/stage/mega_moe_gmm2_combine.hpp"
 
 namespace MegaMoeImpl {
 

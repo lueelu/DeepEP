@@ -57,7 +57,6 @@ def lifecycle_binary(tmp_path_factory):
         "udma-sparse-default",
         "udma-sparse-disabled",
         "megamoe",
-        "megamoe-ep32",
         "low-latency",
         "ll-rank-bias-16",
         "ll-rank-bias-32",

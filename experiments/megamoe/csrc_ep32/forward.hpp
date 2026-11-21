@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <tuple>
 #include <torch/extension.h>
-#include "kernels/mega_moe/mega_moe_tiling.hpp"
+#include "kernels/mega_moe_common/mega_moe_tiling.hpp"
 
 namespace deepep::megamoe_ep32 {
 

@@ -211,11 +211,20 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitTok
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT && g_coreType == AIV) {
         quantTokenSizeBytes = CreateQuantTokenBufferConfig(k_).quantTokenSizeBytes;
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    tokenUnpermuteConfig_ = {.job = {.jobIndex = UnpermuteJobIndex(params_.tilingData, aivCoreIdx_),
+                                     .totalJobs = UnpermuteJobCount(params_.tilingData)},
+                             .quantTokenSizeBytes = quantTokenSizeBytes,
+                             .fullTokenChunkJobCount = params_.tilingData->unpermuteFullTokenChunkCoreCount,
+                             .fullTokenChunkConfig = params_.tilingData->unpermuteConfigForFullTokenChunk,
+                             .tailTokenChunkConfig = params_.tilingData->unpermuteConfigForTailTokenChunk};
+#else
     tokenUnpermuteConfig_ = {.job = {.jobIndex = aivCoreIdx_, .totalJobs = blockAivNum_},
                              .quantTokenSizeBytes = quantTokenSizeBytes,
                              .fullTokenChunkJobCount = params_.tilingData->unpermuteFullTokenChunkCoreCount,
                              .fullTokenChunkConfig = params_.tilingData->unpermuteConfigForFullTokenChunk,
                              .tailTokenChunkConfig = params_.tilingData->unpermuteConfigForTailTokenChunk};
+#endif
 }
 
 // ========================
@@ -240,7 +249,12 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Init(
     rankId_ = mc2Context_->epRankId;
     GM_ADDR dumpBase = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[rankId_]);
     for (int i = 0; i < worldSize_; i++) {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        GM_ADDR peerBase = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[i]);
+        g_winRankAddr_[i] = peerBase == nullptr ? nullptr : peerBase + EXCEPTION_DUMP_REGION_SIZE;
+#else
         g_winRankAddr_[i] = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[i]) + EXCEPTION_DUMP_REGION_SIZE;
+#endif
     }
     params_.aGmAddr = x;
     params_.inputScaleGmAddr = scales;
@@ -356,8 +370,13 @@ template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline typename MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::CombineBufferConfig
 MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitCombineBuffers()
 {
+#ifdef DEEPEP_MEGAMOE_ROCE
+    return InitWaveCombineBuffers<CombineQuantMode, false, WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT>(
+        commonConfig_, waveCombineScratch_, UsePacketizedGatewayCombine(params_.tilingData));
+#else
     return InitWaveCombineBuffers<CombineQuantMode, false, WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT>(commonConfig_,
                                                                                                  waveCombineScratch_);
+#endif
 }
 
 // ======================================================================================
@@ -385,7 +404,11 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendAnd
     // 单个 xOutTensor 槽位与 dispatch 的 token-scale-weight 通信记录使用相同布局。
     uint32_t xOutTensorSize = quantProcessConfig_.quantTokenScaleAlignBytes;
     uint32_t xInAlignSize = Ops::Base::CeilAlign(k_, static_cast<uint32_t>(ALIGN_128)) * sizeof(bfloat16_t);
+#ifdef DEEPEP_MEGAMOE_ROCE
+    uint32_t expertPerCoreMax = CalcSendMaskExpertCapacity(params_.tilingData, blockAivNum_);
+#else
     uint32_t expertPerCoreMax = Ops::Base::CeilDiv(worldSize_ * moeExpertPerRank_, blockAivNum_);
+#endif
     uint32_t sendCntAccSize =
         Ops::Base::CeilAlign(static_cast<int64_t>(expertPerCoreMax * sizeof(int32_t)), static_cast<int64_t>(ALIGN_32));
 
@@ -777,8 +800,13 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         if (allCoreCombineExpertIndex < expertBegin || allCoreCombineExpertIndex >= expertEnd) {
             return;
         }
+#ifdef DEEPEP_MEGAMOE_ROCE
+        CombineBufferConfig activeBufferConfig = PrepareFinalWaveCombineBuffers<CombineQuantMode>(
+            commonConfig_, bufferConfig, waveCombineScratch_, UsePacketizedGatewayCombine(params_.tilingData));
+#else
         CombineBufferConfig activeBufferConfig =
             PrepareFinalWaveCombineBuffers<CombineQuantMode>(commonConfig_, bufferConfig, waveCombineScratch_);
+#endif
         UpdateMoeExpertCombineGlobalBuffer(params_.workspaceInfo, combineAddrInfo, allCoreCombineExpertState);
         uint32_t rowSequence = 0U;
         RunWaveCombineStage<CombineQuantMode, true>(commonConfig_, waveCombineJob_, activeBufferConfig,
@@ -800,8 +828,13 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         bool useAllAivCores = expertIdx == allCoreCombineExpertIndex;
         UpdateMoeExpertCombineGlobalBuffer(params_.workspaceInfo, combineAddrInfo, combineState);
         if (useAllAivCores) {
+#ifdef DEEPEP_MEGAMOE_ROCE
+            activeBufferConfig = PrepareFinalWaveCombineBuffers<CombineQuantMode>(
+                commonConfig_, bufferConfig, waveCombineScratch_, UsePacketizedGatewayCombine(params_.tilingData));
+#else
             activeBufferConfig =
                 PrepareFinalWaveCombineBuffers<CombineQuantMode>(commonConfig_, bufferConfig, waveCombineScratch_);
+#endif
             RunWaveCombineStage<CombineQuantMode, true>(commonConfig_, waveCombineJob_, activeBufferConfig,
                                                         waveCombineScratch_, params_, combineAddrInfo, combineState,
                                                         combineState.expertIdx, rowSequence);

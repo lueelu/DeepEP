@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../common/mega_moe_peermem.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_peermem.hpp"
 #include "kernel_operator.h"
 
 namespace MegaMoeImpl {

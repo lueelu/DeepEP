@@ -6,9 +6,9 @@
 #include "kernel_launch.hpp"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "tiling/platform/platform_ascendc.h"
-#include "kernels/mega_moe/common/ascend_timer_v2.hpp"
-#include "kernels/mega_moe/common/mega_moe_constants.hpp"
-#include "kernels/mega_moe/common/mega_moe_peermem.hpp"
+#include "kernels/mega_moe_common/common/ascend_timer_v2.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_peermem.hpp"
 
 namespace py = pybind11;
 

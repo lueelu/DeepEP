@@ -2,7 +2,7 @@
 #ifndef MEGA_MOE_COMBINE_PACKET_H
 #define MEGA_MOE_COMBINE_PACKET_H
 
-#include "../common/mega_moe_peermem.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_peermem.hpp"
 
 namespace MegaMoeImpl {
 using namespace AscendC;

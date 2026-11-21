@@ -9,7 +9,7 @@ import pytest
 
 from deep_ep import _runtime
 from deep_ep._store import StoreGroup
-from deep_ep_experimental.megamoe.api import _MegaRuntime
+from deep_ep_experimental.megamoe._runtime import _MegaRuntime
 
 
 @pytest.mark.parametrize("backend", ["store", "gloo"])
@@ -90,84 +90,135 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
             runtime.close()
 
 
-@pytest.mark.parametrize(
-    "world,ranks_per_node,case,error",
-    [
-        (32, 16, "normal", None),
-        (32, 16, "qp-mismatch", "QP configuration"),
-        (16, 16, "no-rdma", None),
-        (32, 8, "no-rdma", None),
-        (32, 16, "no-rdma", "requires HNS_1825"),
-        (32, 16, "xscale", "requires HNS_1825"),
-        (32, 16, "sdk-mismatch", "requires HNS_1825"),
-        (32, 16, "peer-no-rdma", "requires HNS_1825"),
-        (32, 16, "backend-mismatch", "disagree on SHMEM RDMA backend"),
-        (32, 16, "interleaved", "contiguous groups of 16"),
-        (32, 16, "one-host", "contiguous groups of 16"),
-        (32, 16, "config-mismatch", "disagree on ranks_per_node"),
-        (64, 16, "normal", "supports EP16 or two-host EP32"),
-    ],
-)
-def test_megamoe_roce_collective_bootstrap(monkeypatch, world, ranks_per_node, case, error):
+@pytest.fixture
+def unified_runtime_environment(monkeypatch):
+    """CPU doubles for resource setup, without Torch or tensor readbacks."""
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
     monkeypatch.setattr(_runtime, "_OWNER", None)
-    monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "test-host")
-    created = []
-    native = SimpleNamespace(
-        Runtime=lambda *args: pytest.fail("Unexpected core runtime"),
-        runtime_busy=lambda: False,
-        create_megamoe_runtime=lambda *args, backend: created.append((*args, backend)) or SimpleNamespace(close=lambda **kwargs: None),
-        shmem_rdma_backend="NONE" if case == "no-rdma" else ("XSCALE" if case == "xscale" else "HNS_1825"),
-        megamoe_combine_qps=16,
-        shmem_sdk_matches=case != "sdk-mismatch",
+    monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "local-host")
+    calls, events, aborted = [], [], []
+    state = SimpleNamespace(local_error="", peer_error="", different_hosts=False, mismatch=False)
+
+    class NativeSession:
+        @property
+        def peer_access_error(self):
+            events.append("peer_access_error")
+            return state.local_error
+
+        def close(self):
+            events.append("close")
+
+        def barrier(self):
+            pytest.fail("No device barrier before peer-access agreement")
+
+    def create(rank, size, capacity, address, timeout, backend="mte"):
+        calls.append((rank, size, capacity, address, timeout, backend))
+        events.append("create")
+        return NativeSession()
+
+    def ordinary(*args, **kwargs):
+        pytest.fail("MegaMoE must use the unified MegaMoE factory")
+
+    monkeypatch.setattr(
+        _runtime,
+        "require_native",
+        lambda operation: SimpleNamespace(runtime_busy=lambda: False, Runtime=ordinary, create_megamoe_runtime=create),
     )
-    monkeypatch.setattr(_runtime, "require_native", lambda operation: native)
     monkeypatch.setattr(
         _runtime,
         "npu_api",
         lambda: SimpleNamespace(
             current_device=lambda: 0,
-            synchronize=lambda device: None,
-            Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: None),
+            Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: events.append("stream-sync")),
         ),
     )
+    group = StoreGroup(None, 0, 4, prefix="unified-runtime-test")
 
-    def exchange(local, stage):
-        if stage == "RoCE runtime close":
-            return [local] * world
-        peers = []
-        for rank in range(world):
-            peer = list(local)
-            peer[4] += rank // ranks_per_node
-            peer[6] = rank % ranks_per_node
-            if case == "interleaved":
-                peer[4], peer[6] = local[4] + rank % 2, rank // 2
-            elif case == "one-host":
-                peer[4], peer[6] = local[4], rank
-            if rank == world - 1:
-                if case == "peer-no-rdma":
-                    peer[8] = 0
-                elif case == "backend-mismatch":
-                    peer[8] = 1
-                elif case == "config-mismatch":
-                    peer[7] = 8
-                elif case == "qp-mismatch":
-                    peer[-1] += 16 * 4
-            peers.append(peer)
+    def exchange(value, stage):
+        events.append(stage)
+        if stage == "runtime configuration":
+            peers = []
+            for rank in range(4):
+                row = list(value)
+                row[6] = rank
+                if state.different_hosts and rank >= 2:
+                    row[4] += 1
+                    row[6] -= 2
+                peers.append(row)
+            if state.mismatch:
+                peers[1][-1] ^= 32
+            return peers
+        peers = [value] * 4
+        if state.peer_error:
+            peers[1] = state.peer_error
         return peers
 
-    group = StoreGroup(None, 0, world, prefix="test-roce")
     monkeypatch.setattr(group, "all_gather", exchange)
-    if error is not None:
-        with pytest.raises((ValueError, RuntimeError), match=error):
-            _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node)
-        assert not created
-        assert _runtime._OWNER is None
+    monkeypatch.setattr(group, "abort", aborted.append)
+    return SimpleNamespace(group=group, state=state, calls=calls, events=events, aborted=aborted)
+
+
+@pytest.mark.parametrize("backend", ["mte", "urma"])
+def test_unified_factory_routes_backend_and_preserves_lifetime(unified_runtime_environment, backend):
+    env = unified_runtime_environment
+    runtime = _MegaRuntime(env.group, 2 << 20, backend=backend)
+    assert env.calls == [(0, 4, 2 << 20, "tcp://127.0.0.1:19091", 120, backend)]
+    assert ("peer_access_error" in env.events) == (backend == "urma")
+    assert _runtime._OWNER is runtime
+    runtime.close()
+    assert env.events[-2:] == ["stream-sync", "close"]
+    assert _runtime._OWNER is None
+    runtime.close()
+    assert env.events.count("close") == 1
+
+
+@pytest.mark.parametrize("backend", ["unsupported", "auto", "", None, True])
+def test_unified_factory_rejects_invalid_backend_before_initialization(unified_runtime_environment, backend):
+    env = unified_runtime_environment
+    with pytest.raises((TypeError, ValueError), match="backend"):
+        _MegaRuntime(env.group, 2 << 20, backend=backend)
+    assert env.calls == []
+    assert _runtime._OWNER is None
+
+
+def test_urma_multi_host_requires_peer_access_not_opt_in(unified_runtime_environment):
+    env = unified_runtime_environment
+    env.state.different_hosts = True
+    runtime = _MegaRuntime(env.group, 2 << 20, backend="urma")
+    assert len(env.calls) == 1 and "peer_access_error" in env.events
+    assert env.aborted == []
+    runtime.close()
+
+
+@pytest.mark.parametrize("failure_origin", ["local", "peer"])
+def test_peer_access_failure_is_shared_and_retains_owner(unified_runtime_environment, failure_origin):
+    env = unified_runtime_environment
+    if failure_origin == "local":
+        env.state.local_error = "peer mapping unavailable"
     else:
-        runtime = _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node)
-        try:
-            assert runtime.use_roce == (ranks_per_node == 16 and world > 16)
-            assert len(created) == 1
-            assert created[0][5:] == (("ep32" if runtime.use_roce else "mte"),)
-        finally:
-            runtime.close()
+        env.state.peer_error = "peer mapping unavailable"
+    with pytest.raises(RuntimeError, match="peer mapping unavailable"):
+        _MegaRuntime(env.group, 2 << 20, backend="urma")
+    assert len(env.calls) == 1
+    assert len(env.aborted) == 1
+    assert _runtime._OWNER is not None
+    assert "close" not in env.events and "stream-sync" not in env.events
+
+
+def test_backend_mismatch_fails_before_shmem(unified_runtime_environment):
+    env = unified_runtime_environment
+    env.state.mismatch = True
+    with pytest.raises(ValueError, match="Ranks disagree"):
+        _MegaRuntime(env.group, 2 << 20, backend="urma")
+    assert env.calls == []
+    assert _runtime._OWNER is None
+
+
+def test_backend_specific_capacity_limits(unified_runtime_environment):
+    env = unified_runtime_environment
+    with pytest.raises(ValueError, match="capacity"):
+        _MegaRuntime(env.group, 2 << 30, backend="mte")
+    assert env.calls == []
+    runtime = _MegaRuntime(env.group, 2 << 30, backend="urma")
+    assert env.calls[0][2] == 2 << 30
+    runtime.close()

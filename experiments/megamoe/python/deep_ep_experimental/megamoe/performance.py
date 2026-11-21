@@ -14,9 +14,6 @@ import statistics
 
 # 整批开始前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
 DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=20)
-PERF_METHODS = ("legacy", "legacy-read", "legacy-zero", "shmem")
-# Match DeepGEMM-Ascend bench_msprof's device delay (system counter ticks).
-SLEEP_CYCLES = 20_000_000
 
 
 def alignment_config(config):
@@ -33,38 +30,18 @@ def flush_l2_before_call():
     flush_l2_cache(True)
 
 
-def enqueue_batch(
-    call,
-    torch,
-    prefix,
-    alignment,
-    iterations,
-    timer=None,
-    *,
-    method="legacy",
-    barrier=None,
-    sleep=None,
-    flush_buffer=None,
-    sum_out=None,
-):
-    """No host barriers, synchronize, or D2H between collective launches."""
-    if method not in PERF_METHODS:
+def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None, *, method="legacy", flush_buffer=None,
+                  sum_out=None):
+    """Enqueue a complete batch without host barriers or device readback."""
+    if method not in ("legacy", "legacy-read"):
         raise ValueError(f"Unknown performance method: {method}")
-    if method == "shmem" and (barrier is None or sleep is None or flush_buffer is None):
-        raise ValueError("shmem method requires a device barrier, sleep and L2 flush buffer")
-    if method.startswith("legacy"):
-        for _ in range(alignment["repeats"]):
-            torch.exp(prefix, out=prefix)
+    if method == "legacy-read" and (flush_buffer is None or sum_out is None):
+        raise ValueError("legacy-read requires a device flush buffer and reduction output")
+    for _ in range(alignment["repeats"]):
+        torch.exp(prefix, out=prefix)
     for iteration in range(iterations):
         if method == "legacy-read":
             torch.sum(flush_buffer, dim=(0,), dtype=torch.int32, out=sum_out)
-        elif method == "legacy-zero":
-            flush_buffer.zero_()
-        elif method == "shmem":
-            flush_buffer.zero_()
-            sleep(SLEEP_CYCLES)
-            barrier()
-        # 所有 rank 排入同样次数；只在最后一轮、选中的 rank 上打点。
         call(timer if iteration + 1 == iterations else None)
 
 
@@ -194,7 +171,7 @@ def collect_profile(call, group, torch, config, prefix, directory, bs, **batch_o
         with_modules=False,
         experimental_config=experimental,
     ) as prof:
-        # 两种方法都只在整批边界 Host 会合；逐轮同步由 SHMEM 设备任务完成。
+        # Only align hosts at batch boundaries.
         torch.npu.synchronize()
         group.barrier(f"profiler ready BS={bs}")
         enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], **batch_options)

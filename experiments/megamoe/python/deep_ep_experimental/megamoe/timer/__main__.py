@@ -15,9 +15,7 @@ from .trace_parser import (
     raw_events_for_rank,
     synchronized_rank_bases,
     trace_events,
-    write_combine_progress_breakdown,
     write_summary,
-    write_startup_breakdown,
 )
 
 
@@ -39,7 +37,7 @@ def parse_ranks(value):
     return result
 
 
-def main(argv=None):
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path, help="One case's timer directory")
     parser.add_argument("--ranks", type=parse_ranks, default=parse_ranks("0-7"))
@@ -51,7 +49,7 @@ def main(argv=None):
         default="rank",
         help="sync is an approximate barrier-anchor alignment, NOT absolute time",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     events = {}
     for rank in args.ranks:
         stem = args.directory / f"rank_{rank}_npu_time"
@@ -59,16 +57,11 @@ def main(argv=None):
         if not raw.exists():
             raw = stem.with_suffix(".csv")
         parsed = args.directory / f"{stem.name}_parsed.csv"
-        if raw.exists():
-            decode(raw, parsed)
-        elif not parsed.exists():
-            raise FileNotFoundError(f"No raw timer or parsed CSV for rank {rank} under {args.directory}")
+        decode(raw, parsed)
         events[rank] = raw_events_for_rank(parsed, rank)
         if not events[rank]:
             raise ValueError(f"rank={rank}: empty trace; check timer-enabled build and collection")
     bases = {rank: first_start_cycle(raw) for rank, raw in events.items()}
-    write_startup_breakdown(events, args.directory / "startup_breakdown.csv")
-    write_combine_progress_breakdown(events, args.directory / "combine_progress_breakdown.csv")
     write_breakdown(
         [rank_breakdown(raw, rank) for rank, raw in events.items()], args.directory, args.directory.parent.name
     )

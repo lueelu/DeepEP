@@ -3,7 +3,7 @@
 #ifndef MEGA_MOE_GATEWAY_READINESS_H
 #define MEGA_MOE_GATEWAY_READINESS_H
 
-#include "../common/mega_moe_utils.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 
 namespace MegaMoeImpl {
 

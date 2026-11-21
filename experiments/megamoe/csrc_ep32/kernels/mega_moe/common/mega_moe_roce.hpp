@@ -6,7 +6,7 @@
 #include <cstdint>
 #include "kernel_operator.h"
 #include "shmem.h"
-#include "ascend_timer_v2_device.hpp"
+#include "kernels/mega_moe_common/common/ascend_timer_v2_device.hpp"
 #include "mega_moe_roce_progress.hpp"
 
 namespace MegaMoeImpl {

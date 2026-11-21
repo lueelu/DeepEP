@@ -131,6 +131,9 @@ struct BlockJobContext {
 struct BlockWorkspaceContext {
     uint32_t blockIdx;
     uint32_t blockNum;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    bool shared = false;
+#endif
 };
 
 template <typename T>
@@ -159,6 +162,9 @@ struct GmmExecutionConfig {
     BlockJobContext blockJob;
     int32_t groupedMatmulMode;
     bool isPerExpertWeightTensor;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    bool sharedWeightList = false;
+#endif
 };
 
 // 各流水阶段在同步 workspace 中为每个专家预留的 slot 数量。

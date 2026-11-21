@@ -15,11 +15,11 @@
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "tiling/platform/platform_ascendc.h"
 
-#include "check.hpp"
-#include "kernels/mega_moe/common/ascend_timer_v2.hpp"
-#include "kernels/mega_moe/common/mega_moe_constants.hpp"
-#include "kernels/mega_moe/common/mega_moe_workspace.hpp"
-#include "kernels/mega_moe/mc2_common/mc2_moe_context.hpp"
+#include "csrc/check.hpp"
+#include "kernels/mega_moe_common/common/ascend_timer_v2.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
+#include "kernels/mega_moe_common/mc2_common/mc2_moe_context.hpp"
 
 namespace deepep::megamoe_ep32 {
 namespace {

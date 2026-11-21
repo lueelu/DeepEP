@@ -2,8 +2,8 @@
 #pragma once
 
 #include <stdexcept>
-#include "kernels/mega_moe/common/mega_moe_peermem.hpp"
-#include "kernels/mega_moe/common/mega_moe_workspace.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_peermem.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_workspace.hpp"
 
 namespace MegaMoeImpl {
 // Control records are plan-private. Every payload class is independently sized

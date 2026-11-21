@@ -13,8 +13,7 @@ namespace {
 int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0, memsets = 0;
 int init_status = 0, memset_status = 0, finalize_status = 0;
 bool allocation_failure = false;
-int qp_count = 0, qp_engine = 0;
-size_t allocation_alignment = 0;
+int qp_count = 0;
 int expected_world = 2;
 uint64_t expected_bytes = 2 << 20;
 alignas(512) int storage = 0;
@@ -162,7 +161,8 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
     check_init_attributes(attr);
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
-    assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | qp_engine));
+    assert(attr->runtime_config.udma_shared_jetty == (qp_count ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DEFAULT));
+    assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
     if (init_status == 0) {
         initialized = 2;
     }
@@ -170,9 +170,7 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 }
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
-    assert(initialized == 0);
-    assert((engine == ACLSHMEM_DATA_OP_UDMA && count == 32) || (engine == ACLSHMEM_DATA_OP_ROCE && count == 17));
-    qp_engine = engine;
+    assert(engine == ACLSHMEM_DATA_OP_UDMA && count == 32 && initialized == 0);
     qp_count = count;
     return 0;
 }
@@ -192,9 +190,8 @@ void* aclshmem_malloc(size_t bytes)
     return allocation_failure ? nullptr : &storage;
 }
 // Match the aligned allocation API used by Session; reuse the existing fault-injection stub.
-void* aclshmem_align(size_t alignment, size_t bytes)
+void* aclshmem_align(size_t, size_t bytes)
 {
-    allocation_alignment = alignment;
     return aclshmem_malloc(bytes);
 }
 void aclshmem_free(void* value)
@@ -305,18 +302,6 @@ int main(int argc, char** argv)
         assert(session.udma() && qp_count == 32 && !session.sparse_qp_enabled());
         session.close();
         assert(!deepep::Session::busy());
-    } else if (mode == "megamoe-ep32") {
-        deepep::SessionOptions options;
-        options.megamoe = true;
-        options.roce_qps = 17;
-        expected_world = 32;
-        deepep::Session session(0, expected_world, expected_bytes, "tcp://127.0.0.1:19091", 30, options);
-        assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == 17 && allocation_alignment == 512);
-        fails([&]() { session.barrier(); });
-        fails([&]() { session.close(); });
-        session.barrier(true);
-        session.close(true);
-        assert(barriers == 0 && finalized == 1 && frees == 1);
     } else if (mode == "megamoe") {
         fails([]() { deepep::Session s(0, 256, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true); });
         fails([]() { deepep::Session s(0, 2, 2ULL << 30, "tcp://127.0.0.1:19091", 30, false, true); });

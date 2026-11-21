@@ -11,8 +11,8 @@
 #ifndef MEGA_MOE_HIERARCHICAL_COMBINE_H
 #define MEGA_MOE_HIERARCHICAL_COMBINE_H
 
-#include "../common/mega_moe_roce.hpp"
-#include "../common/mega_moe_utils.hpp"
+#include "csrc_ep32/kernels/mega_moe/common/mega_moe_roce.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
 
 namespace MegaMoeImpl {
 
