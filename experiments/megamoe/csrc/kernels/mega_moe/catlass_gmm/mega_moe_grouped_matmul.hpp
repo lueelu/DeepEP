@@ -107,12 +107,24 @@ class A8W4MatmulPipeline {
     } addr_;
     GM_ADDR output_ = nullptr;
     bool active_ = false;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    bool bypassWeight_ = false;
+#endif
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    template <class Element, class Layout>
+    __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout, bool bypass = false)
+    {
+#else
     template <class Element, class Layout>
     __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout)
     {
+#endif
         AscendC::GlobalTensor<Element> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(address));
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (bypass) gm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+#endif
         return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
     }
 
@@ -144,6 +156,11 @@ public:
                           std::is_same_v<SA, typename Next::ElementMxScaleAType> &&
                           std::is_same_v<SB, typename Next::ElementMxScaleBType>,
                       "Cannot change GMM element types");
+#ifdef DEEPEP_MEGAMOE_ROCE
+        bypassWeight_ = !Next::IS_SHARED && config.m <= 128U &&
+                        ((config.k == 3584U && config.n == 2560U) || (config.k == 1280U && config.n == 3584U) ||
+                         (config.k == 5120U && config.n == 4608U) || (config.k == 2304U && config.n == 5120U));
+#endif
         config_.m = config.m;
         config_.n = config.n;
         config_.k = config.k;
@@ -197,7 +214,11 @@ protected:
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
     {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB, bypassWeight_);
+#else
         auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB);
+#endif
         auto tileB = tla::GetTile(b, tla::MakeCoord(0, weightN), tla::MakeShape(config_.k, cols));
         block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params, config_.m < 256U);
     }

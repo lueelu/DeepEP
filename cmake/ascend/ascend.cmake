@@ -3,7 +3,7 @@
 
 # find ascend toolkit
 if(UNIX)
-  set(SYSTEM_PREFIX ${CMAKE_SYSTEM_PROCESSOR}-linux)
+  set(SYSTEM_PREFIX ${DEEPEP_HOST_PROCESSOR}-linux)
 endif()
 
 # The root build validates ASCEND_HOME_PATH before enabling this component.

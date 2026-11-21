@@ -275,6 +275,22 @@ __aicore__ inline uint32_t GetWaveEndRowOffsetInExpert(uint64_t expertRowCount, 
     return static_cast<uint32_t>(expertRowCount < maxWaveEndRowOffset ? expertRowCount : maxWaveEndRowOffset);
 }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+// Map a wave-rotated physical Dispatch worker into an expert's smaller group.
+// Returning selectedWorkers denotes an inactive worker; the balanced range
+// helper gives it no rows, but its scheduler still advances through the slice.
+__aicore__ inline uint32_t GetDispatchSubsetJobIndex(uint32_t workerIdx, uint32_t workerCount, uint32_t selectedWorkers,
+                                                     uint32_t expertIdx)
+{
+    if (workerCount == 0U || selectedWorkers == 0U || selectedWorkers > workerCount || workerIdx >= workerCount) {
+        return selectedWorkers;
+    }
+    const uint32_t first = (expertIdx * selectedWorkers) % workerCount;
+    const uint32_t logical = workerIdx >= first ? workerIdx - first : workerIdx + workerCount - first;
+    return logical < selectedWorkers ? logical : selectedWorkers;
+}
+
+#endif
 // 连续均衡分配 token，前 totalTokens % workerCount 个任务各多处理一个 token。
 __aicore__ inline WorkRange GetBalancedTokenRange(uint32_t totalTokens, uint32_t workerIdx, uint32_t workerCount)
 {
@@ -383,7 +399,11 @@ __aicore__ inline uint64_t GetExpertCountWorkspaceOffset(const BlockWorkspaceCon
 {
     if (useBlockMajorLayout) {
         uint32_t blockMajorStride = Ops::Base::CeilAlign(expertCount, static_cast<uint32_t>(INT_CACHELINE));
+#ifdef DEEPEP_MEGAMOE_ROCE
+        return static_cast<uint64_t>(workspace.shared ? 0U : workspace.blockIdx) * blockMajorStride + expertIdx;
+#else
         return static_cast<uint64_t>(workspace.blockIdx) * blockMajorStride + expertIdx;
+#endif
     }
     return static_cast<uint64_t>(expertIdx) * INT32_PER_256B * workspace.blockNum +
            static_cast<uint64_t>(INT32_PER_256B) * workspace.blockIdx;
@@ -428,6 +448,17 @@ template <typename ElementType>
 __aicore__ inline GM_ADDR GetExpertWeightAddr(GM_ADDR tensorListAddr, bool isPerExpertWeightTensor, uint32_t expertIdx,
                                               uint64_t elementOffset)
 {
+#ifdef DEEPEP_MEGAMOE_ROCE
+#if defined(ASCEND_DEEPEP_DIRECT_TENSOR_INPUT)
+    if (isPerExpertWeightTensor) {
+        auto* entry = reinterpret_cast<__gm__ uint64_t*>(tensorListAddr) + expertIdx;
+        GlobalTensor<uint8_t> line;
+        line.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(entry));
+        DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(line);
+        return reinterpret_cast<GM_ADDR>(*entry);
+    }
+#endif
+#endif
     uint16_t tensorIdx = isPerExpertWeightTensor ? static_cast<uint16_t>(expertIdx) : 0U;
     GM_ADDR tensorAddr = GetTensorAddr(tensorIdx, tensorListAddr);
     if (isPerExpertWeightTensor) {
@@ -502,9 +533,16 @@ __aicore__ inline void WaitUntilGmFlagIsNonZero(__gm__ int32_t* flagAddr)
 __aicore__ inline void WaitForMoeExpertTokenCountReady(GM_ADDR tokenCountReadyFlagWorkspace,
                                                        const BlockWorkspaceContext& countWorkspace, uint32_t expertIdx)
 {
+#ifdef DEEPEP_MEGAMOE_ROCE
+    __gm__ int32_t* tokenCountReadyFlag =
+        reinterpret_cast<__gm__ int32_t*>(tokenCountReadyFlagWorkspace) +
+        static_cast<uint64_t>(expertIdx) * countWorkspace.blockNum * INT_CACHELINE +
+        static_cast<uint64_t>(countWorkspace.shared ? 0U : countWorkspace.blockIdx) * INT_CACHELINE;
+#else
     __gm__ int32_t* tokenCountReadyFlag = reinterpret_cast<__gm__ int32_t*>(tokenCountReadyFlagWorkspace) +
                                           static_cast<uint64_t>(expertIdx) * countWorkspace.blockNum * INT_CACHELINE +
                                           static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
+#endif
     WaitUntilGmFlagIsNonZero(tokenCountReadyFlag);
 }
 

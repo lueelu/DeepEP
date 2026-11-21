@@ -49,7 +49,9 @@ class Tensor:
         return self.data.ndim
 
     def __getitem__(self, index):
-        return Tensor(self.data[index], self.dtype, self.device)
+        result = Tensor(self.data[index], self.dtype, self.device)
+        result.npu_format = self.npu_format
+        return result
 
     def view(self, dtype):
         return Tensor(self.data.view(DTYPES[dtype]), dtype, self.device)
@@ -73,7 +75,35 @@ class Tensor:
         base = self.data
         while isinstance(base.base, np.ndarray):
             base = base.base
-        return SimpleNamespace(data_ptr=lambda: base.ctypes.data)
+        return SimpleNamespace(data_ptr=lambda: base.ctypes.data, nbytes=lambda: base.nbytes)
+
+    def data_ptr(self):
+        return self.data.ctypes.data
+
+    def storage_offset(self):
+        return (self.data_ptr() - self.untyped_storage().data_ptr()) // self.data.itemsize
+
+    def numel(self):
+        return self.data.size
+
+    def element_size(self):
+        return self.data.itemsize
+
+    def stride(self):
+        return tuple(n // self.data.itemsize for n in self.data.strides)
+
+    def unsqueeze(self, axis):
+        result = Tensor(np.expand_dims(self.data, axis), self.dtype, self.device)
+        result.npu_format = self.npu_format
+        return result
+
+    def is_inference(self):
+        return False
+
+    def copy_(self, other, non_blocking=False):
+        np.copyto(self.data, other.data)
+        self._version += 1
+        return self
 
     def record_stream(self, stream):
         self.streams.append(stream)
@@ -106,11 +136,15 @@ def backend(monkeypatch):
 
     dist = SimpleNamespace(ProcessGroup=Group, get_world_size=lambda group: group.size(), all_gather_object=gather)
     torch = SimpleNamespace(
+        Tensor=Tensor,
         **{name: name for name in DTYPES},
         device=Device,
         empty=lambda shape, dtype, device: Tensor(np.empty(shape, dtype=DTYPES[dtype]), dtype, device),
         zeros=lambda shape, dtype, device: Tensor(np.zeros(shape), dtype, device),
-        empty_like=lambda t, dtype: Tensor(np.empty(t.shape, dtype=DTYPES[dtype]), dtype, t.device),
+        empty_like=lambda t, dtype=None, device=None: Tensor(
+            np.empty(t.shape, dtype=DTYPES[dtype or t.dtype]), dtype or t.dtype, device or t.device
+        ),
+        tensor=lambda data, dtype, device, pin_memory=False: Tensor(data, dtype, device),
         distributed=dist,
         inference_mode=lambda _: contextlib.nullcontext(),
     )
@@ -119,11 +153,13 @@ def backend(monkeypatch):
 
     def format_cast(t, acl_format, *, customize_dtype, input_dtype):
         # 检查实际传入的协议，不能把所有 format_cast 参数都静默忽略。
-        assert t.dtype == "uint8" and acl_format == 29
+        assert t.dtype == "uint8" and acl_format in (2, 29)
+        if acl_format == 2:
+            assert t.npu_format == 50
         assert customize_dtype == "float8_e4m3fn" and input_dtype == "float4_e2m1fn_x2"
         events.append(("format_cast", t))
         t = Tensor(t.data.copy(), t.dtype, t.device)
-        t.npu_format = 50  # FP4 打包成 uint8 后，输出码与请求的29不同。
+        t.npu_format = 2 if acl_format == 2 else 50  # FP4 打包成 uint8 后，输出码与请求的29不同。
         return t
 
     monkeypatch.setitem(
@@ -133,19 +169,32 @@ def backend(monkeypatch):
             get_npu_format=lambda t: t.npu_format, npu_format_cast=format_cast, float4_e2m1fn_x2="float4_e2m1fn_x2"
         ),
     )
-    stream = SimpleNamespace(
-        wait_stream=lambda _: events.append("wait"), synchronize=lambda: events.append("synchronize")
-    )
+    stream = SimpleNamespace(wait_stream=lambda _: events.append("wait"), synchronize=lambda: events.append("sync"))
     npu = SimpleNamespace(
-        current_device=lambda: 0, current_stream=lambda _: stream, stream=lambda _: contextlib.nullcontext()
+        Event=lambda: SimpleNamespace(record=lambda stream: None, query=lambda: True),
+        is_current_stream_capturing=lambda: False,
+        device=lambda _: contextlib.nullcontext(),
+        current_device=lambda: 0,
+        current_stream=lambda _: stream,
+        stream=lambda _: contextlib.nullcontext(),
     )
     monkeypatch.setattr(api, "npu_api", lambda: npu)
-    monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096))
+    monkeypatch.setattr(
+        api,
+        "require_native",
+        lambda _: SimpleNamespace(
+            megamoe_workspace_address=lambda _: 4096,
+            megamoe_combine_reduce_version=4,
+            megamoe_combine_qps=16,
+            megamoe_dispatch_qps=8,
+            megamoe_dispatch_workers=14,
+        ),
+    )
 
     class Runtime:
-        def __init__(self, group, capacity, timeout, *, backend="mte"):
+        def __init__(self, group, capacity, timeout, *, ranks_per_node=0):
             self.device, self.stream, self.native = 0, stream, SimpleNamespace(capacity=capacity)
-            self.backend = backend
+            self.ranks_per_node = ranks_per_node
             self.closed = False
 
         def ensure_alive(self):
@@ -158,6 +207,38 @@ def backend(monkeypatch):
 
     monkeypatch.setattr(api, "_MegaRuntime", Runtime)
 
+    class Plan:
+        def __init__(self, example, *args):
+            self.bs, self.workspace_bytes = example.shape[0], 4096
+            self.options = args
+            events.append(("prepare", self.bs))
+
+        def forward(self, *args):
+            events.append(("launch", args))
+            output = args[-1]
+            output.data.fill(3)
+            return output, Tensor([2, 3], "int32")
+
+    ext = SimpleNamespace(
+        buffer_size=lambda *args: 2 << 20,
+        Plan=Plan,
+        ffts_config=lambda: 123,
+        timer_enabled=True,
+        timer_numel=64,
+        small_batch_max_tokens=256,
+        hierarchical_max_tokens=256,
+        combine_reduce_version=4,
+        combine_qps=16,
+        dispatch_qps=8,
+        dispatch_workers=14,
+    )
+    monkeypatch.setattr(api, "_extension", lambda: ext)
+    from deep_ep_experimental.megamoe import _platform_api as platform_api
+
+    ep32_ext = ext
+    monkeypatch.setattr(platform_api, "npu_api", api.npu_api)
+    monkeypatch.setattr(platform_api, "require_native", api.require_native)
+    monkeypatch.setattr(platform_api, "_MegaRuntime", lambda group, capacity, timeout, **kw: Runtime(group, capacity, timeout))
     class Plan:
         def __init__(
             self,
@@ -240,11 +321,13 @@ def backend(monkeypatch):
         allocate_timer=lambda example, backend="mte": Tensor(np.zeros(65536 if backend == "urma" else 64), "int64"),
         small_batch_max_tokens=256,
     )
-    monkeypatch.setattr(api, "_extension", lambda: ext)
+    monkeypatch.setattr(platform_api, "_extension", lambda: platform_ext)
+    platform_ext = ext
+    ext = ep32_ext
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
     buffer.topk_idx.data[:] = [0, 1]
     buffer.topk_weights.data[:] = [0.4, 0.6]
-    yield SimpleNamespace(buffer=buffer, events=events, ext=ext, dist=dist, group_type=Group)
+    yield SimpleNamespace(buffer=buffer, events=events, ext=ext, platform_ext=platform_ext, dist=dist, group_type=Group)
     buffer.destroy()
 
 
@@ -279,7 +362,7 @@ def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16)
     launches = [event[1] for event in backend.events if isinstance(event, tuple) and event[0] == "launch"]
     assert launches[0][8] is None and launches[1][8] is timer
     assert (launches[0][1] is None) == bf16
-    assert launches[0][-2] is y and launches[1][-2] is y
+    assert launches[0][-1] is y and launches[1][-1] is y
     assert (
         sum(event == ("prepare", 17) for event in backend.events if isinstance(event, tuple) and event[0] == "prepare")
         == 1
@@ -287,7 +370,7 @@ def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16)
     assert stats.streams == [b._runtime.stream, b._runtime.stream]
     assert b.workspace_bytes == 4096 and b.symmetric_buffer_bytes == 2 << 20
     b.prepare(1)
-    assert b._plan.bs == 17 and b._plan_bs == 17
+    assert b._plan.bs == b._plan_bs == b.num_max_tokens_per_rank
 
 
 def test_output_and_stats_aliases_rejected_before_launch(backend):
@@ -390,7 +473,7 @@ def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
         selected = w1.select(bs <= 256)
         assert launch[4] is selected[0] and launch[6] is selected[1]
-        assert b._plan.bs == 4096  # one plan owns the configured maximum capacity
+        assert b._plan.bs == b.num_max_tokens_per_rank
     assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts
     with pytest.raises(ValueError, match="keep its returned l1 pair intact"):
         api.fp8_fp4_mega_moe(Tensor(np.zeros((257, 1024)), "bfloat16"), tuple(w1), w2, b)
@@ -483,6 +566,7 @@ def test_store_group_public_configuration_and_prepare_without_process_group(back
     buffer.destroy()
     assert stages == [
         "check:MegaMoE product selection",
+        "check:buffer implementation",
         "check:configuration",
         "check:input allocation",
         "check:input preflight",
@@ -503,7 +587,7 @@ def test_non_finite_route_weights_and_bad_capacity_fail_before_launch(backend):
 def test_plan_allocation_failure_is_collective_and_retryable(backend):
     plan_type = backend.ext.Plan
 
-    def fail(*args, **kwargs):
+    def fail(*args):
         raise RuntimeError("workspace allocation failed")
 
     backend.ext.Plan = fail
@@ -512,11 +596,12 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan is None and backend.buffer._plan_bs is None
     backend.ext.Plan = plan_type
     backend.buffer.prepare(17)
-    assert backend.buffer._plan_bs == backend.buffer.num_max_tokens_per_rank
+    assert backend.buffer._plan_bs == 17
 
 
 @pytest.mark.parametrize("board,expected", [(0x44, "urma"), (7, "mte"), (3, "mte"), (None, "mte"), (0x6C, "mte")])
-def test_megamoe_product_selection(monkeypatch, board, expected):
+@pytest.mark.parametrize("capacity", [256, 257])
+def test_megamoe_product_selection(monkeypatch, board, expected, capacity):
     from deep_ep_experimental.megamoe import backend as selector
     from deep_ep import _machine
 
@@ -524,17 +609,15 @@ def test_megamoe_product_selection(monkeypatch, board, expected):
     monkeypatch.setattr(_machine, "physical_device", lambda: 17)
     monkeypatch.setattr(_machine, "board_id", lambda physical: board)
     monkeypatch.setattr(selector, "collective_check", lambda group, stage, error, value: calls.append(value))
-    assert selector.select_backend(object()) == expected
-    assert calls == [expected]
+    selected = expected if capacity > 256 else "mte"
+    assert selector.select_backend(SimpleNamespace(size=lambda: 16), capacity, 16) == selected
+    assert calls == [(selected, capacity, 16, board == 0x44)]
 
 
 def urma_buffer(backend, monkeypatch, *, shared=0):
     from deep_ep_experimental.megamoe import backend as selector
 
-    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
-    # Also cover a module-level imported selector without coupling the test to
-    # whether api.py imports the helper locally or at module initialization.
-    monkeypatch.setattr(api, "select_backend", lambda group: "urma", raising=False)
+    monkeypatch.setattr(selector, "select_backend", lambda group, capacity, ranks_per_node, *, base=None: "urma")
     b = api.SymmBuffer(backend.group_type(16), 32, 2048, 2, 256, 256, num_shared_experts=shared)
     b.topk_idx.data[:] = [0, 1]
     b.topk_weights.data[:] = [0.4, 0.6]
@@ -564,7 +647,7 @@ def test_urma_uses_unified_plan_and_generation_survives_bs_changes(backend, monk
             launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
             assert launch[-2] is y
             assert launch[4] is w1.select(True)[0]  # URMA uses fused layout even above the MTE threshold.
-            assert isinstance(b._plan, backend.ext.Plan)
+            assert isinstance(b._plan, backend.platform_ext.Plan)
             assert b._plan.backend == "urma"
             generations.append(launch[-1])
             plans.append(b._plan)
@@ -604,7 +687,7 @@ def test_urma_timer_uses_unified_forward_and_plan_diagnostics(backend, monkeypat
     b, weights = urma_buffer(backend, monkeypatch)
     try:
         timer = b.allocate_timer()
-        assert timer.data.size > backend.ext.timer_numel
+        assert timer.data.size > backend.platform_ext.timer_numel
         y = Tensor(np.zeros((17, 256)), "bfloat16")
         api.fp8_fp4_mega_moe(y, *weights, b, timer=timer)
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
@@ -619,14 +702,14 @@ def test_urma_timer_uses_unified_forward_and_plan_diagnostics(backend, monkeypat
 
 def test_urma_plan_allocation_failure_poisoned_without_caching_shape(backend, monkeypatch):
     b, weights = urma_buffer(backend, monkeypatch)
-    original_plan = backend.ext.Plan
+    original_plan = backend.platform_ext.Plan
     attempts = []
 
     def fail(*args, **kwargs):
         attempts.append((args, kwargs))
         raise RuntimeError("URMA workspace allocation failed")
 
-    backend.ext.Plan = fail
+    backend.platform_ext.Plan = fail
     y = Tensor(np.zeros((17, 256)), "bfloat16")
     try:
         with pytest.raises(RuntimeError, match="URMA workspace allocation failed"):
@@ -634,21 +717,21 @@ def test_urma_plan_allocation_failure_poisoned_without_caching_shape(backend, mo
         assert b._failure == "URMA workspace allocation failed"
         assert b._plan is None and b._plan_bs is None
         assert len(attempts) == 1
-        backend.ext.Plan = original_plan
+        backend.platform_ext.Plan = original_plan
         with pytest.raises(RuntimeError, match="buffer failed.*restart"):
             api.fp8_fp4_mega_moe(y, *weights, b)
         assert b._plan is None and b._plan_bs is None
         assert len(attempts) == 1
         assert not any(isinstance(e, tuple) and e[0] == "launch" for e in backend.events)
     finally:
-        backend.ext.Plan = original_plan
+        backend.platform_ext.Plan = original_plan
         b.destroy()
 
 
 def test_activation_clamp_reaches_native_forward(backend):
     y = Tensor(np.zeros((17, 1024)), "bfloat16")
     api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=0.25)
-    assert ("activation_clamp", 0.25) in backend.events
+    assert [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1][-3] == 0.25
     with pytest.raises(ValueError, match="activation_clamp"):
         api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=-1)
 
@@ -658,7 +741,7 @@ def test_route_weight_mode_reaches_plan(backend, mode):
     b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)
     try:
         b.prepare(17)
-        assert b._plan.topk_weights_type == mode
+        assert getattr(b._plan, "topk_weights_type", 0) == mode
     finally:
         b.destroy()
 

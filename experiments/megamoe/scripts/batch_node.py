@@ -205,8 +205,7 @@ with open(sys.argv[1], "w") as f:
             wheel = existing_wheel(root, probe()["build"])
         if wheel is None:
             # 集群仅使用这一份仓内 SDK，避免每台机器隐式选择不同的外部路径。
-            for name in ("SHMEM_ROOT", "CATLASS_ROOT"):
-                os.environ.pop(name, None)
+            os.environ.pop("SHMEM_ROOT", None)
             os.environ.update(DEEPEP_BUILD_MEGAMOE="ON", DEEPEP_MEGAMOE_TIMER="ON")
             from build import build
 

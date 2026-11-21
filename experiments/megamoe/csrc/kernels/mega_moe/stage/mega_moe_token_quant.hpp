@@ -6,6 +6,9 @@
 
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_utils.hpp"
+#ifdef DEEPEP_MEGAMOE_ROCE
+#include "csrc_ep32/kernels/mega_moe/stage/mega_moe_dispatch_packet_vf.hpp"
+#endif
 
 namespace MegaMoeImpl {
 
@@ -86,11 +89,35 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
 // FP8 输入只重排为原来的逐 token 通信记录；不解量化、不重复量化。
+#ifdef DEEPEP_MEGAMOE_ROCE
+__aicore__ inline void StoreDispatchPackets(LocalTensor<uint8_t> row, LocalTensor<bfloat16_t> input,
+                                            const Params& params, uint32_t token, uint32_t bytes)
+{
+    if (!UseHierarchicalRoce(params.tilingData)) return;
+    const uint32_t packets = DispatchPacketCount(bytes);
+    auto packet = input.template ReinterpretCast<uint8_t>();
+    PipeBarrier<PIPE_V>();
+    asc_vf_call<PackDispatchVF>(reinterpret_cast<__ubuf__ uint32_t*>(row.GetPhyAddr()),
+                                reinterpret_cast<__ubuf__ uint32_t*>(packet.GetPhyAddr()), bytes / sizeof(uint32_t),
+                                packets, params.tilingData->hierarchicalSequence);
+    SyncFuncStatic<HardEvent::V_MTE3, SYNC_EVENT_ID5>();
+    GlobalTensor<uint8_t> destination;
+    destination.SetGlobalBuffer(params.peermemInfo.dispatchPacketPtr);
+    DataCopy(destination[token * packets * RAIL_PACKET_BYTES], packet, packets * RAIL_PACKET_BYTES);
+}
+
+template <typename ActivationType>
+__aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidden, const Params& params,
+                                          const QuantProcessConfig& config,
+                                          QuantProcessScratch<ActivationType>& scratch)
+{
+#else
 template <typename ActivationType, bool TopkWeightsPrefetch = false>
 __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidden, const Params& params,
                                           const QuantProcessConfig& config,
                                           QuantProcessScratch<ActivationType>& scratch)
 {
+#endif
     GlobalTensor<uint8_t> input, scales, output;
     input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.aGmAddr));
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.inputScaleGmAddr));
@@ -107,6 +134,7 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
         DataCopyPad(buffer, input[row * hidden], {1U, hidden, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes], {1U, scaleBytes, 0U, 0U, 0U},
                     {false, 0U, 0U, 0U});
+#ifndef DEEPEP_MEGAMOE_ROCE
         if constexpr (TopkWeightsPrefetch) {
             // FP8 direct input bypasses QuantizeLocalTokens' BF16 branch, but
             // must still append the same FP32 top-k payload before Dispatch.
@@ -118,10 +146,18 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
                         {1U, static_cast<uint32_t>(params.tilingData->topK * sizeof(float)), 0U, 0U, 0U},
                         {false, 0U, 0U, 0.0F});
         }
+#endif
         SetFlag<HardEvent::MTE2_MTE3>(event);
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         DataCopyPad(output[row * config.quantTokenScaleAlignBytes], buffer,
                     {1U, config.quantTokenScaleAlignBytes, 0U, 0U, 0U});
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (UseHierarchicalRoce(params.tilingData)) {
+            SyncFuncStatic<HardEvent::MTE2_V, SYNC_EVENT_ID5>();
+            StoreDispatchPackets(buffer, index % DOUBLE_BUFFER == 0 ? scratch.xInTensor0 : scratch.xInTensor1, params,
+                                 row, config.quantTokenScaleAlignBytes);
+        }
+#endif
         SetFlag<HardEvent::MTE3_MTE2>(event);
     }
     WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
@@ -143,7 +179,11 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
     }
     uint32_t hiddenDim = common.tokenHiddenDim;
     if (params.inputScaleGmAddr != nullptr) {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        PackFp8LocalTokens(tokenRange, hiddenDim, params, config, scratch);
+#else
         PackFp8LocalTokens<ActivationType, TopkWeightsPrefetch>(tokenRange, hiddenDim, params, config, scratch);
+#endif
         return;
     }
     GlobalTensor<bfloat16_t> srcGlobalTensor;
@@ -196,6 +236,20 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
         auto xOutBytesTensor = xOutTensor.template ReinterpretCast<uint8_t>();
         DataCopyPad(dstGlobalTensor[static_cast<uint64_t>(index) * config.quantTokenScaleAlignBytes], xOutBytesTensor,
                     xCopyOutParams);
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (params.tilingData->bf16Bs96) {
+            const uint32_t row = tokenRange.start + index;
+            GlobalTensor<uint8_t> sharedData, sharedScales;
+            sharedData.SetGlobalBuffer(params.workspaceInfo.sharedExpertInputDataPtr);
+            sharedScales.SetGlobalBuffer(params.workspaceInfo.sharedExpertInputScalePtr);
+            const uint32_t scaleBytes = config.quantScaleNumAlignPerToken;
+            DataCopyPad(sharedData[row * hiddenDim], xOutBytesTensor, {1U, hiddenDim, 0U, 0U, 0U});
+            DataCopyPad(sharedScales[row * scaleBytes], xOutBytesTensor[config.quantTokenAlignBytes],
+                        {1U, scaleBytes, 0U, 0U, 0U});
+        }
+        StoreDispatchPackets(xOutBytesTensor, xInTensor, params, tokenRange.start + index,
+                             config.quantTokenScaleAlignBytes);
+#endif
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
     }
     WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);

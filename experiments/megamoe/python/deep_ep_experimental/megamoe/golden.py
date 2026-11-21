@@ -43,6 +43,9 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
         version=1,
         reference_sha256=hashlib.sha256(source.encode()).hexdigest(),
         model=config["model"],
+        activation_clamp=config.get("activation_clamp", config["model"].get("activation_clamp")),
+        shared_dtype=config.get("shared_dtype", "fp4"),
+        shared_fixture=config.get("shared_fixture", "fp4-subset"),
         seed=config["seed"],
         world=world,
         bs=bs,
@@ -168,19 +171,22 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 model["hidden"],
                 model.get("shared_intermediate_hidden", model["intermediate_hidden"]),
                 config["seed"] + 100000,
+                native_fp8=spec.get("shared_fixture") == "native-fp8",
             )
             for expert in range(shared):
                 yield np.arange(len(x)), None, tuple((data[expert], scale[expert]) for data, scale in raw)
 
     def forward(job):
         token, route_weight, pair = job
-        w1, w2 = map(unpack_weight, pair)
+        native = route_weight is None and spec.get("shared_fixture") == "native-fp8"
+        w1, w2 = (unpack_weight(p, fp8=native) for p in pair)
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
+            early = route_weight is not None and model.get("topk_weights_type", 0) == 1
             result[start:stop] = expert_forward(
-                x[token[start:stop]], w1, w2, model.get("activation_clamp"),
-                route_weight[start:stop] if route_weight is not None and model.get("topk_weights_type", 0) == 1 else None)
+                x[token[start:stop]], w1, w2, spec.get("activation_clamp"), route_weight[start:stop] if early else None
+            )
         if route_weight is not None and model.get("topk_weights_type", 0) == 0:
             result *= route_weight[:, None]
         return token, result

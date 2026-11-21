@@ -1,0 +1,345 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
+"""Thin inference-only API; all algorithm selection remains in the native layer."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+import importlib
+import threading
+from typing import TYPE_CHECKING
+
+from deep_ep._runtime import integer, warn_unclosed
+from .api import SymmBuffer as _PublicBuffer, _RoutedWeightPair, _SharedFp8Pair, _check_fp4_weight_format, _pair
+from ._runtime import _MegaRuntime
+from deep_ep._native import npu_api, require_native
+from deep_ep._store import StoreGroup
+from .validation import collective_check
+from .numerics import normalize_clamp
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from torch.distributed import ProcessGroup
+
+    WeightPair = tuple[Tensor, Tensor]
+
+
+@lru_cache(maxsize=1)
+def _extension():
+    core = require_native("MegaMoE")
+    if not hasattr(core, "create_megamoe_runtime"):
+        raise RuntimeError("Install a wheel built with DEEPEP_BUILD_MEGAMOE=ON")
+    try:
+        extension = importlib.import_module(__package__ + "._C")
+    except ImportError as error:
+        raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
+    if getattr(extension, "api_protocol", None) != 10:
+        raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
+    return extension
+
+
+class SymmBuffer(_PublicBuffer):
+    """Collective resource owner. All ranks construct/call/destroy in the same order.
+
+    num_experts is global; intermediate_hidden is the post-SwiGLU width.
+    This Beta supports nonempty, same-BS calls and one in-flight operation per buffer.
+    """
+
+    def _ensure_alive(self):
+        self._runtime.ensure_alive()
+
+    def __init__(
+        self,
+        group: ProcessGroup | StoreGroup,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        hidden: int,
+        intermediate_hidden: int,
+        num_shared_experts: int = 0,
+        mma_type: str = "fp8xfp4",
+        activation: str = "swiglu",
+        *,
+        ranks_per_node: int = 0,
+        timeout: int = 120,
+        topk_weights_type: int = 0,
+        base: _PublicBuffer | None = None,
+        num_max_configs: int | None = None,
+    ):
+        import torch
+        import torch.distributed as dist
+
+        if not isinstance(group, (StoreGroup, dist.ProcessGroup)):
+            raise TypeError("Pass a StoreGroup or an initialized ProcessGroup explicitly")
+        size = group.size() if isinstance(group, StoreGroup) else dist.get_world_size(group)
+        urma = self._backend_name == "urma"
+        error = None
+        try:
+            integer("num_experts", num_experts, 1, 16384)
+            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384 if urma else 65536)
+            integer("num_topk", num_topk, 1, min(8 if urma else 32, num_experts))
+            integer("hidden", hidden, 256 if urma else 1024, 8192)
+            integer("intermediate_hidden", intermediate_hidden, 256, 16384 if urma else 4096)
+            integer("num_shared_experts", num_shared_experts, 0, 1 if urma else 8)
+            integer("world_size", size, 2, 128)
+            integer("ranks_per_node", ranks_per_node, 0, size)
+            integer("timeout", timeout, 1, 300)
+            integer("topk_weights_type", topk_weights_type, 0, 1)
+            h_align, i_align = (256, 256) if urma else (64, 128)
+            if hidden % h_align or intermediate_hidden % i_align:
+                raise ValueError(f"hidden must be divisible by {h_align}; intermediate_hidden by {i_align}")
+            if urma and (size not in (4, 8, 16) or mma_type != "fp8xfp4"):
+                raise ValueError("URMA supports EP4/EP8/EP16 and routed FP8xFP4")
+            if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
+                raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8 is implemented; no BF16xBF16")
+            if mma_type != "fp8xfp4" and num_shared_experts:
+                raise ValueError("Shared experts currently require FP8xFP4 weights")
+            if num_experts % size or num_experts // size > 128:
+                raise ValueError("Experts must divide EP, with at most 128 local experts")
+            if ranks_per_node and size % ranks_per_node:
+                raise ValueError("ranks_per_node must divide EP (contiguous node-major ranks)")
+        except (TypeError, ValueError) as failure:
+            error = str(failure)
+        # 在进入 SHMEM 之前共同校验布局，不能各 rank 各自选择通信偏移。
+        config = (
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            num_shared_experts,
+            mma_type,
+            activation,
+            ranks_per_node,
+            timeout,
+            topk_weights_type,
+        )
+        collective_check(group, "configuration", error, config)
+        ext = _extension()
+        capacity = int(
+            ext.buffer_size(
+                size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, backend=self._backend_name, topk_weights_type=topk_weights_type
+            )
+        )
+        self._lock = threading.Lock()
+        self._device = torch.device(f"npu:{npu_api().current_device()}")
+        self._plan = self._plan_bs = None
+        self._generation = 0
+        self._failure = None
+        self._world_size = size
+        self.group, self.num_experts = group, num_experts
+        self.num_max_tokens_per_rank, self.num_topk = num_max_tokens_per_rank, num_topk
+        self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
+        self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
+        self.ranks_per_node = ranks_per_node
+        self.topk_weights_type = topk_weights_type
+        self.x = self.x_sf = self.topk_idx = self.topk_weights = None
+        error = None
+        try:
+            self.allocate_inputs()
+        except Exception as failure:
+            error = str(failure)
+        # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
+        collective_check(group, "input allocation", error)
+        self._runtime = _MegaRuntime(group, capacity, timeout, backend=self._backend_name)
+
+    def _prepare(self, bs):
+        integer("BS", bs, 1, self.num_max_tokens_per_rank)
+        if self._plan is not None:
+            return
+        runtime = self._runtime
+        address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
+        ext = _extension()
+        self._plan = ext.Plan(
+            self.x,
+            self.intermediate_hidden,
+            self.num_topk,
+            self.num_experts // self._world_size,
+            self._world_size,
+            self.num_max_tokens_per_rank,
+            self.mma_type == "fp8xfp4",
+            self.num_shared_experts,
+            self.ranks_per_node,
+            ext.ffts_config(),
+            address,
+            runtime.native.capacity,
+            backend=self._backend_name,
+            topk_weights_type=self.topk_weights_type,
+        )
+        # The plan owns capacity for num_max_tokens_per_rank; each forward
+        # supplies its active BS without retiring the device workspace.
+        self._plan_bs = self.num_max_tokens_per_rank
+
+    def prepare(self, bs: int) -> SymmBuffer:
+        """Collectively prepare/reuse one BS before timing; all ranks must call together."""
+        error = None
+        with self._lock:
+            try:
+                self._runtime.ensure_alive()
+                integer("BS", bs, 1, self.num_max_tokens_per_rank)
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, "prepare", error, bs)
+            try:
+                runtime = self._runtime
+                runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
+                with npu_api().stream(runtime.stream):
+                    self._prepare(bs)
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, f"prepare BS={bs}", error)
+        return self
+
+    @property
+    def timer_enabled(self) -> bool:
+        return bool(_extension().timer_enabled and self.mma_type == "fp8xfp4")
+
+    def allocate_timer(self) -> Tensor:
+        """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""
+        self._runtime.ensure_alive()
+        if not self.timer_enabled:
+            raise RuntimeError("W4A8 timer requires DEEPEP_MEGAMOE_TIMER=ON")
+        return _extension().allocate_timer(self.x, backend=self._backend_name)
+
+    def destroy(self):
+        with self._lock:
+            self._runtime.close()
+            self._plan = self._plan_bs = None
+            self.x = self.x_sf = self.topk_idx = self.topk_weights = None
+
+    def __del__(self):
+        warn_unclosed(self)
+
+
+def _run(
+    x,
+    topk_idx,
+    topk_weights,
+    l1_weights,
+    l2_weights,
+    sym_buffer,
+    *,
+    shared_l1_weights=None,
+    shared_l2_weights=None,
+    out=None,
+    timer=None,
+    cumulative_stats=None,
+    activation_clamp=None,
+):
+    import torch
+
+    if not isinstance(sym_buffer, SymmBuffer):
+        raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
+    data, scales = _pair(x, "x") if isinstance(x, tuple) else (x, None)
+    w1, s1 = _pair(l1_weights, "l1_weights")
+    w2, s2 = _pair(l2_weights, "l2_weights")
+    shared = (None, None, None, None)
+    if (shared_l1_weights is None) != (shared_l2_weights is None):
+        raise ValueError("Supply both shared weight pairs, or neither")
+    if shared_l1_weights is not None:
+        if isinstance(shared_l1_weights, _SharedFp8Pair):
+            shared_l1_weights = shared_l1_weights.planar
+        sw1, ss1 = _pair(shared_l1_weights, "shared_l1_weights")
+        sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
+        shared = (sw1, sw2, ss1, ss2)
+    clamp = normalize_clamp(activation_clamp)
+    b = sym_buffer
+    urma = b._backend_name == "urma"
+    if urma and scales is None:
+        raise TypeError("URMA input requires (FP8 E4M3, E8M0 scales)")
+    if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
+        raise ValueError("x must be nonempty [BS,H] within the buffer capacity")
+    if data.device != b._device:
+        raise ValueError("x must be on the buffer's creating device")
+    expected = (b.num_experts // b.group.size(), b.intermediate_hidden * 2)
+    if tuple(w1.shape[:2]) != expected or tuple(topk_idx.shape) != (data.shape[0], b.num_topk):
+        raise ValueError("Weight/routing shapes do not match the buffer configuration")
+    if (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
+        raise ValueError("Shared expert count does not match the buffer configuration")
+    expected_dtype = torch.uint8 if b.mma_type == "fp8xfp4" else torch.float8_e4m3fn
+    if w1.dtype != expected_dtype:
+        raise TypeError("Weight dtype differs from buffer mma_type")
+    prepared_inputs = ()
+    if w1.dtype == torch.uint8:
+        fused = urma or data.shape[0] <= _extension().small_batch_max_tokens
+        if isinstance(l1_weights, _RoutedWeightPair):
+            prepared_inputs = (*l1_weights, *l1_weights._planar)
+            w1, s1 = l1_weights.select(fused)
+        elif urma or not fused:
+            raise ValueError(
+                "Prefill requires both prepared GMM1 layouts; call transform_weights_for_mega_moe "
+                "on raw ND weights and keep its returned l1 pair intact"
+            )
+    if any(t is not None and t.requires_grad for t in (data, scales, topk_weights, w1, s1, w2, s2, out, *shared)):
+        raise NotImplementedError("MegaMoE Beta is inference-only")
+    if out is not None and any(
+        out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+        for tensor in (data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, *prepared_inputs)
+        if tensor is not None
+    ):
+        raise ValueError("out must not overlap any input or timer storage")
+    if topk_idx.dtype != torch.int32:
+        raise TypeError("topk_idx must be int32; convert explicitly before timing")
+    if w1.dtype == torch.uint8:
+        for name, weight in (
+            ("l1_weights", w1),
+            ("l2_weights", w2),
+            ("shared_l1_weights", shared[0]),
+            ("shared_l2_weights", shared[1]),
+        ):
+            if weight is not None:
+                if urma and name.startswith("shared_"):
+                    import torch_npu
+
+                    if (
+                        weight.dtype != torch.float8_e4m3fn
+                        or not weight.is_contiguous()
+                        or torch_npu.get_npu_format(weight) != 2
+                    ):
+                        raise ValueError("URMA shared weights require contiguous ND FP8 E4M3")
+                else:
+                    _check_fp4_weight_format(weight, name)
+    if cumulative_stats is not None:
+        stats = cumulative_stats
+        if (
+            stats.dtype != torch.int32
+            or tuple(stats.shape) != (b.num_experts // b.group.size(),)
+            or stats.device != b._device
+            or not stats.is_contiguous()
+        ):
+            raise ValueError("Cumulative stats must be contiguous local-expert int32 on the buffer device")
+        if any(
+            stats.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
+            for t in (data, scales, topk_idx, topk_weights, w1, w2, s1, s2, out, timer, *shared, *prepared_inputs)
+            if t is not None
+        ):
+            raise ValueError("Cumulative stats must not alias inputs, output or timer")
+    runtime = b._runtime
+    with b._lock:
+        runtime.ensure_alive()
+        if b._failure is not None:
+            raise RuntimeError(f"MegaMoE buffer failed; restart the distributed job: {b._failure}")
+        caller = npu_api().current_stream(runtime.device)
+        runtime.stream.wait_stream(caller)
+        # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。
+        with npu_api().stream(runtime.stream):
+            try:
+                b._prepare(data.shape[0])
+                b._generation += 1
+                result = b._plan.forward(
+                    data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out, b._generation, clamp
+                )
+            except Exception as error:
+                if urma:
+                    b._failure = str(error)
+                    if isinstance(b.group, StoreGroup):
+                        b.group.abort(b._failure)
+                raise
+            if cumulative_stats is not None:
+                cumulative_stats.add_(result[1])
+                cumulative_stats.record_stream(runtime.stream)
+        caller.wait_stream(runtime.stream)
+        for tensor in result:
+            tensor.record_stream(caller)
+        return result

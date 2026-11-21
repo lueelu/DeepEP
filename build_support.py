@@ -178,6 +178,19 @@ def checked_run(argv, **kwargs):
     subprocess.run([str(arg) for arg in argv], check=True, timeout=1800, **kwargs)
 
 
+def shmem_rdma_backend(sdk):
+    """Use the SDK provider's build identity, never infer the NIC from card count."""
+    build = sdk.get("build", {})
+    if not isinstance(build, dict) or build.get("rdma_backend", "NONE") not in ("NONE", "XSCALE", "HNS_1825"):
+        raise RuntimeError("SHMEM SDK rdma_backend must be NONE, XSCALE or HNS_1825")
+    if build.get("rdma_backend") == "HNS_1825":
+        mode = build.get("hns_1825_pi_on_chip")
+        if type(mode) is not int or mode not in (0, 1):
+            raise RuntimeError("HNS_1825 SDK must record hns_1825_pi_on_chip as integer 0 or 1")
+    return build.get("rdma_backend", "NONE")
+
+
+
 def validate_shmem_sdk(root, expected):
     manifest = Path(root) / "deepep-sdk.json"
     if not manifest.is_file():
@@ -197,6 +210,7 @@ def validate_shmem_sdk(root, expected):
             raise RuntimeError(f"SHMEM SDK checksum mismatch: {relative}")
     if "lib/libshmem.so" not in sdk["sha256"] or not any(key.startswith("include/") for key in sdk["sha256"]):
         raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
+    shmem_rdma_backend(sdk)
     return sdk
 
 
@@ -247,6 +261,9 @@ def build_configuration(environment=None):
         raise RuntimeError("MegaMoE build options accept ON or OFF only")
     if timer == "ON" and beta != "ON":
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
+    bf16_bs96 = enabled("DEEPEP_MEGAMOE_BF16_BS96", env)
+    if bf16_bs96 and beta != "ON":
+        raise RuntimeError("BF16 BS96 requires DEEPEP_BUILD_MEGAMOE=ON")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     ll_reference_profile = env.get("DEEPEP_LL_REFERENCE_PROFILE", "OFF")
@@ -280,6 +297,7 @@ def build_configuration(environment=None):
             raise RuntimeError("SHMEM SDK has no deepep-sdk.json")
         sdk = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(sdk, dict):
+            sdk = {}
             raise ValueError("Invalid SHMEM SDK manifest")
         if sdk.get("revision") != lock["shmem"]["revision"]:
             raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
@@ -311,6 +329,7 @@ def build_configuration(environment=None):
     files.append(library)
     # Record actual inputs so replacing an unpinned SDK invalidates the build cache.
     result["shmem"] = {
+        "rdma_backend": shmem_rdma_backend(sdk),
         "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
         # The validated SDK identity travels with the installed wheel so a
         # one-click run can reject a wheel built against another SDK revision.
@@ -347,7 +366,7 @@ def build_configuration(environment=None):
     }
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
-    result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
+    result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON", "bf16_bs96": bf16_bs96}
     if beta == "ON":
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
@@ -431,6 +450,8 @@ class VariantBuild(ConfiguredBuild):
         beta = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
         timer = os.environ.get("DEEPEP_MEGAMOE_TIMER", "OFF") == "ON"
         variant = "megamoe-timer" if beta and timer else ("megamoe" if beta else "core")
+        if enabled("DEEPEP_MEGAMOE_BF16_BS96"):
+            variant += "-bf16-bs96"
         self.build_base = str(Path(self.build_base) / variant)
         super().finalize_options()
 
@@ -527,9 +548,11 @@ class CMakeBuild(build_ext):
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
+            f"-DDEEPEP_HOST_PROCESSOR={configuration.get('machine', platform.machine())}",
             f"-DASCEND_HOME_PATH={configuration['ASCEND_HOME_PATH']}",
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
+            f"-DDEEPEP_MEGAMOE_BF16_BS96={'ON' if megamoe.get('bf16_bs96', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DDEEPEP_LL_REFERENCE_PROFILE={'ON' if configuration.get('ll_reference_profile', False) else 'OFF'}",
             f"-DDEEPEP_LL_STAGE_TIMER={'ON' if configuration.get('ll_stage_timer', False) else 'OFF'}",

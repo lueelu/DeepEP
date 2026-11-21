@@ -129,6 +129,7 @@ def _load_native():
         raise ImportError(
             f"Native extension resolved an external SHMEM library: {library}; restart with a clean environment"
         )
+    module.shmem_sdk_matches = True  # The bundled closure and loaded library were verified above.
     return module
 
 

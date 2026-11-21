@@ -26,13 +26,13 @@ def test_device_schema_and_extended_size():
 
     def names(enum, sentinel):
         body = re.search(r"enum\s+" + enum + r"\s*\{(.*?)\};", header, re.S)[1]
-        return [item.split("=")[0].strip() for item in body.split(",") if item.strip() != sentinel]
+        return [item.split("=")[0].strip() for item in re.sub(r"^#.*$", "", body, flags=re.M).split(",") if item.strip() != sentinel]
 
     assert names("FixedTiming", "FIXED_TIMING_COUNT") == p.FIXED_NAMES
     assert names("DynamicTimingType", "DYNAMIC_TYPE_COUNT_ENUM") == p.DYNAMIC_NAMES
     for name in ("MAX_DYNAMIC_ITER", "N_CORE_COUNT"):
         assert int(re.search(rf"{name}\s*=\s*(\d+)", header)[1]) == getattr(p, name)
-    assert p.TOTAL_BUFFER_SIZE == p.WAVE_ID_OFFSET + p.WAVE_ID_PER_CORE * p.N_CORE_COUNT
+    assert p.COUNT_DIAGNOSTIC_OFFSET == p.WAVE_ID_OFFSET + p.WAVE_ID_PER_CORE * p.N_CORE_COUNT
     assert p.TASK_METADATA_SIZE == p.N_CORE_COUNT * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER * 2
 
 

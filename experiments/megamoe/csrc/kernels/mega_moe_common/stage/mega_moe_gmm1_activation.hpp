@@ -507,12 +507,22 @@ __aicore__ inline void Gmm1Aiv1PrefetchEpilogueTileA8W4(ActivationQuantOp& activ
 }
 
 // 非 Prefetch 路径的 AIV1 从 GM 取回完整 A8W4 GMM1 tile 并执行 SwiGLU/量化。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, typename TensorC, typename ActivationQuantOp,
+          typename Config, typename ActualShape>
+__aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQuantOp, TensorC& l0cOutGm,
+                                                const GMMAddrInfo& gmmAddrInfo, const Config& config,
+                                                const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc,
+                                                bool packShortTile = false)
+{
+#else
 template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, typename TensorC, typename ActivationQuantOp,
           typename Config, typename ActualShape>
 __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQuantOp, TensorC& l0cOutGm,
                                                 const GMMAddrInfo& gmmAddrInfo, const Config& config,
                                                 const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc)
 {
+#endif
     if (Get<M_VALUE>(actualShape) == 0U) {
         return;
     }
@@ -532,8 +542,21 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
     auto tensorBlockUbFirst = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetFirst), layoutL0cUb);
     auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);
     auto copyGm2Ub = AscendC::Te::MakeCopy(AscendC::Te::CopyGM2UB{});
+#ifdef DEEPEP_MEGAMOE_ROCE
+    const bool packed = packShortTile && Config::FUSED_GATE_UP && Get<N_VALUE>(actualShape) * 2 == L1_TILE_N &&
+                        Get<M_VALUE>(actualShape) <= L1_TILE_M_128;
+    if (packed) {
+        auto pair = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
+                                   Te::MakeShape(Get<M_VALUE>(actualShape), 2 * Get<N_VALUE>(actualShape)));
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, pair);
+    } else {
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+    }
+#else
     AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
     AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+#endif
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
     Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape),
@@ -547,7 +570,11 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
         0,
         0};
     AscendC::SetCtrlSpr<60, 60>(0);
+#ifdef DEEPEP_MEGAMOE_ROCE
+    activationQuantOp(epilogueShape, epilogueOffset, 0U, packed);
+#else
     activationQuantOp(epilogueShape, epilogueOffset);
+#endif
     NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
@@ -921,6 +948,15 @@ __aicore__ inline void RunGmm1Generic(
 // 调度器已确认 ready，只执行一个 SwiGLU tile；函数不依赖物理 AIV 子核编号。
 // 路由及非量化共享激活由 AIV1 优先级调度；量化共享尾部由 AIV0 调用。
 // 共享 activationToGmm2Flag=nullptr，使用独立的共享激活完成标记。
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,
+          uint32_t Gmm1TileM, bool TopkWeightsPrefetch, bool FuseGateUp = false, typename ActivationQuantOp>
+__aicore__ inline void RunReadyGmm1ActivationTileA8W4(
+    ActivationQuantOp& activationQuantOp, const ProblemShape& problemShape, const GMMAddrInfo& gmmAddrInfo,
+    const BlockJobContext& blockJob, uint32_t loopIdx, uint32_t expertBeforeCnt,
+    DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType timingType = DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_SWIGLU, bool packShortTile = false)
+{
+#else
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,
           uint32_t Gmm1TileM, bool TopkWeightsPrefetch, bool FuseGateUp = false, typename ActivationQuantOp>
 __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
@@ -928,6 +964,7 @@ __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
     const BlockJobContext& blockJob, uint32_t loopIdx, uint32_t expertBeforeCnt,
     DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType timingType = DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_SWIGLU)
 {
+#endif
     using GmmConfig = GmmKernel::Config<true, 0, ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, false,
                                         TopkWeightsPrefetch, false, false, false, true, FuseGateUp>;
     auto config = GmmConfig::BuildGmm1ProblemConfig(problemShape, blockJob, Gmm1TileM);
@@ -951,8 +988,13 @@ __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
         GmmKernel::Gmm1Aiv1PrefetchEpilogueTileA8W4<ElementC, typename GmmConfig::MakeLayoutC, true>(
             activationQuantOp, gmC, meta, gmmAddrInfo, config, shape, m, n, expertBeforeCnt);
     } else {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        GmmKernel::Gmm1Aiv1EpilogueTileA8W4<ElementC, typename GmmConfig::MakeLayoutC, true>(
+            activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n, packShortTile);
+#else
         GmmKernel::Gmm1Aiv1EpilogueTileA8W4<ElementC, typename GmmConfig::MakeLayoutC, true>(
             activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n);
+#endif
     }
 }
 
@@ -1145,10 +1187,17 @@ __aicore__ inline void UpdateSharedExpertGmm1GlobalBuffer(const MoeStageCommonCo
     if constexpr (EnableA8W4) {
         gmmAddrInfo.gmm1OutGlobal = workspace.sharedExpertGmm1OutPtr + expertIdx * m * n * sizeof(bfloat16_t);
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    gmmAddrInfo.bGlobal = GetExpertWeightAddr<ActivationType>(weights.weight1, gmmConfig.sharedWeightList,
+                                                              sharedExpertIdx, expertIdx * n * k / weightElemsPerByte);
+    gmmAddrInfo.bScaleGlobal = GetExpertWeightAddr<QuantScaleType>(weights.weightScales1, gmmConfig.sharedWeightList,
+                                                                   sharedExpertIdx, expertIdx * n * scaleK);
+#else
     gmmAddrInfo.bGlobal = GetExpertWeightAddr<ActivationType>(weights.weight1, gmmConfig.isPerExpertWeightTensor,
                                                               sharedExpertIdx, expertIdx * n * k / weightElemsPerByte);
     gmmAddrInfo.bScaleGlobal = GetExpertWeightAddr<QuantScaleType>(
         weights.weightScales1, gmmConfig.isPerExpertWeightTensor, sharedExpertIdx, expertIdx * n * scaleK);
+#endif
     gmmAddrInfo.activationToGmm2Flag = nullptr;
     gmmAddrInfo.metaInfoGlobal = nullptr;
     gmmAddrInfo.dispatchToGmm1Flag = nullptr;

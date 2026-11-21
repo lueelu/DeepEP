@@ -1,3 +1,4 @@
+include("${CMAKE_CURRENT_LIST_DIR}/HostArchitecture.cmake")
 # Copyright (c) 2026, Lu Lu
 # Modified by lishaoxun 2026
 
@@ -48,7 +49,7 @@ unset(ASCENDCL_LIBRARY CACHE)
 unset(ASCEND_RUNTIME_LIBRARY CACHE)
 unset(SHMEM_LIBRARY CACHE)
 set(_cann_library_paths "${ASCEND_HOME_PATH}/lib64"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64")
+    "${ASCEND_HOME_PATH}/${DEEPEP_HOST_PROCESSOR}-linux/lib64")
 find_library(ASCENDCL_LIBRARY NAMES ascendcl PATHS ${_cann_library_paths} NO_DEFAULT_PATH REQUIRED)
 find_library(ASCEND_RUNTIME_LIBRARY NAMES runtime PATHS ${_cann_library_paths} NO_DEFAULT_PATH REQUIRED)
 find_library(SHMEM_LIBRARY NAMES shmem PATHS "${SHMEM_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
