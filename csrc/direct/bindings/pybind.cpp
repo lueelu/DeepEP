@@ -13,6 +13,7 @@
 #include "runtime/shmem_instance.h"
 #include "ops/dispatch_host_timing.h"
 #include "ops/dispatch_device_timing.h"
+#include "ops/dispatch_channel_metadata.h"
 #include <pybind11/stl.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -22,6 +23,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("fused_layout_notify_version") = 1;
     m.attr("fused_notify_pipeline_version") = 1;
     m.def("take_dispatch_device_timing", &ascend_deepep::ops::TakeDispatchDeviceTiming);
+    m.def("last_dispatch_channel_metadata", [] { return ascend_deepep::ops::LastDispatchChannelMetadata(); });
+    m.attr("dispatch_channel_metadata_version") = 1;
     m.attr("dispatch_device_timing_version") = 1;
     m.attr("dispatch_device_timing_cycles_per_us") = ascend_deepep::kNpuSystemCyclesPerUs;
     m.attr("dispatch_device_timing_fields") = std::vector<std::string>{

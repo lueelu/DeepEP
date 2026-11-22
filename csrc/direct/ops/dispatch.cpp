@@ -16,6 +16,8 @@
 #include "ops/stream_allocator.h"
 #include "ops/dispatch_host_timing.h"
 #include "ops/dispatch_device_timing.h"
+#include "ops/dispatch_channel_metadata.h"
+#include "common/dispatch_channel_metadata.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "runtime/shmem_instance.h"
 
@@ -567,6 +569,36 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                           host_prep ? torch::Tensor() : allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
+    const bool channel_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA") && !cached_mode;
+    LastDispatchChannelMetadata() = false;
+    c10::optional<torch::Tensor> packed_channel_indices, packed_channel_weights;
+    if (channel_metadata) {
+        TORCH_CHECK(use_udma && !shmem.TokenSchedule() && topk_idx.has_value() && num_topk > 0,
+                    "channel metadata requires fresh peer-scheduled UDMA dispatch with top-k indices");
+        TORCH_CHECK(!capturing, "channel metadata experiment does not support graph capture");
+        TORCH_CHECK(
+            world_size <= ascend_deepep::kChannelMetadataMaxRanks && num_topk <= ascend_deepep::kChannelMetadataMaxTopk,
+            "channel metadata exceeds the UB input tile capacity");
+        const int64_t length = CheckedAddInt64(num_tokens, num_channels - 1, "metadata channel length") / num_channels;
+        const int64_t stride = AlignUpInt64(length, 8);
+        const int64_t row_bytes = CheckedMulInt64(num_topk, sizeof(ascend_deepep::topk_idx_t), "metadata index row");
+        TORCH_CHECK(CheckedMulInt64(length, row_bytes, "metadata channel WQE bytes") <= UINT32_MAX,
+                    "channel metadata exceeds WQE byte-count capacity");
+        const int64_t rows =
+            CheckedMulInt64(CheckedMulInt64(world_size, num_channels, "metadata slots"), stride, "metadata rows");
+        const int64_t elements = CheckedMulInt64(rows, num_topk, "metadata elements");
+        (void)CheckedMulInt64(elements, sizeof(ascend_deepep::topk_idx_t) + sizeof(float), "metadata bytes");
+        packed_channel_indices = allocator.Empty({elements}, topk_idx->options());
+        if (topk_weights.has_value()) packed_channel_weights = allocator.Empty({elements}, topk_weights->options());
+        tiling.channel_metadata = 1;
+        tiling.notify_topk_idx = reinterpret_cast<uint64_t>(topk_idx->data_ptr());
+        tiling.notify_topk_weights =
+            topk_weights.has_value() ? reinterpret_cast<uint64_t>(topk_weights->data_ptr()) : 0;
+        tiling.packed_channel_indices = reinterpret_cast<uint64_t>(packed_channel_indices->data_ptr());
+        tiling.packed_channel_weights =
+            packed_channel_weights.has_value() ? reinterpret_cast<uint64_t>(packed_channel_weights->data_ptr()) : 0;
+        LastDispatchChannelMetadata() = true;
+    }
     tiling.metadata_src_threads = metadata_src_256 ? 256U : 128U;
     tiling.metadata_src_lanes = metadata_src_256 && world_size <= 8 ? 32U : 16U;
     tiling.metadata_topk_threads = metadata_topk_256 ? 256U : 128U;

@@ -6,6 +6,7 @@
 
 #include "kernels/notify/notify_recv_prefix.h"
 #include "kernels/notify/notify_dispatch_plan.h"
+#include "kernels/notify/notify_channel_metadata.h"
 #include "kernels/notify/notify_fused_layout.h"
 #include "kernels/common/v2_handle.h"
 #include "common/launch.h"
@@ -593,6 +594,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         // kernel completion still gates every payload consumer.
         ascend_deepep::BuildDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
     }
+    if (tiling.channel_metadata)
+        ascend_deepep::PackChannelMetadata(resource, send_head, tiling, core_idx);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(

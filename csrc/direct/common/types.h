@@ -117,6 +117,10 @@ struct alignas(8) DispatchTilingData {
     uint64_t dispatch_device_trace = 0;
     uint64_t notify_topk_idx = 0;
     uint64_t notify_expert_partials = 0;
+    uint32_t channel_metadata = 0;
+    uint64_t notify_topk_weights = 0;
+    uint64_t packed_channel_indices = 0;
+    uint64_t packed_channel_weights = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
 };
 

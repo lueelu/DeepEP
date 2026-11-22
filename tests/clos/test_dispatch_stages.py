@@ -99,6 +99,37 @@ def fixture_trace():
     return fields, rows
 
 
+def test_channel_comparison_keeps_notify_comm_and_api_separate():
+    rows = []
+    for turn, (mode, comm) in enumerate(((0, 100), (1, 80), (1, 82), (0, 102))):
+        rows.append(
+            dict(
+                op="fresh",
+                cores=8,
+                channel=0,
+                turn=turn,
+                metadata_requested=mode,
+                policy={"visit": 32},
+                payload_bytes_per_rank=1000000,
+                stats_us={
+                    "notify_dispatch_kernel": {"mean": 20 + mode * 10},
+                    "v1_dispatch_udma_kernel": {"mean": comm},
+                    "api_wall_us": {"mean": 150 - mode * 5},
+                },
+            )
+        )
+    (result,) = bench.channel_comparison(rows)
+    assert result["pairs"] == 2
+    assert result["notify_on_us"] == 30
+    assert result["comm_on_us"] == 81
+    assert result["api_on_us"] == 145  # Not the sum of separately measured stages.
+    assert result["comm_pair_delta_min_us"] == result["comm_pair_delta_max_us"] == -20
+    assert result["on_gbps"] == pytest.approx(1000 / 81)
+    rows[-1]["policy"] = {"visit": 16}
+    with pytest.raises(ValueError, match="unmatched"):
+        bench.channel_comparison(rows)
+
+
 def test_trace_intervals_do_not_add_overlapping_metadata_twice():
     fields, rows = fixture_trace()
     decoded = bench.decode_trace(rows, fields, 3, 8, True, True, 1000)

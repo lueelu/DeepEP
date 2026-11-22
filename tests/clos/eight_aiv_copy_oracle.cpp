@@ -138,6 +138,10 @@ struct DispatchSenderT {
         assert(false);
     }
     void Publish(GM_ADDR, uint64_t, uint32_t, uint32_t) {}
+    void PutChannelField(uint32_t, GM_ADDR, uint64_t, uint64_t, uint32_t)
+    {
+        assert(false);
+    }
     void Quiet() {}
 };
 void WaitPackedScaleReady(const DispatchTilingData&, uint32_t, uint32_t)

@@ -175,6 +175,30 @@ __aicore__ inline void DispatchRemoteImpl(
             }
         }
     }
+    if (td.channel_metadata) {
+        // Immutable notify staging is ready before this same-stream kernel.
+        // No index-window refill or metadata VF can overwrite pending WQEs.
+        sender.Flush();
+        for (uint32_t p = 0; p < sender.Count(); ++p) {
+            const uint32_t peer = sender.Rank(p);
+            const uint32_t rank_base = td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0;
+            for (uint32_t ch = core % td.udma_workers_per_peer; ch < td.num_channels; ch += td.udma_workers_per_peer) {
+                const uint32_t first = ch ? channel_gm.GetValue(peer * td.num_channels + ch - 1) : 0;
+                const uint32_t count = channel_gm.GetValue(peer * td.num_channels + ch) - first;
+                if (!count) continue;
+                const uint64_t slot = (uint64_t(peer) * td.num_channels + ch) * plan_stride;
+                const uint64_t row = uint64_t(rank_base) + first;
+                sender.PutChannelField(p, workspace, td.src_idx_buffer_offset + row * sizeof(int32_t),
+                    reinterpret_cast<uint64_t>(plan) + slot * sizeof(int32_t), count * uint32_t(sizeof(int32_t)));
+                sender.PutChannelField(p, workspace, td.topk_idx_buffer_offset + row * td.num_topk * sizeof(topk_idx_t),
+                    td.packed_channel_indices + slot * td.num_topk * sizeof(topk_idx_t),
+                    count * td.num_topk * uint32_t(sizeof(topk_idx_t)));
+                if (td.has_topk_weights)
+                    sender.PutChannelField(p, workspace, td.topk_weights_buffer_offset + row * td.num_topk * sizeof(float),
+                        td.packed_channel_weights + slot * td.num_topk * sizeof(float), count * td.num_topk * uint32_t(sizeof(float)));
+            }
+        }
+    }
     trace.Mark(DispatchDeviceTrace::PayloadQueued);
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
     trace.Mark(DispatchDeviceTrace::Published);
@@ -182,9 +206,9 @@ __aicore__ inline void DispatchRemoteImpl(
     trace.Mark(DispatchDeviceTrace::IncomingDone);
     sender.Quiet();
     trace.Mark(DispatchDeviceTrace::QuietDone);
-    // SO markers cover payload only. Metadata AIVs can still be doing remote
-    // SIMT stores on another rank; all ranks/cores must join before outputs are
-    // read or the workspace is reused. The collective includes local sync.
+    // Default SO markers cover payload only; channel_metadata also covers the
+    // UDMA metadata above. Keep the collective for default SIMT metadata and
+    // for self-copy on every path before outputs or workspace are consumed.
     aclshmemx_sync_vec_all();
     trace.Mark(DispatchDeviceTrace::SyncDone);
 }

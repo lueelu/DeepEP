@@ -218,6 +218,15 @@ public:
         Base::Publish(base, offset, rank, worker);
     }
 
+    // Caller drains payload spans once before these channel/field descriptors
+    // reuse the request UB. The shared BuildWqes uses one SIMT thread per descriptor;
+    // the SDK owns SQ credits, doorbells and completion on the same payload QP.
+    __aicore__ void PutChannelField(uint32_t p, GM_ADDR workspace, uint64_t dst_offset,
+        uint64_t source, uint32_t bytes)
+    {
+        Base::Put(p, workspace + dst_offset, reinterpret_cast<__gm__ uint8_t*>(source), bytes);
+    }
+
 private:
     const DispatchTilingData& td_;
     uint64_t x_, scales_;

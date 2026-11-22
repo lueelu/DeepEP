@@ -19,6 +19,7 @@ from stage_metrics import L2CacheFlush, prepare_v2_sample
 
 TRACE_ENV = "DEEPEP_CLOS_DISPATCH_DEVICE_TIMING"
 CHANNEL_ENV = "DEEPEP_CLOS_CACHED_CHANNEL_EP16"
+METADATA_ENV = "DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA"
 TIMELINE = (
     "init_done",
     "begin_done",
@@ -32,6 +33,83 @@ TIMELINE = (
     "handle_done",
     "work_done",
 )
+
+
+def cpu_inputs(torch, args, source, tokens=None, routing="random"):
+    tokens = args.tokens if tokens is None else tokens
+    gen = torch.Generator().manual_seed(20261122 + source)
+    x = (torch.randn((tokens, args.hidden), generator=gen) * 0.01).to(torch.bfloat16)
+    idx = torch.rand((tokens, args.experts), generator=gen).topk(args.topk, dim=1).indices
+    weights = torch.rand((tokens, args.topk), generator=gen)
+    if routing == "masked":
+        idx[::7] = -1
+        idx[:, -1] = -1
+    elif routing == "invalid":
+        idx.fill_(-1)
+    elif routing == "skew":
+        idx = torch.arange(args.topk).remainder(args.experts).expand(tokens, -1).clone()
+    return x, idx, weights
+
+
+def check_cpu_reference(torch, actual, args, rank, world, sizes=None, routing="random", cached=False, src_idx=None):
+    """Derive receive rows from original routes, never from Notify/handle output."""
+    recv, recv_idx, recv_weights = actual
+    local_experts = args.experts // world
+    first = 0
+    for source in range(world):
+        x, idx, weights = cpu_inputs(torch, args, source, None if sizes is None else sizes[source], routing)
+        hits = (idx >= rank * local_experts) & (idx < (rank + 1) * local_experts)
+        selected = hits.any(1)
+        n = int(selected.sum())
+        torch.testing.assert_close(recv[first : first + n], x[selected], rtol=0, atol=0)
+        if src_idx is not None:
+            torch.testing.assert_close(
+                src_idx[first : first + n].to(torch.int64), torch.where(selected)[0], rtol=0, atol=0
+            )
+        expected_idx = (idx[selected] - rank * local_experts).masked_fill(~hits[selected], -1)
+        if not cached:
+            torch.testing.assert_close(recv_idx[first : first + n].to(torch.int64), expected_idx, rtol=0, atol=0)
+        if recv_weights is not None:
+            torch.testing.assert_close(
+                recv_weights[first : first + n], weights[selected].masked_fill(~hits[selected], 0), rtol=0, atol=0
+            )
+        first += n
+    if first != len(recv):
+        raise AssertionError("receive row count differs from the independent routing reference")
+
+
+def channel_comparison(results):
+    """Summarize matched off/on turns; never add independently aggregated stages."""
+    comparisons = []
+    for key in sorted({(r["op"], r["cores"], r["channel"]) for r in results}):
+        selected = [r for r in results if (r["op"], r["cores"], r["channel"]) == key]
+        off = [r for r in selected if r["metadata_requested"] == 0]
+        on = [r for r in selected if r["metadata_requested"] == 1]
+        if not off or not on:
+            continue
+        if len(off) != len(on) or any(r["policy"] != off[0]["policy"] for r in selected):
+            raise ValueError("unmatched metadata comparison")
+        row = dict(op=key[0], cores=key[1], cached_channel=key[2], pairs=len(off))
+        notify = "cached_notify_dispatch_kernel" if key[0] == "cached" else "notify_dispatch_kernel"
+        for label, stage in (("notify", notify), ("comm", "v1_dispatch_udma_kernel"), ("api", "api_wall_us")):
+            a = [r["stats_us"][stage]["mean"] for r in off]
+            b = [r["stats_us"][stage]["mean"] for r in on]
+            row.update(
+                {
+                    label + "_off_us": statistics.mean(a),
+                    label + "_on_us": statistics.mean(b),
+                    label + "_on_min_us": min(b),
+                    label + "_on_max_us": max(b),
+                    label + "_time_change_pct": (statistics.mean(b) / statistics.mean(a) - 1) * 100,
+                    label + "_pair_delta_min_us": min(y - x for x, y in zip(a, b)),
+                    label + "_pair_delta_max_us": max(y - x for x, y in zip(a, b)),
+                }
+            )
+        payload = off[0]["payload_bytes_per_rank"]
+        row["off_gbps"] = payload / row["comm_off_us"] / 1000
+        row["on_gbps"] = payload / row["comm_on_us"] / 1000
+        comparisons.append(row)
+    return comparisons
 
 
 def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us):
@@ -91,7 +169,7 @@ def capture_stages(directory, samples, cached):
     return result
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--hidden", type=int, default=2816)
@@ -99,6 +177,7 @@ def main():
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument("--cores", type=int, nargs="+", default=[8, 32])
     parser.add_argument("--cached-channel-modes", type=int, nargs="+", choices=[0, 1], default=[0, 1])
+    parser.add_argument("--metadata-modes", type=int, nargs="+", choices=[0, 1], default=[0])
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--trace-samples", type=int, default=3, help="0 for formal timing only/older baseline")
@@ -107,7 +186,7 @@ def main():
     parser.add_argument("--control-port", type=int, default=29881)
     parser.add_argument("--shmem-port", type=int, default=29882)
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if (
         min(args.tokens, args.hidden, args.topk, args.experts, args.samples, *args.cores) <= 0
         or min(args.warmup, args.trace_samples) < 0
@@ -131,6 +210,8 @@ def main():
     native = load_native_module()
     if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 1:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
+    if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 1:
+        raise RuntimeError("rebuild host and kernel libraries for channel metadata")
     store = dist.TCPStore(
         os.environ["MASTER_ADDR"],
         args.control_port,
@@ -149,6 +230,7 @@ def main():
     for key in (
         TRACE_ENV,
         CHANNEL_ENV,
+        METADATA_ENV,
         "DEEPEP_CLOS_DISPATCH_SRC_IDX_256",
         "DEEPEP_CLOS_DISPATCH_TOPK_256",
         "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY",
@@ -186,6 +268,8 @@ def main():
                 buffer_initializations=1,
                 identity=identity,
                 actual_huge_pages=actual_huge_pages,
+                bandwidth="decimal GB/s, deduplicated BF16 payload including self, excluding metadata",
+                aggregation="per-iteration slowest rank, then mean/P50/P95; API and profiler separate passes",
             ),
             default=str,
             indent=2,
@@ -208,33 +292,74 @@ def main():
         ]
 
     try:
-        gen = torch.Generator().manual_seed(20261122 + rank)
-        x = (torch.randn((args.tokens, args.hidden), generator=gen) * 0.01).to(torch.bfloat16).npu()
-        idx = torch.rand((args.tokens, args.experts), generator=gen).topk(args.topk, dim=1).indices
+        if 1 in args.metadata_modes:
+            precision_cases = []
+            for routing in ("masked", "invalid", "skew", "empty_local"):
+                sizes = [min(args.tokens, 65)] * world
+                if routing == "empty_local":
+                    sizes[0] = 0
+                cpu_x, cpu_idx, cpu_w = cpu_inputs(torch, args, rank, sizes[rank], routing)
+                dx, di, dw = cpu_x.npu(), cpu_idx.to(dtype=topk_idx_t, device="npu"), cpu_w.npu()
+                for core in args.cores:
+                    for weighted in (False, True):
+                        for mode in args.metadata_modes:
+                            group.agree(["precision", routing, core, weighted, mode])
+                            os.environ[METADATA_ENV] = str(mode)
+                            prepare_v2_sample(buffer, flush)
+                            result = done(
+                                buffer.dispatch(
+                                    dx,
+                                    topk_idx=di,
+                                    topk_weights=dw if weighted else None,
+                                    num_experts=args.experts,
+                                    num_sms=core,
+                                    do_expand=False,
+                                )
+                            )
+                            if bool(native.last_dispatch_channel_metadata()) != bool(mode):
+                                raise RuntimeError("precision launch used the wrong channel-metadata mode")
+                            check_cpu_reference(
+                                torch,
+                                snapshot(result),
+                                args,
+                                rank,
+                                world,
+                                sizes,
+                                routing,
+                                src_idx=result[3]._dispatch_layout[3].cpu(),
+                            )
+                            precision_cases.append(dict(routing=routing, cores=core, weighted=weighted, mode=mode))
+            group.agree("channel_metadata_precision_passed")
+            (out / "precision.json").write_text(json.dumps(precision_cases, indent=2), encoding="utf-8")
+        cpu_x, idx, cpu_w = cpu_inputs(torch, args, rank)
+        x = cpu_x.npu()
         owners = idx // (args.experts // world)
         local_rows = sum(int((owners == peer).any(1).sum()) for peer in range(world))
         payload = sum(group.gather(local_rows)) * args.hidden * 2 / world
         idx = idx.to(dtype=topk_idx_t, device="npu")
-        weights = torch.rand((args.tokens, args.topk), generator=gen).npu()
+        weights = cpu_w.npu()
         results = []
         for op in ("fresh", "fresh_weighted", "cached"):
             configs = [
-                (core, flag)
+                (core, flag, metadata)
                 for core in args.cores
                 for flag in args.cached_channel_modes
+                for metadata in args.metadata_modes
                 if flag == 0 or (world == 16 and core == 8 and op == "cached")
             ]
             if not configs:
                 continue
             reference = None
-            for turn, (core, flag) in enumerate(configs + configs[::-1]):
-                group.agree([op, turn, core, flag])
+            policies = {}
+            for turn, (core, flag, metadata) in enumerate(configs + configs[::-1]):
+                group.agree([op, turn, core, flag, metadata])
                 torch.npu.synchronize()
                 os.environ[CHANNEL_ENV] = str(flag)
+                os.environ[METADATA_ENV] = str(metadata)
                 handle = None
 
                 def invoke():
-                    return done(
+                    result = done(
                         buffer.dispatch(
                             x,
                             handle=handle,
@@ -245,12 +370,32 @@ def main():
                             do_expand=False,
                         )
                     )
+                    if getattr(native, "dispatch_channel_metadata_version", 0) == 1:
+                        effective = bool(native.last_dispatch_channel_metadata())
+                        if effective != bool(metadata and handle is None):
+                            raise RuntimeError("native channel-metadata gate did not match this launch")
+                    return result
 
                 initial = invoke()
                 policy = asdict(initial[3]._udma_policy)
+                key = (core, flag)
+                if key in policies and policies[key] != policy:
+                    raise RuntimeError("metadata toggle changed the payload policy")
+                policies[key] = policy
                 if op == "cached":
                     handle = initial[3]
-                checked = snapshot(invoke())
+                checked_result = invoke()
+                checked = snapshot(checked_result)
+                if 1 in args.metadata_modes:
+                    check_cpu_reference(
+                        torch,
+                        checked,
+                        args,
+                        rank,
+                        world,
+                        cached=op == "cached",
+                        src_idx=checked_result[3]._dispatch_layout[3].cpu(),
+                    )
                 if reference is None:
                     reference = checked
                 else:
@@ -268,7 +413,7 @@ def main():
                     start = time.perf_counter_ns()
                     invoke()
                     api.append((time.perf_counter_ns() - start) / 1000)
-                capture = out / f"{op}_round{turn}_aiv{core}_channel{flag}"
+                capture = out / f"{op}_round{turn}_aiv{core}_channel{flag}_metadata{metadata}"
                 prof = torch_npu.profiler
                 with prof.profile(
                     activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
@@ -283,6 +428,9 @@ def main():
                         prepare_v2_sample(buffer, flush)
                         invoke()
                 stages = capture_stages(capture, args.samples, op == "cached")
+                for actual, expected in zip(snapshot(invoke()), reference):
+                    if expected is not None:
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 stages["api_wall_us"] = api
                 (capture / "samples.json").write_text(json.dumps(stages, indent=2), encoding="utf-8")
                 gathered = group.gather(stages)
@@ -300,6 +448,8 @@ def main():
                         turn=turn,
                         cores=core,
                         channel=flag,
+                        metadata_requested=metadata,
+                        metadata_effective=bool(metadata and op != "cached"),
                         policy=policy,
                         stats_us=stats,
                         payload_bytes_per_rank=payload,
@@ -338,8 +488,15 @@ def main():
                         os.environ[TRACE_ENV] = "0"
                     (capture / "device_trace.json").write_text(json.dumps(traces, indent=2), encoding="utf-8")
             group.agree([op, "passed"])
+        comparisons = channel_comparison(results)
+        if comparisons:
+            with (out / "comparison.csv").open("w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=list(comparisons[0]))
+                writer.writeheader()
+                writer.writerows(comparisons)
     finally:
         os.environ[TRACE_ENV] = "0"
+        os.environ[METADATA_ENV] = "0"
         buffer.destroy()
     group.agree("complete")
     (out / "exit.json").write_text('{"exit_code": 0, "variant_precision_passed": true}', encoding="utf-8")

@@ -9,6 +9,51 @@
 
 namespace ascend_deepep::udma {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+__simt_vf__ __launch_bounds__(128) inline void CopySelfChannelWordsVf(
+    const __ubuf__ uint32_t* input, __gm__ uint32_t* output, uint32_t words)
+{
+    for (uint32_t i = threadIdx.x; i < words; i += 128) output[i] = input[i];
+    asc_threadfence();
+}
+
+template <class Resource>
+__aicore__ inline void CopySelfChannelMetadata(Resource& resource, GM_ADDR plan, GM_ADDR workspace,
+    const DispatchTilingData& td, uint32_t channel, uint32_t row, uint32_t count, uint32_t stride)
+{
+    if (!count) return;
+    // Use exact word stores for compact channel boundaries, which may share a
+    // 32-byte GM line. No remote operation or padded write touches another owner.
+    constexpr uint32_t tile_bytes = 32 * 1024;
+    auto tile = resource.template GetBufferByByte<uint32_t>(0);
+    const uint64_t slot = (uint64_t(td.rank) * td.num_channels + channel) * stride;
+    for (uint32_t field = 0; field < (td.has_topk_weights ? 3U : 2U); ++field) {
+        const uint32_t width = field == 0 ? 4U : td.num_topk * (field == 1 ? uint32_t(sizeof(topk_idx_t)) : 4U);
+        const uint64_t source = field == 0 ? reinterpret_cast<uint64_t>(plan) :
+            (field == 1 ? td.packed_channel_indices : td.packed_channel_weights);
+        const uint64_t offset = field == 0 ? td.src_idx_buffer_offset :
+            (field == 1 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset);
+        AscendC::GlobalTensor<uint32_t> input;
+        input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(source + slot * width));
+        auto* output = reinterpret_cast<__gm__ uint32_t*>(workspace + offset + uint64_t(row) * width);
+        const uint64_t words = uint64_t(count) * width / 4U;
+        for (uint64_t start = 0; start < words; start += tile_bytes / 4U) {
+            const uint32_t n = words - start < tile_bytes / 4U ? uint32_t(words - start) : tile_bytes / 4U;
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+            AscendC::DataCopyPad(tile, input[start], AscendC::DataCopyExtParams{1, n * 4U, 0, 0, 0},
+                AscendC::DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
+            asc_vf_call<CopySelfChannelWordsVf>(dim3(128),
+                reinterpret_cast<__ubuf__ uint32_t*>(tile.GetPhyAddr()), output + start, n);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        }
+    }
+}
+
 // Notify already chose the stable ordinal. Metadata workers only publish it.
 template <uint32_t Threads, uint32_t Lanes>
 __simt_vf__ __launch_bounds__(Threads) inline void DispatchSourceIndicesVf(
@@ -173,7 +218,7 @@ __aicore__ inline void DispatchMetadata(
         const uint64_t channel_begin = uint64_t(ch) * channel_tokens;
         const uint32_t begin = channel_begin < td.num_tokens ? uint32_t(channel_begin) : td.num_tokens;
         const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
-        if (build_handle) {
+        if (build_handle && !td.channel_metadata) {
             const uint64_t started = trace.Now();
             if (td.metadata_src_threads == 256 && td.metadata_src_lanes == 32) {
                 asc_vf_call<DispatchSourceIndicesVf<256, 32>>(
@@ -192,7 +237,7 @@ __aicore__ inline void DispatchMetadata(
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             trace.Add(DispatchDeviceTrace::SrcCycles, started);
         }
-        if (td.num_topk && experts_per_rank) {
+        if (td.num_topk && experts_per_rank && !td.channel_metadata) {
             const uint64_t started = trace.Now();
             if (td.metadata_topk_threads == 256) {
                 asc_vf_call<DispatchTopkScatterSimtVf<256>>(
@@ -228,6 +273,8 @@ __aicore__ inline void DispatchMetadata(
         const uint32_t count = channels.GetValue(td.rank * td.num_channels + ch) - previous;
         if (td.udma_output_control && (row > td.num_output_tokens || count > td.num_output_tokens - row))
             trap();
+        if (td.channel_metadata)
+            CopySelfChannelMetadata(resource, plan, workspace, td, ch, row, count, plan_stride);
         const uint64_t list_base = (uint64_t(td.rank) * td.num_channels + ch) * plan_stride;
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t token = plan_gm.GetValue(list_base + i);

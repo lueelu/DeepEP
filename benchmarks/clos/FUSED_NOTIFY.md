@@ -347,6 +347,97 @@ It checks exact token/destination rows and per-visit budget, not network
 completion or device performance. CANN compilation and NPU validation remain
 required before treating the experiment as deployable.
 
+## Opt-in channel metadata experiment
+
+`DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA=1` enables **fresh peer-scheduled UDMA
+dispatch only**. The default is 0. Cached dispatch ignores the switch and is
+the negative control; graph capture is rejected when the fresh experiment is
+requested. All ranks must use the same switch. Rebuild and install both the host
+extension and kernel library because `DispatchTilingData` has new fields.
+
+Notify packs top-k indices and optional FP32 weights in fixed
+`[peer, channel, aligned_channel_tokens, topk]` slots. It does not compact across
+channels. Original top-k positions are retained, with invalid entries -1/0.
+The existing src_idx plan is already compact within a channel and is not copied.
+Each notify AIV owns one channel. It loads token-major indices, weights and
+send-head ordinals through MTE2 to UB; SIMT reads those UB inputs and writes
+the packed GM slots. No SIMT input routing scan through GM is added.
+
+Packing overlays notify's released UB at the tail (after deferred-plan building
+if enabled), using this fixed byte ledger, independent of the actual K/EP:
+
+| UB bytes | Owner / use |
+| --- | --- |
+| 0..32767 | 32 tokens x at most 256 int32 send-head entries |
+| 32768..65535 | 32 tokens x at most 128 64-bit top-k indices |
+| 65536..81919 | 32 tokens x at most 128 FP32 weights |
+
+Loads complete with MTE2_V; V_MTE2 drains readers before the next tile load.
+V_S and same-stream kernel completion gate dispatch. Packed tensors use the
+stream-aware allocator and remain valid through dispatch/UDMA completion. For
+T4096/K8/64-bit indices, staging is 3 MiB/rank at EP8 and 6 MiB/rank at EP16
+with weights (2/4 MiB without weights). Allocation is included in API timing.
+
+Payload peer order, P/W/Q, visit and self-payload copy order stay unchanged.
+After payload submission, each sender handles only its existing peer/channel
+ownership (`channel % workers_per_peer`). AIV prepares source/destination/length
+descriptors; each SIMT lane constructs one channel/field WQE using the existing
+32-WQE builder. UDMA moves the bytes. Only valid rows are sent, never padding
+between channels. At eight channels/W1, a nonempty peer needs at most 16 WQEs
+without weights or 24 with weights, excluding payload. Actual flush counts still
+depend on SQ ownership and available credits. Payload spans are flushed before
+the descriptor UB is reused; metadata uses the same owned QPs and terminal
+markers, with the original incoming wait, quiet and all-AIV/rank collective.
+
+Self metadata stays local: its existing channel workers load packed blocks to
+UB and use exact-word local stores, avoiding padded MTE writes across compact
+channel boundaries. This does not change self **payload** copying. The experiment
+therefore includes notify packing, bulk remote metadata and local metadata copy;
+it is not a payload-scheduling change. With device tracing enabled, `self_cycles`
+also includes the local metadata copy, and `payload_queued` includes metadata
+descriptor submission; formal performance runs keep tracing off.
+
+Use the site's torchrun launcher for **EP8 and EP16 in separate jobs**:
+
+```bash
+# EP8 on one node; use --nnodes=2 --node_rank=$NODE_RANK and the site's
+# rendezvous arguments for EP16 across two eight-rank nodes.
+torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_channel_metadata.py \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 \
+  --warmup 10 --samples 30 --huge-pages --output /path/to/channel_metadata_ep8
+```
+
+The wrapper defaults to 8 AIV, BF16, expand=0, L2 flush then all-rank alignment,
+1 GiB pages, and **off/on/on/off**. It initializes Buffer once per rank per EP,
+including precision checks and all three operators: fresh without weights,
+fresh with weights, and cached. It fixes other experimental flags to 0 and
+checks that the payload policy is identical across off/on. Native
+`last_dispatch_channel_metadata()` is checked for each invocation, not just the
+requested environment value. Native huge-page state and all-rank library hashes
+are recorded; retain the site's physical huge-page allocation audit as well.
+
+Precision precedes performance: an independent CPU oracle reconstructs receive
+rows from source routes, covering masked/tail routes, all-invalid, skew and an
+empty source rank. The normal 4096-token case is also checked independently and
+against the other variant, with another equality check after sampling. Each rank
+keeps raw profiler exports, `samples.json`, `precision.json`, `manifest.json`,
+`summary.json`, `comparison.csv` and final `exit.json`. Require every rank's exit
+file **and** the launcher exit code to be zero.
+
+`comparison.csv` separates notify, communication and unprofiled complete API
+wall time, reports paired deltas and repeat-mean ranges, and derives decimal
+payload GB/s from communication time. It never sums independently aggregated
+stage times into API latency. Cached must stay on the old path; use its variation
+to detect drift. This script has no combine/reduce or expert compute, so it does
+not establish MoE end-to-end performance.
+
+Local checks (CANN/NPU validation is still required remotely):
+
+```bash
+python -m pytest tests/clos/test_channel_metadata.py tests/clos/test_dispatch_stages.py \
+  tests/clos/test_dispatch_metadata_threads.py tests/clos/test_eight_aiv_copy.py -q
+```
+
 ## Report files
 
 Each rank writes `precision.json`, `summary.csv`, `report.json`, raw profiler
