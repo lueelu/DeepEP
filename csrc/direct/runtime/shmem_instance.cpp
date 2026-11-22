@@ -242,9 +242,11 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
         throw std::invalid_argument("invalid or unreserved UDMA launch plan");
     const auto order = values[1], group = values[2], p = values[3], w = values[4], q = values[5];
     const auto v = values[6], copy = values[7], weight = values[8];
+    // Dispatch plans also carry the normalized after-submit marker (2).
+    // Spare-AIV copy (1) and weight transport overrides remain combine-only.
     if (order < 0 || order > 3 || group != ranks_per_group_ || p < 1 || p > 8 || !ValidPeers(p) || (w != 1 && w != 2) ||
         (q != 1 && q != 2) || w * q > 2 || v < 4 || v > 32 || !ValidVisit(v) || copy < 0 || copy > 2 || weight < 0 ||
-        weight > 2 || (!combine && (copy || weight)))
+        weight > 2 || (!combine && ((copy != 0 && copy != 2) || weight)))
         throw std::invalid_argument("UDMA launch plan is outside the reserved schedule set");
     const auto owners = Workers(world_size_, p, order, group);
     const auto aivs = cores == 0 ? 32 : cores;

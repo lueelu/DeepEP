@@ -1105,3 +1105,139 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
         if getattr(exc, "winerror", None) == 4551:
             pytest.skip("compiled, but Windows application control blocked execution (4551)")
         raise
+
+
+@pytest.mark.parametrize("legacy_guard", [False, True])
+def test_python_plans_pass_native_launch_validation(tmp_path, legacy_guard):
+    """Evaluate the native guards against real Python plans, without CANN.
+
+    Fixed arrays replace vector input and rejected plans return a sentinel so
+    every check executes at compile time, including on hosts that block test EXEs.
+    The negative control reinstates the old dispatch guard and must fail.
+    """
+    import json
+    import re
+    import shutil
+
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required for native launch validation")
+    generated = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            DTYPES_ONLY
+            + textwrap.dedent("""
+                import csv, json
+                from dataclasses import replace
+                from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+                cases = []
+                with open('tests/api/fixtures/udma_plans_20261116.csv') as f:
+                    for row in csv.DictReader(f):
+                        ep, group, cores, hidden = (int(row[k]) for k in ('EP','G','aiv','hidden'))
+                        op = {'combine_weighted':'weighted','combine_unweighted':'combine'}.get(row['operator'],'dispatch')
+                        base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                       ranks_per_group=group,topology_known=True)
+                        cases.append([ep,group,cores,op!='dispatch',base.for_launch(cores,hidden*2,op,bf16=True).native_plan()])
+                assert len(cases) == 300
+                for ep in (4,8,16,32,64,128,256):
+                    group = min(ep,8)
+                    base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                   ranks_per_group=group,topology_known=True)
+                    for cores in (8,16,32,48,64):
+                        for op in ('dispatch','combine','weighted'):
+                            plan = base.for_launch(cores,5632,op,bf16=True)
+                            cases.append([ep,group,cores,op!='dispatch',plan.native_plan()])
+                print(json.dumps(cases))
+            """),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert generated.returncode == 0, generated.stderr
+    cases = json.loads(generated.stdout)
+    native = (ROOT / "csrc/direct/runtime/shmem_instance.cpp").read_text()
+    # The shared extractor handles free functions; drop only the member qualifier.
+    body = cpp_functions(native.replace("int64_t cores) const", "int64_t cores)"), "ResolveLaunch")
+    body = body.replace(
+        "ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t>& values",
+        "template<size_t N> constexpr LaunchPlan ResolveLaunch(const std::array<int64_t,N>& values",
+    )
+    body = re.sub(r'throw std::invalid_argument\("[^"\n]*"\);', "return {UINT32_MAX,0,0,0,0,0,0,0};", body)
+    if legacy_guard:
+        fixed = "(!combine && ((copy != 0 && copy != 2) || weight))"
+        assert fixed in body
+        body = body.replace(fixed, "(!combine && (copy || weight))")
+    header = (ROOT / "csrc/direct/runtime/shmem_instance.h").read_text()
+    begin = header.index("struct LaunchPlan {")
+    plan_type = header[begin : header.index("};", begin) + 2]
+    source = r"""
+#include <array>
+#include <cstddef>
+#include "common/udma_schedule.h"
+struct ShmemInstance {
+    int64_t world_size_;
+    uint32_t ranks_per_group_;
+    bool auto_resources_=true;
+    uint32_t dispatch_peer_order_=0, combine_peer_order_=0, peers_per_group_per_worker_=1;
+    uint32_t workers_per_peer_=1, qps_per_worker_=1;
+    // PLAN_TYPE
+    // BODY
+};
+constexpr bool matches(unsigned ep,unsigned group,int cores,bool combine,std::array<int64_t,9> v) {
+    ShmemInstance instance{ep,group};
+    const auto r=instance.ResolveLaunch(v,combine,1,32,cores);
+    return r.order==v[1] && r.group==v[2] && r.peers==v[3] && r.workers==v[4] &&
+           r.qps==v[5] && r.visit==v[6] && r.self_copy==v[7] && r.weight_mode==v[8];
+}
+constexpr bool reject(int index,int64_t value,int cores=8) {
+    ShmemInstance instance{8,8};
+    std::array<int64_t,9> v{1,0,8,1,1,1,32,2,0};
+    v[index]=value;
+    return instance.ResolveLaunch(v,false,1,32,cores).order==UINT32_MAX;
+}
+static_assert(matches(8,8,8,false,{1,0,8,1,1,1,32,0,0})); // Legacy marker stays legal.
+static_assert(reject(0,2) && reject(1,4) && reject(2,4) && reject(3,3));
+static_assert(reject(4,3) && reject(5,3) && reject(6,3) && reject(6,64));
+static_assert(reject(7,-1) && reject(7,1) && reject(7,3));
+static_assert(reject(8,-1) && reject(8,1) && reject(8,2) && reject(8,3));
+static_assert(reject(7,2,-2) && reject(7,2,7) && reject(7,2,6));
+static_assert(reject(4,2)); // Too many sending AIVs.
+constexpr bool resources() {
+    ShmemInstance instance{8,8};
+    const std::array<int64_t,9> good{1,0,8,1,1,1,32,2,0};
+    if(instance.ResolveLaunch(std::array<int64_t,8>{},false,1,32,8).order!=UINT32_MAX)return false;
+    instance.auto_resources_=false;
+    if(instance.ResolveLaunch(good,false,1,32,8).order!=UINT32_MAX)return false;
+    const auto legacy=instance.ResolveLaunch(std::array<int64_t,0>{},false,2,16,8);
+    if(legacy.self_copy!=-1 || legacy.peers!=2 || legacy.visit!=16)return false;
+    instance={64,16};
+    if(instance.ResolveLaunch(std::array<int64_t,9>{1,0,16,1,1,1,32,2,0},false,1,32,64).order!=UINT32_MAX)
+        return false; // Physical QP capacity still applies.
+    if(instance.ResolveLaunch(std::array<int64_t,9>{1,3,16,8,1,1,32,2,0},false,1,32,64).order!=UINT32_MAX)
+        return false; // RR peer capacity still applies.
+    return true;
+}
+static_assert(resources());
+// CASES
+"""
+    checks = "\n".join(
+        f"static_assert(matches({ep},{group},{cores},{str(combine).lower()},{{" + ",".join(map(str, plan)) + "}));"
+        for ep, group, cores, combine, plan in cases
+    )
+    path = tmp_path / "native_launch.cpp"
+    path.write_text(source.replace("// PLAN_TYPE", plan_type).replace("// BODY", body).replace("// CASES", checks))
+    built = subprocess.run(
+        [compiler, "-std=c++17", "-I", str(ROOT / "csrc/direct"), "-c", str(path), "-o", str(tmp_path / "launch.o")],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    if legacy_guard:
+        assert built.returncode != 0 and "static assertion" in built.stderr, built.stderr
+    else:
+        assert built.returncode == 0, built.stderr
