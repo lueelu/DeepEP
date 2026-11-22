@@ -43,7 +43,7 @@ __simt_vf__ __launch_bounds__(32) inline void BuildDispatchWqes(
             __asc_simt_vf::__trap();
             return;
         }
-        auto* header = headers + (peer * 2U + uint32_t(i + 1U == count)) * 8U;
+        auto* header = headers + peer * 2U * 8U;
         auto* wqe = wqes + i * 8U;
         wqe[0] = header[0];
         wqe[1] = header[1];

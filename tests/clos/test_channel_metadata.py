@@ -237,7 +237,7 @@ constexpr bool wqe_check() {
     }
     for(unsigned tid=0;tid<32;++tid) BuildWqes(wqes,requests,headers,24,tid);
     for(unsigned i=0;i<24;++i) {
-        for(unsigned j=0;j<5;++j) if(wqes[i*8+j]!=headers[(requests[i*4+3]*2+(i==23))*8+j])return false;
+        for(unsigned j=0;j<5;++j) if(wqes[i*8+j]!=headers[requests[i*4+3]*2*8+j])return false;
         if(wqes[i*8+5]!=requests[i*4] || wqes[i*8+6]!=requests[i*4+2] || wqes[i*8+7]!=requests[i*4+1])return false;
     }
     for(unsigned i=24*8;i<32*8;++i)if(wqes[i])return false;

@@ -343,7 +343,7 @@ def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us,
             intervals["final_sync_us"] = (row["sync_done"] - row["quiet_done"]) / cycles_per_us
             intervals["self_begin_us"] = row["self_begin"] / cycles_per_us
             intervals["self_end_us"] = row["self_end"] / cycles_per_us
-            for name in ("topk_init_cycles", "source_cycles", "slots_cycles"):
+            for name in ("topk_init_cycles", "source_cycles", "slots_cycles", "final_quiet_cycles"):
                 if name in row:
                     intervals[name + "_us"] = row[name] / cycles_per_us
             queue = dict(

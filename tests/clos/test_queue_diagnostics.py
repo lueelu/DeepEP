@@ -46,11 +46,13 @@ struct dim3 { explicit dim3(unsigned) {} };
 namespace __asc_simt_vf { void __trap(); }
 void trap();
 namespace AscendC {
+enum class TPosition { VECOUT };
 enum class HardEvent { S_V, V_MTE3, V_S, MTE3_S, S_MTE3, S_MTE2, MTE2_S };
 template<HardEvent> void SetFlag(int);
 template<HardEvent> void WaitFlag(int);
 uint64_t GetSystemCycle();
 template<class T> struct LocalTensor {
+    struct { uint8_t logicPos; uint64_t bufferAddr; } address_;
     void SetValue(unsigned,T); void* GetPhyAddr(); LocalTensor operator[](uint64_t);
 };
 template<class T> struct GlobalTensor { void SetGlobalBuffer(T*); T GetValue(uint64_t); GlobalTensor operator[](uint64_t); };
@@ -62,12 +64,13 @@ template<class... Args> void printf(const char*,Args...);
 }
 template<auto Fn,class... Args> void asc_vf_call(dim3,Args... args) { Fn(args...); }
 struct aclshmemx_udma_op_config_t { uint32_t a,b,c,d; };
-struct aclshmemi_udma_queue_state_t { uint32_t sq_head,sq_tail,cqe_cnt; };
+struct aclshmemi_udma_queue_state_t { uint32_t sq_head,sq_tail,cqe_cnt,cq_tail; };
 struct aclshmemi_sqe_ctx_t { uint64_t words[6]; };
 struct aclshmemi_sge_ctx_t { uint64_t words[2]; };
 struct aclshmemi_udma_wq_ctx_t { uint64_t state_addr,buf_addr; uint32_t depth,wqe_size; };
 struct Info { unsigned qp_num; };
 enum class aclshmemi_udma_opcode_t { UDMA_OP_WRITE };
+template<aclshmemi_udma_opcode_t> constexpr uint32_t get_wqe_bb_cnt() { return 1; }
 namespace shm { constexpr unsigned UDMA_SQ_BASKBLK_CNT=1024; }
 constexpr unsigned ACLSHMEM_UDMA_DATA_MOVER_WQE_SIZE=64;
 Info* aclshmemi_udma_qp_info_fetch();
@@ -80,6 +83,8 @@ void aclshmemi_udma_fill_sqe_base_ctx(P,uint8_t*,void*,uint32_t);
 bool aclshmemi_udma_sq_has_credit(aclshmemi_udma_queue_state_t*,uint32_t);
 void aclshmemi_udma_poll_cq_when_sq_overflow(aclshmemi_udma_queue_state_t*,uint32_t,uint32_t,uint32_t);
 void aclshmemi_udma_flush_aggregate_wqes(uint8_t*,aclshmemi_udma_wq_ctx_t*,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+void aclshmemi_udma_copy_wqe_from_ub(uint8_t*,AscendC::LocalTensor<uint8_t>&,uint32_t,int);
+void aclshmemi_udma_post_send_update_info(uint32_t,aclshmemi_udma_wq_ctx_t*,aclshmemi_udma_queue_state_t*);
 template<class T,int Pipe,const aclshmemx_udma_op_config_t& C>
 void aclshmemx_udma_qp_put_nbi(T*,T*,uint64_t*,uint32_t,uint32_t,uint32_t,int);
 void aclshmemx_udma_qp_quiet(uint32_t,uint32_t);
@@ -87,6 +92,7 @@ void aclshmemx_udma_qp_quiet(uint32_t,uint32_t);
 namespace ascend_deepep::udma {
 constexpr aclshmemx_udma_op_config_t kData{}, kLast{}, kDone{};
 constexpr unsigned kRequestsOffset=32*64,kHeadersOffset=kRequestsOffset+32*32;
+constexpr unsigned kPressureScratchOffset=kHeadersOffset+64;
 
 uint64_t* Signal(GM_ADDR,uint64_t,uint32_t);
 // SENDERS
@@ -221,6 +227,11 @@ def test_decoder_distinguishes_queue_counters_and_rejects_invalid_data():
         metadata_wqes=16,
         metadata_flushes=1,
         sq_used_sum=800,
+        cqe_requested=3,
+        credit_checkpoints=1,
+        credit_quiet_calls=1,
+        final_quiet_cycles=250,
+        final_quiet_calls=2,
     )
     row.update({name: (i + 1) * 1000 for i, name in enumerate(bench.TIMELINE)})
     row["incoming_begin"] = row["published"]
@@ -228,6 +239,8 @@ def test_decoder_distinguishes_queue_counters_and_rejects_invalid_data():
     assert decoded["queue"]["mean_batch_wqes"] == 24
     assert decoded["queue"]["blocked_admission_fraction"] == 0.25
     assert decoded["intervals"]["credit_blocked_cycles_us"] == 0.3
+    assert decoded["intervals"]["final_quiet_cycles_us"] == 0.25
+    assert decoded["raw"]["cqe_requested"] == 3
     row["credit_blocked"] = 5
     with pytest.raises(ValueError, match="inconsistent queue"):
         bench.decode_trace([[row[k] for k in names]], names, 1, 1, False, False, 1000)

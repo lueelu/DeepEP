@@ -47,7 +47,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         "wqes", "flushes", "short_flushes", "spans", "state_flushes", "qp_flushes", "index_flushes",
         "metadata_wqes", "metadata_flushes", "submit_no_credit", "self_begin", "self_end", "operation",
         "incoming_begin", "topk_init_cycles", "source_cycles", "slots_cycles",
-        "src_output_bytes", "topk_output_bytes", "weight_output_bytes"};
+        "src_output_bytes", "topk_output_bytes", "weight_output_bytes",
+        "cqe_requested", "credit_checkpoints", "credit_quiet_calls", "final_quiet_cycles", "final_quiet_calls", "sq_wraps"};
     m.attr("combine_device_timing_fields") = m.attr("dispatch_device_timing_fields");
     m.def("begin_dispatch_host_timing", &ascend_deepep::ops::BeginDispatchHostTiming);
     m.def("end_dispatch_host_timing",
