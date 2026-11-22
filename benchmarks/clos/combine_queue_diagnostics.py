@@ -137,6 +137,9 @@ def run_combine_diagnostics(
             (capture / "samples.json").write_text(json.dumps(stages, indent=2), encoding="utf-8")
             traces, diagnostic_api = [], []
             os.environ[TRACE_ENV] = "1"
+            for _ in range(args.trace_warmup):
+                prepare_v2_sample(buffer, flush)
+                invoke()
             for _ in range(args.trace_samples):
                 prepare_v2_sample(buffer, flush)
                 start = time.perf_counter_ns()

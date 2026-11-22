@@ -1,6 +1,8 @@
 #pragma once
 
 #include "kernels/dispatch/dispatch_device_trace.h"
+#include "kernels/common/v2_handle.h"
+#include "common/platform.h"
 #include "device_simt/shmem_device_simt_instance.h"
 
 #include "kernels/common/udma_shared_sender.h"
@@ -18,13 +20,13 @@ __simt_vf__ __launch_bounds__(128) inline void CopySelfChannelWordsVf(
 
 template <class Resource>
 __aicore__ inline void CopySelfChannelMetadata(Resource& resource, GM_ADDR plan, GM_ADDR workspace,
-    const DispatchTilingData& td, uint32_t channel, uint32_t row, uint32_t count, uint32_t stride)
+    const DispatchTilingData& td, uint32_t channel, uint32_t row, uint32_t count, uint32_t stride, uint32_t scratch_offset = 0)
 {
     if (!count) return;
     // Use exact word stores for compact channel boundaries, which may share a
     // 32-byte GM line. No remote operation or padded write touches another owner.
     constexpr uint32_t tile_bytes = 32 * 1024;
-    auto tile = resource.template GetBufferByByte<uint32_t>(0);
+    auto tile = resource.template GetBufferByByte<uint32_t>(scratch_offset);
     const uint64_t slot = (uint64_t(td.rank) * td.num_channels + channel) * stride;
     for (uint32_t field = 0; field < (td.has_topk_weights ? 3U : 2U); ++field) {
         const uint32_t width = field == 0 ? 4U : td.num_topk * (field == 1 ? uint32_t(sizeof(topk_idx_t)) : 4U);
@@ -182,7 +184,8 @@ template <class Resource, class Trace>
 __aicore__ inline void DispatchMetadata(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR plan,
     GM_ADDR rank_prefix, GM_ADDR channel_prefix, GM_ADDR workspace, GM_ADDR send_head, const DispatchTilingData& td,
-    uint32_t core, uint32_t cores, uint32_t stage_bytes, GM_ADDR recv_x, GM_ADDR recv_scales, Trace& trace)
+    uint32_t core, uint32_t cores, uint32_t stage_bytes, GM_ADDR recv_x, GM_ADDR recv_scales, Trace& trace,
+    bool copy_self = true, bool publish_metadata = true, uint32_t scratch_offset = 0)
 {
     const uint32_t first =
         td.udma_token_schedule ? TokenWorkers(cores) : MetadataFirst(td.world_size, td.udma_peers_per_worker, cores, td.udma_peer_order, td.udma_ranks_per_group, td.udma_workers_per_peer);
@@ -194,7 +197,7 @@ __aicore__ inline void DispatchMetadata(
     const uint32_t world = td.world_size;
     const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
-    auto staging_ub = resource.template GetBufferByByte<uint8_t>(0);
+    auto staging_ub = resource.template GetBufferByByte<uint8_t>(scratch_offset);
     auto* rank_ptr = reinterpret_cast<__gm__ int32_t*>(rank_prefix);
     auto* channel_ptr = reinterpret_cast<__gm__ int32_t*>(channel_prefix);
     AscendC::GlobalTensor<int32_t> ranks, channels, plan_gm;
@@ -218,7 +221,7 @@ __aicore__ inline void DispatchMetadata(
         const uint64_t channel_begin = uint64_t(ch) * channel_tokens;
         const uint32_t begin = channel_begin < td.num_tokens ? uint32_t(channel_begin) : td.num_tokens;
         const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
-        if (build_handle && !td.channel_metadata) {
+        if (publish_metadata && build_handle && !td.channel_metadata) {
             const uint64_t started = trace.Now();
             if (td.metadata_src_threads == 256 && td.metadata_src_lanes == 32) {
                 asc_vf_call<DispatchSourceIndicesVf<256, 32>>(
@@ -237,7 +240,7 @@ __aicore__ inline void DispatchMetadata(
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             trace.Add(DispatchDeviceTrace::SrcCycles, started);
         }
-        if (td.num_topk && experts_per_rank && !td.channel_metadata) {
+        if (publish_metadata && td.num_topk && experts_per_rank && !td.channel_metadata) {
             const uint64_t started = trace.Now();
             if (td.metadata_topk_threads == 256) {
                 asc_vf_call<DispatchTopkScatterSimtVf<256>>(
@@ -261,6 +264,7 @@ __aicore__ inline void DispatchMetadata(
             trace.Add(DispatchDeviceTrace::TopkCycles, started);
         }
 
+        if (!copy_self) continue;
         const uint64_t self_started = trace.Now();
         // Metadata stores are issued before self-copy. Keep self rows in list
         // order and drain BOTH ping-pong slots before the next channel.
@@ -274,7 +278,7 @@ __aicore__ inline void DispatchMetadata(
         if (td.udma_output_control && (row > td.num_output_tokens || count > td.num_output_tokens - row))
             trap();
         if (td.channel_metadata)
-            CopySelfChannelMetadata(resource, plan, workspace, td, ch, row, count, plan_stride);
+            CopySelfChannelMetadata(resource, plan, workspace, td, ch, row, count, plan_stride, scratch_offset);
         const uint64_t list_base = (uint64_t(td.rank) * td.num_channels + ch) * plan_stride;
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t token = plan_gm.GetValue(list_base + i);
@@ -313,5 +317,34 @@ __aicore__ inline void DispatchMetadata(
         trace.SelfDone(self_started);
     }
 }
+// Post-submit work has private UB; GM payload sources stay immutable until Quiet.
+template <class Resource, class Trace>
+struct DispatchOverlapWork {
+    Resource& resource;
+    Trace& trace;
+    GM_ADDR x, scales, topk, weights, plan, ranks, channels, workspace, head, recv_x, recv_scales;
+    const DispatchTilingData& td;
+    uint32_t core, cores;
+
+    __aicore__ void operator()(uint32_t scratch_offset)
+    {
+        if (td.dispatch_self_after_submit) {
+            DispatchMetadata(resource, x, scales, topk, weights, plan, ranks, channels,
+                workspace, head, td, core, cores, platform::kKernelUbBytes - scratch_offset,
+                recv_x, recv_scales, trace, true, false, scratch_offset);
+        }
+        if (td.dispatch_early_slots && td.v2_dst_slots) {
+            const uint64_t started = trace.Now();
+            asc_vf_call<V2HandleSlotsVf>(dim3(128), reinterpret_cast<__gm__ topk_idx_t*>(topk),
+                reinterpret_cast<__gm__ int32_t*>(head), reinterpret_cast<__gm__ int32_t*>(channels),
+                reinterpret_cast<__gm__ int32_t*>(td.v2_dst_slots), td.rank, td.world_size,
+                td.num_max_tokens_per_rank / td.world_size, td.num_local_experts,
+                td.num_topk, td.num_tokens, td.num_channels, core, cores);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            trace.Add(Trace::SlotsCycles, started);
+        }
+    }
+};
 #endif
 } // namespace ascend_deepep::udma

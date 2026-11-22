@@ -100,6 +100,10 @@ struct Resource {
     }
 };
 
+struct NoDispatchOverlapWork {
+    void operator()(uint32_t) {}
+};
+
 using Row = std::tuple<uint32_t, uint32_t, uint32_t>;  // peer, input token, output row
 static std::vector<Row> sent;
 static uint32_t max_visit, used_visit;

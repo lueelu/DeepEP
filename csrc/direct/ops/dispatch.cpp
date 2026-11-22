@@ -569,6 +569,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                           host_prep ? torch::Tensor() : allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
+    const bool metadata_double_buffer = enabled_option("DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER");
     const bool channel_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA") && !cached_mode;
     LastDispatchChannelMetadata() = false;
     LastDispatchChannelMetadataTileTokens() = 0;
@@ -591,7 +592,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         }
         const auto metadata_tile = ascend_deepep::SelectChannelMetadataTile(requested_tile,
             world_size, num_topk, sizeof(ascend_deepep::topk_idx_t), topk_weights.has_value(),
-            ascend_deepep::platform::kKernelUbBytes);
+            ascend_deepep::platform::kKernelUbBytes / (metadata_double_buffer ? 2U : 1U));
+        tiling.channel_metadata_double_buffer = metadata_double_buffer;
         TORCH_CHECK(metadata_tile.tokens, "requested channel metadata tile exceeds available UB");
         tiling.channel_metadata_tile_tokens = metadata_tile.tokens;
         LastDispatchChannelMetadataTileTokens() = metadata_tile.tokens;
@@ -669,6 +671,27 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
+    // Experimental overlap never changes peer/QP ownership or FP8 dependencies.
+    const bool overlap_self = enabled_option("DEEPEP_CLOS_DISPATCH_OVERLAP_SELF");
+    const bool early_slots = enabled_option("DEEPEP_CLOS_DISPATCH_EARLY_SLOTS");
+    const bool skip_topk_init = enabled_option("DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT");
+    const bool peer_dispatch = use_udma && !shmem.TokenSchedule();
+    tiling.dispatch_early_slots = peer_dispatch && public_handle != nullptr && early_slots;
+    tiling.dispatch_skip_topk_init = peer_dispatch && channel_metadata && skip_topk_init;
+    const uint32_t metadata_first =
+        peer_dispatch ? ascend_deepep::udma::MetadataFirst(world_size, udma_peers_per_worker, resolved_num_aiv,
+                                                        udma_launch.order, udma_launch.group, udma_launch.workers)
+                      : resolved_num_aiv;
+    const uint32_t overlap_capacity = udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder
+                                          ? ascend_deepep::udma::kGroupPeerCapacity
+                                          : ascend_deepep::udma::kMaxPeers;
+    const uint32_t live_send_bytes = ascend_deepep::udma::DispatchLiveSendUbBytes(overlap_capacity, udma_launch.qps);
+    const uint32_t self_bytes = ascend_deepep::platform::kKernelUbBytes - live_send_bytes;
+    tiling.dispatch_self_after_submit = peer_dispatch && overlap_self && !x_scales.has_value() && metadata_first == 0 &&
+                                        self_bytes >= 32U * 1024U && uint64_t(hidden_bytes) <= self_bytes;
+    LastDispatchOverlapOptions() = tiling.dispatch_self_after_submit | (tiling.dispatch_early_slots << 1U) |
+                                   (tiling.dispatch_skip_topk_init << 2U) | (tiling.channel_metadata_double_buffer << 3U);
+
     tiling.rank_stride = static_cast<uint32_t>(rank_stride);
     tiling.expert_stride = static_cast<uint32_t>(expert_stride);
     tiling.channel_stride = static_cast<uint32_t>(channel_stride);

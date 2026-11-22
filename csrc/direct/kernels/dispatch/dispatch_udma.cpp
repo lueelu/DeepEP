@@ -128,10 +128,12 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     auto staging_pingpong_ub = resource.template GetBufferByByte<uint8_t>(0);
     AscendC::DataCopyPadExtParams<uint8_t> uint8_pad_params{false, 0, 0, 0};
 
-    if (num_topk > 0) {
+    if (num_topk > 0 && !tiling.dispatch_skip_topk_init) {
+        const uint64_t init_started = trace.Now();
         const uint32_t rows = DispatchMin(
             rank_prefix_gm.GetValue((world_size - 1) * world_size + rank), num_output_tokens);
         ascend_deepep::udma::InitializeDispatchTopk(resource, symmetric_buffer, tiling, rows, core_idx, core_num);
+        trace.Add(Trace::TopkInitCycles, init_started);
     }
     if (tiling.udma_output_control && core_idx == 0) {
         ascend_deepep::udma::PrepareDispatchOutput(resource, tiling.udma_output_control, rank, world_size,
@@ -183,14 +185,19 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     // UDMA while the other cores build metadata and copy self channels.
     ascend_deepep::udma::DispatchMetadata(resource, x, dispatch_scales, topk_idx, topk_weights,
         dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head,
-        tiling, core_idx, core_num, kDispatchStageBytes, recv_x, recv_x_scales, trace);
+        tiling, core_idx, core_num, kDispatchStageBytes, recv_x, recv_x_scales, trace,
+        !tiling.dispatch_self_after_submit);
     trace.Mark(Trace::MetadataDone);
     if (tiling.udma_token_schedule) {
         ascend_deepep::udma::DispatchTokenRemote(resource, x, dispatch_scales,
             dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num);
     } else {
+        ascend_deepep::udma::DispatchOverlapWork<decltype(resource), Trace> overlap{
+            resource, trace, x, dispatch_scales, topk_idx, topk_weights, dispatch_plan,
+            rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head, recv_x, recv_x_scales,
+            tiling, uint32_t(core_idx), uint32_t(core_num)};
         ascend_deepep::udma::DispatchRemote(resource, x, dispatch_scales,
-            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num, trace);
+            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num, trace, overlap);
     }
 
     const int32_t actual_recv_tokens = rank_prefix_gm.GetValue((world_size - 1) * world_size + rank);
@@ -275,6 +282,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     if (tiling.v2_rank_prefix != 0) {
         // The existing completion boundary has made all local SHMEM metadata
         // visible. Read it directly: no dependence on another AIV's GM copy.
+        const uint64_t source_started = trace.Now();
         asc_vf_call<ascend_deepep::V2HandleSourceVf>(dim3(128),
             reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),
             reinterpret_cast<__gm__ int32_t*>(symmetric_buffer + tiling.src_idx_buffer_offset),
@@ -283,15 +291,24 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_topk,
             tiling.num_output_tokens, uint32_t(core_idx), uint32_t(core_num));
         AscendC::PipeBarrier<PIPE_V>();
-        asc_vf_call<ascend_deepep::V2HandleSlotsVf>(dim3(128),
-            reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(topk_idx),
-            reinterpret_cast<__gm__ int32_t*>(send_head),
-            reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix),
-            reinterpret_cast<__gm__ int32_t*>(tiling.v2_dst_slots),
-            tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_local_experts,
-            tiling.num_topk, tiling.num_tokens, tiling.num_channels, uint32_t(core_idx), uint32_t(core_num));
+        if constexpr (Trace::enabled) {
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        }
+        trace.Add(Trace::SourceCycles, source_started);
+        const uint64_t slots_started = trace.Now();
+        if (!tiling.dispatch_early_slots) {
+            asc_vf_call<ascend_deepep::V2HandleSlotsVf>(dim3(128),
+                reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(topk_idx),
+                reinterpret_cast<__gm__ int32_t*>(send_head),
+                reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix),
+                reinterpret_cast<__gm__ int32_t*>(tiling.v2_dst_slots),
+                tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_local_experts,
+                tiling.num_topk, tiling.num_tokens, tiling.num_channels, uint32_t(core_idx), uint32_t(core_num));
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        if (!tiling.dispatch_early_slots) trace.Add(Trace::SlotsCycles, slots_started);
     }
 
     trace.Mark(Trace::HandleDone);

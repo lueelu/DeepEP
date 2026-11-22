@@ -1,5 +1,6 @@
 """Compile/evaluate the real packing and WQE bodies without a device SDK."""
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -131,13 +132,17 @@ static_assert(wqe_check());
         assert result.returncode == 0, result.stderr
 
 
-def test_pack_and_local_copy_template_calls_compile(tmp_path):
+def test_pack_and_local_copy_pipeline(tmp_path):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("C++17 compiler required")
     kernels = ROOT / "csrc/direct/kernels"
     functions = cpp_functions(
-        (kernels / "notify/notify_channel_metadata.h").read_text(), "PackChannelMetadataVf", "PackChannelMetadata"
+        (kernels / "notify/notify_channel_metadata.h").read_text(),
+        "PackChannelMetadataVf",
+        "LoadChannelMetadataInput",
+        "PackChannelMetadataDoubleBuffered",
+        "PackChannelMetadata",
     )
     functions += cpp_functions(
         (kernels / "dispatch/udma_dispatch_metadata.h").read_text(), "CopySelfChannelWordsVf", "CopySelfChannelMetadata"
@@ -146,6 +151,15 @@ def test_pack_and_local_copy_template_calls_compile(tmp_path):
     harness = harness.replace("enum class HardEvent {", "enum class HardEvent { MTE2_V, V_MTE2,").replace(
         "    T GetValue(uint64_t i) const",
         "    T* GetPhyAddr() const { return data; }\n    T GetValue(uint64_t i) const",
+    )
+    harness = harness.replace(
+        "template <HardEvent>\nvoid SetFlag(int)\n{\n}",
+        "static int credits[16][8]{};\nstatic unsigned event_sets;\n"
+        "template <HardEvent E> void SetFlag(int e) { assert(!credits[int(E)][e]); credits[int(E)][e]=1; ++event_sets; }",
+    )
+    harness = harness.replace(
+        "template <HardEvent>\nvoid WaitFlag(int)\n{\n}",
+        "template <HardEvent E> void WaitFlag(int e) { assert(credits[int(E)][e]==1); credits[int(E)][e]=0; }",
     )
     harness += r"""
 #define __simt_vf__
@@ -165,14 +179,33 @@ void check(Resource& resource, GM_ADDR head, GM_ADDR plan, GM_ADDR workspace, co
 }
 """
     path = tmp_path / "channel_calls.cpp"
-    path.write_text(harness.replace("// FUNCTIONS", functions))
+    path.write_text(
+        harness.replace("// FUNCTIONS", functions)
+        + Path(__file__).with_name("channel_pack_pipeline_oracle.cpp").read_text()
+    )
     result = subprocess.run(
-        [compiler, "-std=c++17", "-c", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(tmp_path / "calls.o")],
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-I",
+            str(ROOT / "csrc/direct"),
+            str(path),
+            "-o",
+            str(tmp_path / ("calls.exe" if os.name == "nt" else "calls")),
+        ],
         capture_output=True,
         text=True,
         timeout=180,
     )
     assert result.returncode == 0, result.stderr
+
+    try:
+        subprocess.run([str(tmp_path / ("calls.exe" if os.name == "nt" else "calls"))], check=True, timeout=60)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
 
 
 def test_dynamic_metadata_tile_layout_constexpr(tmp_path):
@@ -187,7 +220,7 @@ constexpr bool check() {
     for (unsigned k : {1U, 8U, 128U})
     for (unsigned bytes : {4U, 8U})
     for (bool weights : {false, true})
-    for (unsigned budget : {196608U, 221120U}) {
+    for (unsigned budget : {196608U, 221120U, 98304U, 110560U}) {
         const auto automatic = SelectChannelMetadataTile(0, world, k, bytes, weights, budget);
         if (!automatic.tokens || automatic.bytes > budget) return false;
         for (unsigned tokens : {32U, 64U, 128U, 256U}) {
@@ -203,6 +236,8 @@ constexpr bool check() {
     return true;
 }
 static_assert(check());
+static_assert(SelectChannelMetadataTile(0,256,128,8,true,221120/2).tokens == 32);
+static_assert(SelectChannelMetadataTile(64,256,128,8,true,221120/2).tokens == 0);
 static_assert(MakeChannelMetadataTile(128,8,8,8,true).bytes == 16384);
 static_assert(MakeChannelMetadataTile(128,16,8,8,true).bytes == 20480);
 static_assert(SelectChannelMetadataTile(0,256,128,8,true,221120).tokens == 64);

@@ -61,6 +61,21 @@ class DispatchBenchmarkPolicy:
         return plan
 
 
+OVERLAP_ENVS = (
+    "DEEPEP_CLOS_DISPATCH_OVERLAP_SELF",
+    "DEEPEP_CLOS_DISPATCH_EARLY_SLOTS",
+    "DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT",
+    "DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER",
+)
+OVERLAP_MODES = {"off": 0, "self": 1, "slots": 2, "init": 4, "notify": 8, "all": 15}
+
+
+def set_overlap_mode(mode):
+    mask = OVERLAP_MODES[mode]
+    for bit, name in enumerate(OVERLAP_ENVS):
+        os.environ[name] = str((mask >> bit) & 1)
+
+
 TIMELINE = (
     "init_done",
     "begin_done",
@@ -92,11 +107,14 @@ def cpu_inputs(torch, args, source, tokens=None, routing="random"):
     return x, idx, weights
 
 
-def check_cpu_reference(torch, actual, args, rank, world, sizes=None, routing="random", cached=False, src_idx=None):
+def check_cpu_reference(
+    torch, actual, args, rank, world, sizes=None, routing="random", cached=False, src_idx=None, handle=None
+):
     """Derive receive rows from original routes, never from Notify/handle output."""
     recv, recv_idx, recv_weights = actual
     local_experts = args.experts // world
     first = 0
+    source_metadata = None if handle is None else handle.recv_src_metadata.cpu()
     for source in range(world):
         x, idx, weights = cpu_inputs(torch, args, source, None if sizes is None else sizes[source], routing)
         hits = (idx >= rank * local_experts) & (idx < (rank + 1) * local_experts)
@@ -114,7 +132,28 @@ def check_cpu_reference(torch, actual, args, rank, world, sizes=None, routing="r
             torch.testing.assert_close(
                 recv_weights[first : first + n], weights[selected].masked_fill(~hits[selected], 0), rtol=0, atol=0
             )
+        if source_metadata is not None:
+            expected_source = torch.full((n, args.topk + 2), -1, dtype=source_metadata.dtype)
+            expected_source[:, 0] = source * handle.num_max_tokens_per_rank + torch.where(selected)[0]
+            expected_source[:, 1] = source * args.topk + hits[selected].to(torch.int64).argmax(1)
+            torch.testing.assert_close(source_metadata[first : first + n], expected_source, rtol=0, atol=0)
         first += n
+    if handle is not None:
+        _, local_idx, _ = cpu_inputs(torch, args, rank, None if sizes is None else sizes[rank], routing)
+        expected_slots = torch.full(local_idx.shape, -1, dtype=torch.int32)
+        peer_ordinals = [0] * world
+        for token, experts in enumerate(local_idx.tolist()):
+            seen = set()
+            for column, expert in enumerate(experts):
+                if not 0 <= expert < args.experts:
+                    continue
+                peer = expert // local_experts
+                if peer in seen:
+                    continue
+                seen.add(peer)
+                expected_slots[token, column] = rank * handle.num_max_tokens_per_rank + peer_ordinals[peer]
+                peer_ordinals[peer] += 1
+        torch.testing.assert_close(handle.dst_buffer_slot_idx.cpu(), expected_slots, rtol=0, atol=0)
     if first != len(recv):
         raise AssertionError("receive row count differs from the independent routing reference")
 
@@ -124,7 +163,14 @@ def channel_comparison(results):
     comparisons = []
 
     def comparison_key(r):
-        return (r["op"], r["cores"], r["channel"], r.get("metadata_tile_requested", 32), r.get("dispatch_plan", "auto"))
+        return (
+            r["op"],
+            r["cores"],
+            r["channel"],
+            r.get("metadata_tile_requested", 32),
+            r.get("dispatch_plan", "auto"),
+            r.get("overlap_mode", "off"),
+        )
 
     for key in sorted({comparison_key(r) for r in results}):
         selected = [r for r in results if comparison_key(r) == key]
@@ -140,6 +186,7 @@ def channel_comparison(results):
             cached_channel=key[2],
             metadata_tile_requested=key[3],
             dispatch_plan=key[4],
+            overlap_mode=key[5],
             pairs=len(off),
         )
         notify = "cached_notify_dispatch_kernel" if key[0] == "cached" else "notify_dispatch_kernel"
@@ -161,6 +208,46 @@ def channel_comparison(results):
         row["off_gbps"] = payload / row["comm_off_us"] / 1000
         row["on_gbps"] = payload / row["comm_on_us"] / 1000
         comparisons.append(row)
+    return comparisons
+
+
+def overlap_comparison(results):
+    comparisons = []
+
+    def key(row):
+        return tuple(
+            row[name]
+            for name in ("op", "cores", "channel", "metadata_requested", "metadata_tile_requested", "dispatch_plan")
+        )
+
+    for config in sorted({key(row) for row in results}):
+        selected = [row for row in results if key(row) == config]
+        off = [row for row in selected if row.get("overlap_mode", "off") == "off"]
+        if not off:
+            continue
+        for mode in sorted({row.get("overlap_mode", "off") for row in selected} - {"off"}):
+            on = [row for row in selected if row["overlap_mode"] == mode]
+            if len(on) != len(off) or any(row["policy"] != off[0]["policy"] for row in off + on):
+                raise ValueError("unmatched overlap comparison")
+            row = dict(
+                zip(
+                    ("op", "cores", "channel", "metadata_requested", "metadata_tile_requested", "dispatch_plan"), config
+                )
+            )
+            row.update(mode=mode, pairs=len(on), effective_masks=sorted({r["overlap_effective"] for r in on}))
+            notify = "cached_notify_dispatch_kernel" if config[0] == "cached" else "notify_dispatch_kernel"
+            for label, stage in (("notify", notify), ("comm", "v1_dispatch_udma_kernel"), ("api", "api_wall_us")):
+                a = [r["stats_us"][stage]["mean"] for r in off]
+                b = [r["stats_us"][stage]["mean"] for r in on]
+                row[label + "_off_us"] = statistics.mean(a)
+                row[label + "_on_us"] = statistics.mean(b)
+                row[label + "_time_change_pct"] = (statistics.mean(b) / statistics.mean(a) - 1) * 100
+                row[label + "_pair_delta_min_us"] = min(y - x for x, y in zip(a, b))
+                row[label + "_pair_delta_max_us"] = max(y - x for x, y in zip(a, b))
+            payload = off[0]["payload_bytes_per_rank"]
+            row["off_gbps"] = payload / row["comm_off_us"] / 1000
+            row["on_gbps"] = payload / row["comm_on_us"] / 1000
+            comparisons.append(row)
     return comparisons
 
 
@@ -225,6 +312,9 @@ def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us,
             intervals["final_sync_us"] = (row["sync_done"] - row["quiet_done"]) / cycles_per_us
             intervals["self_begin_us"] = row["self_begin"] / cycles_per_us
             intervals["self_end_us"] = row["self_end"] / cycles_per_us
+            for name in ("topk_init_cycles", "source_cycles", "slots_cycles"):
+                if name in row:
+                    intervals[name + "_us"] = row[name] / cycles_per_us
             queue = dict(
                 mean_batch_wqes=row["wqes"] / row["flushes"] if row["flushes"] else 0,
                 short_batch_fraction=row["short_flushes"] / row["flushes"] if row["flushes"] else 0,
@@ -283,6 +373,8 @@ def main(argv=None):
         default=["auto"],
         help="zeng: EP8/AIV8/H2816 rank/P2/W1/Q1/visit32; metadata path unchanged",
     )
+    parser.add_argument("--overlap-modes", nargs="+", choices=list(OVERLAP_MODES), default=["off"])
+    parser.add_argument("--trace-warmup", type=int, default=5)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--trace-samples", type=int, default=3, help="0 for formal timing only/older baseline")
@@ -298,7 +390,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if (
         min(args.tokens, args.hidden, args.topk, args.experts, args.samples, args.reduce_cores, *args.cores) <= 0
-        or min(args.warmup, args.trace_samples) < 0
+        or min(args.warmup, args.trace_samples, args.trace_warmup) < 0
     ):
         parser.error("invalid shape/core/sample count")
     import torch
@@ -327,6 +419,9 @@ def main(argv=None):
         raise RuntimeError("combine diagnostics requires trace samples and version-2 host/kernel libraries")
     if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for channel metadata")
+    if any(mode != "off" for mode in args.overlap_modes) and getattr(native, "dispatch_overlap_version", 0) != 1:
+        raise RuntimeError("rebuild host and kernel libraries for overlap experiments")
+    set_overlap_mode("off")
     store = dist.TCPStore(
         os.environ["MASTER_ADDR"],
         args.control_port,
@@ -421,10 +516,11 @@ def main(argv=None):
                 dx, di, dw = cpu_x.npu(), cpu_idx.to(dtype=topk_idx_t, device="npu"), cpu_w.npu()
                 for core in args.cores:
                     for weighted in (False, True):
-                        for mode, tile, plan_name in itertools.product(
-                            args.metadata_modes, args.metadata_tile_tokens, args.dispatch_plans
+                        for mode, tile, plan_name, overlap_mode in itertools.product(
+                            args.metadata_modes, args.metadata_tile_tokens, args.dispatch_plans, args.overlap_modes
                         ):
-                            group.agree(["precision", routing, core, weighted, mode, tile, plan_name])
+                            group.agree(["precision", routing, core, weighted, mode, tile, plan_name, overlap_mode])
+                            set_overlap_mode(overlap_mode)
                             launch_policy.variant = plan_name
                             os.environ[METADATA_ENV] = str(mode)
                             os.environ[METADATA_TILE_ENV] = str(tile)
@@ -450,6 +546,7 @@ def main(argv=None):
                                 sizes,
                                 routing,
                                 src_idx=result[3]._dispatch_layout[3].cpu(),
+                                handle=result[3],
                             )
                             effective_tile = native.last_dispatch_channel_metadata_tile_tokens()
                             if (not mode and effective_tile != 0) or (mode and tile and effective_tile != tile):
@@ -463,6 +560,12 @@ def main(argv=None):
                                     tile=tile,
                                     effective_tile=effective_tile,
                                     plan=plan_name,
+                                    overlap_mode=overlap_mode,
+                                    overlap_effective=(
+                                        native.last_dispatch_overlap_options()
+                                        if hasattr(native, "last_dispatch_overlap_options")
+                                        else 0
+                                    ),
                                 )
                             )
             group.agree("channel_metadata_precision_passed")
@@ -477,20 +580,21 @@ def main(argv=None):
         results = []
         for op in ("fresh", "fresh_weighted", "cached"):
             configs = [
-                (core, flag, metadata, tile, plan_name)
+                (core, flag, metadata, tile, plan_name, overlap_mode)
                 for core in args.cores
                 for flag in args.cached_channel_modes
                 for metadata in args.metadata_modes
                 for tile in args.metadata_tile_tokens
                 for plan_name in args.dispatch_plans
-                if flag == 0 or (world == 16 and core == 8 and op == "cached")
+                for overlap_mode in args.overlap_modes
             ]
             if not configs:
                 continue
             reference = None
             policies = {}
-            for turn, (core, flag, metadata, tile, plan_name) in enumerate(configs + configs[::-1]):
-                group.agree([op, turn, core, flag, metadata, tile, plan_name])
+            for turn, (core, flag, metadata, tile, plan_name, overlap_mode) in enumerate(configs + configs[::-1]):
+                group.agree([op, turn, core, flag, metadata, tile, plan_name, overlap_mode])
+                set_overlap_mode(overlap_mode)
                 torch.npu.synchronize()
                 launch_policy.variant = plan_name
                 os.environ[CHANNEL_ENV] = str(flag)
@@ -541,6 +645,7 @@ def main(argv=None):
                         world,
                         cached=op == "cached",
                         src_idx=checked_result[3]._dispatch_layout[3].cpu(),
+                        handle=checked_result[3],
                     )
                 if reference is None:
                     reference = checked
@@ -559,7 +664,10 @@ def main(argv=None):
                     start = time.perf_counter_ns()
                     invoke()
                     api.append((time.perf_counter_ns() - start) / 1000)
-                capture = out / f"{op}_round{turn}_aiv{core}_channel{flag}_metadata{metadata}_tile{tile}_{plan_name}"
+                capture = (
+                    out
+                    / f"{op}_round{turn}_aiv{core}_channel{flag}_metadata{metadata}_tile{tile}_{plan_name}_{overlap_mode}"
+                )
                 prof = torch_npu.profiler
                 with prof.profile(
                     activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
@@ -596,6 +704,12 @@ def main(argv=None):
                         channel=flag,
                         metadata_requested=metadata,
                         dispatch_plan=plan_name,
+                        overlap_mode=overlap_mode,
+                        overlap_effective=(
+                            native.last_dispatch_overlap_options()
+                            if hasattr(native, "last_dispatch_overlap_options")
+                            else 0
+                        ),
                         metadata_effective=bool(metadata and op != "cached"),
                         metadata_tile_requested=tile,
                         metadata_tile_effective=(
@@ -616,6 +730,9 @@ def main(argv=None):
                     fields = list(native.dispatch_device_timing_fields)
                     os.environ[TRACE_ENV] = "1"
                     try:
+                        for _ in range(args.trace_warmup):
+                            prepare_v2_sample(buffer, flush)
+                            invoke()
                         for _ in range(args.trace_samples):
                             prepare_v2_sample(buffer, flush)
                             diagnostic_start = time.perf_counter_ns()
@@ -664,9 +781,16 @@ def main(argv=None):
                 writer = csv.DictWriter(file, fieldnames=list(comparisons[0]))
                 writer.writeheader()
                 writer.writerows(comparisons)
+        overlap_rows = overlap_comparison(results)
+        if overlap_rows:
+            with (out / "overlap_comparison.csv").open("w", encoding="utf-8", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=list(overlap_rows[0]))
+                writer.writeheader()
+                writer.writerows(overlap_rows)
         if args.combine_diagnostics:
             from combine_queue_diagnostics import run_combine_diagnostics
 
+            set_overlap_mode("off")
             launch_policy.variant = "auto"
             os.environ[TRACE_ENV] = "0"
             os.environ[METADATA_ENV] = "0"
@@ -689,6 +813,7 @@ def main(argv=None):
                 decode_trace,
             )
     finally:
+        set_overlap_mode("off")
         os.environ[TRACE_ENV] = "0"
         os.environ[METADATA_ENV] = "0"
         os.environ[METADATA_TILE_ENV] = "0"

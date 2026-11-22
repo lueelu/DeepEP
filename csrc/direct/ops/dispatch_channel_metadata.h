@@ -12,4 +12,9 @@ inline unsigned& LastDispatchChannelMetadataTileTokens()
     static thread_local unsigned tokens = 0;
     return tokens;
 }
+inline unsigned& LastDispatchOverlapOptions()
+{
+    static thread_local unsigned options = 0;
+    return options;
+}
 }  // namespace ascend_deepep::ops

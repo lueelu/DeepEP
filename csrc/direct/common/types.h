@@ -119,6 +119,10 @@ struct alignas(8) DispatchTilingData {
     uint64_t notify_expert_partials = 0;
     uint32_t channel_metadata = 0;
     uint32_t channel_metadata_tile_tokens = 32;
+    uint32_t dispatch_self_after_submit = 0;
+    uint32_t dispatch_early_slots = 0;
+    uint32_t dispatch_skip_topk_init = 0;
+    uint32_t channel_metadata_double_buffer = 0;
     uint64_t notify_topk_weights = 0;
     uint64_t packed_channel_indices = 0;
     uint64_t packed_channel_weights = 0;

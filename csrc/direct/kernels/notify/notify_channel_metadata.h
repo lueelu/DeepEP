@@ -31,12 +31,100 @@ __simt_vf__ __launch_bounds__(128) inline void PackChannelMetadataVf(
     asc_threadfence();
 }
 
+// Each input slot has its own MTE2_V / V_MTE2 event. Only input buffers
+// ping-pong; packed output ownership and exact GM stores are unchanged.
+template <class Resource>
+__aicore__ inline void LoadChannelMetadataInput(Resource& resource, GM_ADDR head,
+    const DispatchTilingData& td, const ChannelMetadataTile& tile, uint32_t start,
+    uint32_t count, uint32_t slot)
+{
+    const uint32_t offset = slot * tile.bytes;
+    const auto event = slot ? EVENT_ID7 : EVENT_ID6;
+    auto heads = resource.template GetBufferByByte<int32_t>(offset);
+    auto indices = resource.template GetBufferByByte<topk_idx_t>(offset + tile.index_offset);
+    auto weights = resource.template GetBufferByByte<float>(offset + (td.has_topk_weights ? tile.weight_offset : 0));
+    AscendC::GlobalTensor<int32_t> hg;
+    AscendC::GlobalTensor<topk_idx_t> ig;
+    AscendC::GlobalTensor<float> wg;
+    hg.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(head));
+    ig.SetGlobalBuffer(reinterpret_cast<__gm__ topk_idx_t*>(td.notify_topk_idx));
+    wg.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(td.notify_topk_weights));
+    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(event);
+    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(event);
+    AscendC::DataCopyPad(heads, hg[uint64_t(start) * td.world_size],
+        AscendC::DataCopyExtParams{1, count * td.world_size * 4U, 0, 0, 0},
+        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+    AscendC::DataCopyPad(indices, ig[uint64_t(start) * td.num_topk],
+        AscendC::DataCopyExtParams{1, count * td.num_topk * uint32_t(sizeof(topk_idx_t)), 0, 0, 0},
+        AscendC::DataCopyPadExtParams<topk_idx_t>{false, 0, 0, 0});
+    if (td.has_topk_weights)
+        AscendC::DataCopyPad(weights, wg[uint64_t(start) * td.num_topk],
+            AscendC::DataCopyExtParams{1, count * td.num_topk * 4U, 0, 0, 0},
+            AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0});
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(event);
+}
+
+template <class Resource>
+__aicore__ inline void PackChannelMetadataDoubleBuffered(Resource& resource, GM_ADDR head,
+    const DispatchTilingData& td, uint32_t channel)
+{
+    const auto tile = MakeChannelMetadataTile(td.channel_metadata_tile_tokens, td.world_size,
+        td.num_topk, sizeof(topk_idx_t), td.has_topk_weights);
+    const uint32_t length = (td.num_tokens + td.num_channels - 1U) / td.num_channels;
+    const uint32_t stride = (length + 7U) / 8U * 8U;
+    const uint32_t begin = channel * length < td.num_tokens ? channel * length : td.num_tokens;
+    const uint32_t end = begin + length < td.num_tokens ? begin + length : td.num_tokens;
+    if (begin == end) return; // No fake credits on empty channels.
+    bool pending[2] = {false, false};
+    const uint32_t first_count = end - begin < tile.tokens ? end - begin : tile.tokens;
+    LoadChannelMetadataInput(resource, head, td, tile, begin, first_count, 0);
+    uint32_t slot = 0;
+    for (uint32_t start = begin; start < end; start += tile.tokens, slot ^= 1U) {
+        const auto event = slot ? EVENT_ID7 : EVENT_ID6;
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(event);
+        const uint32_t next = start + tile.tokens;
+        if (next < end) {
+            const uint32_t other = slot ^ 1U;
+            const auto other_event = other ? EVENT_ID7 : EVENT_ID6;
+            if (pending[other]) {
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(other_event);
+                pending[other] = false;
+            }
+            const uint32_t count = end - next < tile.tokens ? end - next : tile.tokens;
+            LoadChannelMetadataInput(resource, head, td, tile, next, count, other);
+        }
+        const uint32_t offset = slot * tile.bytes;
+        auto heads = resource.template GetBufferByByte<int32_t>(offset);
+        auto indices = resource.template GetBufferByByte<topk_idx_t>(offset + tile.index_offset);
+        auto weights = resource.template GetBufferByByte<float>(offset + (td.has_topk_weights ? tile.weight_offset : 0));
+        const uint32_t count = end - start < tile.tokens ? end - start : tile.tokens;
+        asc_vf_call<PackChannelMetadataVf>(dim3(128),
+            reinterpret_cast<__ubuf__ int32_t*>(heads.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ topk_idx_t*>(indices.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(weights.GetPhyAddr()),
+            reinterpret_cast<__gm__ topk_idx_t*>(td.packed_channel_indices),
+            reinterpret_cast<__gm__ float*>(td.packed_channel_weights), count, td.num_topk, td.world_size,
+            td.num_experts / td.world_size, td.num_channels, channel, stride, td.has_topk_weights);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(event);
+        pending[slot] = true;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (pending[i]) AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(i ? EVENT_ID7 : EVENT_ID6);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+}
+
 // Called at notify's tail, after this core's plan/head is complete and all
 // earlier UB readers have drained. Same-stream kernel completion gates dispatch.
 template <class Resource>
 __aicore__ inline void PackChannelMetadata(Resource& resource, GM_ADDR head,
     const DispatchTilingData& td, uint32_t channel)
 {
+    if (td.channel_metadata_double_buffer) {
+        PackChannelMetadataDoubleBuffered(resource, head, td, channel);
+        return;
+    }
     const auto tile = MakeChannelMetadataTile(td.channel_metadata_tile_tokens, td.world_size,
         td.num_topk, sizeof(topk_idx_t), td.has_topk_weights);
     auto heads = resource.template GetBufferByByte<int32_t>(0);

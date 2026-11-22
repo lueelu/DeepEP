@@ -15,7 +15,7 @@ struct DispatchTraceFields {
         DescriptorCycles, WqeBuildCycles, WqeSubmitCycles, CreditCycles, CreditBlockedCycles,
         CreditChecks, CreditBlocked, CreditMaxCycles, SqUsedMax, SqUsedSum, SqEmptyChecks,
         Wqes, Flushes, ShortFlushes, Spans, StateFlushes, QpFlushes, IndexFlushes,
-        MetadataWqes, MetadataFlushes, SubmitNoCredit, SelfBegin, SelfEnd, Operation, IncomingBegin,
+        MetadataWqes, MetadataFlushes, SubmitNoCredit, SelfBegin, SelfEnd, Operation, IncomingBegin, TopkInitCycles, SourceCycles, SlotsCycles,
         Fields
     };
 };

@@ -22,6 +22,18 @@ inline constexpr uint32_t kGroupStaggeredOrder = 2;
 inline constexpr uint32_t kGroupRoundRobinOrder = 3;
 inline constexpr uint32_t kGroupPeerCapacity = 64;
 
+// Live dispatch WQE/descriptor/header/output-record region plus index windows.
+// Output records have eight uint64_t words. Shared by Host gating and device layout.
+#ifdef ASCEND_DEEPEP_DEVICE_SCHEDULE
+__aicore__
+#endif
+inline constexpr uint32_t DispatchLiveSendUbBytes(uint32_t capacity, uint32_t qps)
+{
+    return kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)) +
+        capacity * qps * (2U * kWqeBytes + 8U * sizeof(uint64_t)) + 32U +
+        capacity * kTileTokens * sizeof(int32_t);
+}
+
 ASCEND_DEEPEP_SCHEDULE_FN bool ValidPeers(uint32_t peers)
 {
     return peers == 1 || peers == 2 || peers == 4 || peers == 8;

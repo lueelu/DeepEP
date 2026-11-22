@@ -2,6 +2,7 @@
 
 import csv
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,6 +20,122 @@ try:
     spec.loader.exec_module(bench)
 finally:
     sys.path.pop(0)
+
+
+def test_post_submit_slots_and_private_ub(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    source = ROOT / "csrc/direct"
+    metadata = (source / "kernels/dispatch/udma_dispatch_metadata.h").read_text()
+    callback = metadata[
+        metadata.index("template <class Resource, class Trace>\nstruct DispatchOverlapWork") : metadata.rindex("#endif")
+    ]
+    slots = cpp_functions((source / "kernels/common/v2_handle.h").read_text(), "V2HandleSlotsVf")
+    metadata_signature = cpp_functions(metadata, "DispatchMetadata").split("{", 1)[0]
+    program = r"""
+#include <cassert>
+#include <cstdint>
+#include <vector>
+#define __aicore__
+#define __simt_vf__
+#define __launch_bounds__(n)
+#define __gm__
+#define ASCEND_DEEPEP_ARCH 3510
+#define ASCEND_DEEPEP_DEVICE_SCHEDULE
+#include "common/types.h"
+#include "common/platform.h"
+#include "common/udma_schedule.h"
+using namespace ascend_deepep;
+using namespace ascend_deepep::udma;
+using GM_ADDR = uint8_t*;
+constexpr int EVENT_ID6=6;
+struct { unsigned x; } threadIdx;
+struct dim3 { unsigned x; explicit dim3(unsigned v):x(v){} };
+void asc_threadfence() {}
+namespace AscendC {
+enum class HardEvent { V_S };
+bool pending=false;
+template<HardEvent> void SetFlag(int) { assert(!pending); pending=true; }
+template<HardEvent> void WaitFlag(int) { assert(pending); pending=false; }
+}
+template<auto Fn, class... Args> void asc_vf_call(dim3 n, Args... args) {
+    for(threadIdx.x=0;threadIdx.x<n.x;++threadIdx.x)Fn(args...);
+}
+struct Resource { unsigned calls=0, offset=0; };
+struct Trace {
+    static constexpr int SlotsCycles=1;
+    unsigned slots=0;
+    uint64_t Now() { return 1; }
+    void Add(int field, uint64_t) { assert(field==SlotsCycles); ++slots; }
+};
+// SLOTS
+// METADATA_SIGNATURE
+{
+    assert(copy_self && !publish_metadata);
+    assert(stage_bytes + scratch_offset == platform::kKernelUbBytes);
+    assert(scratch_offset % 32 == 0 && stage_bytes >= 32768);
+    ++resource.calls;
+    resource.offset=scratch_offset;
+}
+// CALLBACK
+int main() {
+    static_assert(DispatchLiveSendUbBytes(8,1)==12832);
+    static_assert(DispatchLiveSendUbBytes(64,2)==93216);
+    constexpr unsigned T=65, K=3, W=8, C=8, capacity=128, rank=3;
+    std::vector<topk_idx_t> idx(T*K);
+    std::vector<int32_t> head(T*W,-1), prefix(W*C,0), output(T*K,-99), expected(T*K,-1);
+    unsigned counts[W]{};
+    for(unsigned t=0;t<T;++t) {
+        // Two routes to one peer; an invalid slot; all tokens use peer 2.
+        idx[t*K]=4; idx[t*K+1]=5; idx[t*K+2]=-1;
+        const unsigned ch=t/((T+C-1)/C);
+        head[t*W+2]=t%((T+C-1)/C);
+        ++counts[2];
+        for(unsigned p=0;p<W;++p)prefix[p*C+ch]=counts[p];
+        expected[t*K]=rank*capacity+t;
+    }
+    DispatchTilingData td{};
+    td.rank=rank; td.world_size=W; td.num_max_tokens_per_rank=capacity*W;
+    td.num_local_experts=2; td.num_topk=K; td.num_tokens=T; td.num_channels=C;
+    td.v2_dst_slots=reinterpret_cast<uint64_t>(output.data());
+    for(unsigned mask=0;mask<4;++mask) {
+        td.dispatch_self_after_submit=mask&1; td.dispatch_early_slots=(mask>>1)&1;
+        std::fill(output.begin(),output.end(),-99);
+        unsigned copies=0,slots=0;
+        for(unsigned core=0;core<8;++core) {
+            Resource resource; Trace trace;
+            DispatchOverlapWork<Resource,Trace> work{resource,trace,nullptr,nullptr,
+                reinterpret_cast<GM_ADDR>(idx.data()),nullptr,nullptr,nullptr,
+                reinterpret_cast<GM_ADDR>(prefix.data()),nullptr,reinterpret_cast<GM_ADDR>(head.data()),
+                nullptr,nullptr,td,core,8};
+            work(DispatchLiveSendUbBytes(8,1));
+            copies+=resource.calls; slots+=trace.slots;
+            assert(!AscendC::pending);
+        }
+        assert(copies==((mask&1)?8U:0U));
+        assert(slots==((mask&2)?8U:0U));
+        if(mask&2) assert(output==expected);
+        else for(auto v:output)assert(v==-99);
+    }
+}
+"""
+    path = tmp_path / "overlap.cpp"
+    path.write_text(
+        program.replace("// SLOTS", slots)
+        .replace("// METADATA_SIGNATURE", metadata_signature)
+        .replace("// CALLBACK", callback)
+    )
+    executable = tmp_path / ("overlap.exe" if os.name == "nt" else "overlap")
+    subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-I", str(source), str(path), "-o", str(executable)], check=True, timeout=180
+    )
+    try:
+        subprocess.run([str(executable)], check=True, timeout=60)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
 
 
 @pytest.mark.parametrize("drop_peer_trace", [False, True])
@@ -40,14 +157,20 @@ def test_dispatch_calls_compile_against_actual_helper_signatures(tmp_path, drop_
     start = source.index("    ascend_deepep::udma::DispatchMetadata(")
     calls = source[start : source.index("    const int32_t actual_recv_tokens", start)]
     if drop_peer_trace:
-        assert "tiling, core_idx, core_num, trace);" in calls
-        calls = calls.replace("tiling, core_idx, core_num, trace);", "tiling, core_idx, core_num);")
+        assert "tiling, core_idx, core_num, trace, overlap);" in calls
+        calls = calls.replace("tiling, core_idx, core_num, trace, overlap);", "tiling, core_idx, core_num);")
     program = r"""
 #include <cstdint>
 #define __aicore__
 using GM_ADDR = uint8_t*;
 namespace ascend_deepep::udma {
-struct DispatchTilingData { bool udma_token_schedule; };
+struct DispatchTilingData { bool udma_token_schedule; bool dispatch_self_after_submit = false; };
+struct NoDispatchOverlapWork {};
+template<class R,class T> struct DispatchOverlapWork {
+    R& resource; T& trace;
+    GM_ADDR x,scales,topk,weights,plan,ranks,channels,workspace,head,recv_x,recv_scales;
+    const DispatchTilingData& td; uint32_t core,cores;
+};
 // DECLARATIONS
 }
 struct EnabledTrace { enum { MetadataDone }; void Mark(int) {} };
@@ -186,6 +309,38 @@ def test_channel_comparison_separates_tiles_and_payload_plans():
         (plan, tile) for plan in ("auto", "zeng") for tile in (32, 128)
     }
     assert all(r["pairs"] == 2 for r in result)
+
+
+def test_overlap_comparison_separates_cores_and_rejects_changed_policy():
+    rows = []
+    for cores in (8, 32):
+        for mode in ("off", "all", "all", "off"):
+            rows.append(
+                dict(
+                    op="fresh",
+                    cores=cores,
+                    channel=1,
+                    metadata_requested=1,
+                    metadata_tile_requested=128,
+                    dispatch_plan="auto",
+                    overlap_mode=mode,
+                    overlap_effective=15 if mode == "all" else 0,
+                    policy={"cores": cores},
+                    payload_bytes_per_rank=1000000,
+                    stats_us={
+                        name: {"mean": 80 if mode == "all" else 100}
+                        for name in ("notify_dispatch_kernel", "v1_dispatch_udma_kernel", "api_wall_us")
+                    },
+                )
+            )
+    result = bench.overlap_comparison(rows)
+    assert len(result) == 2
+    assert {r["cores"] for r in result} == {8, 32}
+    assert all(r["pairs"] == 2 and r["effective_masks"] == [15] for r in result)
+    assert all(r["api_time_change_pct"] == pytest.approx(-20) for r in result)
+    rows[1]["policy"] = {"changed": True}
+    with pytest.raises(ValueError, match="unmatched"):
+        bench.overlap_comparison(rows)
 
 
 def test_trace_intervals_do_not_add_overlapping_metadata_twice():

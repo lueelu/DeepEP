@@ -29,6 +29,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         return ascend_deepep::ops::LastDispatchChannelMetadataTileTokens();
     });
     m.attr("dispatch_channel_metadata_version") = 2;
+    m.def("last_dispatch_overlap_options", [] { return ascend_deepep::ops::LastDispatchOverlapOptions(); });
+    m.attr("dispatch_overlap_version") = 1;
     m.attr("dispatch_device_timing_version") = 2;
     m.attr("combine_device_timing_version") = 2;
     m.attr("dispatch_device_timing_cycles_per_us") = ascend_deepep::kNpuSystemCyclesPerUs;
@@ -42,7 +44,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         "credit_checks", "credit_blocked", "credit_max_cycles", "sq_used_max", "sq_used_sum", "sq_empty_checks",
         "wqes", "flushes", "short_flushes", "spans", "state_flushes", "qp_flushes", "index_flushes",
         "metadata_wqes", "metadata_flushes", "submit_no_credit", "self_begin", "self_end", "operation",
-        "incoming_begin"};
+        "incoming_begin", "topk_init_cycles", "source_cycles", "slots_cycles"};
     m.attr("combine_device_timing_fields") = m.attr("dispatch_device_timing_fields");
     m.def("begin_dispatch_host_timing", &ascend_deepep::ops::BeginDispatchHostTiming);
     m.def("end_dispatch_host_timing",

@@ -566,3 +566,52 @@ or compare absolute cycle timestamps across devices. Use formal slow-rank
 samples and per-AIV traces to identify preparation, credit pressure, local-copy
 or completion tails before selecting the next optimization. Notify is profiled
 for dispatch; combine's outer alignment notify is excluded from its measured API.
+
+## Dispatch overlap experiments
+
+These four per-launch switches default to `0`. Rebuild both host and kernel
+libraries; the tiling ABI has changed. Peer order, P/W/Q, visit, payload UDMA,
+combine and reduce policies are unchanged.
+
+| Benchmark mode | Environment variable set to `1` | Effective scope |
+| --- | --- | --- |
+| `self` | `DEEPEP_CLOS_DISPATCH_OVERLAP_SELF` | Peer dispatch without auxiliary metadata/copy AIVs or scales, with sufficient private UB: submit remote payload/metadata and terminal flags, then copy self before incoming wait/quiet |
+| `slots` | `DEEPEP_CLOS_DISPATCH_EARLY_SLOTS` | Fresh peer dispatch: build local V2 destination slots after submission/self work; Source still waits for received metadata |
+| `init` | `DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT` | Fresh channel-metadata path only: omit valid-row top-k prefill because packed metadata writes every slot, including invalid `-1` entries |
+| `notify` | `DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER` | Channel-metadata pack: two independent input UB tiles and event pairs; GM output layout is unchanged |
+| `all` / `off` | All four / none | Matched combined treatment / control |
+
+Auxiliary AIVs retain parallel self-copy. A live sender's descriptors, headers,
+completion records and index windows are reserved throughout post-submit work;
+local-copy scratch starts after that region. No incoming wait, quiet, collective,
+output padding initialization or completion publication is removed. Double-buffer
+tile selection checks **two** tiles against UB capacity; an explicit oversized
+tile fails instead of silently changing the experiment.
+
+Run once per EP8/16 using the site's launch arguments, with one Buffer per rank
+across all variants and both core counts:
+
+```bash
+torchrun <site-launch-arguments> benchmarks/clos/bench_channel_metadata.py \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 32 \
+  --metadata-modes 1 --metadata-tile-tokens 128 --dispatch-plans auto \
+  --cached-channel-modes 1 --overlap-modes off self slots init notify all \
+  --warmup 10 --samples 30 --trace-warmup 5 --trace-samples 5 \
+  --flush-l2 --huge-pages --output <shared-result-directory>
+```
+
+Fresh, fresh weighted and cached dispatch run in forward/reverse order. Precision
+checks also compare public Source/Slots against original CPU routes, including
+invalid routes, duplicate peer routes, empty ranks and tails. Timing remains
+L2 flush → rank alignment → measured call. Diagnostic kernels get separate warmup.
+The former cached-channel filter no longer drops fresh/32-core control groups.
+
+`overlap_comparison.csv` reports matched notify, communication and complete API
+means and pair deltas; it never mixes core counts, metadata modes or payload
+policies. `summary.json` also records the native effective option mask:
+bit 0 = after-submit self, bit 1 = early slots, bit 2 = skipped prefill,
+bit 3 = double-buffer pack. Cached or auxiliary-worker paths legitimately mask
+out inapplicable options. Traces append `topk_init_cycles`, `source_cycles` and
+`slots_cycles`; early slots occur before incoming wait and must not be counted
+again as a completion-tail cost. CPU mocks check indexing, UB boundaries and
+event credit pairing, but do not establish device ordering or NPU performance.
