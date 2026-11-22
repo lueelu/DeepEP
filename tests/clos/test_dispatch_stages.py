@@ -3,9 +3,13 @@
 import csv
 import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 
 import pytest
+
+from tests.utils.cpp import cpp_functions
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "benchmarks/clos"))
@@ -15,6 +19,64 @@ try:
     spec.loader.exec_module(bench)
 finally:
     sys.path.pop(0)
+
+
+@pytest.mark.parametrize("drop_peer_trace", [False, True])
+def test_dispatch_calls_compile_against_actual_helper_signatures(tmp_path, drop_peer_trace):
+    """Compile both routing branches; no NPU SDK or executable launch required."""
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required for dispatch call-signature regression")
+    kernels = ROOT / "csrc/direct/kernels/dispatch"
+    declarations = []
+    for filename, name in (
+        ("udma_dispatch_metadata.h", "DispatchMetadata"),
+        ("udma_dispatch_schedule.h", "DispatchRemote"),
+        ("udma_token_dispatch_schedule.h", "DispatchTokenRemote"),
+    ):
+        definition = cpp_functions((kernels / filename).read_text(), name)
+        declarations.append(definition.split("{", 1)[0] + " {}")
+    source = (kernels / "dispatch_udma.cpp").read_text()
+    start = source.index("    ascend_deepep::udma::DispatchMetadata(")
+    calls = source[start : source.index("    const int32_t actual_recv_tokens", start)]
+    if drop_peer_trace:
+        assert "tiling, core_idx, core_num, trace);" in calls
+        calls = calls.replace("tiling, core_idx, core_num, trace);", "tiling, core_idx, core_num);")
+    program = r"""
+#include <cstdint>
+#define __aicore__
+using GM_ADDR = uint8_t*;
+namespace ascend_deepep::udma {
+struct DispatchTilingData { bool udma_token_schedule; };
+// DECLARATIONS
+}
+struct EnabledTrace { enum { MetadataDone }; void Mark(int) {} };
+struct DisabledTrace { enum { MetadataDone }; void Mark(int) {} };
+template<class Trace> void check(bool token) {
+    int resource = 0;
+    GM_ADDR x{}, dispatch_scales{}, topk_idx{}, topk_weights{}, dispatch_plan{}, rank_prefix_matrix{},
+        channel_prefix_matrix{}, symmetric_buffer{}, send_head{}, recv_x{}, recv_x_scales{};
+    ascend_deepep::udma::DispatchTilingData tiling{token};
+    uint32_t core_idx = 0, core_num = 8, kDispatchStageBytes = 65536;
+    Trace trace;
+    // CALLS
+}
+template void check<EnabledTrace>(bool);
+template void check<DisabledTrace>(bool);
+"""
+    path = tmp_path / "dispatch_calls.cpp"
+    path.write_text(program.replace("// DECLARATIONS", "\n".join(declarations)).replace("// CALLS", calls))
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "dispatch_calls.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if drop_peer_trace:
+        assert result.returncode != 0
+        assert "DispatchRemote" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
 
 
 def fixture_trace():

@@ -187,10 +187,10 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     trace.Mark(Trace::MetadataDone);
     if (tiling.udma_token_schedule) {
         ascend_deepep::udma::DispatchTokenRemote(resource, x, dispatch_scales,
-            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num, trace);
+            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num);
     } else {
         ascend_deepep::udma::DispatchRemote(resource, x, dispatch_scales,
-            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num);
+            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num, trace);
     }
 
     const int32_t actual_recv_tokens = rank_prefix_gm.GetValue((world_size - 1) * world_size + rank);
