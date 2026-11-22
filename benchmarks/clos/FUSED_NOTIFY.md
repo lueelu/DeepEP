@@ -257,6 +257,96 @@ T4096/H2816/K8/E256/BF16/expand0, with unchanged routes and huge-page/L2 setting
 Compare modes 0/1/2/3 then 3/2/1/0, checking precision before timing fresh dispatch
 with and without weights; use cached dispatch and combine as regression controls.
 
+## Dispatch stage diagnostic and EP16 cached-channel experiment
+
+`DEEPEP_CLOS_CACHED_CHANNEL_EP16=1` enables the existing whole-channel list
+schedule for **EP16, eight communication AIVs, cached, two-byte payload, no
+scales**. Its default is zero. EP8's existing eight-AIV fast path is unchanged;
+fresh dispatch and all other core/EP combinations retain their prior path.
+Each channel uses its exact compact per-peer count, so the scalar input-token
+window scan and GM-to-UB list refill are skipped. Destination rows, visit/WQE
+budget, sender ownership and all completion operations remain unchanged.
+The longer per-peer channel interval can change inter-peer progress, so this
+is an experiment, not a promised improvement. Keep the flag identical on all
+ranks; change it only between drained, uncaptured launches.
+
+`DEEPEP_CLOS_DISPATCH_DEVICE_TIMING=1` selects a separate diagnostic kernel.
+The default kernel specializes all trace operations away and has no trace
+array, clock reads or diagnostic DMA. Both native and kernel libraries must
+be rebuilt together because `DispatchTilingData` changed. The diagnostic
+currently supports peer-scheduled dispatch only.
+
+Each AIV owns one 512-byte GM row allocated by the stream-aware allocator.
+It accumulates scalar timestamps/counters privately and exports through
+UB `[0,512)` after the original users finish; no trace region overlaps live
+sender staging. The export uses MTE3, with MTE3-to-scalar then scalar-to-MTE3
+ordering. There are no extra cross-rank collectives. Existing V-to-scalar
+completion edges bound source-index and top-k VFs; self-copy timing follows
+its existing final drain. A diagnostic-only MTE3-to-scalar edge bounds output
+copy completion. Formal bandwidth must be measured with diagnostics disabled.
+
+The native `take_dispatch_device_timing()` returns the latest launch tensor
+on the calling host thread and clears that retained reference. Consume the
+dispatch completion event before copying it to CPU; retrieve each launch
+before submitting the next. Rows have stride 64 int64 elements; interpret only
+`dispatch_device_timing_fields`. `entry_cycles` is an absolute local-device
+clock, other timeline fields are per-AIV entry offsets. Convert cycle fields
+using `dispatch_device_timing_cycles_per_us`; never align different devices
+using their absolute clock values.
+
+`payload_queued` means the final PutRows work has been queued, not that its
+last deferred batch or network transfer has completed. `published` follows
+Publish (including its existing flush), `incoming_done` follows incoming
+markers, `quiet_done` follows sender completion, and `sync_done` follows the
+existing all-rank collective. `src_cycles`, `topk_cycles`, `self_cycles` and
+`list_cycles` accumulate substage durations over channels. They overlap the
+timeline intervals and other AIVs: **do not sum their maxima into API time**.
+`work_done` excludes trace-export overhead and is diagnostic, not bandwidth.
+
+Run the following through the site's normal torchrun launcher, once for EP8
+and once for EP16 (same shape, routes, topology and libraries as the baseline):
+
+```bash
+python benchmarks/clos/bench_dispatch_stages.py \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 \
+  --cores 8 32 --cached-channel-modes 0 1 \
+  --warmup 10 --samples 30 --trace-samples 3 --flush-l2 --huge-pages \
+  --output /path/to/results
+```
+
+The script initializes Buffer once per rank and runs fresh without/with
+weights and cached dispatch, forward then reverse. It checks cross-variant
+output equality, requested/native huge-page state and all-rank library hashes.
+Formal API wall and kernel profiling are separate passes with traces off;
+L2 eviction finishes before each alignment barrier. Diagnostic traces follow
+in a separate pass and validate the effective whole-channel gate per core.
+Per-rank raw reports and `summary.json` contain per-iteration slowest-rank
+mean/P50/P95; bandwidth uses decimal GB/s, deduplicated payload including self.
+`device_trace.json` retains every diagnostic core/sample rather than hiding
+slow-core differences in one average.
+
+For an older installed baseline, use this script from the new checkout with
+`--cores 32 --cached-channel-modes 0 --trace-samples 0`; it imports the installed
+wheel rather than placing the checkout package on `sys.path`. Use a separate
+process/environment for each installed version. Cross-variant equality is not
+an independent golden: also run the standard device precision suite, including
+empty/skewed routes and tail tokens. Run the existing ABC harness with reduce48
+for combine and end-to-end regression; this script measures dispatch APIs only
+and contains no expert compute.
+
+CPU checks:
+
+```bash
+python -m pytest tests/clos/test_eight_aiv_copy.py \
+  tests/clos/test_dispatch_metadata_threads.py tests/clos/test_dispatch_stages.py -q
+```
+
+The production-body C++ oracle covers EP8/16/32, on/off, cached/fresh,
+8/16 cores, visit4/8/16/32, empty channels and non-divisible token counts.
+It checks exact token/destination rows and per-visit budget, not network
+completion or device performance. CANN compilation and NPU validation remain
+required before treating the experiment as deployable.
+
 ## Report files
 
 Each rank writes `precision.json`, `summary.csv`, `report.json`, raw profiler

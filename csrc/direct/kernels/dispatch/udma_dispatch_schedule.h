@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kernels/dispatch/dispatch_device_trace.h"
+
 #include "kernels/dispatch/udma_dispatch_sender.h"
 #include "common/platform.h"
 #include "common/types.h"
@@ -57,10 +59,10 @@ __aicore__ inline void WaitPackedScaleReady(const DispatchTilingData& td, uint32
     }
 }
 
-template <uint32_t Capacity, uint32_t Qps, class Resource>
+template <uint32_t Capacity, uint32_t Qps, class Resource, class Trace>
 __aicore__ inline void DispatchRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
-    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
+    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores, Trace& trace)
 {
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + kOutputRecordBytes) + 32;
     static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
@@ -73,8 +75,10 @@ __aicore__ inline void DispatchRemoteImpl(
     rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
     channel_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix));
     const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
-    const bool cached_channel = td.cached_mode && !td.has_x_scales && td.world_size == 8 &&
+    const bool cached_channel = td.cached_mode && !td.has_x_scales && (td.world_size == 8 || (td.world_size == 16 && td.cached_channel_ep16)) &&
         cores == 8 && td.x_element_bytes == 2;
+    trace.Set(DispatchDeviceTrace::PayloadPeers, sender.Count());
+    trace.Set(DispatchDeviceTrace::WholeChannel, cached_channel);
     const uint32_t max_tile = cached_channel ? channel_tokens :
         (65536U / td.world_size < kTileTokens ? 65536U / td.world_size : kTileTokens);
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
@@ -103,6 +107,8 @@ __aicore__ inline void DispatchRemoteImpl(
                     remaining += total[p];
                 }
             } else {
+                const uint64_t list_started = trace.Now();
+                trace.Count(DispatchDeviceTrace::ListWindows);
                 // Keep the original input-token tile and peer visit boundaries.
                 // A sorted list can contribute at most `size` hits to this tile.
                 AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
@@ -128,6 +134,7 @@ __aicore__ inline void DispatchRemoteImpl(
                     remaining += counts[p];
                     consumed[p] += counts[p];
                 }
+                trace.Add(DispatchDeviceTrace::ListCycles, list_started);
             }
             while (remaining) {
                 for (uint32_t p = 0; p < sender.Count(); ++p) {
@@ -137,6 +144,7 @@ __aicore__ inline void DispatchRemoteImpl(
                         const uint64_t base = (uint64_t(sender.Rank(p)) * td.num_channels + ch) * plan_stride;
                         const uint64_t index = base + consumed[p] - counts[p] + cursor[p];
                         const uint32_t available = (counts[p] - cursor[p]) * fields - field[p];
+                        trace.Count(DispatchDeviceTrace::PutRowsCalls);
                         const uint32_t count = sender.PutRows(
                             p, reinterpret_cast<const __gm__ int32_t*>(plan) + index, row[p], field[p],
                             available < visit ? available : visit);
@@ -167,28 +175,33 @@ __aicore__ inline void DispatchRemoteImpl(
             }
         }
     }
+    trace.Mark(DispatchDeviceTrace::PayloadQueued);
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
+    trace.Mark(DispatchDeviceTrace::Published);
     WaitIncoming<true>(workspace, td, core, cores, td.udma_workers_per_peer * Qps);
+    trace.Mark(DispatchDeviceTrace::IncomingDone);
     sender.Quiet();
+    trace.Mark(DispatchDeviceTrace::QuietDone);
     // SO markers cover payload only. Metadata AIVs can still be doing remote
     // SIMT stores on another rank; all ranks/cores must join before outputs are
     // read or the workspace is reused. The collective includes local sync.
     aclshmemx_sync_vec_all();
+    trace.Mark(DispatchDeviceTrace::SyncDone);
 }
-template <class Resource>
+template <class Resource, class Trace>
 __aicore__ inline void DispatchRemote(
     Resource& r, GM_ADDR x, GM_ADDR scales, GM_ADDR plan, GM_ADDR rp, GM_ADDR cp,
-    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores)
+    GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores, Trace& trace)
 {
     if (td.udma_qps_per_worker == 2) {
         if (td.udma_peer_order == kGroupRoundRobinOrder)
-            DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+            DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace);
         else
-            DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+            DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace);
     } else if (td.udma_peer_order == kGroupRoundRobinOrder)
-        DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+        DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace);
     else
-        DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores);
+        DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace);
 }
 #endif
 } // namespace ascend_deepep::udma

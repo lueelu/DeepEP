@@ -15,6 +15,7 @@
 #include "ops/launcher.h"
 #include "ops/stream_allocator.h"
 #include "ops/dispatch_host_timing.h"
+#include "ops/dispatch_device_timing.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "runtime/shmem_instance.h"
 
@@ -569,6 +570,17 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.metadata_src_threads = metadata_src_256 ? 256U : 128U;
     tiling.metadata_src_lanes = metadata_src_256 && world_size <= 8 ? 32U : 16U;
     tiling.metadata_topk_threads = metadata_topk_256 ? 256U : 128U;
+    const bool cached_channel_ep16 = enabled_option("DEEPEP_CLOS_CACHED_CHANNEL_EP16");
+    const bool device_timing = enabled_option("DEEPEP_CLOS_DISPATCH_DEVICE_TIMING");
+    TORCH_CHECK(use_udma || !(cached_channel_ep16 || device_timing), "dispatch diagnostics require UDMA");
+    tiling.cached_channel_ep16 = cached_channel_ep16;
+    DispatchDeviceTimingSlot().reset();
+    if (device_timing) {
+        TORCH_CHECK(!shmem.TokenSchedule(), "dispatch device timing requires peer scheduling");
+        auto trace = allocator.Empty({resolved_num_aiv, 64}, x.options().dtype(torch::kInt64));
+        tiling.dispatch_device_trace = reinterpret_cast<uint64_t>(trace.data_ptr());
+        DispatchDeviceTimingSlot() = trace;
+    }
     c10::optional<torch::Tensor> fused_partials;
     if (fused_layout) {
         TORCH_CHECK(num_topk > 0 && num_experts > 0 &&

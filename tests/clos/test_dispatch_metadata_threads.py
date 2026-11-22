@@ -19,7 +19,7 @@ def test_metadata_vf_thread_variants(tmp_path):
     begin = host.index("    const auto enabled_option =")
     options = host[begin : host.index("    const bool host_prep", begin)]
     begin = host.index("    tiling.metadata_src_threads =")
-    fields = host[begin : host.index("    c10::optional<torch::Tensor> fused_partials", begin)]
+    fields = host[begin : host.index("    const bool cached_channel_ep16", begin)]
     compiler = shutil.which("g++") or shutil.which("clang++")
     if not compiler:
         pytest.skip("C++17 compiler required for production VF oracle")

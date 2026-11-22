@@ -27,6 +27,9 @@ def test_eight_aiv_production_bodies(tmp_path):
     begin = host.index("    tiling.compact_self_rows =")
     gate = host[begin : host.index(";", begin) + 1]
     harness = (Path(__file__).with_name("eight_aiv_copy_oracle.cpp")).read_text()
+    trace = (source / "kernels/dispatch/dispatch_device_trace.h").read_text()
+    trace = "\n".join(line for line in trace.splitlines() if not line.startswith(("#include", "#pragma")))
+    harness = harness.replace("// PRODUCTION_TRACE", trace)
     harness = harness.replace("// PRODUCTION_FUNCTIONS", functions).replace("// PRODUCTION_GATE", gate)
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:

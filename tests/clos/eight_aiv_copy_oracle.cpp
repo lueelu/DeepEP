@@ -17,11 +17,16 @@
 using GM_ADDR = uint8_t*;
 using namespace ascend_deepep;
 using namespace ascend_deepep::udma;
-constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID6 = 6;
+constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID6 = 6, EVENT_ID7 = 7;
 constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)), kOutputRecordBytes = 64;
 static unsigned list_loads;
 namespace AscendC {
-enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S };
+enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S, S_MTE3 };
+inline uint64_t GetSystemCycle()
+{
+    static uint64_t tick = 1000;
+    return ++tick;
+}
 template <HardEvent>
 void SetFlag(int)
 {
@@ -52,6 +57,10 @@ struct LocalTensor {
     T GetValue(uint64_t i) const
     {
         return data[i];
+    }
+    void SetValue(uint64_t i, T value)
+    {
+        data[i] = value;
     }
     LocalTensor operator[](uint64_t i) const
     {
@@ -107,7 +116,7 @@ struct DispatchSenderT {
     }
     uint32_t Rank(uint32_t p) const
     {
-        return p + 1;
+        return p == 0 ? 1U : (p == 1 ? td.world_size / 2U : td.world_size - 1U);
     }
     void BeginVisit(uint32_t)
     {
@@ -141,6 +150,7 @@ void WaitIncoming(GM_ADDR, const DispatchTilingData&, uint32_t, uint32_t, uint32
 }
 void aclshmemx_sync_vec_all() {}
 
+// PRODUCTION_TRACE
 // PRODUCTION_FUNCTIONS
 
 void CheckCopyAndReduction()
@@ -232,50 +242,56 @@ void CheckCopyAndReduction()
 
 void CheckCachedDispatch()
 {
-    for (unsigned tokens : {0U, 3U, 2049U, 8195U})
-        for (unsigned visit : {4U, 8U, 16U, 32U})
-            for (unsigned workers : {1U, 2U}) {
-                DispatchTilingData td{};
-                td.world_size = 8;
-                td.num_tokens = tokens;
-                td.num_channels = 8;
-                td.x_element_bytes = 2;
-                td.udma_workers_per_peer = workers;
-                td.udma_wqes_per_visit = visit;
-                const unsigned width = (tokens + 7) / 8, stride = (width + 7) / 8 * 8;
-                std::vector<int32_t> plan(64 * stride, -1), rp(64), cp(64);
-                std::vector<Row> expected;
-                for (unsigned peer = 1; peer <= 3; ++peer) {
-                    unsigned row = 0;
-                    for (unsigned ch = 0; ch < 8; ++ch) {
-                        unsigned index = 0;
-                        for (unsigned t = ch * width; t < std::min(tokens, (ch + 1) * width); ++t)
-                            if (peer != 2 && ch != 3 && t % (peer + 1) != 0) {
-                                plan[(peer * 8 + ch) * stride + index++] = t;
-                                expected.emplace_back(peer, t, row++);
+    for (unsigned world : {8U, 16U, 32U})
+        for (bool opt_in : {false, true})
+            for (unsigned cores : {8U, 16U})
+                for (unsigned tokens : {0U, 3U, 2049U, 8195U})
+                    for (unsigned visit : {4U, 8U, 16U, 32U})
+                        for (unsigned workers : {1U, 2U}) {
+                            DispatchTilingData td{};
+                            td.world_size = world;
+                            td.cached_channel_ep16 = opt_in;
+                            td.num_tokens = tokens;
+                            td.num_channels = 8;
+                            td.x_element_bytes = 2;
+                            td.udma_workers_per_peer = workers;
+                            td.udma_wqes_per_visit = visit;
+                            const unsigned width = (tokens + 7) / 8, stride = (width + 7) / 8 * 8;
+                            std::vector<int32_t> plan(world * 8 * stride, -1), rp(world * world), cp(world * 8);
+                            std::vector<Row> expected;
+                            for (unsigned peer : {1U, world / 2U, world - 1U}) {
+                                unsigned row = 0;
+                                for (unsigned ch = 0; ch < 8; ++ch) {
+                                    unsigned index = 0;
+                                    for (unsigned t = ch * width; t < std::min(tokens, (ch + 1) * width); ++t)
+                                        if (peer != world / 2U && ch != 3 && t % (peer + 1) != 0) {
+                                            plan[(peer * 8 + ch) * stride + index++] = t;
+                                            expected.emplace_back(peer, t, row++);
+                                        }
+                                    cp[peer * 8 + ch] = row;  // send-side INCLUSIVE prefix
+                                }
                             }
-                        cp[peer * 8 + ch] = row;  // send-side INCLUSIVE prefix
-                    }
-                }
-                std::sort(expected.begin(), expected.end());
-                for (bool cached : {false, true}) {
-                    td.cached_mode = cached;
-                    sent.clear();
-                    list_loads = max_visit = 0;
-                    for (unsigned core = 0; core < workers; ++core) {
-                        Resource resource;
-                        DispatchRemoteImpl<8, 1>(resource, nullptr, nullptr, reinterpret_cast<GM_ADDR>(plan.data()),
-                                                 reinterpret_cast<GM_ADDR>(rp.data()),
-                                                 reinterpret_cast<GM_ADDR>(cp.data()), nullptr, td, core, 8);
-                    }
-                    std::sort(sent.begin(), sent.end());
-                    assert(sent == expected);
-                    if (cached)
-                        assert(list_loads == 0);
-                    else if (tokens > 3)
-                        assert(list_loads > 0);
-                }
-            }
+                            std::sort(expected.begin(), expected.end());
+                            for (bool cached : {false, true}) {
+                                td.cached_mode = cached;
+                                sent.clear();
+                                list_loads = max_visit = 0;
+                                for (unsigned core = 0; core < workers; ++core) {
+                                    Resource resource;
+                                    DisabledDispatchDeviceTrace trace(0);
+                                    DispatchRemoteImpl<8, 1>(
+                                        resource, nullptr, nullptr, reinterpret_cast<GM_ADDR>(plan.data()),
+                                        reinterpret_cast<GM_ADDR>(rp.data()), reinterpret_cast<GM_ADDR>(cp.data()),
+                                        nullptr, td, core, cores, trace);
+                                }
+                                std::sort(sent.begin(), sent.end());
+                                assert(sent == expected);
+                                if (cached && cores == 8 && (world == 8 || (world == 16 && opt_in)))
+                                    assert(list_loads == 0);
+                                else if (tokens > 3)
+                                    assert(list_loads > 0);
+                            }
+                        }
 }
 
 namespace torch {
@@ -314,8 +330,32 @@ void CheckHostGate()
         assert(tiling.compact_self_rows == (exclusion == 0 || exclusion == 13));
     }
 }
+void CheckTrace()
+{
+    Resource resource;
+    std::vector<uint64_t> output(3 * 64, 0xdead);
+    DispatchDeviceTrace trace(reinterpret_cast<uint64_t>(output.data()));
+    trace.Set(DispatchDeviceTrace::Entry, trace.Now());
+    trace.Set(DispatchDeviceTrace::Core, 1);
+    trace.Mark(DispatchDeviceTrace::BeginDone);
+    auto started = trace.Now();
+    trace.Add(DispatchDeviceTrace::SrcCycles, started);
+    trace.Count(DispatchDeviceTrace::PutRowsCalls);
+    trace.Save(resource, 1);
+    assert(output[64 + DispatchDeviceTrace::Core] == 1);
+    assert(output[64 + DispatchDeviceTrace::BeginDone] > 0);
+    assert(output[64 + DispatchDeviceTrace::SrcCycles] == 1);
+    assert(output[64 + DispatchDeviceTrace::PutRowsCalls] == 1);
+    assert(output[64 + DispatchDeviceTrace::WorkDone] > output[64 + DispatchDeviceTrace::BeginDone]);
+    for (unsigned i = 0; i < output.size(); ++i)
+        if (i < 64 || i >= 128) assert(output[i] == 0xdead);
+    DisabledDispatchDeviceTrace off(0);
+    off.Save(resource, 0);
+    assert(output[0] == 0xdead);
+}
 int main()
 {
+    CheckTrace();
     CheckCopyAndReduction();
     CheckCachedDispatch();
     CheckHostGate();

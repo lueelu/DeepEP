@@ -1,4 +1,6 @@
 #pragma once
+
+#include "kernels/dispatch/dispatch_device_trace.h"
 #include "device_simt/shmem_device_simt_instance.h"
 
 #include "kernels/common/udma_shared_sender.h"
@@ -131,11 +133,11 @@ __aicore__ inline void InitializeDispatchTopk(
 // channels for metadata and self-copy; when none are spare, every core does its
 // metadata channel before entering the payload sender. No collective belongs
 // inside this helper: payload cores must be able to run while metadata runs.
-template <class Resource>
+template <class Resource, class Trace>
 __aicore__ inline void DispatchMetadata(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR plan,
     GM_ADDR rank_prefix, GM_ADDR channel_prefix, GM_ADDR workspace, GM_ADDR send_head, const DispatchTilingData& td,
-    uint32_t core, uint32_t cores, uint32_t stage_bytes, GM_ADDR recv_x = nullptr, GM_ADDR recv_scales = nullptr)
+    uint32_t core, uint32_t cores, uint32_t stage_bytes, GM_ADDR recv_x, GM_ADDR recv_scales, Trace& trace)
 {
     const uint32_t first =
         td.udma_token_schedule ? TokenWorkers(cores) : MetadataFirst(td.world_size, td.udma_peers_per_worker, cores, td.udma_peer_order, td.udma_ranks_per_group, td.udma_workers_per_peer);
@@ -172,6 +174,7 @@ __aicore__ inline void DispatchMetadata(
         const uint32_t begin = channel_begin < td.num_tokens ? uint32_t(channel_begin) : td.num_tokens;
         const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
         if (build_handle) {
+            const uint64_t started = trace.Now();
             if (td.metadata_src_threads == 256 && td.metadata_src_lanes == 32) {
                 asc_vf_call<DispatchSourceIndicesVf<256, 32>>(
                     dim3(256), reinterpret_cast<__gm__ int32_t*>(plan), rank_ptr, channel_ptr,
@@ -187,8 +190,10 @@ __aicore__ inline void DispatchMetadata(
             }
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            trace.Add(DispatchDeviceTrace::SrcCycles, started);
         }
         if (td.num_topk && experts_per_rank) {
+            const uint64_t started = trace.Now();
             if (td.metadata_topk_threads == 256) {
                 asc_vf_call<DispatchTopkScatterSimtVf<256>>(
                     dim3(256), reinterpret_cast<__gm__ topk_idx_t*>(topk_idx),
@@ -208,8 +213,10 @@ __aicore__ inline void DispatchMetadata(
             }
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            trace.Add(DispatchDeviceTrace::TopkCycles, started);
         }
 
+        const uint64_t self_started = trace.Now();
         // Metadata stores are issued before self-copy. Keep self rows in list
         // order and drain BOTH ping-pong slots before the next channel.
         uint32_t row = (td.rank ? ranks.GetValue((td.rank - 1) * world + td.rank) : 0) +
@@ -256,6 +263,7 @@ __aicore__ inline void DispatchMetadata(
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        trace.Add(DispatchDeviceTrace::SelfCycles, self_started);
     }
 }
 #endif

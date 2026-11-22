@@ -12,6 +12,7 @@
 #include "common/types.h"
 #include "runtime/shmem_instance.h"
 #include "ops/dispatch_host_timing.h"
+#include "ops/dispatch_device_timing.h"
 #include <pybind11/stl.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -20,6 +21,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
     m.attr("fused_layout_notify_version") = 1;
     m.attr("fused_notify_pipeline_version") = 1;
+    m.def("take_dispatch_device_timing", &ascend_deepep::ops::TakeDispatchDeviceTiming);
+    m.attr("dispatch_device_timing_version") = 1;
+    m.attr("dispatch_device_timing_cycles_per_us") = ascend_deepep::kNpuSystemCyclesPerUs;
+    m.attr("dispatch_device_timing_fields") = std::vector<std::string>{
+        "version",        "rank",          "core",          "cached",      "payload_peers", "whole_channel",
+        "src_threads",    "topk_threads",  "entry_cycles",  "init_done",   "begin_done",    "metadata_done",
+        "payload_queued", "published",     "incoming_done", "quiet_done",  "sync_done",     "output_done",
+        "handle_done",    "work_done",     "src_cycles",    "topk_cycles", "self_cycles",   "list_cycles",
+        "list_windows",   "put_rows_calls"};
     m.def("begin_dispatch_host_timing", &ascend_deepep::ops::BeginDispatchHostTiming);
     m.def("end_dispatch_host_timing",
           [] { ascend_deepep::ops::MarkDispatchHostTiming(ascend_deepep::ops::ApiReturn); });

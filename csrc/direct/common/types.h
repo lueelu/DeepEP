@@ -113,6 +113,8 @@ struct alignas(8) DispatchTilingData {
     uint32_t metadata_src_threads = 128;
     uint32_t metadata_src_lanes = 16;
     uint32_t metadata_topk_threads = 128;
+    uint32_t cached_channel_ep16 = 0;
+    uint64_t dispatch_device_trace = 0;
     uint64_t notify_topk_idx = 0;
     uint64_t notify_expert_partials = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
