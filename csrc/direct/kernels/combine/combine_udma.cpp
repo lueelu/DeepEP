@@ -51,6 +51,18 @@ __aicore__ inline int32_t CombineAlignUpElements(int32_t value, int32_t alignmen
     return (value + alignment - 1) / alignment * alignment;
 }
 
+__aicore__ inline uint64_t ContributorSlot(const ascend_deepep::CombineTilingData& td,
+    AscendC::GlobalTensor<int32_t>& channel_prefix, uint32_t contributor, uint32_t token, uint32_t ordinal)
+{
+    uint32_t row = token;
+    if (td.compact_self_rows && contributor == td.rank) {
+        const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
+        const uint32_t ch = token / channel_tokens;
+        row = channel_prefix.GetValue(td.rank * td.num_channels + ch) + ordinal;
+    }
+    return uint64_t(contributor) * td.token_capacity + row;
+}
+
 template <typename T, bool DoCommunication = true, bool DoReduction = true, uint32_t Phase = 0>
 __aicore__ inline void V1CombineUdmaImpl(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
@@ -64,7 +76,6 @@ __aicore__ inline void V1CombineUdmaImpl(
     const int32_t hidden = static_cast<int32_t>(tiling.hidden);
     const int32_t num_topk = static_cast<int32_t>(tiling.num_topk);
     const int32_t core_num = get_block_num() * get_subblockdim();
-    const int32_t token_capacity = static_cast<int32_t>(tiling.token_capacity);
     const uint32_t hidden_bytes = static_cast<uint32_t>(hidden) * tiling.x_element_bytes;
     const uint32_t topk_weights_row_bytes = static_cast<uint32_t>(num_topk) * kCombineFloatBytes;
 
@@ -118,6 +129,8 @@ __aicore__ inline void V1CombineUdmaImpl(
     }
 
     if constexpr (DoReduction) {
+        AscendC::GlobalTensor<int32_t> channel_starts;
+        channel_starts.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix));
         // Communication is complete, so the reduction phase reuses UB from zero.
         AscendC::LocalTensor<uint8_t> input_pingpong_bytes_ub =
             resource.template GetBufferByByte<uint8_t>(kCombineInputOffset);
@@ -162,10 +175,11 @@ __aicore__ inline void V1CombineUdmaImpl(
                         contributor_ptr =
                             reinterpret_cast<__gm__ uint8_t*>(bias_1) + static_cast<uint64_t>(token) * hidden_bytes;
                     } else {
-                        if (send_head_gm.GetValue(token * world_size + contributor) < 0) {
+                        const int32_t ordinal = send_head_gm.GetValue(token * world_size + contributor);
+                        if (ordinal < 0) {
                             continue;
                         }
-                        const uint64_t local_slot = static_cast<uint64_t>(contributor) * token_capacity + token;
+                        const uint64_t local_slot = ContributorSlot(tiling, channel_starts, contributor, token, ordinal);
                         contributor_ptr = reinterpret_cast<__gm__ uint8_t*>(symmetric_buffer) + tiling.x_buffer_offset +
                                           local_slot * tiling.x_row_stride;
                     }
@@ -226,10 +240,11 @@ __aicore__ inline void V1CombineUdmaImpl(
                 AscendC::PipeBarrier<PIPE_V>();
 
                 for (int32_t contributor = 0; contributor < world_size; ++contributor) {
-                    if (send_head_gm.GetValue(token * world_size + contributor) < 0) {
+                    const int32_t ordinal = send_head_gm.GetValue(token * world_size + contributor);
+                    if (ordinal < 0) {
                         continue;
                     }
-                    const uint64_t local_slot = static_cast<uint64_t>(contributor) * token_capacity + token;
+                    const uint64_t local_slot = ContributorSlot(tiling, channel_starts, contributor, token, ordinal);
                     AscendC::DataCopyExtParams weight_copy_params(1, topk_weights_row_bytes, 0, 0, 0);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
                     AscendC::DataCopyPad(

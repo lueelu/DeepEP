@@ -102,6 +102,47 @@ This script covers BF16, FP32 routing weights, and expert alignment 1. FP8/scale
 graph capture and asynchronous fixed-capacity dispatch need separate device
 qualification before enabling this experimental path for those uses.
 
+## Eight-AIV copy and cached-path transplant
+
+The branch also contains the compact self-copy and cached dispatch changes from
+[optimize_8aiv_kernel, commit 8d98be0](https://github.com/ZiHa0-Zeng/DeepEP/commit/8d98be0e7fb93420e55a62cb8c3a69f569a60cc9).
+Automatic peer order, P/W/Q, visit, weight transport, and self-copy scheduling
+are unchanged; the source branch's policy and weight-sender changes are not included.
+
+- Ordinary UDMA V2 combine uses compact local rows for EP8, eight communication
+  AIVs and eight handle channels, with BF16 payload and dense aligned row strides.
+  It copies payload and optional weights in 64 KiB MTE chunks, partitioning rows
+  across the existing self-copy AIVs. Remote slots remain token-indexed; reduce
+  locates local rows through the receive channel prefix and send-head ordinal.
+  Independent reduction core counts keep that same mapping. Early-single,
+  aggregate-pipeline and token scheduling retain their original path.
+- Cached UDMA dispatch with EP8/eight AIVs, two-byte elements and no scales uses
+  the handle's full per-channel counts, skipping repeated 256-token list-window
+  loads and scans. Per-peer visit budgets and completion synchronization remain
+  unchanged. Fresh dispatch and unsupported layouts retain the old loop.
+
+CPU ownership/addressing checks execute extracted production functions:
+
+```bash
+python -m pytest tests/clos/test_eight_aiv_copy.py tests/clos/test_fused_notify.py tests/api/test_clos_compatibility.py -q
+```
+
+The CPU mocks do not validate device ordering or performance. In addition to the
+fused on/off precision commands above, check independent reduction cores against
+the public CPU golden on an idle EP8 machine after rebuilding:
+
+```bash
+for reduce in 8 32; do
+    python tests/clos/source/test_v1_v2_shared_backend.py \
+        --api v2 --public-auto --auto-policy --ep-size 8 \
+        --num-tokens 129 --hidden 2816 --num-topk 8 --experts-per-rank 32 \
+        --num-aiv 8 --combine-num-sms 8 --reduce-num-sms "$reduce" --check-events
+done
+```
+
+Rebuild the native library as well as Python: the internal combine tiling ABI
+now carries the local-layout flag.
+
 ## Reports and interpretation
 
 Each rank writes `precision.json`, `summary.csv`, `report.json`, raw profiler

@@ -358,6 +358,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.token_capacity = static_cast<uint32_t>(workspace.token_capacity);
     tiling.x_row_stride = static_cast<uint32_t>(workspace.x_row_stride);
     tiling.topk_weights_row_stride = static_cast<uint32_t>(workspace.topk_weights_row_stride);
+    // Keep this rank's contribution in dispatch order. Only the local reader
+    // uses this layout; remote senders retain their original token addressing.
+    tiling.compact_self_rows =
+        use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens &&
+        !expanded_x.has_value() && world_size == 8 && resolved_num_aiv == 8 && num_channels == 8 &&
+        x.scalar_type() == torch::kBFloat16 && workspace.x_row_stride == hidden_bytes &&
+        (!topk_weights.has_value() || workspace.topk_weights_row_stride == topk_weights_row_bytes);
     tiling.x_buffer_offset = static_cast<uint64_t>(workspace.x_buffer_offset);
     tiling.topk_weights_buffer_offset = static_cast<uint64_t>(workspace.topk_weights_buffer_offset);
     tiling.udma_completion_signal_offset = static_cast<uint64_t>(workspace.udma_completion_signal_offset);

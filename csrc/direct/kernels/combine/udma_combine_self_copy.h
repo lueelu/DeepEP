@@ -8,11 +8,63 @@
 
 namespace ascend_deepep::udma {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+// Both ends of each field are dense and 32-byte aligned (checked on the host).
+// Drain both MTEs before giving the shared scratch back to the sender.
+template <class Resource>
+__aicore__ inline void CopySelfField(Resource& resource, GM_ADDR source, GM_ADDR destination, uint64_t bytes)
+{
+    constexpr uint32_t tile = 64U * 1024U;
+    constexpr uint32_t offset = kBatchWqes * kWqeBytes;
+    static_assert(offset + tile <= platform::kKernelUbBytes);
+    auto scratch = resource.template GetBufferByByte<uint8_t>(offset);
+    AscendC::GlobalTensor<uint8_t> input, output;
+    input.SetGlobalBuffer(source);
+    output.SetGlobalBuffer(destination);
+    for (uint64_t i = 0; i < bytes; i += tile) {
+        const uint32_t n = bytes - i < tile ? uint32_t(bytes - i) : tile;
+        AscendC::DataCopyExtParams copy{1, n, 0, 0, 0};
+        AscendC::DataCopyPad(scratch, input[i], copy, AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::DataCopyPad(output[i], scratch, copy);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+}
+
+template <class Resource>
+__aicore__ inline void CopyCompactSelf(Resource& resource, GM_ADDR x, GM_ADDR weights,
+    GM_ADDR rank_prefix, GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
+{
+    const uint32_t first = td.udma_self_copy_first_aiv;
+    if (core < first) return;
+    AscendC::GlobalTensor<int32_t> ranks;
+    ranks.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
+    const uint32_t base = td.rank ? ranks.GetValue((td.rank - 1) * td.world_size + td.rank) : 0U;
+    const uint32_t rows = ranks.GetValue(td.rank * td.world_size + td.rank) - base;
+    const uint32_t workers = td.block_dim - first;
+    const uint32_t begin = uint64_t(rows) * (core - first) / workers;
+    const uint32_t end = uint64_t(rows) * (core - first + 1) / workers;
+    const uint64_t src = base + begin, dst = uint64_t(td.rank) * td.token_capacity + begin;
+    CopySelfField(resource, x + src * td.x_row_stride, workspace + td.x_buffer_offset + dst * td.x_row_stride,
+                  uint64_t(end - begin) * td.x_row_stride);
+    if (td.has_topk_weights)
+        CopySelfField(resource, weights + src * td.topk_weights_row_stride,
+                      workspace + td.topk_weights_buffer_offset + dst * td.topk_weights_row_stride,
+                      uint64_t(end - begin) * td.topk_weights_row_stride);
+}
+
 template <class Resource>
 __aicore__ inline void CombineSelfCopy(
     Resource& resource, GM_ADDR x, GM_ADDR topk_weights, GM_ADDR src_idx, GM_ADDR rank_prefix,
     GM_ADDR channel_prefix, GM_ADDR symmetric_buffer, const CombineTilingData& tiling, int32_t core_idx)
 {
+    if (tiling.compact_self_rows) {
+        CopyCompactSelf(resource, x, topk_weights, rank_prefix, symmetric_buffer, tiling, core_idx);
+        return;
+    }
     constexpr uint32_t kCombineUbBytes = platform::kKernelUbBytes;
     constexpr uint32_t kCombineAlignmentBytes = 32;
     constexpr int32_t kCombineSrcIdxTileElements = 4096;

@@ -73,7 +73,10 @@ __aicore__ inline void DispatchRemoteImpl(
     rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
     channel_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix));
     const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
-    const uint32_t max_tile = 65536U / td.world_size < kTileTokens ? 65536U / td.world_size : kTileTokens;
+    const bool cached_channel = td.cached_mode && !td.has_x_scales && td.world_size == 8 &&
+        cores == 8 && td.x_element_bytes == 2;
+    const uint32_t max_tile = cached_channel ? channel_tokens :
+        (65536U / td.world_size < kTileTokens ? 65536U / td.world_size : kTileTokens);
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
     const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
     const uint32_t fields = td.has_x_scales && scale_bytes && !td.packed_peer_scales ? 2U : 1U;
@@ -92,30 +95,39 @@ __aicore__ inline void DispatchRemoteImpl(
         for (uint32_t start = begin; start < end; start += max_tile) {
             const uint32_t size = end - start < max_tile ? end - start : max_tile;
             uint32_t counts[Capacity]{}, cursor[Capacity]{}, field[Capacity]{}, remaining = 0;
-            // Keep the original input-token tile and peer visit boundaries.
-            // A sorted list can contribute at most `size` hits to this tile.
-            AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
-            for (uint32_t p = 0; p < sender.Count(); ++p) {
-                const uint32_t left = total[p] - consumed[p];
-                const uint32_t load = left < size ? left : size;
-                if (load == 0)
-                    continue;
-                const uint64_t base = (uint64_t(sender.Rank(p)) * td.num_channels + ch) * plan_stride;
-                AscendC::DataCopyExtParams copy{1, load * uint32_t(sizeof(int32_t)), 0, 0, 0};
-                AscendC::DataCopyPad(
-                    lists[p * kTileTokens], plan_gm[base + consumed[p]], copy,
-                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
-            }
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
-            for (uint32_t p = 0; p < sender.Count(); ++p) {
-                const uint32_t left = total[p] - consumed[p];
-                const uint32_t load = left < size ? left : size;
-                while (counts[p] < load && uint32_t(lists.GetValue(p * kTileTokens + counts[p])) < start + size)
-                    ++counts[p];
-                remaining += counts[p];
-                consumed[p] += counts[p];
+            if (cached_channel) {
+                // The handle already contains compact lists and the exact per-peer
+                // count for this channel. PutRows reads token indices from that list.
+                for (uint32_t p = 0; p < sender.Count(); ++p) {
+                    counts[p] = consumed[p] = total[p];
+                    remaining += total[p];
+                }
+            } else {
+                // Keep the original input-token tile and peer visit boundaries.
+                // A sorted list can contribute at most `size` hits to this tile.
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+                for (uint32_t p = 0; p < sender.Count(); ++p) {
+                    const uint32_t left = total[p] - consumed[p];
+                    const uint32_t load = left < size ? left : size;
+                    if (load == 0)
+                        continue;
+                    const uint64_t base = (uint64_t(sender.Rank(p)) * td.num_channels + ch) * plan_stride;
+                    AscendC::DataCopyExtParams copy{1, load * uint32_t(sizeof(int32_t)), 0, 0, 0};
+                    AscendC::DataCopyPad(
+                        lists[p * kTileTokens], plan_gm[base + consumed[p]], copy,
+                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+                }
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                for (uint32_t p = 0; p < sender.Count(); ++p) {
+                    const uint32_t left = total[p] - consumed[p];
+                    const uint32_t load = left < size ? left : size;
+                    while (counts[p] < load && uint32_t(lists.GetValue(p * kTileTokens + counts[p])) < start + size)
+                        ++counts[p];
+                    remaining += counts[p];
+                    consumed[p] += counts[p];
+                }
             }
             while (remaining) {
                 for (uint32_t p = 0; p < sender.Count(); ++p) {

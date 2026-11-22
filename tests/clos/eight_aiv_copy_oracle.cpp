@@ -1,0 +1,322 @@
+// CPU mocks for the production bodies extracted by test_eight_aiv_copy.py.
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <tuple>
+#include <vector>
+
+#define __aicore__
+#define __gm__
+#define ASCEND_DEEPEP_ARCH 3510
+#include "common/types.h"
+#include "common/platform.h"
+#include "common/udma_schedule.h"
+
+using GM_ADDR = uint8_t*;
+using namespace ascend_deepep;
+using namespace ascend_deepep::udma;
+constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID6 = 6;
+constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)), kOutputRecordBytes = 64;
+static unsigned list_loads;
+namespace AscendC {
+enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S };
+template <HardEvent>
+void SetFlag(int)
+{
+}
+template <HardEvent>
+void WaitFlag(int)
+{
+}
+template <class T>
+struct GlobalTensor {
+    T* data{};
+    void SetGlobalBuffer(T* p)
+    {
+        data = p;
+    }
+    T GetValue(uint64_t i) const
+    {
+        return data[i];
+    }
+    GlobalTensor operator[](uint64_t i) const
+    {
+        return {data + i};
+    }
+};
+template <class T>
+struct LocalTensor {
+    T* data{};
+    T GetValue(uint64_t i) const
+    {
+        return data[i];
+    }
+    LocalTensor operator[](uint64_t i) const
+    {
+        return {data + i};
+    }
+};
+struct DataCopyExtParams {
+    uint32_t blocks, bytes, src_stride, dst_stride, reserved;
+};
+template <class T>
+struct DataCopyPadExtParams {
+    bool pad;
+    uint8_t left, right;
+    T value;
+};
+template <class T>
+void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams copy, DataCopyPadExtParams<T>)
+{
+    assert(copy.blocks == 1);
+    if constexpr (sizeof(T) == 4) ++list_loads;
+    std::memcpy(dst.data, src.data, copy.bytes);
+}
+template <class T>
+void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams copy)
+{
+    assert(copy.blocks == 1);
+    std::memcpy(dst.data, src.data, copy.bytes);
+}
+}  // namespace AscendC
+struct Resource {
+    std::vector<uint64_t> ub = std::vector<uint64_t>(platform::kKernelUbBytes / 8, 0);
+    template <class T>
+    AscendC::LocalTensor<T> GetBufferByByte(uint32_t offset)
+    {
+        assert(offset % 32 == 0 && offset < platform::kKernelUbBytes);
+        return {reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(ub.data()) + offset)};
+    }
+};
+
+using Row = std::tuple<uint32_t, uint32_t, uint32_t>;  // peer, input token, output row
+static std::vector<Row> sent;
+static uint32_t max_visit, used_visit;
+template <uint32_t Capacity, uint32_t Qps>
+struct DispatchSenderT {
+    DispatchTilingData td;
+    DispatchSenderT(const DispatchTilingData& t, uint32_t, AscendC::LocalTensor<uint8_t>, GM_ADDR, GM_ADDR, GM_ADDR)
+        : td(t)
+    {
+    }
+    uint32_t Count() const
+    {
+        return 3;
+    }
+    uint32_t Rank(uint32_t p) const
+    {
+        return p + 1;
+    }
+    void BeginVisit(uint32_t)
+    {
+        used_visit = 0;
+    }
+    uint32_t PutRows(uint32_t p, const int32_t* plan, uint32_t row, uint32_t field, uint32_t n)
+    {
+        assert(field == 0);
+        n = std::min(n, 7U);  // Exercise partial progress, not only full visits.
+        used_visit += n;
+        assert(used_visit <= td.udma_wqes_per_visit);
+        max_visit = std::max(max_visit, used_visit);
+        for (uint32_t i = 0; i < n; ++i) sent.emplace_back(Rank(p), plan[i], row + i);
+        return n;
+    }
+    void Flush() {}
+    void PutPackedScales(uint32_t, uint32_t, uint32_t, uint32_t)
+    {
+        assert(false);
+    }
+    void Publish(GM_ADDR, uint64_t, uint32_t, uint32_t) {}
+    void Quiet() {}
+};
+void WaitPackedScaleReady(const DispatchTilingData&, uint32_t, uint32_t)
+{
+    assert(false);
+}
+template <bool>
+void WaitIncoming(GM_ADDR, const DispatchTilingData&, uint32_t, uint32_t, uint32_t)
+{
+}
+void aclshmemx_sync_vec_all() {}
+
+// PRODUCTION_FUNCTIONS
+
+void CheckCopyAndReduction()
+{
+    for (unsigned tokens : {0U, 1U, 3U, 65U, 257U, 4099U})
+        for (unsigned rank : {0U, 3U, 7U})
+            for (unsigned first : {0U, 4U, 7U})
+                for (bool weighted : {false, true}) {
+                    CombineTilingData td{};
+                    td.rank = rank;
+                    td.world_size = 8;
+                    td.block_dim = 8;
+                    td.num_channels = 8;
+                    td.num_tokens = tokens;
+                    td.token_capacity = tokens + 32;
+                    td.x_row_stride = 64;
+                    td.topk_weights_row_stride = 32;
+                    td.x_buffer_offset = 32;
+                    td.topk_weights_buffer_offset = td.x_buffer_offset + 8ULL * td.token_capacity * td.x_row_stride;
+                    td.has_topk_weights = weighted;
+                    td.compact_self_rows = 1;
+                    td.udma_self_copy_first_aiv = first;
+                    const unsigned channel_tokens = (tokens + 7) / 8;
+                    std::vector<int32_t> rp(64), cp(64), ordinal(tokens, -1);
+                    std::vector<unsigned> local_tokens;
+                    for (unsigned ch = 0; ch < 8; ++ch) {
+                        cp[rank * 8 + ch] = local_tokens.size();  // receive-side EXCLUSIVE prefix
+                        unsigned n = 0;
+                        for (unsigned t = ch * channel_tokens; t < std::min(tokens, (ch + 1) * channel_tokens); ++t)
+                            if ((t + rank) % 3 == 0 && ch != 2) {
+                                ordinal[t] = n++;
+                                local_tokens.push_back(t);
+                            }
+                    }
+                    const unsigned base = rank ? 5 : 0;
+                    if (rank) rp[(rank - 1) * 8 + rank] = base;
+                    rp[rank * 8 + rank] = base + local_tokens.size();
+                    std::vector<uint8_t> x((base + local_tokens.size() + 1) * 64), weights(x.size());
+                    for (unsigned i = 0; i < x.size(); ++i) {
+                        x[i] = (i * 17) % 251;
+                        weights[i] = (i * 19) % 253;
+                    }
+                    std::vector<uint8_t> output(td.topk_weights_buffer_offset + 8ULL * td.token_capacity * 32 + 32,
+                                                0xAB);
+                    auto expected = output;
+                    auto scatter = output;
+                    for (unsigned j = 0; j < local_tokens.size(); ++j) {
+                        auto compact = uint64_t(rank) * td.token_capacity + j;
+                        auto original = uint64_t(rank) * td.token_capacity + local_tokens[j];
+                        for (unsigned field = 0; field < (weighted ? 2U : 1U); ++field) {
+                            const unsigned stride = field ? 32 : 64;
+                            const auto offset = field ? td.topk_weights_buffer_offset : td.x_buffer_offset;
+                            const auto& input = field ? weights : x;
+                            std::copy_n(input.data() + (base + j) * stride, stride,
+                                        expected.data() + offset + compact * stride);
+                            std::copy_n(input.data() + (base + j) * stride, stride,
+                                        scatter.data() + offset + original * stride);
+                        }
+                    }
+                    Resource resource;
+                    for (unsigned core = 0; core < 8; ++core)
+                        CopyCompactSelf(resource, x.data(), weights.data(), reinterpret_cast<GM_ADDR>(rp.data()),
+                                        output.data(), td, core);
+                    assert(output == expected);  // Includes untouched remote partitions and guard bytes.
+                    AscendC::GlobalTensor<int32_t> channels;
+                    channels.SetGlobalBuffer(cp.data());
+                    for (unsigned reduce_cores : {8U, 16U, 32U, 64U}) {
+                        td.block_dim = reduce_cores;
+                        const auto step = (tokens + reduce_cores - 1) / reduce_cores;
+                        for (unsigned core = 0; core < reduce_cores; ++core)
+                            for (unsigned t = core * step; t < std::min(tokens, (core + 1) * step); ++t) {
+                                for (unsigned peer = 0; peer < 8; ++peer)
+                                    if (peer != rank)
+                                        assert(ContributorSlot(td, channels, peer, t, 0) ==
+                                               uint64_t(peer) * td.token_capacity + t);
+                                if (ordinal[t] < 0) continue;
+                                const auto slot = ContributorSlot(td, channels, rank, t, ordinal[t]);
+                                const auto old_slot = uint64_t(rank) * td.token_capacity + t;
+                                for (unsigned field = 0; field < (weighted ? 2U : 1U); ++field) {
+                                    const unsigned stride = field ? 32 : 64;
+                                    const auto offset = field ? td.topk_weights_buffer_offset : td.x_buffer_offset;
+                                    assert(std::memcmp(output.data() + offset + slot * stride,
+                                                       scatter.data() + offset + old_slot * stride, stride) == 0);
+                                }
+                            }
+                    }
+                }
+}
+
+void CheckCachedDispatch()
+{
+    for (unsigned tokens : {0U, 3U, 2049U, 8195U})
+        for (unsigned visit : {4U, 8U, 16U, 32U})
+            for (unsigned workers : {1U, 2U}) {
+                DispatchTilingData td{};
+                td.world_size = 8;
+                td.num_tokens = tokens;
+                td.num_channels = 8;
+                td.x_element_bytes = 2;
+                td.udma_workers_per_peer = workers;
+                td.udma_wqes_per_visit = visit;
+                const unsigned width = (tokens + 7) / 8, stride = (width + 7) / 8 * 8;
+                std::vector<int32_t> plan(64 * stride, -1), rp(64), cp(64);
+                std::vector<Row> expected;
+                for (unsigned peer = 1; peer <= 3; ++peer) {
+                    unsigned row = 0;
+                    for (unsigned ch = 0; ch < 8; ++ch) {
+                        unsigned index = 0;
+                        for (unsigned t = ch * width; t < std::min(tokens, (ch + 1) * width); ++t)
+                            if (peer != 2 && ch != 3 && t % (peer + 1) != 0) {
+                                plan[(peer * 8 + ch) * stride + index++] = t;
+                                expected.emplace_back(peer, t, row++);
+                            }
+                        cp[peer * 8 + ch] = row;  // send-side INCLUSIVE prefix
+                    }
+                }
+                std::sort(expected.begin(), expected.end());
+                for (bool cached : {false, true}) {
+                    td.cached_mode = cached;
+                    sent.clear();
+                    list_loads = max_visit = 0;
+                    for (unsigned core = 0; core < workers; ++core) {
+                        Resource resource;
+                        DispatchRemoteImpl<8, 1>(resource, nullptr, nullptr, reinterpret_cast<GM_ADDR>(plan.data()),
+                                                 reinterpret_cast<GM_ADDR>(rp.data()),
+                                                 reinterpret_cast<GM_ADDR>(cp.data()), nullptr, td, core, 8);
+                    }
+                    std::sort(sent.begin(), sent.end());
+                    assert(sent == expected);
+                    if (cached)
+                        assert(list_loads == 0);
+                    else if (tokens > 3)
+                        assert(list_loads > 0);
+                }
+            }
+}
+
+namespace torch {
+constexpr int kBFloat16 = 1;
+}
+void CheckHostGate()
+{
+    // Flip every exclusion separately; independent reduce core count is not a gate.
+    for (unsigned exclusion = 0; exclusion <= 13; ++exclusion) {
+        CombineTilingData tiling{};
+        bool use_udma = exclusion != 1, epilogue = exclusion != 2, aggregate = exclusion == 4;
+        tiling.udma_token_schedule = exclusion == 3;
+        unsigned pipeline_chunk_tokens = exclusion == 5 ? 64 : 0;
+        std::optional<int> expanded_x, topk_weights;
+        if (exclusion == 13) topk_weights = 1;
+        if (exclusion == 6) expanded_x = 1;
+        unsigned world_size = exclusion == 7 ? 16 : 8, resolved_num_aiv = exclusion == 8 ? 16 : 8;
+        unsigned num_channels = exclusion == 9 ? 16 : 8;
+        struct Tensor {
+            int dtype;
+            int scalar_type() const
+            {
+                return dtype;
+            }
+        } x{exclusion == 10 ? 0 : 1};
+        unsigned hidden_bytes = 5632, topk_weights_row_bytes = 32;
+        struct {
+            unsigned x_row_stride, topk_weights_row_stride;
+        } workspace{5632, 32};
+        if (exclusion == 11) workspace.x_row_stride += 32;
+        if (exclusion == 12) {
+            topk_weights = 1;
+            workspace.topk_weights_row_stride += 32;
+        }
+        // PRODUCTION_GATE
+        assert(tiling.compact_self_rows == (exclusion == 0 || exclusion == 13));
+    }
+}
+int main()
+{
+    CheckCopyAndReduction();
+    CheckCachedDispatch();
+    CheckHostGate();
+}

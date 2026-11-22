@@ -105,7 +105,8 @@ __aicore__ inline void CombineRemoteImpl(
                 // SIMT weight AIVs finish CombineRemoteWeights (V_S) above before
                 // copying their self channels. Payload AIVs have posted all
                 // UDMA requests, including weights when no spare AIV exists.
-                // Self writes use (rank * capacity + token) on this rank;
+                // Self writes use this rank's capacity-sized partition (with
+                // compact row indices when compact_self_rows is enabled);
                 // remote contributors use their own rank slots, so neither
                 // payload nor weight self stores collide with incoming writes.
                 // The SQ now owns the WQEs. Finish MTE3's reads of the reused
