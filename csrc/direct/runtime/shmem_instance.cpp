@@ -670,7 +670,7 @@ void* ShmemInstance::PrepareNotifyHostCounts(std::size_t count)
     return notify_device_counts_;
 }
 
-std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
+std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count, int64_t* total_observed_ns)
 {
     TORCH_CHECK(notify_host_pending_ && count <= notify_count_capacity_, "Notify host counts were not prepared");
     const auto start = std::chrono::steady_clock::now();
@@ -695,6 +695,11 @@ std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
         }
         TORCH_CHECK(value - 1U <= uint32_t(std::numeric_limits<int32_t>::max()), "invalid Notify host count");
         counts[i] = static_cast<int32_t>(value - 1U);
+        if (i == 0 && total_observed_ns != nullptr) {
+            *total_observed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+        }
     }
     notify_host_pending_ = false;
     return counts;

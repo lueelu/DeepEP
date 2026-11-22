@@ -52,6 +52,8 @@ static auto buffer_runtime_registry =
         .def("data_op_engine_type", &BufferRuntime::DataOpEngineType)
         .def("low_latency_mode", &BufferRuntime::LowLatencyMode)
         .def("use_1g_huge_pages", &BufferRuntime::Use1gHugePages)
+        .def("allocate_dispatch_layout", &BufferRuntime::AllocateDispatchLayout, "",
+             {torch::arg("topk_idx"), torch::arg("num_experts"), torch::arg("allocation_stream_id") = c10::IValue()})
         .def("get_dispatch_layout", &BufferRuntime::GetDispatchLayout, "",
              {torch::arg("topk_idx"), torch::arg("num_experts"), torch::arg("allocation_stream_id") = c10::IValue()})
         .def("intranode_dispatch", &BufferRuntime::IntranodeDispatch, "",

@@ -662,6 +662,15 @@ class ElasticBuffer:
     ) -> Tuple[Any, Optional[Any], Optional[Any], EPHandle, EventOverlap]:
         """Dispatch through the intranode kernel, optionally expanding rows."""
 
+        host_timing = None
+        timing_flag = os.environ.get("DEEPEP_CLOS_DISPATCH_HOST_TIMING", "0")
+        if timing_flag not in ("0", "1"):
+            raise ValueError("DEEPEP_CLOS_DISPATCH_HOST_TIMING must be 0 or 1")
+        if timing_flag == "1":
+            host_timing = load_native_module()
+            if getattr(host_timing, "fused_notify_pipeline_version", 0) != 1:
+                raise RuntimeError("rebuild native/device libraries for notify pipeline diagnostics")
+            host_timing.begin_dispatch_host_timing()
         self._ensure_alive()
         _validate_dispatch_scope(
             x,
@@ -791,7 +800,16 @@ class ElasticBuffer:
         fused_layout = os.environ.get("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY", "0") if not cached_mode else "0"
         if fused_layout not in ("0", "1"):
             raise ValueError("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1")
-        if make_single_source or fused_layout == "1":
+        host_prep = os.environ.get("DEEPEP_CLOS_NOTIFY_HOST_PREP", "0") if not cached_mode else "0"
+        defer_plan = os.environ.get("DEEPEP_CLOS_NOTIFY_DEFER_PLAN", "0") if not cached_mode else "0"
+        if host_prep not in ("0", "1") or defer_plan not in ("0", "1"):
+            raise ValueError("notify HOST_PREP/DEFER_PLAN options must be 0 or 1")
+        if host_prep == "1" or defer_plan == "1":
+            if fused_layout != "1":
+                raise ValueError("notify HOST_PREP/DEFER_PLAN require fused layout notify")
+            if getattr(load_native_module(), "fused_notify_pipeline_version", 0) != 1:
+                raise RuntimeError("rebuild native/device libraries for notify pipeline options")
+        if make_single_source or (fused_layout == "1" and host_prep == "0"):
             import torch
 
             allocation_stream = self._communication_stream if allocate_on_comm_stream else _current_npu_stream()
@@ -820,14 +838,23 @@ class ElasticBuffer:
                         raise ValueError("fused layout requires fresh V2 UDMA dispatch")
                     if getattr(load_native_module(), "fused_layout_notify_version", 0) != 1:
                         raise RuntimeError("rebuild both native and device libraries for fused layout notify")
-                    with _use_comm_stream(allocation_stream):
-                        num_tokens_per_rank = torch.empty((self.num_ranks,), device=x_tensor.device, dtype=torch.int32)
-                        num_tokens_per_expert = torch.empty(
-                            (resolved_num_experts,), device=x_tensor.device, dtype=torch.int32
+                    if host_prep == "1":
+                        num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank = (
+                            self._native.allocate_dispatch_layout(
+                                resolved_topk_idx, resolved_num_experts, allocation_stream_id
+                            )
                         )
-                        is_token_in_rank = torch.empty(
-                            (x_tensor.shape[0], self.num_ranks), device=x_tensor.device, dtype=torch.bool
-                        )
+                    else:
+                        with _use_comm_stream(allocation_stream):
+                            num_tokens_per_rank = torch.empty(
+                                (self.num_ranks,), device=x_tensor.device, dtype=torch.int32
+                            )
+                            num_tokens_per_expert = torch.empty(
+                                (resolved_num_experts,), device=x_tensor.device, dtype=torch.int32
+                            )
+                            is_token_in_rank = torch.empty(
+                                (x_tensor.shape[0], self.num_ranks), device=x_tensor.device, dtype=torch.bool
+                            )
                 else:
                     (
                         num_tokens_per_rank,
@@ -1001,6 +1028,8 @@ class ElasticBuffer:
                 handle,
             ),
         )
+        if host_timing is not None:
+            host_timing.end_dispatch_host_timing()
         return recv_x, recv_topk_idx, recv_topk_weights, handle, event
 
     @staticmethod

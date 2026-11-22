@@ -585,6 +585,14 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
     }
+    if (tiling.fused_layout_notify && tiling.notify_defer_plan) {
+        // Counts and public prefixes no longer use this AIV's UB. Its mask was
+        // fully stored before the original local join. Re-read only owned rows;
+        // core 0 publishes mapped counts before reaching here, allowing Host
+        // receive allocation to overlap plan/head generation. Same-stream
+        // kernel completion still gates every payload consumer.
+        ascend_deepep::BuildDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
+    }
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(

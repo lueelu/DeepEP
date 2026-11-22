@@ -66,12 +66,13 @@ def test_store_topology_runs_real_auto_policy_and_restores_collective(hosts, exp
     """)
 
 
-@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("mode_name", list(bench.MODES))
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("tokens", [0, 129])
-def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode, cached, tokens):
+def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode_name, cached, tokens):
     from tests.api.test_clos_compatibility import run_host
 
+    mode, host, plan = bench.MODES[mode_name]
     run_host(f"""
         import os
         from contextlib import nullcontext
@@ -84,12 +85,15 @@ def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode, cached
             def size(self, dim): return self.shape[dim]
             def element_size(self): return 2
         torch.bool = 'bool'
-        allocations, layouts = [], []
+        allocations, layouts, native_allocations = [], [], []
         def empty(shape, **kw):
             allocations.append(tuple(shape))
             return Tensor(shape, **kw)
         torch.empty = empty
         os.environ['DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY'] = '{mode}'
+        os.environ['DEEPEP_CLOS_NOTIFY_HOST_PREP'] = '{host}'
+        os.environ['DEEPEP_CLOS_NOTIFY_DEFER_PLAN'] = '{plan}'
+        os.environ['DEEPEP_CLOS_DISPATCH_HOST_TIMING'] = '0'
         for name in ('_validate_dispatch_scope', '_validate_dispatch_tensors'):
             setattr(m, name, lambda *a: None)
         m._get_allocation_stream_id = lambda _: 0
@@ -97,11 +101,15 @@ def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode, cached
         m._current_npu_stream = lambda: 'caller'
         m._use_stream_after_event = lambda *a: nullcontext()
         m._use_comm_stream = lambda *a: nullcontext()
-        m.load_native_module = lambda: SimpleNamespace(fused_layout_notify_version=1)
+        m.load_native_module = lambda: SimpleNamespace(fused_layout_notify_version=1, fused_notify_pipeline_version=1)
         x, topk = Tensor(({tokens},2816)), Tensor(({tokens},8))
         mask = Tensor(({tokens},8))
         def layout(*a):
             layouts.append(a)
+            return Tensor((8,)), None, Tensor((256,)), mask
+        def allocate(*a):
+            assert a == (topk, 256, 0)
+            native_allocations.append(a)
             return Tensor((8,)), None, Tensor((256,)), mask
         def submit(*a):
             assert a[12] == 8
@@ -117,7 +125,7 @@ def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode, cached
             get_buffer_size_hint=lambda *a: 0, group=None, allow_hybrid_mode=True,
             num_bytes=1, num_device_aiv=64, _udma_auto_policy=policy, transport='udma',
             _communication_stream='comm', _use_single_source_combine=False,
-            _native=SimpleNamespace(get_dispatch_layout=layout,
+            _native=SimpleNamespace(get_dispatch_layout=layout, allocate_dispatch_layout=allocate,
                 intranode_dispatch_with_plan=submit, intranode_dispatch_with_handle=submit))
         handle = SimpleNamespace(num_sms=8, num_experts=256, num_max_tokens_per_rank=129,
             expert_alignment=1, do_expand=False, topk_idx=topk, num_recv_tokens=0,
@@ -128,8 +136,72 @@ def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode, cached
         except Submitted: pass
         else: raise AssertionError('dispatch never reached native submission')
         assert len(layouts) == int(not {cached} and {mode} == 0)
-        assert allocations == ([(8,), (256,), ({tokens},8)] if not {cached} and {mode} else [])
+        assert allocations == ([(8,), (256,), ({tokens},8)] if not {cached} and {mode} and not {host} else [])
+        assert len(native_allocations) == int(not {cached} and {host})
     """)
+
+
+def host_fields():
+    return [
+        "api_entry",
+        "native_entry",
+        "notify_submit_begin",
+        "notify_submitted",
+        "count_wait_begin",
+        "total_observed",
+        "counts_observed",
+        "output_ready",
+        "comm_submit_begin",
+        "comm_submitted",
+        "native_return",
+        "api_return",
+        "complete",
+        "fused",
+        "host_prep",
+        "deferred_plan",
+        "mapped_counts",
+    ]
+
+
+@pytest.mark.parametrize("mode", list(bench.MODES))
+def test_host_intervals_are_same_call_and_native_flags_are_checked(mode):
+    fields = host_fields()
+    row = [1000 * (i + 1) for i in range(13)] + list(bench.MODES[mode]) + [1]
+    result = bench.host_durations([row], fields, 1, mode)
+    assert result["api_to_notify_submit"] == [3.0]
+    assert result["post_launch_prepare"] == [1.0]
+    assert result["wait_total"] == [1.0]
+    assert result["wait_remaining_counts"] == [1.0]
+    assert result["comm_submit_to_complete"] == [3.0]
+    assert result["api_complete_diagnostic"] == [12.0]
+    with pytest.raises(RuntimeError, match="expected"):
+        bench.host_durations([row], fields, 2, mode)
+    with pytest.raises(RuntimeError, match="schema"):
+        bench.host_durations([row[:-1]], fields, 1, mode)
+    wrong = row.copy()
+    wrong[13] = 1 - wrong[13]
+    with pytest.raises(RuntimeError, match="flags"):
+        bench.host_durations([wrong], fields, 1, mode)
+    for timestamp in (0, 999999):
+        wrong = row.copy()
+        wrong[5] = timestamp
+        with pytest.raises(RuntimeError, match="timestamp"):
+            bench.host_durations([wrong], fields, 1, mode)
+
+
+def test_sweep_is_forward_reverse_and_resets_all_options(monkeypatch):
+    for env in (bench.ENV, bench.HOST_PREP_ENV, bench.DEFER_PLAN_ENV):
+        monkeypatch.setenv(env, "stale")
+    for sweep in (False, True):
+        order = bench.mode_order(sweep)
+        assert order == order[::-1]
+        assert len(order) == (10 if sweep else 4)
+        for name in order:
+            bench.set_mode(name)
+            assert (
+                tuple(int(os.environ[e]) for e in (bench.ENV, bench.HOST_PREP_ENV, bench.DEFER_PLAN_ENV))
+                == bench.MODES[name]
+            )
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -175,6 +247,39 @@ def vf_body(name):
         depth += (src[end] == "{") - (src[end] == "}")
         end += 1
     return src[start:end]
+
+
+def test_deferred_plan_production_builders_and_host_clock(tmp_path):
+    from tests.utils.cpp import cpp_functions
+
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("C++17 compiler required for deferred plan CPU oracle")
+    source = ROOT / "csrc/direct"
+    plan = (source / "kernels/notify/notify_dispatch_plan.h").read_text()
+    fused = (source / "kernels/notify/notify_fused_layout.h").read_text()
+    functions = plan[plan.index("constexpr uint32_t kPlanCountBytes") : plan.index("#if defined")]
+    functions += cpp_functions(
+        plan, "CountDispatchChunksVf", "PrefixDispatchChunksVf", "ScatterDispatchPlanVf", "BuildDispatchPlan"
+    )
+    functions += cpp_functions(
+        fused, "DecodeFusedRoutesVf", "CountFusedExpertsVf", "StoreFusedExpertsVf", "BuildFusedDispatchPlan"
+    )
+    harness = (
+        Path(__file__).with_name("fused_pipeline_oracle.cpp").read_text().replace("// PRODUCTION_FUNCTIONS", functions)
+    )
+    path = tmp_path / "pipeline.cpp"
+    path.write_text(harness)
+    executable = tmp_path / ("pipeline.exe" if os.name == "nt" else "pipeline")
+    subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-I", str(source), str(path), "-o", str(executable)], check=True, timeout=180
+    )
+    try:
+        subprocess.run([str(executable)], check=True, timeout=60)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked oracle execution (4551)")
+        raise
 
 
 def test_actual_vf_bodies_against_histogram_oracle(tmp_path):

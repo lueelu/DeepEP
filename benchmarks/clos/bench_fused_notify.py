@@ -13,6 +13,60 @@ import statistics
 import time
 
 ENV = "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY"
+HOST_PREP_ENV = "DEEPEP_CLOS_NOTIFY_HOST_PREP"
+DEFER_PLAN_ENV = "DEEPEP_CLOS_NOTIFY_DEFER_PLAN"
+HOST_TIMING_ENV = "DEEPEP_CLOS_DISPATCH_HOST_TIMING"
+MODES = {
+    "baseline": (0, 0, 0),
+    "fused": (1, 0, 0),
+    "host": (1, 1, 0),
+    "plan": (1, 0, 1),
+    "both": (1, 1, 1),
+}
+
+
+def mode_order(sweep):
+    names = list(MODES) if sweep else ["baseline", "fused"]
+    return names + names[::-1]
+
+
+def set_mode(name):
+    for env, value in zip((ENV, HOST_PREP_ENV, DEFER_PLAN_ENV), MODES[name]):
+        os.environ[env] = str(value)
+
+
+def host_durations(rows, fields, samples, mode):
+    """Same-call host intervals; never subtract profiler and unprofiled runs."""
+    if len(rows) != samples:
+        raise RuntimeError(f"expected {samples} Host rows, found {len(rows)}")
+    intervals = {
+        "api_to_notify_submit": ("api_entry", "notify_submitted"),
+        "python_front": ("api_entry", "native_entry"),
+        "native_prepare": ("native_entry", "notify_submit_begin"),
+        "notify_launch": ("notify_submit_begin", "notify_submitted"),
+        "post_launch_prepare": ("notify_submitted", "count_wait_begin"),
+        "wait_total": ("count_wait_begin", "total_observed"),
+        "wait_remaining_counts": ("total_observed", "counts_observed"),
+        "notify_to_counts": ("notify_submitted", "counts_observed"),
+        "count_to_outputs": ("counts_observed", "output_ready"),
+        "comm_launch": ("comm_submit_begin", "comm_submitted"),
+        "comm_submit_to_complete": ("comm_submitted", "complete"),
+        "api_host_return": ("api_entry", "api_return"),
+        "api_complete_diagnostic": ("api_entry", "complete"),
+    }
+    result = {key: [] for key in intervals}
+    for raw in rows:
+        if len(raw) != len(fields):
+            raise RuntimeError("Host timing schema mismatch")
+        row = dict(zip(fields, raw))
+        if tuple(row[key] for key in ("fused", "host_prep", "deferred_plan")) != MODES[mode]:
+            raise RuntimeError("native pipeline flags do not match requested mode")
+        timestamps = [row[key] for key in fields if key not in ("fused", "host_prep", "deferred_plan", "mapped_counts")]
+        if any(t <= 0 for t in timestamps) or timestamps != sorted(timestamps):
+            raise RuntimeError("missing or out-of-order Host stage timestamps")
+        for name, (start, end) in intervals.items():
+            result[name].append((row[end] - row[start]) / 1000)
+    return result
 
 
 @contextmanager
@@ -77,6 +131,8 @@ def main():
     p.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--flush-l2", action="store_true")
     p.add_argument("--precision-only", action="store_true")
+    p.add_argument("--pipeline-sweep", action="store_true", help="baseline/fused/host/plan/both, then reverse order")
+    p.add_argument("--host-timing", action="store_true", help="separate unprofiled Host diagnostic pass")
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     if min(args.tokens, args.hidden, args.topk, args.experts, args.samples) <= 0 or args.warmup < 0:
@@ -98,6 +154,8 @@ def main():
     native = load_native_module()
     if getattr(native, "fused_layout_notify_version", 0) != 1:
         raise RuntimeError("install this branch's native and device libraries before initializing Buffer")
+    if getattr(native, "fused_notify_pipeline_version", 0) != 1:
+        raise RuntimeError("rebuild native and device libraries for pipeline sweep/Host timing")
     store = dist.TCPStore(
         os.environ["MASTER_ADDR"],
         args.control_port,
@@ -127,7 +185,8 @@ def main():
         encoding="utf-8",
     )
     rows = []
-    old_env = os.environ.get(ENV)
+    old_env = {key: os.environ.get(key) for key in (ENV, HOST_PREP_ENV, DEFER_PLAN_ENV, HOST_TIMING_ENV)}
+    os.environ[HOST_TIMING_ENV] = "0"
     with store_topology_collective(group):
         buffer = ElasticBuffer(
             group,
@@ -208,7 +267,10 @@ def main():
         weights = torch.rand((args.tokens, args.topk), generator=gen).npu()
         for routing in ("random", "masked", "hot", "empty", "empty_local"):
             if rank == 0:
-                print(f"PRECISION routing={routing} expand={args.expand} order=0,1,1,0", flush=True)
+                print(
+                    f"PRECISION routing={routing} expand={args.expand} order={mode_order(args.pipeline_sweep)}",
+                    flush=True,
+                )
             cpu_idx = raw.clone()
             if routing == "masked":
                 cpu_idx[::3, -1] = -1
@@ -226,10 +288,10 @@ def main():
             idx = cpu_idx.to(dtype=topk_idx_t, device="npu")
             for weighted in (False, True):
                 baseline = None
-                for mode in (0, 1, 1, 0):
+                for mode in mode_order(args.pipeline_sweep):
                     torch.npu.synchronize()
                     group.agree([routing, weighted, mode])
-                    os.environ[ENV] = str(mode)
+                    set_mode(mode)
                     result = buffer.dispatch(
                         local_x,
                         topk_idx=idx,
@@ -267,12 +329,12 @@ def main():
                         )
                     )
 
-                for turn, mode in enumerate((0, 1, 1, 0)):
+                for turn, mode in enumerate(mode_order(args.pipeline_sweep)):
                     if rank == 0:
                         print(f"PERFORMANCE weights={weighted} round={turn} fused={mode}", flush=True)
                     torch.npu.synchronize()
                     group.agree(["performance", weighted, turn, mode])
-                    os.environ[ENV] = str(mode)
+                    set_mode(mode)
                     check = invoke()
                     policy = asdict(check[3]._udma_policy)
                     group.agree(policy)
@@ -288,7 +350,7 @@ def main():
                         start = time.perf_counter_ns()
                         invoke()
                         api.append((time.perf_counter_ns() - start) / 1000)
-                    capture = out / f"weight{int(weighted)}_round{turn}_fused{mode}"
+                    capture = out / f"weight{int(weighted)}_round{turn}_{mode}"
                     prof = torch_npu.profiler
                     with prof.profile(
                         activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
@@ -302,7 +364,7 @@ def main():
                         for _ in range(args.samples + 4):
                             prepare_v2_sample(buffer, flush)
                             invoke()
-                    stages = parse_capture(capture, mode, args.samples, bool(args.expand), guards=2)
+                    stages = parse_capture(capture, bool(MODES[mode][0]), args.samples, bool(args.expand), guards=2)
                     stages["api_wall_us_unprofiled"] = api
                     stages["layout_plus_notify"] = [
                         a + b
@@ -319,7 +381,10 @@ def main():
                         dict(
                             weighted=weighted,
                             turn=turn,
-                            fused=mode,
+                            mode=mode,
+                            fused=MODES[mode][0],
+                            host_prep=MODES[mode][1],
+                            deferred_plan=MODES[mode][2],
                             means_us=summary,
                             policy=policy,
                             logical_payload_bytes_per_rank=mean_payload_bytes,
@@ -327,6 +392,42 @@ def main():
                         )
                     )
                     (capture / "samples.json").write_text(json.dumps(stages, indent=2), encoding="utf-8")
+                    if args.host_timing:
+                        for _ in range(args.warmup):
+                            prepare_v2_sample(buffer, flush)
+                            invoke()
+                        native.take_dispatch_host_timings()
+                        os.environ[HOST_TIMING_ENV] = "1"
+                        try:
+                            for _ in range(args.samples):
+                                prepare_v2_sample(buffer, flush)
+                                invoke()
+                                native.complete_dispatch_host_timing()
+                            host_rows = native.take_dispatch_host_timings()
+                        finally:
+                            os.environ[HOST_TIMING_ENV] = "0"
+                        fields = list(native.dispatch_host_timing_fields)
+                        durations = host_durations(host_rows, fields, args.samples, mode)
+                        (capture / "host_timing.json").write_text(
+                            json.dumps(
+                                dict(
+                                    fields=fields,
+                                    rows_ns=host_rows,
+                                    durations_us=durations,
+                                    mapped_counts=[r[fields.index("mapped_counts")] for r in host_rows],
+                                ),
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                        host_all = group.gather(durations)
+                        rows[-1]["host_diagnostic_means_us"] = {
+                            key: statistics.mean(max(g[key][i] for g in host_all) for i in range(args.samples))
+                            for key in durations
+                        }
+                        rows[-1]["mapped_counts_all_samples"] = all(
+                            group.gather(all(r[fields.index("mapped_counts")] == 1 for r in host_rows))
+                        )
         (out / "report.json").write_text(
             json.dumps(
                 dict(
@@ -345,6 +446,9 @@ def main():
                 "weighted",
                 "turn",
                 "fused",
+                "mode",
+                "host_prep",
+                "deferred_plan",
                 "layout_us",
                 "notify_us",
                 "layout_notify_us",
@@ -362,6 +466,9 @@ def main():
                         weighted=row["weighted"],
                         turn=row["turn"],
                         fused=row["fused"],
+                        mode=row["mode"],
+                        host_prep=row["host_prep"],
+                        deferred_plan=row["deferred_plan"],
                         layout_us=s.get("dispatch_layout_kernel", 0),
                         notify_us=s["notify_dispatch_kernel"],
                         layout_notify_us=s["layout_plus_notify"],
@@ -371,12 +478,21 @@ def main():
                         payload_gbps=row["payload_gbps"],
                     )
                 )
+        if args.host_timing and rows:
+            with (out / "host_summary.csv").open("w", newline="", encoding="utf-8") as f:
+                fields = ["weighted", "turn", "mode", "mapped_counts_all_samples"]
+                fields += list(rows[0]["host_diagnostic_means_us"])
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row[key] for key in fields[:4]} | row["host_diagnostic_means_us"])
     finally:
         buffer.destroy()
-        if old_env is None:
-            os.environ.pop(ENV, None)
-        else:
-            os.environ[ENV] = old_env
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     group.agree("complete")
     (out / "exit.json").write_text('{"exit_code": 0}', encoding="utf-8")
 

@@ -306,6 +306,15 @@ bool BufferRuntime::Use1gHugePages() const
     return use_1g_huge_pages_;
 }
 
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
+BufferRuntime::AllocateDispatchLayout(torch::Tensor topk_idx, int64_t num_experts,
+                                      c10::optional<int64_t> allocation_stream_id)
+{
+    return ascend_deepep::ops::GetDispatchLayout(topk_idx, num_experts, static_cast<int>(rank_),
+                                                 static_cast<int>(num_ranks_), static_cast<int>(num_device_aiv_), 0,
+                                                 allocation_stream_id, true);
+}
+
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> BufferRuntime::GetDispatchLayout(
     torch::Tensor topk_idx, int64_t num_experts, c10::optional<int64_t> allocation_stream_id)
 {

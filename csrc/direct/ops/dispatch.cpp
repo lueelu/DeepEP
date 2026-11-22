@@ -14,6 +14,7 @@
 #include "common/udma_schedule.h"
 #include "ops/launcher.h"
 #include "ops/stream_allocator.h"
+#include "ops/dispatch_host_timing.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "runtime/shmem_instance.h"
 
@@ -189,7 +190,7 @@ namespace ascend_deepep::ops {
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> GetDispatchLayout(
     torch::Tensor topk_idx, int64_t num_experts, int rank, int world_size, int num_device_aiv, uint64_t ffts_addr,
-    c10::optional<int64_t> allocation_stream_id)
+    c10::optional<int64_t> allocation_stream_id, bool allocate_only)
 {
     StreamAllocator allocator(allocation_stream_id);
     allocator.Record({topk_idx});
@@ -232,12 +233,18 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
     auto int_options = topk_idx.options().dtype(torch::kInt32);
     auto bool_options = topk_idx.options().dtype(torch::kBool);
 
-    auto num_tokens_per_rank_storage = allocator.Empty({rank_stride}, int_options);
-    auto num_tokens_per_expert_storage = allocator.Empty({expert_stride}, int_options);
+    // Opt-in fused preparation owns one aligned arena for both count vectors.
+    // Each invocation still owns its allocations; no old handle is overwritten.
+    auto count_storage = allocate_only ? allocator.Empty({rank_stride + expert_stride}, int_options) : torch::Tensor();
+    auto num_tokens_per_rank_storage =
+        allocate_only ? count_storage.narrow(0, 0, rank_stride) : allocator.Empty({rank_stride}, int_options);
+    auto num_tokens_per_expert_storage = allocate_only ? count_storage.narrow(0, rank_stride, expert_stride)
+                                                       : allocator.Empty({expert_stride}, int_options);
     auto num_tokens_per_rank = num_tokens_per_rank_storage.narrow(0, 0, world_size);
     auto num_tokens_per_expert = num_tokens_per_expert_storage.narrow(0, 0, num_experts);
     // Layout writes every route row, including all-invalid rows.
     auto is_token_in_rank = allocator.Empty({num_tokens, world_size}, bool_options);
+    if (allocate_only) return {num_tokens_per_rank, c10::nullopt, num_tokens_per_expert, is_token_in_rank};
     auto scratch_buffer =
         allocator.Empty({static_cast<int64_t>(block_dim) * (rank_stride + expert_stride)}, int_options);
 
@@ -273,6 +280,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
            bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan)
 {
+    DispatchHostTiming host_timing;
     const auto udma_launch =
         shmem.ResolveLaunch(launch_plan, false, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
     udma_peers_per_worker = udma_launch.peers;
@@ -319,6 +327,16 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                 "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1");
     const bool fused_layout = !cached_mode && public_handle != nullptr && fused_env && std::strcmp(fused_env, "1") == 0;
     TORCH_CHECK(!fused_layout || (use_udma && topk_idx.has_value()), "fused layout requires fresh V2 UDMA dispatch");
+    const auto enabled_option = [](const char* name) {
+        const char* value = std::getenv(name);
+        TORCH_CHECK(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0, name, " must be 0 or 1");
+        return value && std::strcmp(value, "1") == 0;
+    };
+    const bool host_prep = fused_layout && enabled_option("DEEPEP_CLOS_NOTIFY_HOST_PREP");
+    const bool deferred_plan = fused_layout && enabled_option("DEEPEP_CLOS_NOTIFY_DEFER_PLAN");
+    host_timing.Value(Fused, fused_layout);
+    host_timing.Value(HostPrep, host_prep);
+    host_timing.Value(DeferredPlan, deferred_plan);
     TORCH_CHECK(cached_rank_prefix_matrix.has_value() == cached_channel_prefix_matrix.has_value(),
                 "cached rank/channel prefix matrices must be passed together");
     if (!cached_mode) {
@@ -541,7 +559,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         // Exact metadata ownership follows the normal stream-aware allocator.
         *public_handle = {allocator.Empty({world_size}, int_options), allocator.Empty({num_local_experts}, int_options),
                           notify_num_recv_tokens_per_expert.narrow(0, 0, num_local_experts), torch::Tensor(),
-                          allocator.Empty({num_tokens, num_topk}, int_options)};
+                          host_prep ? torch::Tensor() : allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
     c10::optional<torch::Tensor> fused_partials;
@@ -551,6 +569,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                     "fused layout expert histogram exceeds UB capacity");
         fused_partials = allocator.Empty({num_channels, expert_stride}, int_options);
         tiling.fused_layout_notify = 1;
+        tiling.notify_defer_plan = deferred_plan;
         tiling.notify_topk_idx = reinterpret_cast<uint64_t>(topk_idx->data_ptr());
         tiling.notify_expert_partials = reinterpret_cast<uint64_t>(fused_partials->data_ptr());
     }
@@ -561,7 +580,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         if (!defer_public_expert_prefix) {
             tiling.v2_expert_prefix = reinterpret_cast<uint64_t>((*public_handle)[1].data_ptr());
         }
-        tiling.v2_dst_slots = reinterpret_cast<uint64_t>((*public_handle)[4].data_ptr());
+        if (!host_prep) tiling.v2_dst_slots = reinterpret_cast<uint64_t>((*public_handle)[4].data_ptr());
     }
     tiling.rank = static_cast<uint32_t>(rank);
     tiling.world_size = static_cast<uint32_t>(world_size);
@@ -649,6 +668,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         (!host_poll || std::strcmp(host_poll, "1") == 0)) {
         tiling.notify_host_counts = reinterpret_cast<uint64_t>(shmem.PrepareNotifyHostCounts(1 + num_local_experts));
     }
+    host_timing.Value(MappedCounts, tiling.notify_host_counts != 0);
+    host_timing.Mark(NotifySubmitBegin);
     if (cached_mode) {
         LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());
         if (rebuild_cached_plan)
@@ -659,6 +680,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                                    notify_num_recv_tokens_per_expert, dispatch_plan, send_head, tiling,
                                    symmetric_buffer, shmem.FftsAddr());
     }
+    host_timing.Mark(NotifySubmitted);
+    // Notify never reads dst_slots. Allocate owned payload metadata while its
+    // count generation runs, then update only the later dispatch launch tiling.
+    if (host_prep) {
+        (*public_handle)[4] = allocator.Empty({num_tokens, num_topk}, int_options);
+        tiling.v2_dst_slots = reinterpret_cast<uint64_t>((*public_handle)[4].data_ptr());
+    }
+    host_timing.Mark(CountWaitBegin);
     int64_t num_recv_tokens = 0;
     std::vector<int64_t> num_recv_tokens_per_expert_list;
     if (cached_mode) {
@@ -672,12 +701,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         std::vector<int32_t> published_counts;
         const int32_t* recv_counts;
         if (tiling.notify_host_counts) {
-            published_counts = shmem.WaitNotifyHostCounts(1 + num_local_experts);
+            published_counts = shmem.WaitNotifyHostCounts(1 + num_local_experts, host_timing.TotalSlot());
             recv_counts = published_counts.data();
         } else {
             recv_counts_cpu = notify_counts.cpu();
+            host_timing.Mark(TotalObserved);
             recv_counts = recv_counts_cpu.data_ptr<int32_t>();
         }
+        host_timing.Mark(CountsObserved);
         num_recv_tokens = static_cast<int64_t>(recv_counts[0]);
         TORCH_CHECK(num_recv_tokens >= 0, "notify_dispatch returned a negative receive count");
 
@@ -729,10 +760,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // Dispatch writes every valid source index. Fixed-capacity tails are
     // unspecified; consumers select valid rows by rank/channel prefixes.
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
+    host_timing.Mark(OutputReady);
+    host_timing.Mark(CommSubmitBegin);
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
                            num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
                            rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
                            send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+    host_timing.Mark(CommSubmitted);
+    host_timing.Finish();
     return {recv_x,
             recv_x_scales,
             recv_topk_idx,

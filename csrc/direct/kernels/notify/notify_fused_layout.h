@@ -159,9 +159,11 @@ __aicore__ inline void BuildFusedDispatchPlan(Resource& resource, GM_ADDR routes
         asc_vf_call<PrefixDispatchChunksVf>(dim3(128), chunk, reinterpret_cast<__ubuf__ int32_t*>(counts.GetPhyAddr()),
                                             td.world_size, per_peer);
         AscendC::PipeBarrier<PIPE_V>();
-        asc_vf_call<ScatterDispatchPlanVf>(dim3(128), mask, chunk, reinterpret_cast<__gm__ int32_t*>(plan),
+        if (!td.notify_defer_plan) {
+            asc_vf_call<ScatterDispatchPlanVf>(dim3(128), mask, chunk, reinterpret_cast<__gm__ int32_t*>(plan),
                                            reinterpret_cast<__gm__ int32_t*>(head), td.world_size, td.num_channels,
                                            channel, stride, start, size, per_peer);
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         const AscendC::DataCopyExtParams store(1, size * td.world_size, 0, 0, 0);
