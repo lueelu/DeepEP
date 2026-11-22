@@ -4,6 +4,7 @@ Run with torchrun. This is a dispatch diagnostic, not a MoE end-to-end benchmark
 """
 
 import argparse
+from contextlib import contextmanager
 import csv
 from dataclasses import asdict, replace
 import datetime
@@ -13,7 +14,9 @@ import math
 import os
 from pathlib import Path
 import statistics
+import sys
 import time
+import traceback
 
 from bench_fused_notify import store_topology_collective
 from stage_metrics import L2CacheFlush, prepare_v2_sample
@@ -90,6 +93,53 @@ def set_metadata_output_mode(mode):
         os.environ[name] = str((mask >> bit) & 1)
 
 
+def offset_weights(weights, offset):
+    """One tensor addition, identical on device inputs and the CPU reference."""
+    return None if weights is None else weights + offset
+
+
+@contextmanager
+def benchmark_session(buffer, group):
+    """Collectively destroy only after successful work on every rank."""
+    try:
+        yield
+    finally:
+        set_metadata_output_mode("off")
+        set_overlap_mode("off")
+        os.environ[TRACE_ENV] = "0"
+        os.environ["DEEPEP_CLOS_COMBINE_DEVICE_TIMING"] = "0"
+        os.environ[METADATA_ENV] = "0"
+        os.environ[METADATA_TILE_ENV] = "0"
+    # An exception thrown through yield exits after finally, skipping this
+    # collective and destroy. Never introduce a second device wait on failure.
+    group.agree("ready_to_destroy")
+    buffer.destroy()
+
+
+def run_worker(entrypoint):
+    """Preserve the first failure and let torchrun tear down this failed job.
+
+    Raising normally can run native Buffer/profiler destructors or atexit hooks
+    while peers are in a different collective. Keep the traceback (and its live
+    frame resources), flush it, then exit this worker without Python teardown.
+    This is a CLI failure path only; successful runs explicitly destroy Buffer.
+    """
+    try:
+        entrypoint()
+    except BaseException as error:
+        if isinstance(error, SystemExit) and error.code in (None, 0):
+            raise
+        code = 130 if isinstance(error, KeyboardInterrupt) else 1
+        if isinstance(error, SystemExit) and isinstance(error.code, int) and 0 < error.code < 256:
+            code = error.code
+        try:
+            traceback.print_exc()
+            sys.stderr.flush()
+            sys.stdout.flush()
+        finally:
+            os._exit(code)
+
+
 def notify_stage(row):
     if "notify_total_us" in row["stats_us"]:
         return "notify_total_us"
@@ -161,7 +211,7 @@ def check_cpu_reference(
         if recv_weights is not None:
             torch.testing.assert_close(
                 recv_weights[first : first + n],
-                (weights[selected] + weight_offset).masked_fill(~hits[selected], 0),
+                offset_weights(weights[selected], weight_offset).masked_fill(~hits[selected], 0),
                 rtol=0,
                 atol=0,
             )
@@ -577,7 +627,7 @@ def main(argv=None):
                     buffer.dispatch(
                         dx,
                         handle=handle,
-                        topk_weights=None if dw is None else dw + generation,
+                        topk_weights=offset_weights(dw, generation),
                         num_sms=core,
                         do_expand=expanded,
                     )
@@ -594,7 +644,7 @@ def main(argv=None):
             outputs.extend(None if value is None else value.cpu().clone() for value in combined[:2])
         return outputs
 
-    try:
+    with benchmark_session(buffer, group):
         if 1 in args.metadata_modes or any(mode != "off" for mode in args.metadata_output_modes):
             precision_cases = []
             for routing in ("masked", "invalid", "skew", "empty_local"):
@@ -646,7 +696,7 @@ def main(argv=None):
                             )
                             # Reuse this handle, but update weights on each cached call.
                             for generation in range(2):
-                                cached_w = (dw + generation + 1) if weighted else None
+                                cached_w = offset_weights(dw, generation + 1) if weighted else None
                                 prepare_v2_sample(buffer, flush)
                                 cached_result = done(
                                     buffer.dispatch(
@@ -998,16 +1048,9 @@ def main(argv=None):
                 out,
                 decode_trace,
             )
-    finally:
-        set_metadata_output_mode("off")
-        set_overlap_mode("off")
-        os.environ[TRACE_ENV] = "0"
-        os.environ[METADATA_ENV] = "0"
-        os.environ[METADATA_TILE_ENV] = "0"
-        buffer.destroy()
     group.agree("complete")
     (out / "exit.json").write_text('{"exit_code": 0, "variant_precision_passed": true}', encoding="utf-8")
 
 
 if __name__ == "__main__":
-    main()
+    run_worker(main)

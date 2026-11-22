@@ -1,11 +1,13 @@
 """Validate diagnostic accounting independently of device clocks/profiler runtime."""
 
 import csv
+import ast
 import importlib.util
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import sys
 
 import pytest
@@ -20,6 +22,137 @@ try:
     spec.loader.exec_module(bench)
 finally:
     sys.path.pop(0)
+
+
+def test_cached_weight_generations_use_one_fp32_addition():
+    def fp32(value):
+        return struct.unpack("f", struct.pack("f", value))[0]
+
+    class Weight:
+        additions = []
+
+        def __init__(self, value):
+            self.value = fp32(value)
+
+        def __add__(self, offset):
+            self.additions.append(offset)
+            return Weight(self.value + offset)
+
+    # An FP32 witness where rounding after each addition changes the answer.
+    w = Weight(5 * 2**-25)
+    assert ((w + 1) + 1).value != (w + 2).value
+    for generation in range(2):
+        Weight.additions.clear()
+        result = bench.offset_weights(w, generation + 1)
+        assert Weight.additions == [generation + 1]
+        assert result.value == fp32(w.value + (generation + 1))
+    Weight.additions.clear()
+    assert bench.offset_weights(None, 2) is None
+    assert not Weight.additions
+
+
+def test_weight_input_and_reference_keep_zero_tolerance():
+    tree = ast.parse((ROOT / "benchmarks/clos/bench_dispatch_stages.py").read_text())
+    assertions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "assert_close"
+    ]
+    assert assertions
+    for call in assertions:
+        tolerances = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords if kw.arg in ("rtol", "atol")}
+        assert tolerances == {"rtol": 0, "atol": 0}
+    (cached,) = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "cached_w" for t in node.targets)
+    ]
+    assert ast.unparse(cached.value.body) == "offset_weights(dw, generation + 1)"
+
+
+@pytest.mark.parametrize("failure", [None, "precision", "agreement"])
+def test_benchmark_session_only_destroys_after_successful_agreement(monkeypatch, failure):
+    calls = []
+
+    class Buffer:
+        def destroy(self):
+            calls.append("destroy")
+
+    class Group:
+        def agree(self, value):
+            calls.append(value)
+            if failure == "agreement":
+                raise RuntimeError("peer failed")
+
+    envs = (
+        *bench.OVERLAP_ENVS,
+        *bench.METADATA_OUTPUT_ENVS,
+        bench.TRACE_ENV,
+        "DEEPEP_CLOS_COMBINE_DEVICE_TIMING",
+        bench.METADATA_ENV,
+        bench.METADATA_TILE_ENV,
+    )
+    for name in envs:
+        monkeypatch.setenv(name, "1")
+
+    def work():
+        with bench.benchmark_session(Buffer(), Group()):
+            calls.append("work")
+            if failure == "precision":
+                raise AssertionError("original precision error")
+
+    if failure:
+        with pytest.raises((AssertionError, RuntimeError), match="original precision error|peer failed"):
+            work()
+    else:
+        work()
+    assert (
+        calls
+        == {
+            None: ["work", "ready_to_destroy", "destroy"],
+            "precision": ["work"],
+            "agreement": ["work", "ready_to_destroy"],
+        }[failure]
+    )
+    assert all(os.environ[name] == "0" for name in envs)
+
+
+def test_failed_worker_preserves_traceback_without_collective_or_destructors(tmp_path):
+    # A real Python subprocess is essential: mocking os._exit would unwind
+    # frames and run exactly the destructors this failure path must avoid.
+    program = r"""
+import atexit
+import sys
+sys.path.insert(0, sys.argv[1])
+from bench_dispatch_stages import benchmark_session, run_worker
+atexit.register(lambda: print("UNEXPECTED_ATEXIT"))
+class Buffer:
+    def destroy(self):
+        raise RuntimeError("UNEXPECTED_DESTROY")
+    def __del__(self):
+        print("UNEXPECTED_DESTRUCTOR", flush=True)
+class Group:
+    def agree(self, value):
+        raise RuntimeError("UNEXPECTED_COLLECTIVE")
+def work():
+    buffer = Buffer()
+    print("worker diagnostic before failure")
+    with benchmark_session(buffer, Group()):
+        raise AssertionError("original precision mismatch")
+    print("UNEXPECTED_SUCCESS")
+run_worker(work)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(ROOT / "benchmarks/clos")],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 1
+    assert "Traceback (most recent call last)" in result.stderr
+    assert "AssertionError: original precision mismatch" in result.stderr
+    assert "worker diagnostic before failure" in result.stdout
+    assert "UNEXPECTED_" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("packed", [False, True])
