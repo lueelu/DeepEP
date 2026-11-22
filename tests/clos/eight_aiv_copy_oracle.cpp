@@ -19,7 +19,9 @@ using namespace ascend_deepep;
 using namespace ascend_deepep::udma;
 constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID5 = 5, EVENT_ID6 = 6, EVENT_ID7 = 7;
 constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)), kOutputRecordBytes = 64;
+constexpr unsigned kOutputSrcWord=6, kOutputWeightWord=7;
 static unsigned list_loads;
+void trap() { assert(false); }
 namespace AscendC {
 enum class HardEvent { V_S, MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S, S_MTE3 };
 inline uint64_t GetSystemCycle()
@@ -143,6 +145,7 @@ struct DispatchSenderT {
         assert(false);
     }
     void Publish(GM_ADDR, uint64_t, uint32_t, uint32_t) {}
+    void PutChannelOutput(uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) { assert(false); }
     void PutChannelField(uint32_t, GM_ADDR, uint64_t, uint64_t, uint32_t)
     {
         assert(false);

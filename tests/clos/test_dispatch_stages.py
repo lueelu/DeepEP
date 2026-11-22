@@ -22,6 +22,41 @@ finally:
     sys.path.pop(0)
 
 
+@pytest.mark.parametrize("packed", [False, True])
+def test_cached_weighted_profiler_accounts_for_plan_rebuild(tmp_path, packed):
+    notify = "cached_notify_dispatch_packed_kernel" if packed else "cached_notify_dispatch_kernel"
+    names = ["cached_notify_combine_kernel", notify]
+    if not packed:
+        names.append("cached_dispatch_plan_kernel")
+    names.append("v1_dispatch_udma_kernel")
+    costs = {
+        "cached_notify_combine_kernel": 999,
+        notify: 20,
+        "cached_dispatch_plan_kernel": 30,
+        "v1_dispatch_udma_kernel": 40,
+    }
+    with (tmp_path / "kernel_details.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Name", "Start Time(us)", "Duration(us)"])
+        for i, name in enumerate(names * 6):
+            writer.writerow([name, i * 1000, costs[name]])
+    result = bench.capture_stages(tmp_path, 2, True, cached_weighted=True, cached_pack=packed)
+    assert result["notify_total_us"] == [20 if packed else 50] * 2
+    assert result["v1_dispatch_udma_kernel"] == [40, 40]
+    with pytest.raises(RuntimeError, match="sequence"):
+        bench.capture_stages(tmp_path, 2, True, cached_weighted=True, cached_pack=not packed)
+
+
+@pytest.mark.parametrize("mode", bench.METADATA_OUTPUT_MODES)
+def test_metadata_output_modes_are_independent_and_reset(monkeypatch, mode):
+    for env in bench.METADATA_OUTPUT_ENVS:
+        monkeypatch.setenv(env, "1")
+    bench.set_metadata_output_mode(mode)
+    mask = bench.METADATA_OUTPUT_MODES[mode]
+    for bit, env in enumerate(bench.METADATA_OUTPUT_ENVS):
+        assert os.environ[env] == str(int(bool(mask & (1 << bit))))
+
+
 def test_post_submit_slots_and_private_ub(tmp_path):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:

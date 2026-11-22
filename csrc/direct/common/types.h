@@ -123,6 +123,12 @@ struct alignas(8) DispatchTilingData {
     uint32_t dispatch_early_slots = 0;
     uint32_t dispatch_skip_topk_init = 0;
     uint32_t channel_metadata_double_buffer = 0;
+    uint32_t cached_weight_pack = 0;
+    uint32_t metadata_direct_output = 0;
+    uint32_t omit_topk_output = 0;
+    uint64_t cached_metadata_head = 0;
+    uint64_t metadata_src_output = 0;
+    uint64_t metadata_weight_output = 0;
     uint64_t notify_topk_weights = 0;
     uint64_t packed_channel_indices = 0;
     uint64_t packed_channel_weights = 0;

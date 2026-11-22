@@ -206,6 +206,12 @@ public:
 
     __aicore__ void Put(uint32_t p, __gm__ uint8_t* dst, __gm__ uint8_t* src, uint32_t bytes)
     {
+        const uint32_t queue = QueuePeer(p);
+        PutAbsolute(p, peers_[queue].remote_base + (reinterpret_cast<uint64_t>(dst) - local_base_), src, bytes);
+    }
+    // Published tensor VAs are already remote addresses; never translate as SHMEM offsets.
+    __aicore__ void PutAbsolute(uint32_t p, uint64_t dst, __gm__ uint8_t* src, uint32_t bytes)
+    {
         p = QueuePeer(p);
         if (pending_ && active_state_ != peers_[p].state) {
             TraceCount(Trace::StateFlushes);
@@ -217,7 +223,7 @@ public:
         }
         const uint64_t prepared = TraceNow();
         auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + pending_ * 4U;
-        request[0] = peers_[p].remote_base + (reinterpret_cast<uint64_t>(dst) - local_base_);
+        request[0] = dst;
         request[1] = reinterpret_cast<uint64_t>(src);
         request[2] = bytes;
         request[3] = p;

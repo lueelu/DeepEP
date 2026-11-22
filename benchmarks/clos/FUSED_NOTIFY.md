@@ -615,3 +615,57 @@ out inapplicable options. Traces append `topk_init_cycles`, `source_cycles` and
 `slots_cycles`; early slots occur before incoming wait and must not be counted
 again as a completion-tail cost. CPU mocks check indexing, UB boundaries and
 event credit pairing, but do not establish device ordering or NPU performance.
+
+### Cached weights and direct metadata outputs (opt-in)
+
+Three independent flags default to `0`; rebuild both host and kernels before
+using them, with identical settings on every rank. The default payload schedule, core count, visit and completion
+protocol are unchanged.
+
+| Flag | Effect |
+| --- | --- |
+| `DEEPEP_CLOS_CACHED_WEIGHT_PACK=1` | Repack this cached invocation's weights in cached notify, using the handle-owned head and plan. Send channel top-k/weight blocks with UDMA. |
+| `DEEPEP_CLOS_DISPATCH_METADATA_DIRECT=1` | For channel UDMA metadata only, send fresh source indices and fresh/cached weights directly into owned output tensors, including self. SIMT metadata retains its SHMEM path. |
+| `DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT=1` | Skip the unused top-k output allocation/copy for cached weighted non-expanded public dispatch. Internal routing indices and expanded consumers remain intact. |
+
+Fresh channel packing still requires `DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA=1`.
+Cached packing requires the current handle's private plan/head, and shares the
+existing channel-packing capacity and graph-capture restrictions. It repacks
+every call: changing weights does not change routing or mutate the handle.
+
+Direct output addresses occupy the two spare words of the existing payload
+record. Capacity checks and epoch publication remain in place; no additional
+address-exchange round or collective is added. Output tensors exist before
+publication and use the existing stream-aware allocator. Source conversion
+still runs, reading the final source-index tensor. Internal top-k remains in
+SHMEM. Invalid weight slots are initialized in the actual final destination.
+
+Run separately for EP8 and EP16, with one Buffer per rank throughout each run:
+
+```bash
+torchrun <site-launch-arguments> benchmarks/clos/bench_channel_metadata.py \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 32 \
+  --metadata-modes 1 --metadata-tile-tokens 128 --dispatch-plans auto \
+  --cached-channel-modes 1 --overlap-modes off \
+  --metadata-output-modes off pack direct omit pack_direct all \
+  --reduce-cores 48 --warmup 10 --samples 30 --trace-warmup 5 --trace-samples 5 \
+  --flush-l2 --huge-pages --output <shared-result-directory>
+```
+
+`cached_weighted` is measured separately. Precision checks read raw weights
+(including invalid zeros), change cached weights across two handle reuses,
+and compare expansion and subsequent combine against options-off controls.
+They cover masked/invalid/skewed routes, empty ranks and partial tiles. Formal
+timing disables diagnostic instrumentation. Traces separately report
+`src_output_bytes`, `topk_output_bytes` and `weight_output_bytes` for valid-row
+SHMEM-to-output copies. Direct mode must eliminate source/weight copies;
+cached omit mode must eliminate the top-k copy.
+
+`metadata_output_comparison.csv` groups matched options and reports notify,
+communication and complete API timing separately. The legacy cached weighted
+plan-rebuild kernel is reported separately and included in `notify_total_us`
+within each rank/sample before rank aggregation. The effective metadata mask is
+bit 0 = cached pack, bit 1 = direct output, bit 2 = omitted top-k output.
+The older overlap experiments remain off in this comparison. CPU tests validate
+addressing and control flow; CANN compilation and NPU precision/performance
+must be checked on the target environment before enabling these options.

@@ -893,8 +893,17 @@ class ElasticBuffer:
                 handle._dispatch_plan if cached_mode else None,
             )
             if cached_mode:
+                metadata_options = topk_weights is not None and any(
+                    os.environ.get(name, "0") == "1"
+                    for name in ("DEEPEP_CLOS_CACHED_WEIGHT_PACK", "DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT")
+                )
+                extra = ()
+                if metadata_options:
+                    if getattr(load_native_module(), "dispatch_metadata_output_version", 0) != 1:
+                        raise RuntimeError("rebuild host and kernels for cached metadata output experiments")
+                    extra = (handle._dispatch_layout[5], not do_expand)
                 result = self._native.intranode_dispatch_with_plan(
-                    *dispatch_args, policy.native_plan() if policy else []
+                    *dispatch_args, policy.native_plan() if policy else [], *extra
                 )
                 public_handle = None
             else:

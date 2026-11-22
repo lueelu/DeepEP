@@ -119,7 +119,10 @@ public:
                 if (!epoch || out[kOutputEpochWord] != epoch || out[2] > UINT32_MAX ||
                     out[3] != x_bytes || out[4] != scale_bytes || (out[2] && !out[0]) ||
                     (out[2] && scale_bytes && !out[1]) ||
-                    out[0] > UINT64_MAX - out[2] * x_bytes || out[1] > UINT64_MAX - out[2] * scale_bytes) {
+                    out[0] > UINT64_MAX - out[2] * x_bytes || out[1] > UINT64_MAX - out[2] * scale_bytes ||
+                    (td.metadata_direct_output &&
+                        (!ValidMetadataOutput(out[kOutputSrcWord], uint32_t(out[2]), !td.cached_mode ? sizeof(int32_t) : 0U) ||
+                         !ValidMetadataOutput(out[kOutputWeightWord], uint32_t(out[2]), td.has_topk_weights ? td.num_topk * sizeof(float) : 0U)))) {
                     AscendC::printf("dispatch output descriptor mismatch rank=%u peer=%u epoch=%llu remote=%llu\n",
                         td.rank, peers_[p].peer, static_cast<unsigned long long>(epoch),
                         static_cast<unsigned long long>(out[kOutputEpochWord]));
@@ -226,6 +229,18 @@ public:
         uint64_t source, uint32_t bytes)
     {
         Base::Put(p, workspace + dst_offset, reinterpret_cast<__gm__ uint8_t*>(source), bytes);
+    }
+
+    __aicore__ void PutChannelOutput(uint32_t p, uint32_t field, uint64_t row, uint64_t source, uint32_t count)
+    {
+        const uint32_t queue = Base::QueuePeer(p);
+        auto* output = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset) + queue * kOutputRecordWords;
+        const uint32_t width = field == kOutputSrcWord ? sizeof(int32_t) : td_.num_topk * sizeof(float);
+        if ((field != kOutputSrcWord && field != kOutputWeightWord) || row > output[2] ||
+            count > output[2] - row || uint64_t(count) * width > UINT32_MAX || (count && !output[field])) {
+            trap(); return;
+        }
+        Base::PutAbsolute(p, output[field] + row * width, reinterpret_cast<__gm__ uint8_t*>(source), count * width);
     }
 
 private:

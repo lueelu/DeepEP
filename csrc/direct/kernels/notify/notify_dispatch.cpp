@@ -611,17 +611,35 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
         dispatch_plan, send_head, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr, uint32_t instance_id)
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(
+    uint64_t ffts_addr, uint32_t instance_id)
 {
     aclshmemx_instance_ctx_set(instance_id);
     util_set_ffts_config(ffts_addr);
     aclshmemx_sync_vec_all();
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
-    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id)
+// One cached-notify launch in either mode. Keep the default kernel's small
+// argument block and zero-UB launch unchanged when packing is disabled.
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_packed_kernel(
+    ascend_deepep::DispatchTilingData td, uint64_t ffts_addr)
 {
-    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, instance_id);
+    aclshmemx_instance_ctx_set(td.instance_id);
+    util_set_ffts_config(ffts_addr);
+    aclshmemx_sync_vec_all();
+    ascend_deepep::UbWorkspace resource;
+    const uint32_t channel = get_block_idx() * get_subblockdim() + get_subblockid();
+    ascend_deepep::PackChannelMetadata(resource, reinterpret_cast<GM_ADDR>(td.cached_metadata_head), td, channel);
+}
+
+extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
+    uint32_t block_dim, void* stream, uint8_t* tiling_host, uint64_t ffts_addr)
+{
+    auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
+    if (td->cached_weight_pack)
+        cached_notify_dispatch_packed_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kNotifyDispatchUbBytes), stream>>>(*td, ffts_addr);
+    else
+        cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, td->instance_id);
 }
 
 // Legacy six-tensor handles have no private plan. Rebuild locally on the same

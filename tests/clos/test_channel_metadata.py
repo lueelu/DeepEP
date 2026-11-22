@@ -12,11 +12,151 @@ from tests.utils.cpp import cpp_functions
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_output_publication_preserves_epoch_and_rejects_invalid_capacity(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    functions = cpp_functions(
+        (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_output.h").read_text(), "PublishDispatchOutput"
+    )
+    source = r"""
+#include <array>
+#include <cassert>
+#include <vector>
+#include "common/dispatch_output.h"
+#define __simt_vf__
+#define __launch_bounds__(n)
+#define __gm__
+using namespace ascend_deepep::udma;
+struct { unsigned x; } threadIdx;
+std::array<uint64_t,128> control;
+std::vector<unsigned> writes;
+bool trapped=false;
+void asc_threadfence() {}
+namespace __asc_simt_vf { void __trap() { trapped=true; } }
+namespace simt {
+void aclshmemx_instance_ctx_set(unsigned) {}
+void aclshmem_uint64_p(uint64_t* addr,uint64_t value,unsigned peer) {
+    assert(peer==0); writes.push_back(unsigned(addr-control.data())); *addr=value;
+}
+}
+// FUNCTIONS
+static_assert(ValidMetadataOutput(0,0,4));
+static_assert(!ValidMetadataOutput(0,1,4));
+static_assert(!ValidMetadataOutput(32,1,0));
+static_assert(!ValidMetadataOutput(UINT64_MAX-3,1,4));
+static_assert(ValidMetadataOutput(16,UINT32_MAX,UINT32_MAX));
+int main() {
+    for(unsigned cached:{0U,1U}) for(unsigned direct:{0U,1U}) {
+        control.fill(77); writes.clear(); trapped=false;
+        PublishDispatchOutput(reinterpret_cast<uint8_t*>(control.data()),0,1,9,1024,0,3,3,16,0,0,
+            direct&&!cached?2048:0,direct?4096:0,direct&&!cached?4:0,direct?32:0);
+        assert(!trapped && writes.back()==64+kOutputEpochWord);
+        assert(writes.size()==(direct?8:6));
+        assert(control[64+kOutputSrcWord]==(direct?(cached?0:2048):77));
+        assert(control[64+kOutputWeightWord]==(direct?4096:77));
+    }
+    writes.clear(); trapped=false;
+    PublishDispatchOutput(reinterpret_cast<uint8_t*>(control.data()),0,1,10,1024,0,3,3,16,0,0,0,4096,4,32);
+    assert(trapped && writes.empty());
+}
+"""
+    path = tmp_path / "publication.cpp"
+    path.write_text(source.replace("// FUNCTIONS", functions))
+    binary = tmp_path / ("publication.exe" if os.name == "nt" else "publication")
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+    try:
+        subprocess.run([str(binary)], check=True, timeout=30)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
+
+
 def vf_as_constexpr(source, name):
     body = cpp_functions(source, name)
     # SIMT lanes run independently; inject the lane id as a constexpr argument.
     end = body.rfind(")", 0, body.index("{"))
     return (body[:end] + ", uint32_t tid" + body[end:]).replace("threadIdx.x", "tid")
+
+
+def test_channel_output_uses_remote_tensor_va_and_queue_lane(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    functions = cpp_functions(
+        (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_sender.h").read_text(), "PutChannelOutput"
+    )
+    source = r"""
+#include <cassert>
+#include <array>
+#include "common/dispatch_output.h"
+#define __aicore__
+#define __ubuf__
+#define __gm__
+using namespace ascend_deepep::udma;
+constexpr unsigned kDispatchBasesOffset=32;
+bool trapped=false;
+void trap() { trapped=true; }
+struct Base {
+    static unsigned lane, peer, bytes, calls;
+    static uint64_t destination, source;
+    static unsigned QueuePeer(unsigned p) { return lane*4+p; }
+    static void PutAbsolute(unsigned p,uint64_t dst,uint8_t* src,unsigned n) {
+        ++calls; peer=p; destination=dst; source=reinterpret_cast<uint64_t>(src); bytes=n;
+    }
+};
+unsigned Base::lane,Base::peer,Base::bytes,Base::calls;
+uint64_t Base::destination,Base::source;
+struct Sender {
+    struct { unsigned num_topk=8; } td_;
+    alignas(32) uint8_t scratch_[32+8*64]{};
+    // FUNCTIONS
+};
+int main() {
+    Sender sender;
+    for(unsigned lane:{0U,1U}) for(unsigned field:{kOutputSrcWord,kOutputWeightWord}) {
+        Base::lane=lane; Base::calls=0; trapped=false;
+        auto* record=reinterpret_cast<uint64_t*>(sender.scratch_+32)+Base::QueuePeer(2)*8;
+        record[2]=100; record[field]=0x1000000+lane*0x10000;
+        sender.PutChannelOutput(2,field,7,0x800000,65);
+        assert(!trapped && Base::calls==1 && Base::peer==2);
+        const unsigned width=field==kOutputSrcWord?4:32;
+        assert(Base::destination==record[field]+7*width && Base::source==0x800000 && Base::bytes==65*width);
+        sender.PutChannelOutput(2,field,99,0x800000,2);
+        assert(trapped && Base::calls==1);
+        trapped=false;
+        sender.PutChannelOutput(2,99,0,0,1);
+        assert(trapped && Base::calls==1);
+        trapped=false;
+        record[field]=0;
+        sender.PutChannelOutput(2,field,0,0x800000,1);
+        assert(trapped && Base::calls==1);
+    }
+}
+"""
+    path = tmp_path / "channel_address.cpp"
+    path.write_text(source.replace("// FUNCTIONS", functions))
+    binary = tmp_path / ("channel_address.exe" if os.name == "nt" else "channel_address")
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+    try:
+        subprocess.run([str(binary)], check=True, timeout=30)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
 
 
 @pytest.mark.parametrize("bits", [32, 64])

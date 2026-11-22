@@ -62,7 +62,8 @@ void LaunchNotifyDispatchKernel(torch::Tensor num_tokens_per_rank, torch::Tensor
 void LaunchCachedNotifyDispatchKernel(const ascend_deepep::DispatchTilingData& tiling, uint64_t ffts_addr)
 {
     aclrtStream stream = GetCurrentAclStream();
-    cached_notify_dispatch_kernel_do(tiling.block_dim, stream, ffts_addr, tiling.instance_id);
+    cached_notify_dispatch_kernel_do(tiling.block_dim, stream,
+        reinterpret_cast<uint8_t*>(const_cast<ascend_deepep::DispatchTilingData*>(&tiling)), ffts_addr);
 }
 
 void LaunchCachedDispatchPlanKernel(torch::Tensor routes, torch::Tensor plan, torch::Tensor send_head,

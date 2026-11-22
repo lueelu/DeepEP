@@ -358,7 +358,8 @@ BufferRuntime::IntranodeDispatchWithPlan(
     int64_t expert_alignment, int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
     int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy, c10::optional<int64_t> allocation_stream_id,
     c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
-    c10::optional<torch::Tensor> cached_dispatch_plan, const std::vector<int64_t>& launch_plan)
+    c10::optional<torch::Tensor> cached_dispatch_plan, const std::vector<int64_t>& launch_plan,
+    c10::optional<torch::Tensor> cached_send_head, bool allow_omit_topk_output)
 {
     TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
@@ -370,7 +371,7 @@ BufferRuntime::IntranodeDispatchWithPlan(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan);
+        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan, cached_send_head, allow_omit_topk_output);
     symmetric_workspace_active_ = true;
     return result;
 }

@@ -100,7 +100,8 @@ static auto buffer_runtime_registry =
               torch::arg("udma_peers_per_worker") = 4,
               torch::arg("udma_wqes_per_visit") = 8,
               torch::arg("cached_dispatch_plan") = c10::IValue(),
-              torch::arg("launch_plan") = std::vector<int64_t>{}})
+              torch::arg("launch_plan") = std::vector<int64_t>{},
+              torch::arg("cached_send_head") = c10::IValue(), torch::arg("allow_omit_topk_output") = false})
         .def("intranode_dispatch_with_handle", &BufferRuntime::IntranodeDispatchWithHandle, "",
              {torch::arg("x"),
               torch::arg("x_scales"),

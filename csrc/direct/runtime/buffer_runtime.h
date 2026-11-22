@@ -91,7 +91,9 @@ public:
                               c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt,
                               int64_t udma_peers_per_worker = 4, int64_t udma_wqes_per_visit = 8,
                               c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt,
-                              const std::vector<int64_t>& launch_plan = {});
+                              const std::vector<int64_t>& launch_plan = {},
+                              c10::optional<torch::Tensor> cached_send_head = c10::nullopt,
+                              bool allow_omit_topk_output = false);
 
     std::tuple<std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
                           c10::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,

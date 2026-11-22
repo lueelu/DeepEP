@@ -193,14 +193,21 @@ __aicore__ inline void DispatchRemoteImpl(
                 if (!count) continue;
                 const uint64_t slot = (uint64_t(peer) * td.num_channels + ch) * plan_stride;
                 const uint64_t row = uint64_t(rank_base) + first;
-                sender.PutChannelField(p, workspace, td.src_idx_buffer_offset + row * sizeof(int32_t),
-                    reinterpret_cast<uint64_t>(plan) + slot * sizeof(int32_t), count * uint32_t(sizeof(int32_t)));
+                if (!td.cached_mode) {
+                    const uint64_t source = reinterpret_cast<uint64_t>(plan) + slot * sizeof(int32_t);
+                    if (td.metadata_direct_output) sender.PutChannelOutput(p, kOutputSrcWord, row, source, count);
+                    else sender.PutChannelField(p, workspace, td.src_idx_buffer_offset + row * sizeof(int32_t),
+                        source, count * uint32_t(sizeof(int32_t)));
+                }
                 sender.PutChannelField(p, workspace, td.topk_idx_buffer_offset + row * td.num_topk * sizeof(topk_idx_t),
                     td.packed_channel_indices + slot * td.num_topk * sizeof(topk_idx_t),
                     count * td.num_topk * uint32_t(sizeof(topk_idx_t)));
-                if (td.has_topk_weights)
-                    sender.PutChannelField(p, workspace, td.topk_weights_buffer_offset + row * td.num_topk * sizeof(float),
-                        td.packed_channel_weights + slot * td.num_topk * sizeof(float), count * td.num_topk * uint32_t(sizeof(float)));
+                if (td.has_topk_weights) {
+                    const uint64_t source = td.packed_channel_weights + slot * td.num_topk * sizeof(float);
+                    if (td.metadata_direct_output) sender.PutChannelOutput(p, kOutputWeightWord, row, source, count);
+                    else sender.PutChannelField(p, workspace, td.topk_weights_buffer_offset + row * td.num_topk * sizeof(float),
+                        source, count * td.num_topk * uint32_t(sizeof(float)));
+                }
             }
         }
     }

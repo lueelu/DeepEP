@@ -38,6 +38,7 @@ def test_sender_templates_compile_with_and_without_diagnostics(tmp_path):
 #define ASCEND_DEEPEP_ARCH 3510
 #include "common/types.h"
 #include "common/udma_schedule.h"
+#include "common/dispatch_output.h"
 using GM_ADDR = uint8_t*;
 constexpr int EVENT_ID5=5, EVENT_ID6=6, EVENT_ID7=7, PIPE_MTE3=3;
 struct { unsigned x; } threadIdx;
@@ -86,8 +87,7 @@ void aclshmemx_udma_qp_quiet(uint32_t,uint32_t);
 namespace ascend_deepep::udma {
 constexpr aclshmemx_udma_op_config_t kData{}, kLast{}, kDone{};
 constexpr unsigned kRequestsOffset=32*64,kHeadersOffset=kRequestsOffset+32*32;
-constexpr unsigned kOutputRecordWords=8,kOutputRecordBytes=64,kOutputEpochWord=5;
-uint64_t OutputRecordOffset(uint32_t);
+
 uint64_t* Signal(GM_ADDR,uint64_t,uint32_t);
 // SENDERS
 template class SenderT<8,1>;

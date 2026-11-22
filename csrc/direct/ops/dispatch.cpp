@@ -281,7 +281,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            bool use_udma, ShmemInstance& shmem, void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
            c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
            c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
-           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan)
+           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan,
+           c10::optional<torch::Tensor> cached_send_head, bool allow_omit_topk_output)
 {
     DispatchHostTiming host_timing;
     const auto udma_launch =
@@ -292,7 +293,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     TORCH_CHECK(!use_udma || dispatch_output_control != nullptr,
                 "UDMA dispatch requires its Buffer-owned output address control");
     allocator.Record({x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
-                      cached_rank_prefix_matrix, cached_channel_prefix_matrix, cached_dispatch_plan});
+                      cached_rank_prefix_matrix, cached_channel_prefix_matrix, cached_dispatch_plan, cached_send_head});
     CheckNpuContiguous(x, "x");
     CheckNpuContiguous(is_token_in_rank, "is_token_in_rank");
     CheckOptionalNpu(x_scales, "x_scales");
@@ -303,6 +304,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     CheckOptionalNpuContiguous(cached_rank_prefix_matrix, "cached_rank_prefix_matrix");
     CheckOptionalNpuContiguous(cached_channel_prefix_matrix, "cached_channel_prefix_matrix");
     CheckOptionalNpuContiguous(cached_dispatch_plan, "cached_dispatch_plan");
+    CheckOptionalNpuContiguous(cached_send_head, "cached_send_head");
 
     TORCH_CHECK(world_size > 0, "world_size must be greater than zero");
     TORCH_CHECK(world_size <= kDispatchLayoutMaxRanks, "intranode dispatch currently supports at most ",
@@ -335,6 +337,18 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         TORCH_CHECK(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0, name, " must be 0 or 1");
         return value && std::strcmp(value, "1") == 0;
     };
+    const bool cached_weight_pack = cached_mode && topk_weights.has_value() &&
+        enabled_option("DEEPEP_CLOS_CACHED_WEIGHT_PACK");
+    const bool direct_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_METADATA_DIRECT");
+    const bool omit_topk_output = use_udma && cached_mode && topk_weights.has_value() &&
+        allow_omit_topk_output && enabled_option("DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT");
+    if (cached_weight_pack) {
+        TORCH_CHECK(use_udma && !shmem.TokenSchedule() && cached_dispatch_plan.has_value() && cached_send_head.has_value(),
+                    "cached weight packing requires peer UDMA and handle-owned plan/send_head");
+        TORCH_CHECK(cached_send_head->scalar_type() == torch::kInt32 && cached_send_head->dim() == 2 &&
+                        cached_send_head->size(0) == x.size(0) && cached_send_head->size(1) == world_size,
+                    "cached send_head must be int32 [num_tokens, world_size]");
+    }
     const bool metadata_src_256 = enabled_option("DEEPEP_CLOS_DISPATCH_SRC_IDX_256");
     const bool metadata_topk_256 = enabled_option("DEEPEP_CLOS_DISPATCH_TOPK_256");
     TORCH_CHECK(use_udma || !(metadata_src_256 || metadata_topk_256),
@@ -511,12 +525,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         cached_mode ? allocator.Empty({0}, int_options) : allocator.Empty({world_size, num_channels}, int_options);
 
     // Notify produces send_head and the private stable token lists for UDMA.
-    // The low-level cached+topk API needs a temporary head; ordinary Python
-    // cached calls have no top-k and reuse the handle-owned plan unchanged.
-    auto send_head = cached_mode && !(use_udma && topk_idx.has_value())
-                         ? allocator.Empty({0}, int_options)
-                         : (use_udma ? allocator.Empty({num_tokens, world_size}, int_options)
-                                     : allocator.Full({num_tokens, world_size}, -1, int_options));
+    // Cached weight packing reuses the immutable handle head/plan. The legacy
+    // cached+topk path rebuilds a temporary head; unweighted cached reuses its plan.
+    auto send_head = cached_weight_pack
+                         ? *cached_send_head
+                         : (cached_mode && !(use_udma && topk_idx.has_value())
+                                ? allocator.Empty({0}, int_options)
+                                : (use_udma ? allocator.Empty({num_tokens, world_size}, int_options)
+                                            : allocator.Full({num_tokens, world_size}, -1, int_options)));
     c10::optional<torch::Tensor> dispatch_plan = c10::nullopt;
     bool rebuild_cached_plan = false;
     TORCH_CHECK(!cached_dispatch_plan.has_value() || (use_udma && cached_mode),
@@ -533,7 +549,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                             plan.size(1) == num_channels && plan.size(2) == stride,
                         "cached dispatch plan must be int32 [world_size, num_aiv, aligned channel tokens]");
         }
-        if (cached_dispatch_plan.has_value() && !topk_idx.has_value()) {
+        if (cached_dispatch_plan.has_value() && (!topk_idx.has_value() || cached_weight_pack)) {
             dispatch_plan = cached_dispatch_plan;
         } else {
             dispatch_plan = allocator.Empty({world_size, num_channels, stride}, int_options);
@@ -570,13 +586,20 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     }
     ascend_deepep::DispatchTilingData tiling{};
     const bool metadata_double_buffer = enabled_option("DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER");
-    const bool channel_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA") && !cached_mode;
+    const bool channel_metadata =
+        (enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA") && !cached_mode) || cached_weight_pack;
+    tiling.cached_weight_pack = cached_weight_pack;
+    tiling.cached_metadata_head = cached_weight_pack ? reinterpret_cast<uint64_t>(send_head.data_ptr()) : 0;
+    tiling.metadata_direct_output = channel_metadata && direct_metadata;
+    tiling.omit_topk_output = omit_topk_output;
+    LastDispatchMetadataOptions() = uint32_t(cached_weight_pack) | (tiling.metadata_direct_output << 1U) |
+                                   (uint32_t(omit_topk_output) << 2U);
     LastDispatchChannelMetadata() = false;
     LastDispatchChannelMetadataTileTokens() = 0;
     c10::optional<torch::Tensor> packed_channel_indices, packed_channel_weights;
     if (channel_metadata) {
         TORCH_CHECK(use_udma && !shmem.TokenSchedule() && topk_idx.has_value() && num_topk > 0,
-                    "channel metadata requires fresh peer-scheduled UDMA dispatch with top-k indices");
+                    "channel metadata requires peer-scheduled UDMA dispatch with top-k indices");
         TORCH_CHECK(!capturing, "channel metadata experiment does not support graph capture");
         TORCH_CHECK(
             world_size <= ascend_deepep::kChannelMetadataMaxRanks && num_topk <= ascend_deepep::kChannelMetadataMaxTopk,
@@ -836,9 +859,12 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     c10::optional<torch::Tensor> recv_topk_idx = c10::nullopt;
     c10::optional<torch::Tensor> recv_topk_weights = c10::nullopt;
     if (topk_idx.has_value()) {
-        recv_topk_idx = zero_copy ? MakeShmemTensor(symmetric_buffer, dispatch_workspace.topk_idx_buffer_offset,
-                                                    {num_recv_tokens, num_topk}, topk_idx->scalar_type())
-                                  : allocator.Empty({num_recv_tokens, num_topk}, topk_idx->options());
+        if (!omit_topk_output) {
+            recv_topk_idx = zero_copy
+                                ? MakeShmemTensor(symmetric_buffer, dispatch_workspace.topk_idx_buffer_offset,
+                                                  {num_recv_tokens, num_topk}, topk_idx->scalar_type())
+                                : allocator.Empty({num_recv_tokens, num_topk}, topk_idx->options());
+        }
         if (topk_weights.has_value()) {
             recv_topk_weights = zero_copy
                                     ? MakeShmemTensor(symmetric_buffer, dispatch_workspace.topk_weights_buffer_offset,
@@ -850,6 +876,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // Dispatch writes every valid source index. Fixed-capacity tails are
     // unspecified; consumers select valid rows by rank/channel prefixes.
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
+    if (tiling.metadata_direct_output) {
+        tiling.metadata_src_output = cached_mode ? 0 : reinterpret_cast<uint64_t>(recv_src_idx.data_ptr());
+        tiling.metadata_weight_output = recv_topk_weights.has_value()
+            ? reinterpret_cast<uint64_t>(recv_topk_weights->data_ptr()) : 0;
+    }
     host_timing.Mark(OutputReady);
     host_timing.Mark(CommSubmitBegin);
     LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,

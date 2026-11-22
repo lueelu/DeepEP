@@ -17,4 +17,9 @@ inline unsigned& LastDispatchOverlapOptions()
     static thread_local unsigned options = 0;
     return options;
 }
+inline unsigned& LastDispatchMetadataOptions()
+{
+    static thread_local unsigned options = 0;
+    return options;
+}
 }  // namespace ascend_deepep::ops

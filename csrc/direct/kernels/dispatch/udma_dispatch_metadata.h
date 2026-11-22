@@ -28,7 +28,7 @@ __aicore__ inline void CopySelfChannelMetadata(Resource& resource, GM_ADDR plan,
     constexpr uint32_t tile_bytes = 32 * 1024;
     auto tile = resource.template GetBufferByByte<uint32_t>(scratch_offset);
     const uint64_t slot = (uint64_t(td.rank) * td.num_channels + channel) * stride;
-    for (uint32_t field = 0; field < (td.has_topk_weights ? 3U : 2U); ++field) {
+    for (uint32_t field = td.cached_mode ? 1U : 0U; field < (td.has_topk_weights ? 3U : 2U); ++field) {
         const uint32_t width = field == 0 ? 4U : td.num_topk * (field == 1 ? uint32_t(sizeof(topk_idx_t)) : 4U);
         const uint64_t source = field == 0 ? reinterpret_cast<uint64_t>(plan) :
             (field == 1 ? td.packed_channel_indices : td.packed_channel_weights);
@@ -36,7 +36,12 @@ __aicore__ inline void CopySelfChannelMetadata(Resource& resource, GM_ADDR plan,
             (field == 1 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset);
         AscendC::GlobalTensor<uint32_t> input;
         input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(source + slot * width));
-        auto* output = reinterpret_cast<__gm__ uint32_t*>(workspace + offset + uint64_t(row) * width);
+        const uint64_t destination = td.metadata_direct_output && field == 0 ? td.metadata_src_output :
+            (td.metadata_direct_output && field == 2 ? td.metadata_weight_output : reinterpret_cast<uint64_t>(workspace) + offset);
+        if (td.metadata_direct_output && (row > td.num_output_tokens || count > td.num_output_tokens - row)) {
+            trap(); return;
+        }
+        auto* output = reinterpret_cast<__gm__ uint32_t*>(destination + uint64_t(row) * width);
         const uint64_t words = uint64_t(count) * width / 4U;
         for (uint64_t start = 0; start < words; start += tile_bytes / 4U) {
             const uint32_t n = words - start < tile_bytes / 4U ? uint32_t(words - start) : tile_bytes / 4U;
@@ -156,8 +161,10 @@ __aicore__ inline void InitializeDispatchTopk(
     for (uint32_t field = 0; field < (td.has_topk_weights ? 2U : 1U); ++field) {
         const uint32_t element_bytes = field == 0 ? sizeof(topk_idx_t) : sizeof(float);
         const uint64_t row_bytes = uint64_t(td.num_topk) * element_bytes;
-        const uint64_t offset =
-            (field == 0 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset) + uint64_t(begin) * row_bytes;
+        const uint64_t base = field == 1 && td.metadata_direct_output ? td.metadata_weight_output :
+            reinterpret_cast<uint64_t>(workspace) + (field == 0 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset);
+        local.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(base));
+        const uint64_t offset = uint64_t(begin) * row_bytes;
         AscendC::Duplicate(fill_int32, int32_t(field == 0 ? -1 : 0), fill_bytes / sizeof(int32_t));
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);

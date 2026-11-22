@@ -139,7 +139,10 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         ascend_deepep::udma::PrepareDispatchOutput(resource, tiling.udma_output_control, rank, world_size,
             recv_x, recv_x_scales, tiling.num_output_tokens,
             static_cast<uint32_t>(rank_prefix_gm.GetValue((world_size - 1) * world_size + rank)),
-            hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0, tiling.instance_id);
+            hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0, tiling.instance_id,
+            tiling.metadata_src_output, tiling.metadata_weight_output,
+            tiling.metadata_direct_output && !tiling.cached_mode ? sizeof(int32_t) : 0U,
+            tiling.metadata_direct_output && tiling.has_topk_weights ? topk_weights_row_bytes : 0U);
     }
     trace.Mark(Trace::InitDone);
     // Clears incoming payload markers and publishes this invocation's output
@@ -219,7 +222,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     // unaligned, while both ping-pong UB starts remain 32-byte aligned.
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-    if (rebuild_dispatch_handle) {
+    if (rebuild_dispatch_handle && !tiling.metadata_direct_output) {
         int32_t copied_src_idx_tokens = 0;
         int32_t src_idx_buffer_idx = 0;
         while (copied_src_idx_tokens < worker_tokens) {
@@ -243,6 +246,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
                     [static_cast<uint64_t>(recv_token_begin + copied_src_idx_tokens) * kDispatchInt32Bytes],
                 src_idx_staging_ub, src_idx_copy_params);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(src_idx_event_id);
+            trace.Accumulate(Trace::SrcOutputBytes, tile_bytes);
             copied_src_idx_tokens += tile_tokens;
             src_idx_buffer_idx = (src_idx_buffer_idx + 1) & staging_buffer_mask;
         }
@@ -266,11 +270,15 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         }
     }
     if (num_topk > 0) {
-        ascend_deepep::CopyDispatchRecvToGm(
-            recv_topk_idx, symmetric_buffer, tiling.topk_idx_buffer_offset,
-            static_cast<uint64_t>(recv_token_begin) * topk_idx_row_bytes,
-            static_cast<uint64_t>(worker_tokens) * topk_idx_row_bytes, staging_pingpong_ub, staging_capacity);
-        if (tiling.has_topk_weights != 0) {
+        if (!tiling.omit_topk_output) {
+            trace.Accumulate(Trace::TopkOutputBytes, uint64_t(worker_tokens) * topk_idx_row_bytes);
+            ascend_deepep::CopyDispatchRecvToGm(
+                recv_topk_idx, symmetric_buffer, tiling.topk_idx_buffer_offset,
+                static_cast<uint64_t>(recv_token_begin) * topk_idx_row_bytes,
+                static_cast<uint64_t>(worker_tokens) * topk_idx_row_bytes, staging_pingpong_ub, staging_capacity);
+        }
+        if (tiling.has_topk_weights != 0 && !tiling.metadata_direct_output) {
+            trace.Accumulate(Trace::WeightOutputBytes, uint64_t(worker_tokens) * topk_weights_row_bytes);
             ascend_deepep::CopyDispatchRecvToGm(
                 recv_topk_weights, symmetric_buffer, tiling.topk_weights_buffer_offset,
                 static_cast<uint64_t>(recv_token_begin) * topk_weights_row_bytes,
@@ -285,7 +293,8 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         const uint64_t source_started = trace.Now();
         asc_vf_call<ascend_deepep::V2HandleSourceVf>(dim3(128),
             reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),
-            reinterpret_cast<__gm__ int32_t*>(symmetric_buffer + tiling.src_idx_buffer_offset),
+            reinterpret_cast<__gm__ int32_t*>(tiling.metadata_direct_output
+                ? recv_src_idx : symmetric_buffer + tiling.src_idx_buffer_offset),
             reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(symmetric_buffer + tiling.topk_idx_buffer_offset),
             reinterpret_cast<__gm__ int32_t*>(tiling.v2_src_metadata),
             tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_topk,
@@ -329,7 +338,8 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             output_scales_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_x_scales));
         }
         if (num_topk > 0) {
-            output_topk_idx_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_topk_idx));
+            if (!tiling.omit_topk_output)
+                output_topk_idx_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_topk_idx));
             if (tiling.has_topk_weights != 0) {
                 output_weights_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_topk_weights));
             }
@@ -352,7 +362,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         auto topk_idx_ub =
             resource.template GetBufferByByte<ascend_deepep::topk_idx_t>(kDispatchPaddingTopkOffset);
         auto topk_idx_bytes_ub = topk_idx_ub.ReinterpretCast<uint8_t>();
-        if (num_topk > 0) {
+        if (num_topk > 0 && !tiling.omit_topk_output) {
             for (int32_t topk = 0; topk < num_topk; ++topk) {
                 topk_idx_ub.SetValue(topk, static_cast<ascend_deepep::topk_idx_t>(-1));
             }
@@ -375,9 +385,11 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
                     zero_staging_ub, zero_scale_store_params);
             }
             if (num_topk > 0) {
-                AscendC::DataCopyPad(
-                    output_topk_idx_gm[static_cast<uint64_t>(padding_token) * topk_idx_row_bytes],
-                    topk_idx_bytes_ub, invalid_topk_store_params);
+                if (!tiling.omit_topk_output) {
+                    AscendC::DataCopyPad(
+                        output_topk_idx_gm[static_cast<uint64_t>(padding_token) * topk_idx_row_bytes],
+                        topk_idx_bytes_ub, invalid_topk_store_params);
+                }
                 if (tiling.has_topk_weights != 0) {
                     AscendC::DataCopyPad(
                         output_weights_gm[static_cast<uint64_t>(padding_token) * topk_weights_row_bytes],
