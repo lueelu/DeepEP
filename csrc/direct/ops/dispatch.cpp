@@ -9,6 +9,7 @@
 #include <torch_npu/csrc/aten/common/from_blob.h>
 
 #include "common/types.h"
+#include "common/fused_layout.h"
 #include "common/platform.h"
 #include "common/udma_schedule.h"
 #include "ops/launcher.h"
@@ -313,6 +314,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                 "num_max_nvl_chunked_send_tokens must be smaller than num_max_nvl_chunked_recv_tokens");
 
     const bool cached_mode = cached_rank_prefix_matrix.has_value() || cached_channel_prefix_matrix.has_value();
+    const char* fused_env = std::getenv("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY");
+    TORCH_CHECK(!fused_env || std::strcmp(fused_env, "0") == 0 || std::strcmp(fused_env, "1") == 0,
+                "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1");
+    const bool fused_layout = !cached_mode && public_handle != nullptr && fused_env && std::strcmp(fused_env, "1") == 0;
+    TORCH_CHECK(!fused_layout || (use_udma && topk_idx.has_value()), "fused layout requires fresh V2 UDMA dispatch");
     TORCH_CHECK(cached_rank_prefix_matrix.has_value() == cached_channel_prefix_matrix.has_value(),
                 "cached rank/channel prefix matrices must be passed together");
     if (!cached_mode) {
@@ -538,6 +544,16 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                           allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
+    c10::optional<torch::Tensor> fused_partials;
+    if (fused_layout) {
+        TORCH_CHECK(num_topk > 0 && num_experts > 0 &&
+                        uint64_t(expert_stride) * sizeof(int32_t) <= ascend_deepep::kFusedHistogramBytes,
+                    "fused layout expert histogram exceeds UB capacity");
+        fused_partials = allocator.Empty({num_channels, expert_stride}, int_options);
+        tiling.fused_layout_notify = 1;
+        tiling.notify_topk_idx = reinterpret_cast<uint64_t>(topk_idx->data_ptr());
+        tiling.notify_expert_partials = reinterpret_cast<uint64_t>(fused_partials->data_ptr());
+    }
     tiling.instance_id = shmem.InstanceId();
     if (use_udma) tiling.npu_timeout_cycles = shmem.NpuTimeoutCycles();
     if (public_handle != nullptr) {

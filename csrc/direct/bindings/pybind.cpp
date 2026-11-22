@@ -16,6 +16,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("get_shmem_unique_id", &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
+    m.attr("fused_layout_notify_version") = 1;
     // Keep the Python dtype contract tied to the native V1 dispatch path.
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<ascend_deepep::topk_idx_t>::value);
 }

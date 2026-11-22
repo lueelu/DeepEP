@@ -6,6 +6,7 @@
 
 #include "kernels/notify/notify_recv_prefix.h"
 #include "kernels/notify/notify_dispatch_plan.h"
+#include "kernels/notify/notify_fused_layout.h"
 #include "kernels/common/v2_handle.h"
 #include "common/launch.h"
 #include "common/types.h"
@@ -170,7 +171,9 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     const int32_t tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
     const int32_t token_begin = NotifyIntMin(core_idx * tokens_per_channel, num_tokens);
     const int32_t token_end = NotifyIntMin(token_begin + tokens_per_channel, num_tokens);
-    if (dispatch_plan != nullptr) {
+    if (tiling.fused_layout_notify != 0) {
+        ascend_deepep::BuildFusedDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
+    } else if (dispatch_plan != nullptr) {
         ascend_deepep::BuildDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
     } else {
         AscendC::Duplicate(accumulator_ub, static_cast<int32_t>(0), rank_stride);
@@ -198,6 +201,16 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         1, static_cast<uint32_t>(rank_stride * kNotifyInt32Bytes), 0, 0, 0);
     AscendC::DataCopyPad(channel_values_gm[core_idx * rank_stride], accumulator_ub, channel_count_store_params);
     AscendC::SyncAll<true>();
+
+    if (tiling.fused_layout_notify != 0) {
+        ascend_deepep::ReduceFusedLayoutPartials(resource,
+            reinterpret_cast<GM_ADDR>(shmem_base + channel_values_offset), num_tokens_per_rank,
+            num_channels, rank_stride, world_size, core_idx, core_num);
+        ascend_deepep::ReduceFusedLayoutPartials(resource,
+            reinterpret_cast<GM_ADDR>(tiling.notify_expert_partials), num_tokens_per_expert,
+            num_channels, expert_stride, num_experts, core_idx, core_num);
+        AscendC::SyncAll<true>();
+    }
 
     // Prefix channel counts as aligned rank-vector tiles in place.
     const int32_t rank_block_count = rank_stride / kNotifyInt32AlignElems;

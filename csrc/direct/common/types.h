@@ -107,6 +107,10 @@ struct alignas(8) DispatchTilingData {
     // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
     uint64_t notify_host_counts = 0;
     uint32_t instance_id = 0;
+    // Optional fused layout input and per-channel expert-count scratch.
+    uint32_t fused_layout_notify = 0; // Independent of the pointer for zero-token ranks.
+    uint64_t notify_topk_idx = 0;
+    uint64_t notify_expert_partials = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
 };
 

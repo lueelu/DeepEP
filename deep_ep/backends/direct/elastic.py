@@ -7,7 +7,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from typing import Any, List, Optional, Tuple, Union
 
-from ._native import get_native_class
+from ._native import get_native_class, load_native_module
 from .buffer import (
     _BOOTSTRAP_LOCK,
     _compact_extra_tensors,
@@ -788,7 +788,10 @@ class ElasticBuffer:
         make_single_source = (
             not cached_mode and do_expand and self.transport == "udma" and self._use_single_source_combine
         )
-        if make_single_source:
+        fused_layout = os.environ.get("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY", "0") if not cached_mode else "0"
+        if fused_layout not in ("0", "1"):
+            raise ValueError("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1")
+        if make_single_source or fused_layout == "1":
             import torch
 
             allocation_stream = self._communication_stream if allocate_on_comm_stream else _current_npu_stream()
@@ -812,12 +815,26 @@ class ElasticBuffer:
                     )
             else:
                 kernel_topk_idx = resolved_topk_idx
-                (
-                    num_tokens_per_rank,
-                    _,
-                    num_tokens_per_expert,
-                    is_token_in_rank,
-                ) = self._native.get_dispatch_layout(resolved_topk_idx, resolved_num_experts, allocation_stream_id)
+                if fused_layout == "1":
+                    if self.transport != "udma":
+                        raise ValueError("fused layout requires fresh V2 UDMA dispatch")
+                    if getattr(load_native_module(), "fused_layout_notify_version", 0) != 1:
+                        raise RuntimeError("rebuild both native and device libraries for fused layout notify")
+                    with _use_comm_stream(allocation_stream):
+                        num_tokens_per_rank = torch.empty((self.num_ranks,), device=x_tensor.device, dtype=torch.int32)
+                        num_tokens_per_expert = torch.empty(
+                            (resolved_num_experts,), device=x_tensor.device, dtype=torch.int32
+                        )
+                        is_token_in_rank = torch.empty(
+                            (x_tensor.shape[0], self.num_ranks), device=x_tensor.device, dtype=torch.bool
+                        )
+                else:
+                    (
+                        num_tokens_per_rank,
+                        _,
+                        num_tokens_per_expert,
+                        is_token_in_rank,
+                    ) = self._native.get_dispatch_layout(resolved_topk_idx, resolved_num_experts, allocation_stream_id)
                 rank_prefix_matrix = None
                 channel_prefix_matrix = None
             config = Config(
