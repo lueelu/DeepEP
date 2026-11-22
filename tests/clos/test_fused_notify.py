@@ -15,6 +15,57 @@ bench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bench)
 
 
+@pytest.mark.parametrize(
+    "hosts,expected_group,known",
+    [
+        (["a"] * 8, 8, True),
+        (["a"] * 4 + ["b"] * 4, 4, True),
+        ([None] * 8, 8, False),
+    ],
+)
+def test_store_topology_runs_real_auto_policy_and_restores_collective(hosts, expected_group, known):
+    from tests.api.test_clos_compatibility import run_host
+
+    run_host(f"""
+        import importlib.util
+        from unittest.mock import patch
+        from pathlib import Path
+        from deep_ep import _machine
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        dist = ModuleType('torch.distributed')
+        dist.ProcessGroup = type('ProcessGroup', (), {{}})
+        dist.get_world_size = lambda g: 2
+        dist.all_gather_object = lambda rows, record, group: rows.__setitem__(slice(None), [record] * 2)
+        sys.modules['torch.distributed'] = torch.distributed = dist
+        spec = importlib.util.spec_from_file_location('fused', 'benchmarks/clos/bench_fused_notify.py')
+        fused = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fused)
+        records = []
+        def gather(record):
+            records.append(record)
+            return {hosts!r}
+        group = SimpleNamespace(gather=gather)
+        policy = resolve_udma_policy(True, 8, 'udma', None, None, None, None, None)
+        original = _machine.gather_records
+        # Reproduce the reported failure before installing the adapter.
+        try: policy.bind_group(group)
+        except TypeError as e: assert 'EP ProcessGroup or MPI' in str(e)
+        else: raise AssertionError('unsupported StoreGroup unexpectedly accepted')
+        boot = '11111111-1111-1111-1111-111111111111'
+        with fused.store_topology_collective(group), patch.object(Path, 'read_text', return_value=boot):
+            bound = policy.bind_group(group)
+            assert records == [boot]  # actual host probe, not a guessed rank count
+            assert bound.ranks_per_group == {expected_group} and bound.topology_known is {known}
+            assert _machine.gather_records(dist.ProcessGroup(), 'foreign') == ['foreign', 'foreign']
+        assert _machine.gather_records is original
+        class InitFailed(Exception): pass
+        try:
+            with fused.store_topology_collective(group): raise InitFailed
+        except InitFailed: pass
+        assert _machine.gather_records is original
+    """)
+
+
 @pytest.mark.parametrize("mode", [0, 1])
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("tokens", [0, 129])

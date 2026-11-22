@@ -73,6 +73,10 @@ stream. The outer barrier is excluded from layout/notify/communication timing.
 Use a new output directory for each run. Multi-node runs use the normal torchrun
 `--nnodes`, `--node_rank`, `--nproc_per_node`, `--master_addr`, `--master_port`
 arguments. The separate control and SHMEM ports default to 29871 and 29872.
+The benchmark's TCPStore group also carries the automatic policy's host-identity
+collective during Buffer construction. This adapter is scoped to that group and
+restored after construction (including failures); physical topology inference
+and the default send policy remain unchanged. No Gloo/HCCL process group is added.
 
 Each process creates Buffer once, checks precision, then measures both weight
 modes with switch order **0, 1, 1, 0**. Each phase keeps the same routing and

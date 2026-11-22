@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+from contextlib import contextmanager
 from dataclasses import asdict
 import datetime
 import json
@@ -12,6 +13,29 @@ import statistics
 import time
 
 ENV = "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY"
+
+
+@contextmanager
+def store_topology_collective(group):
+    """Adapt constructor topology discovery to this benchmark's TCPStore group.
+
+    Keep bind_group's real host identities and topology inference. Other EP
+    groups retain their normal collective; restore it even if initialization fails.
+    """
+    from deep_ep import _machine
+
+    original = _machine.gather_records
+
+    def gather_records(ep_group, record):
+        if ep_group is group:
+            return group.gather(record)
+        return original(ep_group, record)
+
+    _machine.gather_records = gather_records
+    try:
+        yield
+    finally:
+        _machine.gather_records = original
 
 
 def parse_capture(directory, fused, samples, expanded=False, guards=0):
@@ -104,17 +128,18 @@ def main():
     )
     rows = []
     old_env = os.environ.get(ENV)
-    buffer = ElasticBuffer(
-        group,
-        num_max_tokens_per_rank=args.tokens,
-        hidden=args.hidden,
-        num_topk=args.topk,
-        explicitly_destroy=True,
-        transport="udma",
-        udma_auto_policy=True,
-        use_1g_huge_pages=args.huge_pages,
-        shmem_ip_port=f"tcp://{os.environ['MASTER_ADDR']}:{args.shmem_port}",
-    )
+    with store_topology_collective(group):
+        buffer = ElasticBuffer(
+            group,
+            num_max_tokens_per_rank=args.tokens,
+            hidden=args.hidden,
+            num_topk=args.topk,
+            explicitly_destroy=True,
+            transport="udma",
+            udma_auto_policy=True,
+            use_1g_huge_pages=args.huge_pages,
+            shmem_ip_port=f"tcp://{os.environ['MASTER_ADDR']}:{args.shmem_port}",
+        )
     if rank == 0:
         print(f"BUFFER_READY EP={world} AIV=8 initializations=1", flush=True)
     flush = L2CacheFlush(torch, buffer, args.flush_l2)
