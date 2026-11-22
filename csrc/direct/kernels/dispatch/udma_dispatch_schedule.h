@@ -68,7 +68,8 @@ __aicore__ inline void DispatchRemoteImpl(
     static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto lists = resource.template GetBufferByByte<int32_t>(sender_bytes);
-    DispatchSenderT<Capacity, Qps> sender(td, core, wq, workspace, x, scales);
+    DispatchSenderT<Capacity, Qps, Trace> sender(td, core, wq, workspace, x, scales);
+    sender.SetTrace(&trace);
     AscendC::GlobalTensor<int32_t> plan_gm;
     plan_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(plan));
     AscendC::GlobalTensor<int32_t> rank_gm, channel_gm;
@@ -202,6 +203,7 @@ __aicore__ inline void DispatchRemoteImpl(
     trace.Mark(DispatchDeviceTrace::PayloadQueued);
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
     trace.Mark(DispatchDeviceTrace::Published);
+    trace.Mark(DispatchDeviceTrace::IncomingBegin);
     WaitIncoming<true>(workspace, td, core, cores, td.udma_workers_per_peer * Qps);
     trace.Mark(DispatchDeviceTrace::IncomingDone);
     sender.Quiet();

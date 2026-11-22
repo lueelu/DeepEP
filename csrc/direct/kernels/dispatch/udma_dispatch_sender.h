@@ -58,9 +58,9 @@ __simt_vf__ __launch_bounds__(32) inline void BuildDispatchWqes(
     __asc_simt_vf::__trap();
 }
 
-template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
-class DispatchSenderT : public SenderT<Capacity, Qps> {
-    using Base = SenderT<Capacity, Qps>;
+template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, class Trace = DisabledDispatchDeviceTrace>
+class DispatchSenderT : public SenderT<Capacity, Qps, Trace> {
+    using Base = SenderT<Capacity, Qps, Trace>;
     using Base::scratch_; using Base::count_; using Base::peers_; using Base::qp_;
     using Base::active_state_; using Base::last_;
     static constexpr uint32_t kDispatchBasesOffset = kHeadersOffset + Capacity * Qps * 2U * kWqeBytes;
@@ -131,15 +131,15 @@ public:
     __aicore__ uint32_t PutRows(uint32_t p, const __gm__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count)
     {
         p = Base::QueuePeer(p);
-        if (rows_pending_ && active_state_ != peers_[p].state)
+        if (rows_pending_ && active_state_ != peers_[p].state) {
+            Base::TraceCount(Trace::StateFlushes);
             Flush();
+        }
         if (!rows_pending_) {
             active_state_ = peers_[p].state;
-            auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
-            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
-            if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes))
-                trap();
+            Base::Admit(p);
         }
+        const uint64_t prepared = Base::TraceNow();
         const uint32_t n = count < kBatchWqes - rows_pending_ ? count : kBatchWqes - rows_pending_;
         auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
         span[0] = reinterpret_cast<uint64_t>(indices);
@@ -149,6 +149,7 @@ public:
         ++spans_;
         rows_pending_ += n;
         last_ = p;
+        Base::TraceAdd(Trace::DescriptorCycles, prepared);
         if (rows_pending_ == kBatchWqes)
             Flush();
         return n;
@@ -158,6 +159,7 @@ public:
     {
         if (!rows_pending_)
             return;
+        const uint64_t built = Base::TraceNow();
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         asc_vf_call<BuildDispatchWqes>(
@@ -170,8 +172,8 @@ public:
             rows_pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-        aclshmemi_udma_flush_aggregate_wqes(
-            scratch_, peers_[last_].context, peers_[last_].slot, qp_, EVENT_ID5, rows_pending_, kWqeBytes);
+        Base::FinishWqeBuild(built);
+        Base::SubmitBatch(rows_pending_, spans_, false);
         rows_pending_ = 0;
         spans_ = 0;
     }
@@ -181,6 +183,7 @@ public:
     __aicore__ void BeginVisit(uint32_t p)
     {
         if constexpr (Qps == 2) {
+            if (rows_pending_) Base::TraceCount(Trace::QpFlushes);
             Flush();
             Base::SelectQp(next_qp_[p]);
             next_qp_[p] ^= 1U;
@@ -199,9 +202,7 @@ public:
         if (uint64_t(first) + count > td_.num_tokens || row + count > output[2] ||
             uint64_t(count) * bytes > UINT32_MAX) { trap(); return; }
         active_state_ = peers_[p].state;
-        auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
-        aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
-        if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes)) { trap(); return; }
+        Base::Admit(p);
         auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset);
         request[0] = output[1] + row * bytes;
         request[1] = td_.packed_peer_scales + (uint64_t(peers_[p].peer) * td_.num_tokens + first) * bytes;

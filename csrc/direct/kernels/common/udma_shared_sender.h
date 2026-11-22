@@ -3,6 +3,7 @@
 #include "kernel_operator.h"
 #include "shmem.h"
 #include "simt_api/device_sync_functions.h"
+#include "kernels/dispatch/dispatch_device_trace.h"
 #define ASCEND_DEEPEP_DEVICE_SCHEDULE
 #include "common/udma_schedule.h"
 #undef ASCEND_DEEPEP_DEVICE_SCHEDULE
@@ -84,7 +85,7 @@ __simt_vf__ __launch_bounds__(32) inline void BuildWqes(
 
 // Cache only for this kernel invocation. The SDK still owns admission, SQ
 // wrap, publication, and CQ accounting; every short batch requests one CQE.
-template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1>
+template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, class Trace = DisabledDispatchDeviceTrace>
 class SenderT {
     static_assert(Qps == 1 || Qps == 2);
 public:
@@ -146,18 +147,75 @@ public:
         return peers_[p].peer;
     }
 
+    __aicore__ void SetTrace(Trace* trace) { trace_ = trace; }
+    __aicore__ uint64_t TraceNow() const {
+        if constexpr (Trace::enabled) return trace_->Now();
+        return 0;
+    }
+    __aicore__ void TraceAdd(DispatchTraceFields::Field field, uint64_t begin) {
+        if constexpr (Trace::enabled) trace_->Add(field, begin);
+    }
+    __aicore__ void TraceCount(DispatchTraceFields::Field field) {
+        if constexpr (Trace::enabled) trace_->Count(field);
+    }
+    __aicore__ void FinishWqeBuild(uint64_t begin) {
+        if constexpr (Trace::enabled) trace_->FinishWqeBuild(begin);
+    }
+    __aicore__ void Admit(uint32_t p) {
+        auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(peers_[p].state);
+        const uint64_t start = TraceNow();
+        bool blocked = false;
+        if constexpr (Trace::enabled) {
+            // Software head/tail snapshot, not hardware queue occupancy.
+            const uint32_t used = state->sq_head - state->sq_tail;
+            trace_->Count(Trace::CreditChecks);
+            trace_->Accumulate(Trace::SqUsedSum, used);
+            trace_->Maximum(Trace::SqUsedMax, used);
+            if (!used) trace_->Count(Trace::SqEmptyChecks);
+            blocked = !aclshmemi_udma_sq_has_credit(state, kBatchWqes);
+            if (blocked) trace_->Count(Trace::CreditBlocked);
+        }
+        aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
+        if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes)) trap();
+        if constexpr (Trace::enabled) {
+            const uint64_t elapsed = trace_->Now() - start;
+            trace_->Accumulate(Trace::CreditCycles, elapsed);
+            if (blocked) trace_->Accumulate(Trace::CreditBlockedCycles, elapsed);
+            trace_->Maximum(Trace::CreditMaxCycles, elapsed);
+        }
+    }
+    __aicore__ void SubmitBatch(uint32_t count, uint32_t spans, bool metadata) {
+        if constexpr (Trace::enabled) {
+            trace_->Accumulate(Trace::Wqes, count);
+            trace_->Accumulate(Trace::Spans, spans);
+            trace_->Count(Trace::Flushes);
+            if (count < kBatchWqes) trace_->Count(Trace::ShortFlushes);
+            if (metadata) {
+                trace_->Accumulate(Trace::MetadataWqes, count);
+                trace_->Count(Trace::MetadataFlushes);
+            }
+            auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(peers_[last_].state);
+            if (!aclshmemi_udma_sq_has_credit(state, count)) trace_->Count(Trace::SubmitNoCredit);
+        }
+        const uint64_t start = TraceNow();
+        // Inclusive SDK submission time: includes internal polling if the SDK needs it.
+        aclshmemi_udma_flush_aggregate_wqes(
+            scratch_, peers_[last_].context, peers_[last_].slot, qp_, EVENT_ID5, count, kWqeBytes);
+        TraceAdd(Trace::WqeSubmitCycles, start);
+    }
+
     __aicore__ void Put(uint32_t p, __gm__ uint8_t* dst, __gm__ uint8_t* src, uint32_t bytes)
     {
         p = QueuePeer(p);
-        if (pending_ && active_state_ != peers_[p].state)
+        if (pending_ && active_state_ != peers_[p].state) {
+            TraceCount(Trace::StateFlushes);
             Flush();
+        }
         if (!pending_) {
             active_state_ = peers_[p].state;
-            auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(active_state_);
-            aclshmemi_udma_poll_cq_when_sq_overflow(state, peers_[p].slot, qp_, kBatchWqes);
-            if (!aclshmemi_udma_sq_has_credit(state, kBatchWqes))
-                trap();
+            Admit(p);
         }
+        const uint64_t prepared = TraceNow();
         auto* request = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + pending_ * 4U;
         request[0] = peers_[p].remote_base + (reinterpret_cast<uint64_t>(dst) - local_base_);
         request[1] = reinterpret_cast<uint64_t>(src);
@@ -165,6 +223,7 @@ public:
         request[3] = p;
         last_ = p;
         ++pending_;
+        TraceAdd(Trace::DescriptorCycles, prepared);
         if (pending_ == kBatchWqes)
             Flush();
     }
@@ -172,6 +231,7 @@ public:
     {
         if (pending_ == 0)
             return;
+        const uint64_t built = TraceNow();
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         asc_vf_call<BuildWqes>(
@@ -180,8 +240,8 @@ public:
             reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset), pending_);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-        aclshmemi_udma_flush_aggregate_wqes(
-            scratch_, peers_[last_].context, peers_[last_].slot, qp_, EVENT_ID5, pending_, kWqeBytes);
+        FinishWqeBuild(built);
+        SubmitBatch(pending_, pending_, true);
         // SDK MTE3_S completion drains WQE reads before scratch/requests reuse.
         pending_ = 0;
     }
@@ -221,6 +281,7 @@ protected:
     __ubuf__ uint8_t* scratch_;
     uint64_t local_base_, active_state_ = 0;
     uint32_t last_ = 0;
+    Trace* trace_ = nullptr;
 };
 
 using Sender = SenderT<>;

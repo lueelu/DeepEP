@@ -63,7 +63,8 @@ __aicore__ inline uint64_t ContributorSlot(const ascend_deepep::CombineTilingDat
     return uint64_t(contributor) * td.token_capacity + row;
 }
 
-template <typename T, bool DoCommunication = true, bool DoReduction = true, uint32_t Phase = 0>
+template <typename T, bool DoCommunication = true, bool DoReduction = true, uint32_t Phase = 0,
+          class Trace = ascend_deepep::udma::DisabledDispatchDeviceTrace>
 __aicore__ inline void V1CombineUdmaImpl(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
@@ -76,6 +77,12 @@ __aicore__ inline void V1CombineUdmaImpl(
     const int32_t hidden = static_cast<int32_t>(tiling.hidden);
     const int32_t num_topk = static_cast<int32_t>(tiling.num_topk);
     const int32_t core_num = get_block_num() * get_subblockdim();
+    Trace trace(tiling.combine_device_trace);
+    trace.Set(Trace::Version, 2);
+    trace.Set(Trace::Operation, 1);
+    trace.Set(Trace::Rank, tiling.rank);
+    trace.Set(Trace::Core, core_idx);
+    trace.Set(Trace::Entry, trace.Now());
     const uint32_t hidden_bytes = static_cast<uint32_t>(hidden) * tiling.x_element_bytes;
     const uint32_t topk_weights_row_bytes = static_cast<uint32_t>(num_topk) * kCombineFloatBytes;
 
@@ -95,6 +102,7 @@ __aicore__ inline void V1CombineUdmaImpl(
     AscendC::DataCopyPadExtParams<uint8_t> uint8_pad_params{false, 0, 0, 0};
     AscendC::DataCopyPadExtParams<float> float_pad_params{false, 0, 0, 0};
 
+    trace.Mark(Trace::InitDone);
     if constexpr (DoCommunication && Phase == 1) {
         ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
             core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
@@ -114,20 +122,29 @@ __aicore__ inline void V1CombineUdmaImpl(
                 tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
         }
 
+        trace.Mark(Trace::BeginDone);
         if (!tiling.udma_self_copy_after_submit) {
+            const uint64_t started = trace.Now();
             ascend_deepep::udma::CombineSelfCopy(resource, x, topk_weights, src_idx, rank_prefix_matrix,
                 channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
+            trace.SelfDone(started);
         }
+        trace.Mark(Trace::MetadataDone);
         if (tiling.udma_token_schedule) {
             ascend_deepep::udma::CombineTokenRemote<Phase>(resource, x, topk_weights, src_idx, rank_prefix_matrix,
                 channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
         } else {
             ascend_deepep::udma::CombineRemote<Phase>(resource, x, topk_weights, src_idx, rank_prefix_matrix,
-                channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
+                channel_prefix_matrix, symmetric_buffer, tiling, core_idx, trace);
         }
 
     }
 
+    if constexpr (Trace::enabled) {
+        trace.Mark(Trace::OutputDone);
+        trace.Mark(Trace::HandleDone);
+        trace.Save(resource, core_idx);
+    }
     if constexpr (DoReduction) {
         AscendC::GlobalTensor<int32_t> channel_starts;
         channel_starts.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix));
@@ -328,15 +345,43 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 }
 
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_comm_trace_kernel(
+    GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
+    GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
+    GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
+{
+    aclshmemx_instance_ctx_set(tiling.instance_id);
+    util_set_ffts_config(ffts_addr);
+    if ASCEND_IS_AIC {
+        return;
+    }
+
+    if (tiling.x_dtype == kCombineDtypeBfloat16) {
+        V1CombineUdmaImpl<bfloat16_t, true, false, 0, ascend_deepep::udma::DispatchDeviceTrace>(
+            x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
+            symmetric_buffer, recv_x, recv_topk_weights, tiling);
+    } else if (tiling.x_dtype == kCombineDtypeFloat16) {
+        V1CombineUdmaImpl<half, true, false, 0, ascend_deepep::udma::DispatchDeviceTrace>(
+            x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
+            symmetric_buffer, recv_x, recv_topk_weights, tiling);
+    }
+}
+
 extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* bias_0, uint8_t* bias_1,
     uint8_t* src_idx, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* send_head,
     uint8_t* symmetric_buffer, uint8_t* recv_x, uint8_t* recv_topk_weights, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::CombineTilingData*>(tiling_host);
-    v1_combine_udma_comm_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
-        x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
-        symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
+    if (td->combine_device_trace) {
+        v1_combine_udma_comm_trace_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+            x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
+            symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
+    } else {
+        v1_combine_udma_comm_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+            x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
+            symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
+    }
 }
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_udma_reduce_kernel(

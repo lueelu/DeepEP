@@ -143,7 +143,7 @@ def test_pack_and_local_copy_template_calls_compile(tmp_path):
         (kernels / "dispatch/udma_dispatch_metadata.h").read_text(), "CopySelfChannelWordsVf", "CopySelfChannelMetadata"
     )
     harness = (Path(__file__).with_name("eight_aiv_copy_oracle.cpp")).read_text().split("using Row =", 1)[0]
-    harness = harness.replace("enum class HardEvent {", "enum class HardEvent { MTE2_V, V_MTE2, V_S,").replace(
+    harness = harness.replace("enum class HardEvent {", "enum class HardEvent { MTE2_V, V_MTE2,").replace(
         "    T GetValue(uint64_t i) const",
         "    T* GetPhyAddr() const { return data; }\n    T GetValue(uint64_t i) const",
     )

@@ -310,7 +310,7 @@ __aicore__ inline void DispatchMetadata(
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
-        trace.Add(DispatchDeviceTrace::SelfCycles, self_started);
+        trace.SelfDone(self_started);
     }
 }
 #endif

@@ -58,7 +58,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const int32_t core_num = get_block_num() * get_subblockdim();
     Trace trace(tiling.dispatch_device_trace);
-    trace.Set(Trace::Version, 1);
+    trace.Set(Trace::Version, 2);
     trace.Set(Trace::Rank, tiling.rank);
     trace.Set(Trace::Core, core_idx);
     trace.Set(Trace::Cached, tiling.cached_mode);

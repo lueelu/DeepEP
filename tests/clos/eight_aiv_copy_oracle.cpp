@@ -17,11 +17,11 @@
 using GM_ADDR = uint8_t*;
 using namespace ascend_deepep;
 using namespace ascend_deepep::udma;
-constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID6 = 6, EVENT_ID7 = 7;
+constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID5 = 5, EVENT_ID6 = 6, EVENT_ID7 = 7;
 constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)), kOutputRecordBytes = 64;
 static unsigned list_loads;
 namespace AscendC {
-enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S, S_MTE3 };
+enum class HardEvent { V_S, MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S, S_MTE3 };
 inline uint64_t GetSystemCycle()
 {
     static uint64_t tick = 1000;
@@ -103,7 +103,7 @@ struct Resource {
 using Row = std::tuple<uint32_t, uint32_t, uint32_t>;  // peer, input token, output row
 static std::vector<Row> sent;
 static uint32_t max_visit, used_visit;
-template <uint32_t Capacity, uint32_t Qps>
+template <uint32_t Capacity, uint32_t Qps, class Trace>
 struct DispatchSenderT {
     DispatchTilingData td;
     DispatchSenderT(const DispatchTilingData& t, uint32_t, AscendC::LocalTensor<uint8_t>, GM_ADDR, GM_ADDR, GM_ADDR)
@@ -118,6 +118,7 @@ struct DispatchSenderT {
     {
         return p == 0 ? 1U : (p == 1 ? td.world_size / 2U : td.world_size - 1U);
     }
+    void SetTrace(Trace*) {}
     void BeginVisit(uint32_t)
     {
         used_visit = 0;

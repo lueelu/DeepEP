@@ -16,4 +16,15 @@ inline c10::optional<torch::Tensor> TakeDispatchDeviceTiming()
     DispatchDeviceTimingSlot().reset();
     return result;
 }
+inline c10::optional<torch::Tensor>& CombineDeviceTimingSlot()
+{
+    static thread_local c10::optional<torch::Tensor> tensor;
+    return tensor;
+}
+inline c10::optional<torch::Tensor> TakeCombineDeviceTiming()
+{
+    auto result = CombineDeviceTimingSlot();
+    CombineDeviceTimingSlot().reset();
+    return result;
+}
 }  // namespace ascend_deepep::ops

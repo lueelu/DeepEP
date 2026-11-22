@@ -1,7 +1,10 @@
 #include "ops/combine.h"
+#include "ops/dispatch_device_timing.h"
+#include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <algorithm>
 
@@ -294,6 +297,21 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(!aggregate || (expanded_x.has_value() && use_udma && epilogue != nullptr),
                 "early single-source combine requires expanded UDMA inputs and an epilogue");
     ascend_deepep::CombineTilingData tiling{};
+    CombineDeviceTimingSlot().reset();
+    c10::optional<torch::Tensor> combine_trace;
+    const char* trace_option = std::getenv("DEEPEP_CLOS_COMBINE_DEVICE_TIMING");
+    TORCH_CHECK(!trace_option || std::strcmp(trace_option, "0") == 0 || std::strcmp(trace_option, "1") == 0,
+                "DEEPEP_CLOS_COMBINE_DEVICE_TIMING must be 0 or 1");
+    if (trace_option && std::strcmp(trace_option, "1") == 0) {
+        TORCH_CHECK(use_udma && epilogue && !shmem.TokenSchedule() && !aggregate &&
+                    !pipeline_chunk_tokens && !expanded_x.has_value(),
+                    "combine device timing requires ordinary peer-scheduled split UDMA combine");
+        TORCH_CHECK(c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None,
+                    "combine device timing does not support graph capture");
+        combine_trace = allocator.Empty({resolved_num_aiv, 64}, x.options().dtype(torch::kInt64));
+        tiling.combine_device_trace = reinterpret_cast<uint64_t>(combine_trace->data_ptr());
+        CombineDeviceTimingSlot() = combine_trace;
+    }
     tiling.instance_id = shmem.InstanceId();
     if (use_udma) tiling.npu_timeout_cycles = shmem.NpuTimeoutCycles();
     if (expanded_x.has_value()) {
@@ -409,6 +427,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     // Capture the prepared tensors/tiling by value once; no recomputation or
     // allocation between communication and reduction, and no host synchronize.
     auto launch = [=](CombinePhase phase) {
+        (void)combine_trace;
         // Explicit odr-use retains GM source owners, not just tiling addresses.
         (void)expanded_x;
         (void)single_source_slots;

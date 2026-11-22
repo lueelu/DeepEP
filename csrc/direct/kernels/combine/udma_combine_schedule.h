@@ -9,20 +9,25 @@
 
 namespace ascend_deepep::udma {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-template <uint32_t Capacity, uint32_t Phase, uint32_t Qps, class Resource>
+template <uint32_t Capacity, uint32_t Phase, uint32_t Qps, class Resource, class Trace>
 __aicore__ inline void CombineRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR weights, GM_ADDR src_idx, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
-    GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
+    GM_ADDR workspace, const CombineTilingData& td, uint32_t core, Trace& trace)
 {
     constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
     static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto indices = resource.template GetBufferByByte<int32_t>(sender_bytes);
     const bool simt_weights = Phase == 0 && CombineSimtWeightsEnabled(td);
-    if (simt_weights)
+    if (simt_weights) {
+        const uint64_t started = trace.Now();
         CombineRemoteWeights(weights, src_idx, rank_prefix, workspace, td, core);
-    CombineSenderT<Capacity, Qps> sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()), workspace,
+        trace.Add(Trace::TopkCycles, started);
+    }
+    CombineSenderT<Capacity, Qps, Trace> sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()), workspace,
         x, weights, UINT32_MAX, 0, 1, 0, !simt_weights);
+    sender.SetTrace(&trace);
+    trace.Set(Trace::PayloadPeers, sender.Count());
     AscendC::GlobalTensor<int32_t> src_gm, rank_gm;
     src_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(src_idx));
     rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
@@ -61,7 +66,8 @@ __aicore__ inline void CombineRemoteImpl(
                 }
                 if (cursor[p] == loaded[p]) {
                     // Pending spans can still read this window in SIMT.
-                    sender.Flush();
+                    sender.FlushForIndex();
+                    const uint64_t loaded_at = trace.Now();
                     const uint32_t aligned = row[p] / 8 * 8;
                     const uint32_t leading = row[p] - aligned;
                     const uint32_t count =
@@ -74,6 +80,12 @@ __aicore__ inline void CombineRemoteImpl(
                         AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
+                    if constexpr (Trace::enabled) {
+                        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                    }
+                    trace.Add(Trace::ListCycles, loaded_at);
+                    trace.Count(Trace::ListWindows);
                     cursor[p] = leading;
                     loaded[p] = leading + count;
                 }
@@ -84,6 +96,7 @@ __aicore__ inline void CombineRemoteImpl(
                     available = available < ready_fields ? available : ready_fields;
                 }
                 auto* window = reinterpret_cast<__ubuf__ int32_t*>(indices.GetPhyAddr()) + p * kTileTokens + cursor[p];
+                trace.Count(Trace::PutRowsCalls);
                 const uint32_t count =
                     sender.template PutSelectedRows<Phase == 3 ? 0 : Phase>(
                         p, window, row[p], field[p], available < visit ? available : visit);
@@ -99,9 +112,12 @@ __aicore__ inline void CombineRemoteImpl(
     if constexpr (Phase == 1) {
         sender.Flush(); // Drain WQE staging, not the asynchronous payload reads.
     } else {
+        trace.Mark(Trace::PayloadQueued);
         sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
+        trace.Mark(Trace::Published);
         if constexpr (Phase == 0) {
             if (td.udma_self_copy_after_submit) {
+                const uint64_t self_started = trace.Now();
                 // SIMT weight AIVs finish CombineRemoteWeights (V_S) above before
                 // copying their self channels. Payload AIVs have posted all
                 // UDMA requests, including weights when no spare AIV exists.
@@ -114,32 +130,45 @@ __aicore__ inline void CombineRemoteImpl(
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
                 CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
+                trace.SelfDone(self_started);
             }
         }
+        trace.Mark(Trace::IncomingBegin);
         WaitIncoming<false>(workspace, td, core, td.block_dim, td.udma_workers_per_peer * Qps);
+        trace.Mark(Trace::IncomingDone);
         sender.Quiet();
+        trace.Mark(Trace::QuietDone);
         // UDMA SO markers do not cover SIMT stores issued by other AIVs.
         // Match Dispatch's full-rank completion before Reduce/workspace reuse.
         if (simt_weights)
             aclshmemx_sync_vec_all();
         else
             AscendC::SyncAll<true>();
+        trace.Mark(Trace::SyncDone);
     }
+}
+template <uint32_t Phase = 0, class Resource, class Trace>
+__aicore__ inline void CombineRemote(
+    Resource& r, GM_ADDR x, GM_ADDR weights, GM_ADDR idx, GM_ADDR rp, GM_ADDR cp,
+    GM_ADDR workspace, const CombineTilingData& td, uint32_t core, Trace& trace)
+{
+    if (td.udma_qps_per_worker == 2) {
+        if (td.udma_peer_order == kGroupRoundRobinOrder)
+            CombineRemoteImpl<kGroupPeerCapacity, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
+        else
+            CombineRemoteImpl<kMaxPeers, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
+    } else if (td.udma_peer_order == kGroupRoundRobinOrder)
+        CombineRemoteImpl<kGroupPeerCapacity, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
+    else
+        CombineRemoteImpl<kMaxPeers, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
 }
 template <uint32_t Phase = 0, class Resource>
 __aicore__ inline void CombineRemote(
     Resource& r, GM_ADDR x, GM_ADDR weights, GM_ADDR idx, GM_ADDR rp, GM_ADDR cp,
     GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
 {
-    if (td.udma_qps_per_worker == 2) {
-        if (td.udma_peer_order == kGroupRoundRobinOrder)
-            CombineRemoteImpl<kGroupPeerCapacity, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core);
-        else
-            CombineRemoteImpl<kMaxPeers, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core);
-    } else if (td.udma_peer_order == kGroupRoundRobinOrder)
-        CombineRemoteImpl<kGroupPeerCapacity, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core);
-    else
-        CombineRemoteImpl<kMaxPeers, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core);
+    DisabledDispatchDeviceTrace trace(0);
+    CombineRemote<Phase>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
 }
 #endif
 } // namespace ascend_deepep::udma

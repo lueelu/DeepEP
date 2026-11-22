@@ -164,7 +164,7 @@ def channel_comparison(results):
     return comparisons
 
 
-def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us):
+def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us, operation=0):
     if len(raw) != cores or cycles_per_us <= 0:
         raise ValueError("trace core count/clock mismatch")
     result = []
@@ -172,14 +172,15 @@ def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us)
         if len(values) < len(fields):
             raise ValueError("truncated trace")
         row = dict(zip(fields, values))
-        if [row[k] for k in ("version", "rank", "core", "cached", "whole_channel")] != [
-            1,
+        if row["version"] not in (1, 2) or [row[k] for k in ("rank", "core", "cached", "whole_channel")] != [
             rank,
             core,
             int(cached),
             int(whole_channel),
         ]:
             raise ValueError("trace identity or effective whole-channel gate mismatch")
+        if row["version"] == 2 and row.get("operation") != operation:
+            raise ValueError("trace operation mismatch")
         stamps = [row[k] for k in TIMELINE]
         if stamps != sorted(stamps) or stamps[0] < 0 or not row["entry_cycles"]:
             raise ValueError("invalid trace timeline")
@@ -194,7 +195,44 @@ def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us)
                 for key in ("src_cycles", "topk_cycles", "self_cycles", "list_cycles")
             }
         )
-        result.append(dict(raw=row, intervals=intervals))
+        queue = {}
+        if row["version"] == 2:
+            for name in (
+                "descriptor_cycles",
+                "wqe_build_cycles",
+                "wqe_submit_cycles",
+                "credit_cycles",
+                "credit_blocked_cycles",
+                "credit_max_cycles",
+            ):
+                intervals[name + "_us"] = row[name] / cycles_per_us
+            if (
+                row["credit_blocked"] > row["credit_checks"]
+                or row["short_flushes"] > row["flushes"]
+                or row["metadata_wqes"] > row["wqes"]
+                or row["metadata_flushes"] > row["flushes"]
+                or row["wqes"] > row["flushes"] * 32
+                or row["wqes"] < row["flushes"]
+                or row["credit_blocked_cycles"] > row["credit_cycles"]
+            ):
+                raise ValueError("inconsistent queue counters")
+            if row["self_end"] < row["self_begin"] or row["self_end"] > row["work_done"]:
+                raise ValueError("invalid local-copy interval")
+            if not row["published"] <= row["incoming_begin"] <= row["incoming_done"]:
+                raise ValueError("invalid incoming-wait interval")
+            intervals["incoming_wait_us"] = (row["incoming_done"] - row["incoming_begin"]) / cycles_per_us
+            intervals["quiet_wait_us"] = (row["quiet_done"] - row["incoming_done"]) / cycles_per_us
+            intervals["final_sync_us"] = (row["sync_done"] - row["quiet_done"]) / cycles_per_us
+            intervals["self_begin_us"] = row["self_begin"] / cycles_per_us
+            intervals["self_end_us"] = row["self_end"] / cycles_per_us
+            queue = dict(
+                mean_batch_wqes=row["wqes"] / row["flushes"] if row["flushes"] else 0,
+                short_batch_fraction=row["short_flushes"] / row["flushes"] if row["flushes"] else 0,
+                blocked_admission_fraction=row["credit_blocked"] / row["credit_checks"] if row["credit_checks"] else 0,
+                mean_software_sq_used=row["sq_used_sum"] / row["credit_checks"] if row["credit_checks"] else 0,
+                sender=bool(row["payload_peers"]),
+            )
+        result.append(dict(raw=row, intervals=intervals, queue=queue))
     return result
 
 
@@ -248,6 +286,10 @@ def main(argv=None):
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--trace-samples", type=int, default=3, help="0 for formal timing only/older baseline")
+    parser.add_argument(
+        "--combine-diagnostics", action="store_true", help="also trace ordinary combine in the same Buffer"
+    )
+    parser.add_argument("--reduce-cores", type=int, default=48)
     parser.add_argument("--flush-l2", action="store_true")
     parser.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--control-port", type=int, default=29881)
@@ -255,7 +297,7 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if (
-        min(args.tokens, args.hidden, args.topk, args.experts, args.samples, *args.cores) <= 0
+        min(args.tokens, args.hidden, args.topk, args.experts, args.samples, args.reduce_cores, *args.cores) <= 0
         or min(args.warmup, args.trace_samples) < 0
     ):
         parser.error("invalid shape/core/sample count")
@@ -277,8 +319,12 @@ def main(argv=None):
         parser.error("zeng dispatch comparison requires EP8, --cores 8 and --hidden 2816")
     torch.npu.set_device(device)
     native = load_native_module()
-    if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 1:
+    if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
+    if args.combine_diagnostics and (
+        args.trace_samples < 1 or getattr(native, "combine_device_timing_version", 0) != 2
+    ):
+        raise RuntimeError("combine diagnostics requires trace samples and version-2 host/kernel libraries")
     if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for channel metadata")
     store = dist.TCPStore(
@@ -298,6 +344,7 @@ def main(argv=None):
     # Explicitly isolate these changes from earlier experimental metadata/notify options.
     for key in (
         TRACE_ENV,
+        "DEEPEP_CLOS_COMBINE_DEVICE_TIMING",
         CHANNEL_ENV,
         METADATA_ENV,
         METADATA_TILE_ENV,
@@ -565,12 +612,15 @@ def main(argv=None):
                 (out / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
                 if args.trace_samples:
                     traces = []
+                    diagnostic_api = []
                     fields = list(native.dispatch_device_timing_fields)
                     os.environ[TRACE_ENV] = "1"
                     try:
                         for _ in range(args.trace_samples):
                             prepare_v2_sample(buffer, flush)
+                            diagnostic_start = time.perf_counter_ns()
                             traced = invoke()
+                            diagnostic_api.append((time.perf_counter_ns() - diagnostic_start) / 1000)
                             tensor = native.take_dispatch_device_timing()
                             if tensor is None:
                                 raise RuntimeError("device trace missing")
@@ -593,6 +643,20 @@ def main(argv=None):
                     finally:
                         os.environ[TRACE_ENV] = "0"
                     (capture / "device_trace.json").write_text(json.dumps(traces, indent=2), encoding="utf-8")
+                    gathered_api = group.gather(diagnostic_api)
+                    diagnostic_max = [max(values[i] for values in gathered_api) for i in range(args.trace_samples)]
+                    (capture / "trace_overhead.json").write_text(
+                        json.dumps(
+                            dict(
+                                diagnostic_api_us=diagnostic_max,
+                                formal_api_mean_us=stats["api_wall_us"]["mean"],
+                                diagnostic_api_mean_us=statistics.mean(diagnostic_max),
+                                note="Diagnostic API overhead only; never use diagnostic times for headline bandwidth.",
+                            ),
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
             group.agree([op, "passed"])
         comparisons = channel_comparison(results)
         if comparisons:
@@ -600,6 +664,30 @@ def main(argv=None):
                 writer = csv.DictWriter(file, fieldnames=list(comparisons[0]))
                 writer.writeheader()
                 writer.writerows(comparisons)
+        if args.combine_diagnostics:
+            from combine_queue_diagnostics import run_combine_diagnostics
+
+            launch_policy.variant = "auto"
+            os.environ[TRACE_ENV] = "0"
+            os.environ[METADATA_ENV] = "0"
+            run_combine_diagnostics(
+                buffer,
+                native,
+                torch,
+                torch_npu,
+                group,
+                args,
+                flush,
+                cpu_x,
+                owners,
+                cpu_w,
+                x,
+                idx,
+                weights,
+                payload,
+                out,
+                decode_trace,
+            )
     finally:
         os.environ[TRACE_ENV] = "0"
         os.environ[METADATA_ENV] = "0"

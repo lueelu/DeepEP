@@ -491,3 +491,78 @@ excluded from the requested sample count.
   and L2 flush. It is not a device-only API span.
 
 No NPU performance or precision claim follows from local CPU checks alone.
+
+## Queue and local-copy diagnostics
+
+Version-2 device traces add per-rank, per-AIV accounting to fresh/cached dispatch
+and ordinary split peer-scheduled combine. Rebuild **both host and kernels**.
+Normal kernels use the disabled trace specialization; no policy, visit, batch
+capacity or payload transport is changed. The switches default off:
+
+- `DEEPEP_CLOS_DISPATCH_DEVICE_TIMING=1`
+- `DEEPEP_CLOS_COMBINE_DEVICE_TIMING=1`
+
+The benchmark controls these switches itself. Formal API timing and kernel
+profiling run with tracing off; a separate diagnostic pass enables tracing.
+`trace_overhead.json` compares instrumented and normal API samples. Diagnostic
+V_S/MTE2_S edges and counters can perturb overlap, so never publish bandwidth
+computed from diagnostic timings. Combine tracing rejects token scheduling,
+early-single/aggregate pipeline, integrated expanded inputs and graph capture.
+
+Example, once per EP8/16 with the site's usual torchrun launch arguments:
+
+```bash
+torchrun <site-launch-arguments> benchmarks/clos/bench_channel_metadata.py \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 \
+  --metadata-modes 1 --metadata-tile-tokens 128 --dispatch-plans auto \
+  --cached-channel-modes 1 --combine-diagnostics --reduce-cores 48 \
+  --warmup 10 --samples 30 --trace-samples 5 --flush-l2 --huge-pages \
+  --output <shared-result-directory>
+```
+
+One Buffer per rank is reused across precision checks, forward/reverse formal
+sampling and diagnostic passes, including weighted/unweighted combine. BF16,
+expand=0 and routing are fixed. Fresh metadata keeps the notify-prepacked UDMA
+path. Combine uses its existing automatic policy, independent of the dispatch
+plan override. For EP8 only, `--dispatch-plans auto zeng` additionally compares
+the existing Q2 plan with rank/P2/W1/Q1/visit32; no default strategy is changed.
+Use `--cores 8 32 --dispatch-plans auto` to include a same-build 32-core control
+without another Buffer initialization. Reduce remains independently fixed at 48.
+
+Per-rank output retains the original formal dispatch `summary.json`, adds
+`combine_summary.json`, and writes `device_trace.json` in each capture directory.
+Every trace row includes these measurements:
+
+| Field | Interpretation |
+| --- | --- |
+| `list_cycles` | Load/scan the dispatch index window, or load the combine index window |
+| `descriptor_cycles` | Scalar descriptor/span preparation; excludes nested submission |
+| `wqe_build_cycles` | Completed SIMT WQE construction, including synchronization |
+| `wqe_submit_cycles` | Inclusive SHMEM batch submission; SDK-internal CQ polling is included |
+| `credit_cycles` / `credit_blocked_cycles` | Explicit SQ admission checks / checks that initially lacked credit |
+| `credit_checks`, `credit_blocked`, `credit_max_cycles` | Admission count, blocked count and maximum check duration |
+| `wqes`, `flushes`, `short_flushes`, `spans` | Aggregate sender WQEs, batches, batches smaller than 32, and spans |
+| `state_flushes`, `qp_flushes`, `index_flushes` | Nonempty batches flushed for state, QP or combine index-window changes |
+| `metadata_wqes`, `metadata_flushes` | Subset submitted through the generic descriptor sender, including channel metadata |
+| `submit_no_credit` | SDK submissions observed without sufficient credit immediately before the call |
+| `sq_used_max`, `sq_used_sum`, `sq_empty_checks` | Software `sq_head-sq_tail` snapshots at admission |
+| `self_cycles`, `self_begin`, `self_end` | Local-copy duration and its interval relative to that AIV's entry |
+| `src_cycles`, `topk_cycles` | Direct SIMT metadata/weight work when that path is active |
+
+The decoder supplies microseconds, mean WQEs per batch, short-batch fraction,
+blocked-admission fraction, and separate incoming-flag, quiet and final-sync
+intervals. `incoming_wait_us` starts **after** any after-submit local copy;
+the older `incoming_done_interval_us` may contain that copy and is not a pure
+wait metric. Sender publication, including terminal flags, has its own timeline
+interval. Direct SIMT metadata/weights and terminal flags are not aggregate
+WQEs and are not included in the WQE counters.
+
+Software head/tail snapshots are not hardware queue occupancy, and an empty
+snapshot alone does not prove a starved link. Explicit admission wait also does
+not capture SDK-internal waits; inspect inclusive submission and
+`submit_no_credit` together. Same-core nested counters and stages overlap;
+different AIVs overlap as well. Do not sum stage maxima into kernel/API time,
+or compare absolute cycle timestamps across devices. Use formal slow-rank
+samples and per-AIV traces to identify preparation, credit pressure, local-copy
+or completion tails before selecting the next optimization. Notify is profiled
+for dispatch; combine's outer alignment notify is excluded from its measured API.
