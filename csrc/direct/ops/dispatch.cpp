@@ -332,6 +332,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         TORCH_CHECK(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0, name, " must be 0 or 1");
         return value && std::strcmp(value, "1") == 0;
     };
+    const bool metadata_src_256 = enabled_option("DEEPEP_CLOS_DISPATCH_SRC_IDX_256");
+    const bool metadata_topk_256 = enabled_option("DEEPEP_CLOS_DISPATCH_TOPK_256");
+    TORCH_CHECK(use_udma || !(metadata_src_256 || metadata_topk_256),
+                "dispatch metadata thread overrides require UDMA");
     const bool host_prep = fused_layout && enabled_option("DEEPEP_CLOS_NOTIFY_HOST_PREP");
     const bool deferred_plan = fused_layout && enabled_option("DEEPEP_CLOS_NOTIFY_DEFER_PLAN");
     host_timing.Value(Fused, fused_layout);
@@ -562,6 +566,9 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                           host_prep ? torch::Tensor() : allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
+    tiling.metadata_src_threads = metadata_src_256 ? 256U : 128U;
+    tiling.metadata_src_lanes = metadata_src_256 && world_size <= 8 ? 32U : 16U;
+    tiling.metadata_topk_threads = metadata_topk_256 ? 256U : 128U;
     c10::optional<torch::Tensor> fused_partials;
     if (fused_layout) {
         TORCH_CHECK(num_topk > 0 && num_experts > 0 &&

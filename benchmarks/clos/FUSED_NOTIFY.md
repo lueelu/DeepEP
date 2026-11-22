@@ -218,7 +218,46 @@ done
 Rebuild the native library as well as Python: the internal combine tiling ABI
 now carries the local-layout flag.
 
-## Reports and interpretation
+## Opt-in metadata thread comparison
+
+Two independent native dispatch options accept only `0` (default/unset) or `1`:
+
+| Mode | `DEEPEP_CLOS_DISPATCH_SRC_IDX_256` | `DEEPEP_CLOS_DISPATCH_TOPK_256` |
+| --- | --- | --- |
+| Baseline | 0 | 0 |
+| Top-k only | 0 | 1 |
+| Source indices only | 1 | 0 |
+| Both | 1 | 1 |
+
+These options require UDMA. They are read at each native dispatch call, so a
+drained Buffer can be reused across modes without SHMEM reinitialization.
+Keep all ranks in the same mode. Captured graphs retain their captured tiling;
+use ordinary uncaptured calls for this comparison.
+
+The default remains 128 threads for each VF and 16 threads per peer for source
+indices. The source-index option selects 256 threads, with 32 threads per peer
+for EP <= 8 and 16 for larger EP (including EP16). The top-k option selects 256
+threads for the existing token/top-k slot loop, including optional FP32 weights.
+Neither option changes peer scheduling, P/W/Q, visit, payload WQE batches,
+self-copy placement, UB allocation or completion synchronization. Source-index
+publication remains fresh-only; top-k publication still requires top-k inputs.
+Cached calls without top-k inputs do not exercise either VF.
+
+After rebuilding, inspect native `DispatchTilingData.metadata_src_threads`,
+`metadata_src_lanes`, and `metadata_topk_threads` during precision checks to
+verify the actual configuration. Remove diagnostic probes before timing.
+The tiling ABI changed, so rebuilding only Python is insufficient.
+
+Run `python -m pytest tests/clos/test_dispatch_metadata_threads.py -q` with a
+C++17 compiler for production-body CPU checks (sparse/empty routes, both weight
+modes, per-peer ownership and host option validation). These mocks do not
+validate SIMT execution, resource usage or remote-store completion on device.
+For device comparisons use EP8/16, eight communication AIVs, reduce48,
+T4096/H2816/K8/E256/BF16/expand0, with unchanged routes and huge-page/L2 settings.
+Compare modes 0/1/2/3 then 3/2/1/0, checking precision before timing fresh dispatch
+with and without weights; use cached dispatch and combine as regression controls.
+
+## Report files
 
 Each rank writes `precision.json`, `summary.csv`, `report.json`, raw profiler
 exports and per-phase `samples.json`. `exit.json` with code 0 is written only

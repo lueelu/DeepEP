@@ -110,6 +110,9 @@ struct alignas(8) DispatchTilingData {
     // Optional fused layout input and per-channel expert-count scratch.
     uint32_t fused_layout_notify = 0; // Independent of the pointer for zero-token ranks.
     uint32_t notify_defer_plan = 0;
+    uint32_t metadata_src_threads = 128;
+    uint32_t metadata_src_lanes = 16;
+    uint32_t metadata_topk_threads = 128;
     uint64_t notify_topk_idx = 0;
     uint64_t notify_expert_partials = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
