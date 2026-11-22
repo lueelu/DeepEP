@@ -617,7 +617,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
             ? ascend_deepep::udma::kGroupPeerCapacity : ascend_deepep::udma::kMaxPeers;
         const uint32_t packing_ub = ascend_deepep::platform::kKernelUbBytes -
             ascend_deepep::udma::DispatchLiveSendUbBytes(peer_capacity, udma_launch.qps);
-        const uint32_t descriptor_bytes = AlignUpInt64(peer_capacity * 3U * sizeof(uint32_t), 32);
+        const uint32_t descriptor_bytes = AlignUpInt64(
+            peer_capacity * ascend_deepep::kChannelMetadataDescriptorWords * sizeof(uint32_t), 32);
         const auto metadata_tile = ascend_deepep::SelectChannelMetadataTile(requested_tile,
             peer_capacity, num_topk, sizeof(ascend_deepep::topk_idx_t), topk_weights.has_value(),
             packing_ub / (metadata_double_buffer ? 2U : 1U) - descriptor_bytes);

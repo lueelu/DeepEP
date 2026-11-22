@@ -111,9 +111,12 @@ static unsigned sender_phase;
 static bool pending_rows;
 static bool metadata_packed;
 namespace ascend_deepep {
-template <uint32_t Capacity, class R, class... Args> void PackRemoteChannelMetadata(R&, Args...) {
+template <uint32_t Capacity, class R, class Sender, class Post>
+void PackRemoteChannelMetadata(R&, Sender&, GM_ADDR, GM_ADDR, const DispatchTilingData& td,
+                               uint32_t core, uint32_t, Post& post) {
     assert(sender_phase == 0 && !pending_rows && !metadata_packed);
     metadata_packed = true;
+    for (uint32_t ch=core%td.udma_workers_per_peer;ch<td.num_channels;ch+=td.udma_workers_per_peer)post(ch);
 }
 }
 static bool in_combine;

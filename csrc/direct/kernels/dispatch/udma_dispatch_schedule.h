@@ -14,6 +14,60 @@ constexpr uint32_t kListsOffset = kDispatchSenderBytes;
 static_assert(kListsOffset + kMaxPeers * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 
+template <class Sender, class Trace>
+struct SubmitDispatchChannelMetadata {
+    Sender& sender;
+    Trace& trace;
+    const DispatchTilingData& td;
+    GM_ADDR plan;
+    GM_ADDR rank_prefix;
+    GM_ADDR channel_prefix;
+    GM_ADDR workspace;
+    uint32_t plan_stride;
+    uint64_t submit_cycles = 0;
+
+    __aicore__ void operator()(uint32_t ch)
+    {
+        const uint64_t started = trace.Now();
+        AscendC::GlobalTensor<int32_t> rank_gm, channel_gm;
+        rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
+        channel_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix));
+        for (uint32_t p = 0; p < sender.Count(); ++p) {
+            const uint32_t peer = sender.Rank(p);
+            const uint32_t rank_base = td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0;
+            const uint32_t first = ch ? channel_gm.GetValue(peer * td.num_channels + ch - 1) : 0;
+            const uint32_t count = channel_gm.GetValue(peer * td.num_channels + ch) - first;
+            if (!count) continue;
+            const uint64_t slot = (uint64_t(peer) * td.num_channels + ch) * plan_stride;
+            const uint64_t row = uint64_t(rank_base) + first;
+            if (!td.cached_mode) {
+                const uint64_t source = reinterpret_cast<uint64_t>(plan) + slot * sizeof(int32_t);
+                if (td.metadata_direct_output)
+                    sender.PutChannelOutput(p, kOutputSrcWord, row, source, count);
+                else
+                    sender.PutChannelField(p, workspace, td.src_idx_buffer_offset + row * sizeof(int32_t), source,
+                                           count * uint32_t(sizeof(int32_t)));
+            }
+            sender.PutChannelField(p, workspace, td.topk_idx_buffer_offset + row * td.num_topk * sizeof(topk_idx_t),
+                                   td.packed_channel_indices + slot * td.num_topk * sizeof(topk_idx_t),
+                                   count * td.num_topk * uint32_t(sizeof(topk_idx_t)));
+            if (td.has_topk_weights) {
+                const uint64_t source = td.packed_channel_weights + slot * td.num_topk * sizeof(float);
+                if (td.metadata_direct_output)
+                    sender.PutChannelOutput(p, kOutputWeightWord, row, source, count);
+                else
+                    sender.PutChannelField(p, workspace,
+                                           td.topk_weights_buffer_offset + row * td.num_topk * sizeof(float), source,
+                                           count * td.num_topk * uint32_t(sizeof(float)));
+            }
+        }
+        // Publish this complete channel without a per-tile quiet. GM staging
+        // stays live until the original final sender.Quiet().
+        sender.Flush();
+        submit_cycles += trace.Now() - started;
+    }
+};
+
 // Each producer owns one 512-byte local flag slot. Before Begin, zero is
 // drained by every core. After both SIMT outputs drain, producers publish one.
 template <class Resource>
@@ -187,35 +241,11 @@ __aicore__ inline void DispatchRemoteImpl(
         // that owner's immutable GM staging. No extra collective is required.
         sender.Flush();
         const uint64_t pack_started = trace.Now();
+        SubmitDispatchChannelMetadata<decltype(sender), Trace> submit{
+            sender, trace, td, plan, rank_prefix, channel_prefix, workspace, plan_stride};
         ascend_deepep::PackRemoteChannelMetadata<Capacity>(resource, sender, plan, channel_prefix,
-            td, core, DispatchLiveSendUbBytes(Capacity, Qps));
-        trace.Add(Trace::TopkCycles, pack_started);
-        for (uint32_t p = 0; p < sender.Count(); ++p) {
-            const uint32_t peer = sender.Rank(p);
-            const uint32_t rank_base = td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0;
-            for (uint32_t ch = core % td.udma_workers_per_peer; ch < td.num_channels; ch += td.udma_workers_per_peer) {
-                const uint32_t first = ch ? channel_gm.GetValue(peer * td.num_channels + ch - 1) : 0;
-                const uint32_t count = channel_gm.GetValue(peer * td.num_channels + ch) - first;
-                if (!count) continue;
-                const uint64_t slot = (uint64_t(peer) * td.num_channels + ch) * plan_stride;
-                const uint64_t row = uint64_t(rank_base) + first;
-                if (!td.cached_mode) {
-                    const uint64_t source = reinterpret_cast<uint64_t>(plan) + slot * sizeof(int32_t);
-                    if (td.metadata_direct_output) sender.PutChannelOutput(p, kOutputSrcWord, row, source, count);
-                    else sender.PutChannelField(p, workspace, td.src_idx_buffer_offset + row * sizeof(int32_t),
-                        source, count * uint32_t(sizeof(int32_t)));
-                }
-                sender.PutChannelField(p, workspace, td.topk_idx_buffer_offset + row * td.num_topk * sizeof(topk_idx_t),
-                    td.packed_channel_indices + slot * td.num_topk * sizeof(topk_idx_t),
-                    count * td.num_topk * uint32_t(sizeof(topk_idx_t)));
-                if (td.has_topk_weights) {
-                    const uint64_t source = td.packed_channel_weights + slot * td.num_topk * sizeof(float);
-                    if (td.metadata_direct_output) sender.PutChannelOutput(p, kOutputWeightWord, row, source, count);
-                    else sender.PutChannelField(p, workspace, td.topk_weights_buffer_offset + row * td.num_topk * sizeof(float),
-                        source, count * td.num_topk * uint32_t(sizeof(float)));
-                }
-            }
-        }
+            td, core, DispatchLiveSendUbBytes(Capacity, Qps), submit);
+        trace.Accumulate(Trace::TopkCycles, trace.Now() - pack_started - submit.submit_cycles);
     }
     // Submit the short tail before same-core SIMT metadata. Neither this callback
     // nor the local work below may overwrite live sender headers/descriptors.

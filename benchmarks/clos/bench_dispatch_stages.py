@@ -536,15 +536,15 @@ def main(argv=None):
         parser.error("zeng dispatch comparison requires EP8, --cores 8 and --hidden 2816")
     torch.npu.set_device(device)
     native = load_native_module()
-    if getattr(native, "clos_sender_pipeline_version", 0) != 3:
-        raise RuntimeError("rebuild host and kernel libraries for post-submit plan packing and direct self metadata")
+    if getattr(native, "clos_sender_pipeline_version", 0) != 4:
+        raise RuntimeError("rebuild version-4 host and kernel libraries for cached-plan channel packing")
     if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
     if args.combine_diagnostics and (
         args.trace_samples < 1 or getattr(native, "combine_device_timing_version", 0) != 2
     ):
         raise RuntimeError("combine diagnostics requires trace samples and version-2 host/kernel libraries")
-    if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 3:
+    if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 4:
         raise RuntimeError("rebuild host and kernel libraries for channel metadata")
     if any(mode != "off" for mode in args.overlap_modes) and getattr(native, "dispatch_overlap_version", 0) != 1:
         raise RuntimeError("rebuild host and kernel libraries for overlap experiments")

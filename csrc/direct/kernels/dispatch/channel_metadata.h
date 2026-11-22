@@ -34,7 +34,7 @@ struct PlanMetadataWindow {
 };
 
 // Batch the sender's peers in one VF and reuse the input token window. The
-// three-word descriptor is {peer, valid_rows, first_ordinal}; only valid plan
+// Descriptor: {peer, valid_rows, first_ordinal, cache_cursor}; only valid plan
 // rows are traversed. In particular, do not launch a VF per peer/token row.
 __simt_vf__ __launch_bounds__(128) inline void PackRemoteMetadataVf(
     const __ubuf__ int32_t* plans, const __ubuf__ uint32_t* descriptors, const __ubuf__ topk_idx_t* indices,
@@ -43,10 +43,11 @@ __simt_vf__ __launch_bounds__(128) inline void PackRemoteMetadataVf(
     uint32_t channel, uint32_t stride, uint32_t has_weights)
 {
     for (uint32_t p = 0; p < peers; ++p) {
-        const uint32_t peer = descriptors[p * 3U], rows = descriptors[p * 3U + 1U];
-        const uint64_t base = ((uint64_t(peer) * channels + channel) * stride + descriptors[p * 3U + 2U]) * topk;
+        const uint32_t peer = descriptors[p * 4U], rows = descriptors[p * 4U + 1U];
+        const uint32_t cursor = descriptors[p * 4U + 3U];
+        const uint64_t base = ((uint64_t(peer) * channels + channel) * stride + descriptors[p * 4U + 2U]) * topk;
         for (uint32_t item = threadIdx.x; item < rows * topk; item += 128U) {
-            const uint32_t token = uint32_t(plans[p * tile_tokens + item / topk]);
+            const uint32_t token = uint32_t(plans[p * tile_tokens + cursor + item / topk]);
             const uint32_t input = (token - input_begin) * topk + item % topk;
             const topk_idx_t expert = indices[input];
             const bool valid =
@@ -63,9 +64,10 @@ __aicore__ inline void LoadRemoteMetadataWindow(Resource& resource, Sender& send
                                                 const DispatchTilingData& td, const ChannelMetadataTile& tile,
                                                 uint32_t channel, uint32_t stride, uint32_t input_begin,
                                                 uint32_t input_count, const uint32_t* totals, uint32_t* consumed,
-                                                uint32_t offset, uint32_t slot)
+                                                uint32_t offset, uint32_t slot, uint32_t plan_tokens,
+                                                uint32_t* cache_begin, uint32_t* cache_rows)
 {
-    constexpr uint32_t descriptor_bytes = (Capacity * 3U * 4U + 31U) / 32U * 32U;
+    constexpr uint32_t descriptor_bytes = (Capacity * kChannelMetadataDescriptorWords * 4U + 31U) / 32U * 32U;
     const auto event = slot ? EVENT_ID7 : EVENT_ID6;
     auto descriptors = resource.template GetBufferByByte<uint32_t>(offset);
     auto plans = resource.template GetBufferByByte<int32_t>(offset + descriptor_bytes);
@@ -80,14 +82,53 @@ __aicore__ inline void LoadRemoteMetadataWindow(Resource& resource, Sender& send
     wg.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(td.notify_topk_weights));
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(event);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(event);
+    bool loaded = false;
     for (uint32_t p = 0; p < sender.Count(); ++p) {
         const uint32_t left = totals[p] - consumed[p];
-        const uint32_t n = left < tile.tokens ? left : tile.tokens;
+        const uint32_t n = left < plan_tokens ? left : plan_tokens;
         if (!n) continue;
+        // The caller has retired this slot's VF before inspecting/reusing it.
+        // Keep its unconsumed suffix if it covers the entire input window.
+        const uint32_t cached_end = cache_begin[p] + cache_rows[p];
+        if (consumed[p] >= cache_begin[p] && consumed[p] < cached_end &&
+            (cached_end == totals[p] ||
+             uint32_t(plans.GetValue(p * plan_tokens + cache_rows[p] - 1U)) >= input_begin + input_count - 1U))
+            continue;
         const uint64_t first = (uint64_t(sender.Rank(p)) * td.num_channels + channel) * stride + consumed[p];
-        AscendC::DataCopyPad(plans[p * tile.tokens], pg[first], AscendC::DataCopyExtParams{1, n * 4U, 0, 0, 0},
+        AscendC::DataCopyPad(plans[p * plan_tokens], pg[first], AscendC::DataCopyExtParams{1, n * 4U, 0, 0, 0},
                              AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+        cache_begin[p] = consumed[p];
+        cache_rows[p] = n;
+        loaded = true;
     }
+    if (loaded) {
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(event);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(event);
+    }
+    for (uint32_t p = 0; p < sender.Count(); ++p) {
+        if (consumed[p] == totals[p]) {
+            descriptors.SetValue(p * 4U, sender.Rank(p));
+            descriptors.SetValue(p * 4U + 1U, 0);
+            descriptors.SetValue(p * 4U + 2U, consumed[p]);
+            descriptors.SetValue(p * 4U + 3U, 0);
+            continue;
+        }
+        const uint32_t cursor = consumed[p] - cache_begin[p];
+        uint32_t low = cursor, high = cache_rows[p];
+        while (low < high) {
+            const uint32_t middle = low + (high - low) / 2U;
+            if (uint32_t(plans.GetValue(p * plan_tokens + middle)) < input_begin + input_count)
+                low = middle + 1U;
+            else
+                high = middle;
+        }
+        descriptors.SetValue(p * 4U, sender.Rank(p));
+        descriptors.SetValue(p * 4U + 1U, low - cursor);
+        descriptors.SetValue(p * 4U + 2U, consumed[p]);
+        descriptors.SetValue(p * 4U + 3U, cursor);
+        consumed[p] += low - cursor;
+    }
+    // Input DMA need only complete before VF reads it, not before scalar work.
     AscendC::DataCopyPad(
         indices, ig[uint64_t(input_begin) * td.num_topk],
         AscendC::DataCopyExtParams{1, input_count * td.num_topk * uint32_t(sizeof(topk_idx_t)), 0, 0, 0},
@@ -96,45 +137,30 @@ __aicore__ inline void LoadRemoteMetadataWindow(Resource& resource, Sender& send
         AscendC::DataCopyPad(weights, wg[uint64_t(input_begin) * td.num_topk],
                              AscendC::DataCopyExtParams{1, input_count * td.num_topk * 4U, 0, 0, 0},
                              AscendC::DataCopyPadExtParams<float>{false, 0, 0, 0});
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(event);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(event);
-    for (uint32_t p = 0; p < sender.Count(); ++p) {
-        const uint32_t left = totals[p] - consumed[p];
-        uint32_t low = 0, high = left < tile.tokens ? left : tile.tokens;
-        while (low < high) {
-            const uint32_t middle = low + (high - low) / 2U;
-            if (uint32_t(plans.GetValue(p * tile.tokens + middle)) < input_begin + input_count)
-                low = middle + 1U;
-            else
-                high = middle;
-        }
-        descriptors.SetValue(p * 3U, sender.Rank(p));
-        descriptors.SetValue(p * 3U + 1U, low);
-        descriptors.SetValue(p * 3U + 2U, consumed[p]);
-        consumed[p] += low;
-    }
     AscendC::SetFlag<AscendC::HardEvent::S_V>(event);
     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(event);
 }
 
-template <uint32_t Capacity, class Resource, class Sender>
+template <uint32_t Capacity, class Resource, class Sender, class PostChannel>
 __aicore__ inline void PackRemoteChannelMetadata(Resource& resource, Sender& sender, GM_ADDR plan,
                                                  GM_ADDR channel_prefix, const DispatchTilingData& td, uint32_t core,
-                                                 uint32_t scratch_offset)
+                                                 uint32_t scratch_offset, PostChannel& post_channel)
 {
     if (!sender.Count()) return;
-    constexpr uint32_t descriptor_bytes = (Capacity * 3U * 4U + 31U) / 32U * 32U;
+    constexpr uint32_t descriptor_bytes = (Capacity * kChannelMetadataDescriptorWords * 4U + 31U) / 32U * 32U;
     const uint32_t slots = td.channel_metadata_double_buffer ? 2U : 1U;
-    const auto tile = SelectChannelMetadataTile(td.channel_metadata_tile_tokens, Capacity, td.num_topk,
-                                                sizeof(topk_idx_t), td.has_topk_weights,
-                                                (platform::kKernelUbBytes - scratch_offset) / slots - descriptor_bytes);
-    if (!tile.tokens) {
+    const uint32_t budget = (platform::kKernelUbBytes - scratch_offset) / slots - descriptor_bytes;
+    const auto selected = SelectChannelMetadataTile(td.channel_metadata_tile_tokens, Capacity, td.num_topk,
+                                                    sizeof(topk_idx_t), td.has_topk_weights, budget);
+    if (!selected.tokens) {
         trap();
         return;
     }
-    const uint32_t slot_bytes = descriptor_bytes + tile.bytes;
     const uint32_t length = (td.num_tokens + td.num_channels - 1U) / td.num_channels;
     const uint32_t stride = (length + 7U) / 8U * 8U;
+    const auto cached = ExtendMetadataPlanCache(selected, sender.Count(), stride, budget);
+    const auto tile = cached.input;
+    const uint32_t slot_bytes = descriptor_bytes + tile.bytes;
     AscendC::GlobalTensor<int32_t> prefixes;
     prefixes.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix));
     for (uint32_t ch = core % td.udma_workers_per_peer; ch < td.num_channels; ch += td.udma_workers_per_peer) {
@@ -149,24 +175,17 @@ __aicore__ inline void PackRemoteChannelMetadata(Resource& resource, Sender& sen
         const uint32_t begin = ch * length < td.num_tokens ? ch * length : td.num_tokens;
         const uint32_t end = begin + length < td.num_tokens ? begin + length : td.num_tokens;
         bool pending[2] = {false, false};
+        uint32_t cache_begin[2][Capacity]{}, cache_rows[2][Capacity]{};
         uint32_t slot = 0;
         const uint32_t initial = end - begin < tile.tokens ? end - begin : tile.tokens;
         LoadRemoteMetadataWindow<Capacity>(resource, sender, plan, td, tile, ch, stride, begin, initial, totals,
-                                           consumed, scratch_offset, 0);
+                                           consumed, scratch_offset, 0, cached.plan_tokens, cache_begin[0],
+                                           cache_rows[0]);
         for (uint32_t start = begin; start < end; start += tile.tokens) {
             const auto event = slot ? EVENT_ID7 : EVENT_ID6;
             AscendC::WaitFlag<AscendC::HardEvent::S_V>(event);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(event);
             const uint32_t next = start + tile.tokens, other = slot ^ 1U;
-            if (slots == 2U && next < end) {
-                if (pending[other]) {
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(other ? EVENT_ID7 : EVENT_ID6);
-                    pending[other] = false;
-                }
-                LoadRemoteMetadataWindow<Capacity>(resource, sender, plan, td, tile, ch, stride, next,
-                                                   end - next < tile.tokens ? end - next : tile.tokens, totals,
-                                                   consumed, scratch_offset + other * slot_bytes, other);
-            }
             const uint32_t offset = scratch_offset + slot * slot_bytes;
             auto descriptors = resource.template GetBufferByByte<uint32_t>(offset);
             auto plans = resource.template GetBufferByByte<int32_t>(offset + descriptor_bytes);
@@ -179,25 +198,45 @@ __aicore__ inline void PackRemoteChannelMetadata(Resource& resource, Sender& sen
                 reinterpret_cast<__ubuf__ topk_idx_t*>(indices.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ float*>(weights.GetPhyAddr()),
                 reinterpret_cast<__gm__ topk_idx_t*>(td.packed_channel_indices),
-                reinterpret_cast<__gm__ float*>(td.packed_channel_weights), sender.Count(), tile.tokens, start,
+                reinterpret_cast<__gm__ float*>(td.packed_channel_weights), sender.Count(), cached.plan_tokens, start,
                 td.num_topk, td.num_experts / td.world_size, td.num_channels, ch, stride, td.has_topk_weights);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(event);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(event);
             pending[slot] = true;
+            // Launch the current VF before blocking on the next slot's DMA.
+            if (slots == 2U && next < end) {
+                if (pending[other]) {
+                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(other ? EVENT_ID7 : EVENT_ID6);
+                    AscendC::WaitFlag<AscendC::HardEvent::V_S>(other ? EVENT_ID7 : EVENT_ID6);
+                    pending[other] = false;
+                }
+                LoadRemoteMetadataWindow<Capacity>(resource, sender, plan, td, tile, ch, stride, next,
+                                                   end - next < tile.tokens ? end - next : tile.tokens, totals,
+                                                   consumed, scratch_offset + other * slot_bytes, other,
+                                                   cached.plan_tokens, cache_begin[other], cache_rows[other]);
+            }
             if (slots == 1U) {
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(event);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(event);
                 pending[slot] = false;
                 if (next < end)
                     LoadRemoteMetadataWindow<Capacity>(resource, sender, plan, td, tile, ch, stride, next,
                                                        end - next < tile.tokens ? end - next : tile.tokens, totals,
-                                                       consumed, scratch_offset, 0);
+                                                       consumed, scratch_offset, 0, cached.plan_tokens, cache_begin[0],
+                                                       cache_rows[0]);
             }
             if (slots == 2U) slot = other;
         }
-        for (uint32_t i = 0; i < slots; ++i)
-            if (pending[i]) AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(i ? EVENT_ID7 : EVENT_ID6);
+        for (uint32_t i = 0; i < slots; ++i) {
+            if (pending[i]) {
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(i ? EVENT_ID7 : EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(i ? EVENT_ID7 : EVENT_ID6);
+            }
+        }
+        // GM staging is immutable until final Quiet. Retire this channel's
+        // SIMT stores before handing its addresses to the UDMA sender.
+        post_channel(ch);
     }
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
 }
 
 // Load a bounded sorted plan prefix, then one contiguous input window covering
@@ -280,14 +319,6 @@ __aicore__ inline void PackPeerChannelMetadata(Resource& resource, GM_ADDR plan,
         const uint32_t next_row = row + window.rows;
         const uint32_t other = slot ^ 1U;
         PlanMetadataWindow next{};
-        if (slots == 2U && next_row < count) {
-            if (pending[other]) {
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(other ? EVENT_ID7 : EVENT_ID6);
-                pending[other] = false;
-            }
-            next = LoadPlanMetadataWindow(resource, plan, td, tile, base + next_row, count - next_row,
-                                          scratch_offset + other * tile.bytes, other);
-        }
         const uint32_t offset = scratch_offset + slot * tile.bytes;
         auto tokens = resource.template GetBufferByByte<int32_t>(offset);
         auto indices = resource.template GetBufferByByte<topk_idx_t>(offset + tile.index_offset);
@@ -303,9 +334,20 @@ __aicore__ inline void PackPeerChannelMetadata(Resource& resource, GM_ADDR plan,
             output_src ? reinterpret_cast<__gm__ int32_t*>(output_src) + row : nullptr, window.rows, window.input_begin,
             td.num_topk, peer, td.num_experts / td.world_size, td.has_topk_weights);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(event);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(event);
         pending[slot] = true;
+        if (slots == 2U && next_row < count) {
+            if (pending[other]) {
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(other ? EVENT_ID7 : EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(other ? EVENT_ID7 : EVENT_ID6);
+                pending[other] = false;
+            }
+            next = LoadPlanMetadataWindow(resource, plan, td, tile, base + next_row, count - next_row,
+                                          scratch_offset + other * tile.bytes, other);
+        }
         if (slots == 1U) {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(event);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(event);
             pending[slot] = false;
             if (next_row < count)
                 next = LoadPlanMetadataWindow(resource, plan, td, tile, base + next_row, count - next_row,
@@ -315,11 +357,13 @@ __aicore__ inline void PackPeerChannelMetadata(Resource& resource, GM_ADDR plan,
         window = next;
         if (slots == 2U) slot = other;
     }
-    for (uint32_t i = 0; i < slots; ++i)
-        if (pending[i]) AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(i ? EVENT_ID7 : EVENT_ID6);
+    for (uint32_t i = 0; i < slots; ++i) {
+        if (pending[i]) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(i ? EVENT_ID7 : EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(i ? EVENT_ID7 : EVENT_ID6);
+        }
+    }
     // Finish SIMT GM writes before UDMA reads staging or a consumer uses self.
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
 }
 #endif
 }  // namespace ascend_deepep

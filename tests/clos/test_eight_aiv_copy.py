@@ -22,7 +22,10 @@ def test_eight_aiv_production_bodies(tmp_path):
         (source / "kernels/combine/udma_combine_self_copy.h").read_text(), "CopySelfField", "CopyCompactSelf"
     )
     functions += cpp_functions((source / "kernels/combine/combine_udma.cpp").read_text(), "ContributorSlot")
-    functions += cpp_functions((source / "kernels/dispatch/udma_dispatch_schedule.h").read_text(), "DispatchRemoteImpl")
+    schedule = (source / "kernels/dispatch/udma_dispatch_schedule.h").read_text()
+    begin = schedule.index("template <class Sender, class Trace>")
+    functions += schedule[begin : schedule.index("// Each producer", begin)]
+    functions += cpp_functions(schedule, "DispatchRemoteImpl")
     functions += cpp_functions((source / "kernels/combine/udma_combine_schedule.h").read_text(), "CombineRemoteImpl")
     functions += cpp_functions(
         (source / "kernels/combine/udma_token_combine_schedule.h").read_text(),
@@ -33,6 +36,7 @@ def test_eight_aiv_production_bodies(tmp_path):
     begin = host.index("    tiling.compact_self_rows =")
     gate = host[begin : host.index(";", begin) + 1]
     harness = (Path(__file__).with_name("eight_aiv_copy_oracle.cpp")).read_text()
+    harness = harness.replace("using GM_ADDR = uint8_t*;", "#define GM_ADDR uint8_t*")
     trace = (source / "kernels/dispatch/dispatch_device_trace.h").read_text()
     trace = "\n".join(line for line in trace.splitlines() if not line.startswith(("#include", "#pragma")))
     harness = harness.replace("// PRODUCTION_TRACE", trace)

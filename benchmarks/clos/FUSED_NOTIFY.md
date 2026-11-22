@@ -441,7 +441,7 @@ For EP16 tile testing use `--dispatch-plans auto`; no EP16 Zeng policy is assume
 Every summary includes the requested/effective tile and actual native launch
 policy. Native `last_dispatch_channel_metadata_tile_tokens()` returns zero when
 packing is inactive (including cached). Rebuild host and kernel together; this
-benchmark requires `dispatch_channel_metadata_version=3` for enabled packing.
+benchmark requires `dispatch_channel_metadata_version=4` for enabled packing.
 
 The wrapper defaults to 8 AIV, BF16, expand=0, L2 flush then all-rank alignment,
 1 GiB pages, and **off/on/on/off**. It initializes Buffer once per rank per EP,
@@ -682,7 +682,7 @@ must be checked on the target environment before enabling these options.
 
 ### Generic sender pipeline and local copies
 
-`clos_sender_pipeline_version=3` identifies the rebuilt native module. The
+`clos_sender_pipeline_version=4` identifies the rebuilt native module. The
 following paths use data-layout/resource eligibility rather than exact EP,
 hidden, channel-count or core-count matches:
 
@@ -762,8 +762,8 @@ send-first; that old execution order is no longer selectable in this library.
 ### Post-submit packing verification
 
 Both `dispatch_channel_metadata_version` and `clos_sender_pipeline_version` are
-3; rebuild host and kernels together. Existing channel/pack flags select the new
-algorithm. Compare parent `c91221b` under the same options, routing, huge pages,
+4; rebuild host and kernels together. Existing channel/pack flags select the new
+algorithm. Compare packing baseline `de50285` under the same options, routing, huge pages,
 SHMEM and benchmark wrapper. Run EP8/16/32, 8/32 communication AIVs,
 T4096/H2816/K8/E256/BF16, reduce 48; one Buffer per EP/rank. Include fresh and
 cached, weighted/unweighted, DIRECT off/on, single/double buffer and expand 0/1.
@@ -771,3 +771,39 @@ Keep zero tolerance; cover changing weights, continuous reuse, empty ranks,
 invalid routes and tails. Formal sampling disables traces and reports notify,
 communication and unprofiled complete API mean/P95 separately. Local compiler
 and mock checks cannot replace CANN/NPU precision and performance validation.
+
+
+### Channel packing pipeline (version 4)
+
+The current VF is issued before loading the next input slot. Each slot has
+separate V-to-MTE2 and V-to-scalar retirement credits: DMA cannot overwrite
+live inputs, and scalar descriptor/cache inspection cannot race the VF. Empty
+channels produce no credits. All issued credits drain before channel publication.
+The existing single/double-buffer option is retained; it is not enabled implicitly.
+
+Unused private packing UB extends each slot's per-peer sorted-plan cache. Cached
+suffixes are reused while they cover the next token window; exhausted or short
+windows refill from the current ordinal. A double-buffered invocation owns two
+independent caches, so initial loads can be duplicated, but neither slot aliases
+sender WQEs, headers or payload index windows. The common layout helper bounds
+the cache by the available per-slot budget, actual peer count and channel length;
+all per-peer plan bases remain 32-byte aligned. No EP/hidden exception is added.
+
+Each completed channel is handed to the existing sender immediately. Its
+src/top-k/weight addresses, logical row order and direct-output gates are unchanged.
+The sender flushes a channel's short WQE tail but never quiets per tile/channel.
+GM staging remains immutable until the original final quiet and collective.
+The extra short-tail flushes are a performance tradeoff to measure, not a claimed
+unconditional improvement. Sender order/P/W/Q/visit, WQE capacity, self-copy and
+combine remain unchanged. TopkCycles excludes the per-channel submission callback;
+queue/build counters continue to measure those submissions separately.
+
+For A/B use both revisions' own matching benchmark/native module, with identical
+options. Compare de50285 and version 4 at 8 and 32 communication cores, reduce 48,
+EP8/16/32, T4096/H2816/K8/E256/BF16, huge pages enabled. Run the existing double-buffer
+option off/on in both versions. Include fresh/cached, weighted/unweighted, local
+and remote consumers, tails, empty routes, repeated weight updates and expand
+precision. Preserve zero tolerance. Report same-core version changes separately
+from new-8 versus old-32, and keep notify/communication/API mean/P95 separate.
+Windows CPU compilation/constexpr and mocked event/address checks do not establish
+CANN compilation, NPU ordering/precision or an end-to-end speedup.

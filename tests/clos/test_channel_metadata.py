@@ -237,18 +237,19 @@ constexpr bool pack_check() {
     for(unsigned i=0;i<output.size();++i) { output[i]=-77; ow[i]=-77; }
     for(unsigned start=0;start<Tokens;start+=TILE_TOKENS) {
         const unsigned n=Tokens-start<TILE_TOKENS?Tokens-start:TILE_TOKENS;
-        std::array<int32_t,World*TILE_TOKENS> plans{};
-        std::array<uint32_t,World*3> desc{};
+        std::array<int32_t,World*(TILE_TOKENS+8)> plans{};
+        std::array<uint32_t,World*4> desc{};
         for(unsigned p=0;p<World;++p) {
-            desc[p*3]=p;
+            desc[p*4]=p;
+            desc[p*4+3]=1;
             for(unsigned t=start;t<start+n;++t) if(heads[t*World+p]>=0) {
-                if(!desc[p*3+1])desc[p*3+2]=heads[t*World+p];
-                plans[p*TILE_TOKENS+desc[p*3+1]++]=t;
+                if(!desc[p*4+1])desc[p*4+2]=heads[t*World+p];
+                plans[p*(TILE_TOKENS+8)+1+desc[p*4+1]++]=t;
             }
         }
         for(unsigned tid=0;tid<128;++tid)
             PackRemoteMetadataVf(plans.data(),desc.data(),idx.data()+start*K,weights.data()+start*K,
-                output.data(),ow.data(),World,TILE_TOKENS,start,K,16,C,Ch,S,Weighted,tid);
+                output.data(),ow.data(),World,TILE_TOKENS+8,start,K,16,C,Ch,S,Weighted,tid);
     }
     for(unsigned i=0;i<output.size();++i) if(output[i]!=expected[i] || ow[i]!=ew[i])return false;
     return true;
@@ -309,6 +310,15 @@ def test_pack_and_local_copy_pipeline(tmp_path):
         (Path(__file__).with_name("eight_aiv_copy_oracle.cpp")).read_text().split("static unsigned sender_phase;", 1)[0]
     )
     harness = harness.replace("enum class HardEvent {", "enum class HardEvent { V_MTE2,")
+    harness = harness.replace(
+        "static unsigned list_loads;",
+        "static unsigned list_loads;\nstatic uintptr_t plan_begin, plan_end;\nstatic uint64_t plan_bytes;",
+    )
+    harness = harness.replace(
+        "if constexpr (sizeof(T) == 4) ++list_loads;",
+        "if constexpr (sizeof(T) == 4) ++list_loads;\n"
+        "    if (uintptr_t(src.data)>=plan_begin && uintptr_t(src.data)<plan_end) plan_bytes+=copy.bytes;",
+    )
     harness = harness.replace(
         "template <HardEvent>\nvoid SetFlag(int)\n{\n}",
         "static int credits[16][8]{};\nstatic unsigned event_sets;\n"
@@ -376,10 +386,17 @@ constexpr bool check() {
     for(unsigned slots:{1U,2U}) for(unsigned k:{1U,8U,128U})
     for(unsigned index_bytes:{4U,8U}) for(bool weighted:{false,true}) {
         const unsigned live=udma::DispatchLiveSendUbBytes(capacity,qps);
-        const unsigned descriptors=(capacity*12+31)/32*32;
+        const unsigned descriptors=(capacity*16+31)/32*32;
         const unsigned budget=(221120-live)/slots-descriptors;
         const auto tile=SelectChannelMetadataTile(0,capacity,k,index_bytes,weighted,budget);
         if(!tile.tokens || live+slots*(descriptors+tile.bytes)>221120)return false;
+        for(unsigned peers:{1U,capacity}) for(unsigned stride:{0U,8U,128U,512U,8192U}) {
+            const auto cache=ExtendMetadataPlanCache(tile,peers,stride,budget);
+            if(cache.plan_tokens<tile.tokens || cache.plan_tokens%8 ||
+               cache.input.bytes>budget || cache.input.index_offset%32 ||
+               cache.input.weight_offset%32 || cache.input.index_offset!=peers*cache.plan_tokens*4 ||
+               cache.input.bytes-cache.input.index_offset!=tile.bytes-tile.index_offset)return false;
+        }
     }
     for (unsigned world : {1U, 8U, 16U, 256U})
     for (unsigned k : {1U, 8U, 128U})
