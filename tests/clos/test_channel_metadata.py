@@ -12,7 +12,8 @@ from tests.utils.cpp import cpp_functions
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_output_publication_preserves_epoch_and_rejects_invalid_capacity(tmp_path):
+@pytest.mark.parametrize("device_parse", [False, True])
+def test_output_publication_preserves_epoch_and_rejects_invalid_capacity(tmp_path, device_parse):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("C++17 compiler required")
@@ -64,8 +65,11 @@ int main() {
     path = tmp_path / "publication.cpp"
     path.write_text(source.replace("// FUNCTIONS", functions))
     binary = tmp_path / ("publication.exe" if os.name == "nt" else "publication")
+    # Exercise the device preprocessor branch as well: its helper must remain
+    # constexpr for both the compile-time oracle and the SIMT caller contract.
+    flags = ["-D__CCE_AICORE__", "-D__aicore__="] if device_parse else []
     result = subprocess.run(
-        [compiler, "-std=c++17", "-O2", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(binary)],
+        [compiler, "-std=c++17", "-O2", *flags, "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(binary)],
         capture_output=True,
         text=True,
         timeout=180,

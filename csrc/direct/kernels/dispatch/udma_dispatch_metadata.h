@@ -329,7 +329,18 @@ template <class Resource, class Trace>
 struct DispatchOverlapWork {
     Resource& resource;
     Trace& trace;
-    GM_ADDR x, scales, topk, weights, plan, ranks, channels, workspace, head, recv_x, recv_scales;
+    // GM_ADDR expands to a pointer declaration, not a pointer typedef.
+    GM_ADDR x;
+    GM_ADDR scales;
+    GM_ADDR topk;
+    GM_ADDR weights;
+    GM_ADDR plan;
+    GM_ADDR ranks;
+    GM_ADDR channels;
+    GM_ADDR workspace;
+    GM_ADDR head;
+    GM_ADDR recv_x;
+    GM_ADDR recv_scales;
     const DispatchTilingData& td;
     uint32_t core, cores;
 

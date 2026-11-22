@@ -57,6 +57,60 @@ def test_metadata_output_modes_are_independent_and_reset(monkeypatch, mode):
         assert os.environ[env] == str(int(bool(mask & (1 << bit))))
 
 
+@pytest.mark.parametrize("broken_declaration", [False, True])
+def test_overlap_gm_members_use_pointer_macro(tmp_path, broken_declaration):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    source = (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_metadata.h").read_text()
+    start = source.index("template <class Resource, class Trace>\nstruct DispatchOverlapWork")
+    fields = source[start : source.index("    __aicore__ void operator()", start)] + "};"
+    names = (
+        "x",
+        "scales",
+        "topk",
+        "weights",
+        "plan",
+        "ranks",
+        "channels",
+        "workspace",
+        "head",
+        "recv_x",
+        "recv_scales",
+    )
+    if broken_declaration:
+        # Reproduce CANN's original error: the star only binds to the first member.
+        for name in names:
+            fields = fields.replace(f"    GM_ADDR {name};", "")
+        fields = fields.replace(
+            "    const DispatchTilingData& td;",
+            "    GM_ADDR " + ", ".join(names) + ";\n    const DispatchTilingData& td;",
+        )
+    program = (
+        """
+#include <cstdint>
+#include <type_traits>
+#define __gm__
+#define GM_ADDR __gm__ uint8_t*
+struct DispatchTilingData {};
+"""
+        + fields
+        + "\nusing Work = DispatchOverlapWork<int,int>;\n"
+    )
+    program += "\n".join(f"static_assert(std::is_same_v<decltype(Work::{name}), uint8_t*>);" for name in names)
+    path = tmp_path / "gm_members.cpp"
+    path.write_text(program)
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "gm_members.o")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert (result.returncode != 0) == broken_declaration, result.stderr
+    if broken_declaration:
+        assert "static assertion failed" in result.stderr, result.stderr
+
+
 def test_post_submit_slots_and_private_ub(tmp_path):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
@@ -83,7 +137,7 @@ def test_post_submit_slots_and_private_ub(tmp_path):
 #include "common/udma_schedule.h"
 using namespace ascend_deepep;
 using namespace ascend_deepep::udma;
-using GM_ADDR = uint8_t*;
+#define GM_ADDR __gm__ uint8_t*
 constexpr int EVENT_ID6=6;
 struct { unsigned x; } threadIdx;
 struct dim3 { unsigned x; explicit dim3(unsigned v):x(v){} };

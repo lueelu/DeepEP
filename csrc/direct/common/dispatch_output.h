@@ -17,7 +17,12 @@ static_assert(kOutputWeightWord < kOutputRecordWords);
 #else
 #define ASCEND_DEEPEP_OUTPUT_FN inline constexpr
 #endif
-ASCEND_DEEPEP_OUTPUT_FN bool ValidMetadataOutput(uint64_t base, uint32_t rows, uint32_t row_bytes)
+// Pure arithmetic shared by scalar AIV and SIMT VF callers. SIMT permits
+// constexpr __aicore__ helpers, but cannot call an ordinary __aicore__ helper.
+#if defined(__CCE_AICORE__)
+__aicore__
+#endif
+inline constexpr bool ValidMetadataOutput(uint64_t base, uint32_t rows, uint32_t row_bytes)
 {
     if (!row_bytes) return base == 0;
     return (!rows || base != 0) && base <= UINT64_MAX - uint64_t(rows) * row_bytes;
