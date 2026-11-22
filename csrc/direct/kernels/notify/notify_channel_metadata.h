@@ -5,7 +5,6 @@
 #include "common/types.h"
 
 namespace ascend_deepep {
-static_assert(kChannelMetadataUbBytes <= platform::kKernelUbBytes);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 // AIV loads token-major heads/indices/weights into UB. Each thread owns one
 // (token, top-k slot), and writes every routed peer's corresponding packed slot.
@@ -38,9 +37,12 @@ template <class Resource>
 __aicore__ inline void PackChannelMetadata(Resource& resource, GM_ADDR head,
     const DispatchTilingData& td, uint32_t channel)
 {
+    const auto tile = MakeChannelMetadataTile(td.channel_metadata_tile_tokens, td.world_size,
+        td.num_topk, sizeof(topk_idx_t), td.has_topk_weights);
     auto heads = resource.template GetBufferByByte<int32_t>(0);
-    auto indices = resource.template GetBufferByByte<topk_idx_t>(kChannelMetadataHeadBytes);
-    auto weights = resource.template GetBufferByByte<float>(kChannelMetadataHeadBytes + kChannelMetadataIndexBytes);
+    auto indices = resource.template GetBufferByByte<topk_idx_t>(tile.index_offset);
+    // No weight buffer is read in the unweighted path; keep the unused pointer within UB.
+    auto weights = resource.template GetBufferByByte<float>(td.has_topk_weights ? tile.weight_offset : 0);
     AscendC::GlobalTensor<int32_t> head_gm;
     AscendC::GlobalTensor<topk_idx_t> index_gm;
     AscendC::GlobalTensor<float> weight_gm;
@@ -51,8 +53,8 @@ __aicore__ inline void PackChannelMetadata(Resource& resource, GM_ADDR head,
     const uint32_t stride = (length + 7U) / 8U * 8U;
     const uint32_t begin = channel * length < td.num_tokens ? channel * length : td.num_tokens;
     const uint32_t end = begin + length < td.num_tokens ? begin + length : td.num_tokens;
-    for (uint32_t start = begin; start < end; start += kChannelMetadataTileTokens) {
-        const uint32_t n = end - start < kChannelMetadataTileTokens ? end - start : kChannelMetadataTileTokens;
+    for (uint32_t start = begin; start < end; start += tile.tokens) {
+        const uint32_t n = end - start < tile.tokens ? end - start : tile.tokens;
         AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
         AscendC::DataCopyPad(heads, head_gm[uint64_t(start) * td.world_size],

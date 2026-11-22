@@ -20,7 +20,8 @@ def vf_as_constexpr(source, name):
 
 @pytest.mark.parametrize("bits", [32, 64])
 @pytest.mark.parametrize("corrupt", [False, True])
-def test_real_metadata_and_wqe_bodies_constexpr(tmp_path, bits, corrupt):
+@pytest.mark.parametrize("tile", [32, 64, 128, 256])
+def test_real_metadata_and_wqe_bodies_constexpr(tmp_path, bits, corrupt, tile):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("C++17 compiler required")
@@ -70,8 +71,8 @@ constexpr bool pack_check() {
             ++n;
         }
     }
-    for(unsigned start=0;start<Tokens;start+=32) {
-        unsigned n=Tokens-start<32?Tokens-start:32;
+    for(unsigned start=0;start<Tokens;start+=TILE_TOKENS) {
+        unsigned n=Tokens-start<TILE_TOKENS?Tokens-start:TILE_TOKENS;
         for(unsigned tid=0;tid<128;++tid)
             PackChannelMetadataVf(heads.data()+start*World,idx.data()+start*K,weights.data()+start*K,
                 output.data(),ow.data(),n,K,World,16,C,Ch,S,Weighted,tid);
@@ -105,11 +106,16 @@ constexpr bool wqe_check() {
 static_assert(pack_check<8,0,false>());
 static_assert(pack_check<8,33,false>());
 static_assert(pack_check<16,65,true>());
+static_assert(pack_check<8,TILE_TOKENS+1,true>());
 static_assert(pack_check<256,2,true>());
 static_assert(wqe_check());
 """
     path = tmp_path / "channel_metadata.cpp"
-    path.write_text(source.replace("INDEX_TYPE", f"int{bits}_t").replace("// FUNCTIONS", functions))
+    path.write_text(
+        source.replace("INDEX_TYPE", f"int{bits}_t")
+        .replace("TILE_TOKENS", str(tile))
+        .replace("// FUNCTIONS", functions)
+    )
     version = subprocess.run([compiler, "--version"], capture_output=True, text=True, timeout=30).stdout.lower()
     limit = "-fconstexpr-steps=10000000" if "clang" in version else "-fconstexpr-ops-limit=100000000"
     result = subprocess.run(
@@ -162,6 +168,54 @@ void check(Resource& resource, GM_ADDR head, GM_ADDR plan, GM_ADDR workspace, co
     path.write_text(harness.replace("// FUNCTIONS", functions))
     result = subprocess.run(
         [compiler, "-std=c++17", "-c", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(tmp_path / "calls.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_dynamic_metadata_tile_layout_constexpr(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    source = r"""
+#include "common/dispatch_channel_metadata.h"
+using namespace ascend_deepep;
+constexpr bool check() {
+    for (unsigned world : {1U, 8U, 16U, 256U})
+    for (unsigned k : {1U, 8U, 128U})
+    for (unsigned bytes : {4U, 8U})
+    for (bool weights : {false, true})
+    for (unsigned budget : {196608U, 221120U}) {
+        const auto automatic = SelectChannelMetadataTile(0, world, k, bytes, weights, budget);
+        if (!automatic.tokens || automatic.bytes > budget) return false;
+        for (unsigned tokens : {32U, 64U, 128U, 256U}) {
+            const auto tile = MakeChannelMetadataTile(tokens, world, k, bytes, weights);
+            if (tile.index_offset % 32 || tile.weight_offset % 32 || tile.bytes % 32) return false;
+            if (tile.index_offset < tokens*world*4 || tile.weight_offset < tile.index_offset+tokens*k*bytes ||
+                tile.bytes < tile.weight_offset+(weights?tokens*k*4:0)) return false;
+            const auto selected = SelectChannelMetadataTile(tokens, world, k, bytes, weights, budget);
+            if (bool(selected.tokens) != (tile.bytes <= budget)) return false;
+            if (selected.tokens && selected.tokens != tokens) return false;
+        }
+    }
+    return true;
+}
+static_assert(check());
+static_assert(MakeChannelMetadataTile(128,8,8,8,true).bytes == 16384);
+static_assert(MakeChannelMetadataTile(128,16,8,8,true).bytes == 20480);
+static_assert(SelectChannelMetadataTile(0,256,128,8,true,221120).tokens == 64);
+static_assert(SelectChannelMetadataTile(128,256,128,8,true,221120).tokens == 0);
+static_assert(SelectChannelMetadataTile(64,256,128,8,true,221120).bytes == 163840);
+static_assert(SelectChannelMetadataTile(17,8,8,8,true,221120).tokens == 0);
+static_assert(SelectChannelMetadataTile(0,257,8,8,true,221120).tokens == 0);
+static_assert(SelectChannelMetadataTile(0,8,129,8,true,221120).tokens == 0);
+"""
+    path = tmp_path / "tile_layout.cpp"
+    path.write_text("#include <initializer_list>\n" + source)
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-c", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(tmp_path / "tile.o")],
         capture_output=True,
         text=True,
         timeout=180,

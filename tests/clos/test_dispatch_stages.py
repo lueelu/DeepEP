@@ -130,6 +130,64 @@ def test_channel_comparison_keeps_notify_comm_and_api_separate():
         bench.channel_comparison(rows)
 
 
+def test_zeng_dispatch_override_preserves_metadata_and_auto_policy():
+    from tests.api.test_clos_compatibility import run_host
+
+    run_host("""
+        sys.path.insert(0, 'benchmarks/clos')
+        from bench_dispatch_stages import DispatchBenchmarkPolicy
+        from deep_ep.backends.direct.udma_policy import UdmaPolicy
+        base = UdmaPolicy(8, 2, 1, 2, 32, ranks_per_group=8, topology_known=True)
+        wrapper = DispatchBenchmarkPolicy(base)
+        automatic = wrapper.for_launch(8, 5632, 'dispatch', bf16=True)
+        assert automatic.qps_per_worker == 2
+        wrapper.variant = 'zeng'
+        plan = wrapper.for_launch(8, 5632, 'dispatch', bf16=True)
+        assert (plan.peer_order, plan.peers_per_worker, plan.workers_per_peer,
+                plan.qps_per_worker, plan.wqes_per_visit, plan.self_copy, plan.weight_mode) == (0,2,1,1,32,0,0)
+        assert plan.send_workers == 4
+        wrapper.variant = 'auto'
+        assert wrapper.for_launch(8, 5632, 'dispatch', bf16=True) == automatic
+        wrapper.variant = 'zeng'
+        for cores, width, op in [(16,5632,'dispatch'), (8,8192,'dispatch'), (8,5632,'weighted')]:
+            try:
+                wrapper.for_launch(cores, width, op, bf16=True)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('unsupported fixture must not silently use the Zeng label')
+    """)
+
+
+def test_channel_comparison_separates_tiles_and_payload_plans():
+    rows = []
+    for plan in ("auto", "zeng"):
+        for tile in (32, 128):
+            for mode in (0, 1, 1, 0):
+                rows.append(
+                    dict(
+                        op="fresh",
+                        cores=8,
+                        channel=0,
+                        metadata_requested=mode,
+                        metadata_tile_requested=tile,
+                        dispatch_plan=plan,
+                        policy={"plan": plan},
+                        payload_bytes_per_rank=1000000,
+                        stats_us={
+                            name: {"mean": 100 - mode * 10}
+                            for name in ("notify_dispatch_kernel", "v1_dispatch_udma_kernel", "api_wall_us")
+                        },
+                    )
+                )
+    result = bench.channel_comparison(rows)
+    assert len(result) == 4
+    assert {(r["dispatch_plan"], r["metadata_tile_requested"]) for r in result} == {
+        (plan, tile) for plan in ("auto", "zeng") for tile in (32, 128)
+    }
+    assert all(r["pairs"] == 2 for r in result)
+
+
 def test_trace_intervals_do_not_add_overlapping_metadata_twice():
     fields, rows = fixture_trace()
     decoded = bench.decode_trace(rows, fields, 3, 8, True, True, 1000)

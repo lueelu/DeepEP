@@ -7,4 +7,9 @@ inline bool& LastDispatchChannelMetadata()
     static thread_local bool enabled = false;
     return enabled;
 }
+inline unsigned& LastDispatchChannelMetadataTileTokens()
+{
+    static thread_local unsigned tokens = 0;
+    return tokens;
+}
 }  // namespace ascend_deepep::ops

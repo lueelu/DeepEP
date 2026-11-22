@@ -571,6 +571,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     ascend_deepep::DispatchTilingData tiling{};
     const bool channel_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA") && !cached_mode;
     LastDispatchChannelMetadata() = false;
+    LastDispatchChannelMetadataTileTokens() = 0;
     c10::optional<torch::Tensor> packed_channel_indices, packed_channel_weights;
     if (channel_metadata) {
         TORCH_CHECK(use_udma && !shmem.TokenSchedule() && topk_idx.has_value() && num_topk > 0,
@@ -579,6 +580,21 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         TORCH_CHECK(
             world_size <= ascend_deepep::kChannelMetadataMaxRanks && num_topk <= ascend_deepep::kChannelMetadataMaxTopk,
             "channel metadata exceeds the UB input tile capacity");
+        const char* tile_option = std::getenv("DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS");
+        uint32_t requested_tile = 0;
+        if (tile_option && *tile_option) {
+            TORCH_CHECK(std::strcmp(tile_option, "0") == 0 || std::strcmp(tile_option, "32") == 0 ||
+                        std::strcmp(tile_option, "64") == 0 || std::strcmp(tile_option, "128") == 0 ||
+                        std::strcmp(tile_option, "256") == 0,
+                        "DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS must be 0(auto), 32, 64, 128 or 256");
+            requested_tile = static_cast<uint32_t>(std::atoi(tile_option));
+        }
+        const auto metadata_tile = ascend_deepep::SelectChannelMetadataTile(requested_tile,
+            world_size, num_topk, sizeof(ascend_deepep::topk_idx_t), topk_weights.has_value(),
+            ascend_deepep::platform::kKernelUbBytes);
+        TORCH_CHECK(metadata_tile.tokens, "requested channel metadata tile exceeds available UB");
+        tiling.channel_metadata_tile_tokens = metadata_tile.tokens;
+        LastDispatchChannelMetadataTileTokens() = metadata_tile.tokens;
         const int64_t length = CheckedAddInt64(num_tokens, num_channels - 1, "metadata channel length") / num_channels;
         const int64_t stride = AlignUpInt64(length, 8);
         const int64_t row_bytes = CheckedMulInt64(num_topk, sizeof(ascend_deepep::topk_idx_t), "metadata index row");

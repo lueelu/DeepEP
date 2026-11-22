@@ -5,8 +5,9 @@ Run with torchrun. This is a dispatch diagnostic, not a MoE end-to-end benchmark
 
 import argparse
 import csv
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import datetime
+import itertools
 import json
 import math
 import os
@@ -20,6 +21,46 @@ from stage_metrics import L2CacheFlush, prepare_v2_sample
 TRACE_ENV = "DEEPEP_CLOS_DISPATCH_DEVICE_TIMING"
 CHANNEL_ENV = "DEEPEP_CLOS_CACHED_CHANNEL_EP16"
 METADATA_ENV = "DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA"
+METADATA_TILE_ENV = "DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS"
+
+
+class DispatchBenchmarkPolicy:
+    """Per-launch benchmark override; never changes the library's default policy."""
+
+    def __init__(self, base):
+        self.base = base
+        self.variant = "auto"
+
+    def for_launch(self, num_aiv, row_bytes, operation, **kwargs):
+        plan = self.base.for_launch(num_aiv, row_bytes, operation, **kwargs)
+        if self.variant == "auto":
+            return plan
+        if (
+            operation != "dispatch"
+            or self.base.world_size != 8
+            or num_aiv != 8
+            or row_bytes != 5632
+            or not self.base.topology_known
+            or self.base.ranks_per_group != 8
+            or not kwargs.get("bf16")
+            or kwargs.get("expanded")
+            or not kwargs.get("v2", True)
+        ):
+            raise ValueError("zeng dispatch comparison requires contiguous EP8/AIV8/H2816/BF16/non-expanded V2")
+        plan = replace(
+            plan,
+            peer_order=0,
+            peers_per_worker=2,
+            workers_per_peer=1,
+            qps_per_worker=1,
+            wqes_per_visit=32,
+            self_copy=0,
+            weight_mode=0,
+        )
+        plan.validate_num_aiv(num_aiv)
+        return plan
+
+
 TIMELINE = (
     "init_done",
     "begin_done",
@@ -81,15 +122,26 @@ def check_cpu_reference(torch, actual, args, rank, world, sizes=None, routing="r
 def channel_comparison(results):
     """Summarize matched off/on turns; never add independently aggregated stages."""
     comparisons = []
-    for key in sorted({(r["op"], r["cores"], r["channel"]) for r in results}):
-        selected = [r for r in results if (r["op"], r["cores"], r["channel"]) == key]
+
+    def comparison_key(r):
+        return (r["op"], r["cores"], r["channel"], r.get("metadata_tile_requested", 32), r.get("dispatch_plan", "auto"))
+
+    for key in sorted({comparison_key(r) for r in results}):
+        selected = [r for r in results if comparison_key(r) == key]
         off = [r for r in selected if r["metadata_requested"] == 0]
         on = [r for r in selected if r["metadata_requested"] == 1]
         if not off or not on:
             continue
         if len(off) != len(on) or any(r["policy"] != off[0]["policy"] for r in selected):
             raise ValueError("unmatched metadata comparison")
-        row = dict(op=key[0], cores=key[1], cached_channel=key[2], pairs=len(off))
+        row = dict(
+            op=key[0],
+            cores=key[1],
+            cached_channel=key[2],
+            metadata_tile_requested=key[3],
+            dispatch_plan=key[4],
+            pairs=len(off),
+        )
         notify = "cached_notify_dispatch_kernel" if key[0] == "cached" else "notify_dispatch_kernel"
         for label, stage in (("notify", notify), ("comm", "v1_dispatch_udma_kernel"), ("api", "api_wall_us")):
             a = [r["stats_us"][stage]["mean"] for r in off]
@@ -178,6 +230,21 @@ def main(argv=None):
     parser.add_argument("--cores", type=int, nargs="+", default=[8, 32])
     parser.add_argument("--cached-channel-modes", type=int, nargs="+", choices=[0, 1], default=[0, 1])
     parser.add_argument("--metadata-modes", type=int, nargs="+", choices=[0, 1], default=[0])
+    parser.add_argument(
+        "--metadata-tile-tokens",
+        type=int,
+        nargs="+",
+        choices=[0, 32, 64, 128, 256],
+        default=[0],
+        help="0: automatic 128-token tile with UB fallback; reuse one Buffer across choices",
+    )
+    parser.add_argument(
+        "--dispatch-plans",
+        nargs="+",
+        choices=["auto", "zeng"],
+        default=["auto"],
+        help="zeng: EP8/AIV8/H2816 rank/P2/W1/Q1/visit32; metadata path unchanged",
+    )
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--trace-samples", type=int, default=3, help="0 for formal timing only/older baseline")
@@ -206,11 +273,13 @@ def main(argv=None):
     rank, world, device = (int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
     if world not in (8, 16) or args.experts % world or args.topk > args.experts:
         parser.error("this experiment requires EP8/16 and experts divisible by EP")
+    if "zeng" in args.dispatch_plans and (world != 8 or args.cores != [8] or args.hidden != 2816):
+        parser.error("zeng dispatch comparison requires EP8, --cores 8 and --hidden 2816")
     torch.npu.set_device(device)
     native = load_native_module()
     if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 1:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
-    if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 1:
+    if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for channel metadata")
     store = dist.TCPStore(
         os.environ["MASTER_ADDR"],
@@ -231,6 +300,7 @@ def main(argv=None):
         TRACE_ENV,
         CHANNEL_ENV,
         METADATA_ENV,
+        METADATA_TILE_ENV,
         "DEEPEP_CLOS_DISPATCH_SRC_IDX_256",
         "DEEPEP_CLOS_DISPATCH_TOPK_256",
         "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY",
@@ -252,6 +322,8 @@ def main(argv=None):
             shmem_ip_port=f"tcp://{os.environ['MASTER_ADDR']}:{args.shmem_port}",
         )
     flush = L2CacheFlush(torch, buffer, args.flush_l2)
+    launch_policy = DispatchBenchmarkPolicy(buffer._udma_auto_policy)
+    buffer._udma_auto_policy = launch_policy
     actual_huge_pages = bool(buffer.runtime.use_1g_huge_pages())
     if not all(group.gather(actual_huge_pages == args.huge_pages)):
         raise RuntimeError("native huge-page state differs from requested configuration")
@@ -302,9 +374,13 @@ def main(argv=None):
                 dx, di, dw = cpu_x.npu(), cpu_idx.to(dtype=topk_idx_t, device="npu"), cpu_w.npu()
                 for core in args.cores:
                     for weighted in (False, True):
-                        for mode in args.metadata_modes:
-                            group.agree(["precision", routing, core, weighted, mode])
+                        for mode, tile, plan_name in itertools.product(
+                            args.metadata_modes, args.metadata_tile_tokens, args.dispatch_plans
+                        ):
+                            group.agree(["precision", routing, core, weighted, mode, tile, plan_name])
+                            launch_policy.variant = plan_name
                             os.environ[METADATA_ENV] = str(mode)
+                            os.environ[METADATA_TILE_ENV] = str(tile)
                             prepare_v2_sample(buffer, flush)
                             result = done(
                                 buffer.dispatch(
@@ -328,7 +404,20 @@ def main(argv=None):
                                 routing,
                                 src_idx=result[3]._dispatch_layout[3].cpu(),
                             )
-                            precision_cases.append(dict(routing=routing, cores=core, weighted=weighted, mode=mode))
+                            effective_tile = native.last_dispatch_channel_metadata_tile_tokens()
+                            if (not mode and effective_tile != 0) or (mode and tile and effective_tile != tile):
+                                raise RuntimeError("precision launch used the wrong metadata tile")
+                            precision_cases.append(
+                                dict(
+                                    routing=routing,
+                                    cores=core,
+                                    weighted=weighted,
+                                    mode=mode,
+                                    tile=tile,
+                                    effective_tile=effective_tile,
+                                    plan=plan_name,
+                                )
+                            )
             group.agree("channel_metadata_precision_passed")
             (out / "precision.json").write_text(json.dumps(precision_cases, indent=2), encoding="utf-8")
         cpu_x, idx, cpu_w = cpu_inputs(torch, args, rank)
@@ -341,21 +430,25 @@ def main(argv=None):
         results = []
         for op in ("fresh", "fresh_weighted", "cached"):
             configs = [
-                (core, flag, metadata)
+                (core, flag, metadata, tile, plan_name)
                 for core in args.cores
                 for flag in args.cached_channel_modes
                 for metadata in args.metadata_modes
+                for tile in args.metadata_tile_tokens
+                for plan_name in args.dispatch_plans
                 if flag == 0 or (world == 16 and core == 8 and op == "cached")
             ]
             if not configs:
                 continue
             reference = None
             policies = {}
-            for turn, (core, flag, metadata) in enumerate(configs + configs[::-1]):
-                group.agree([op, turn, core, flag, metadata])
+            for turn, (core, flag, metadata, tile, plan_name) in enumerate(configs + configs[::-1]):
+                group.agree([op, turn, core, flag, metadata, tile, plan_name])
                 torch.npu.synchronize()
+                launch_policy.variant = plan_name
                 os.environ[CHANNEL_ENV] = str(flag)
                 os.environ[METADATA_ENV] = str(metadata)
+                os.environ[METADATA_TILE_ENV] = str(tile)
                 handle = None
 
                 def invoke():
@@ -370,15 +463,21 @@ def main(argv=None):
                             do_expand=False,
                         )
                     )
-                    if getattr(native, "dispatch_channel_metadata_version", 0) == 1:
+                    if getattr(native, "dispatch_channel_metadata_version", 0) >= 1:
                         effective = bool(native.last_dispatch_channel_metadata())
                         if effective != bool(metadata and handle is None):
                             raise RuntimeError("native channel-metadata gate did not match this launch")
+                        if getattr(native, "dispatch_channel_metadata_version", 0) >= 2:
+                            effective_tile = native.last_dispatch_channel_metadata_tile_tokens()
+                            if (not effective and effective_tile != 0) or (
+                                effective and tile and effective_tile != tile
+                            ):
+                                raise RuntimeError("native metadata tile did not match this launch")
                     return result
 
                 initial = invoke()
                 policy = asdict(initial[3]._udma_policy)
-                key = (core, flag)
+                key = (core, flag, plan_name)
                 if key in policies and policies[key] != policy:
                     raise RuntimeError("metadata toggle changed the payload policy")
                 policies[key] = policy
@@ -413,7 +512,7 @@ def main(argv=None):
                     start = time.perf_counter_ns()
                     invoke()
                     api.append((time.perf_counter_ns() - start) / 1000)
-                capture = out / f"{op}_round{turn}_aiv{core}_channel{flag}_metadata{metadata}"
+                capture = out / f"{op}_round{turn}_aiv{core}_channel{flag}_metadata{metadata}_tile{tile}_{plan_name}"
                 prof = torch_npu.profiler
                 with prof.profile(
                     activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
@@ -449,7 +548,14 @@ def main(argv=None):
                         cores=core,
                         channel=flag,
                         metadata_requested=metadata,
+                        dispatch_plan=plan_name,
                         metadata_effective=bool(metadata and op != "cached"),
+                        metadata_tile_requested=tile,
+                        metadata_tile_effective=(
+                            native.last_dispatch_channel_metadata_tile_tokens()
+                            if getattr(native, "dispatch_channel_metadata_version", 0) >= 2
+                            else 0
+                        ),
                         policy=policy,
                         stats_us=stats,
                         payload_bytes_per_rank=payload,
@@ -497,6 +603,7 @@ def main(argv=None):
     finally:
         os.environ[TRACE_ENV] = "0"
         os.environ[METADATA_ENV] = "0"
+        os.environ[METADATA_TILE_ENV] = "0"
         buffer.destroy()
     group.agree("complete")
     (out / "exit.json").write_text('{"exit_code": 0, "variant_precision_passed": true}', encoding="utf-8")

@@ -364,13 +364,23 @@ send-head ordinals through MTE2 to UB; SIMT reads those UB inputs and writes
 the packed GM slots. No SIMT input routing scan through GM is added.
 
 Packing overlays notify's released UB at the tail (after deferred-plan building
-if enabled), using this fixed byte ledger, independent of the actual K/EP:
+if enabled). The input tile uses actual EP/K/index width, with each region
+rounded up to 32 bytes. For tile length B:
 
-| UB bytes | Owner / use |
+| Region | Bytes |
 | --- | --- |
-| 0..32767 | 32 tokens x at most 256 int32 send-head entries |
-| 32768..65535 | 32 tokens x at most 128 64-bit top-k indices |
-| 65536..81919 | 32 tokens x at most 128 FP32 weights |
+| Send heads, starting at UB byte 0 | align32(B x EP x 4) |
+| Top-k indices, immediately after heads | align32(B x K x sizeof(topk_idx_t)) |
+| Optional FP32 weights, immediately after indices | align32(B x K x 4), or zero without weights |
+
+`DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS=0` (unset/default) selects 128 tokens,
+halving to 64 or 32 only when the complete tile exceeds the architecture's
+available kernel UB. Explicit 32/64/128/256 settings fail on the host if they
+do not fit. EP/K remain bounded by 256/128. EP8/K8/64-bit indices with weights
+uses 16 KiB at B=128; EP16 uses 20 KiB. This reduces per-channel load/VF/event
+rounds from 16 to 4 for T4096/eight channels, without changing the 128 SIMT
+threads, route ownership, output layout or completion rules. Device performance
+must still be measured; the channel-metadata experiment remains opt-in.
 
 Loads complete with MTE2_V; V_MTE2 drains readers before the next tile load.
 V_S and same-stream kernel completion gate dispatch. Packed tensors use the
@@ -405,7 +415,26 @@ Use the site's torchrun launcher for **EP8 and EP16 in separate jobs**:
 torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_channel_metadata.py \
   --tokens 4096 --hidden 2816 --topk 8 --experts 256 \
   --warmup 10 --samples 30 --huge-pages --output /path/to/channel_metadata_ep8
+
+# One Buffer: compare 32/64/128/256-token packing under unchanged auto payload
+# policy and Zeng's contiguous EP8/AIV8/H2816 rank/P2/W1/Q1/visit32 policy.
+# Keep weights prepacked in notify for every measured fresh dispatch.
+torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_channel_metadata.py \
+  --metadata-modes 1 --metadata-tile-tokens 32 64 128 256 \
+  --dispatch-plans auto zeng --warmup 10 --samples 30 --huge-pages \
+  --output /path/to/channel_tile_zeng_ep8
 ```
+
+The second command visits every tile/plan combination and then reverses the
+order, reusing a single Buffer throughout. `--dispatch-plans zeng` is restricted
+to contiguous EP8/AIV8/H2816/BF16/non-expanded dispatch; it is a benchmark-only
+per-launch override and leaves the production default policy untouched. It does
+not change the prepacked weight path or enable Zeng's combine weight policy.
+For EP16 tile testing use `--dispatch-plans auto`; no EP16 Zeng policy is assumed.
+Every summary includes the requested/effective tile and actual native launch
+policy. Native `last_dispatch_channel_metadata_tile_tokens()` returns zero when
+packing is inactive (including cached). Rebuild host and kernel together; this
+benchmark requires `dispatch_channel_metadata_version=2` for enabled packing.
 
 The wrapper defaults to 8 AIV, BF16, expand=0, L2 flush then all-rank alignment,
 1 GiB pages, and **off/on/on/off**. It initializes Buffer once per rank per EP,
