@@ -332,10 +332,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                 "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1");
     const bool fused_layout = !cached_mode && public_handle != nullptr && fused_env && std::strcmp(fused_env, "1") == 0;
     TORCH_CHECK(!fused_layout || (use_udma && topk_idx.has_value()), "fused layout requires fresh V2 UDMA dispatch");
-    const auto enabled_option = [](const char* name) {
+    const auto enabled_option = [](const char* name, bool default_value = false) {
         const char* value = std::getenv(name);
         TORCH_CHECK(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0, name, " must be 0 or 1");
-        return value && std::strcmp(value, "1") == 0;
+        return value ? std::strcmp(value, "1") == 0 : default_value;
     };
     const bool cached_weight_pack = cached_mode && topk_weights.has_value() &&
         enabled_option("DEEPEP_CLOS_CACHED_WEIGHT_PACK");
@@ -643,10 +643,12 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.metadata_src_threads = metadata_src_256 ? 256U : 128U;
     tiling.metadata_src_lanes = metadata_src_256 && world_size <= 8 ? 32U : 16U;
     tiling.metadata_topk_threads = metadata_topk_256 ? 256U : 128U;
-    const bool cached_channel_ep16 = enabled_option("DEEPEP_CLOS_CACHED_CHANNEL_EP16");
+    // Keep the old experiment variable as a fallback for existing runners.
+    const bool cached_channel = enabled_option("DEEPEP_CLOS_CACHED_CHANNEL",
+        enabled_option("DEEPEP_CLOS_CACHED_CHANNEL_EP16", true));
     const bool device_timing = enabled_option("DEEPEP_CLOS_DISPATCH_DEVICE_TIMING");
-    TORCH_CHECK(use_udma || !(cached_channel_ep16 || device_timing), "dispatch diagnostics require UDMA");
-    tiling.cached_channel_ep16 = cached_channel_ep16;
+    TORCH_CHECK(use_udma || !device_timing, "dispatch diagnostics require UDMA");
+    tiling.cached_channel = use_udma && cached_channel;
     DispatchDeviceTimingSlot().reset();
     if (device_timing) {
         TORCH_CHECK(!shmem.TokenSchedule(), "dispatch device timing requires peer scheduling");
@@ -694,9 +696,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
-    // Experimental overlap never changes peer/QP ownership or FP8 dependencies.
-    const bool overlap_self = enabled_option("DEEPEP_CLOS_DISPATCH_OVERLAP_SELF");
-    const bool early_slots = enabled_option("DEEPEP_CLOS_DISPATCH_EARLY_SLOTS");
+    // Send first when metadata shares the sending AIVs. Preserve peer/QP
+    // ownership and FP8 producer dependencies; explicit zero keeps the baseline.
+    const bool overlap_self = enabled_option("DEEPEP_CLOS_DISPATCH_OVERLAP_SELF", true);
+    const bool early_slots = enabled_option("DEEPEP_CLOS_DISPATCH_EARLY_SLOTS", true);
     const bool skip_topk_init = enabled_option("DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT");
     const bool peer_dispatch = use_udma && !shmem.TokenSchedule();
     tiling.dispatch_early_slots = peer_dispatch && public_handle != nullptr && early_slots;

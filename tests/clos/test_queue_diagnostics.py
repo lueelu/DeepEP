@@ -241,6 +241,14 @@ def test_decoder_distinguishes_queue_counters_and_rejects_invalid_data():
     assert decoded["intervals"]["credit_blocked_cycles_us"] == 0.3
     assert decoded["intervals"]["final_quiet_cycles_us"] == 0.25
     assert decoded["raw"]["cqe_requested"] == 3
+    row["metadata_done"], row["payload_queued"] = row["payload_queued"], row["metadata_done"]
+    (deferred,) = bench.decode_trace([[row[k] for k in names]], names, 1, 1, False, False, 1000)
+    assert deferred["queue"]["metadata_after_payload"]
+    assert all(value >= 0 for value in deferred["intervals"].values())
+    row["operation"] = 1
+    with pytest.raises(ValueError, match="timeline"):
+        bench.decode_trace([[row[k] for k in names]], names, 1, 1, False, False, 1000, operation=1)
+    row["operation"] = 0
     row["credit_blocked"] = 5
     with pytest.raises(ValueError, match="inconsistent queue"):
         bench.decode_trace([[row[k] for k in names]], names, 1, 1, False, False, 1000)

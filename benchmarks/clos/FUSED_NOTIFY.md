@@ -569,14 +569,16 @@ for dispatch; combine's outer alignment notify is excluded from its measured API
 
 ## Dispatch overlap experiments
 
-These four per-launch switches default to `0`. Rebuild both host and kernel
-libraries; the tiling ABI has changed. Peer order, P/W/Q, visit, payload UDMA,
-combine and reduce policies are unchanged.
+Rebuild both host and kernel libraries; the tiling ABI has changed. The self
+and slots switches now default to `1` on eligible paths; init and notify remain
+opt-in. Explicit `0` selects the control. Peer order, P/W/Q, visit, payload UDMA,
+combine and reduce core policies are unchanged.
 
 | Benchmark mode | Environment variable set to `1` | Effective scope |
 | --- | --- | --- |
 | `self` | `DEEPEP_CLOS_DISPATCH_OVERLAP_SELF` | Peer dispatch without auxiliary metadata/copy AIVs or scales, with sufficient private UB: submit remote payload/metadata and terminal flags, then copy self before incoming wait/quiet |
 | `slots` | `DEEPEP_CLOS_DISPATCH_EARLY_SLOTS` | Fresh peer dispatch: build local V2 destination slots after submission/self work; Source still waits for received metadata |
+| `send` | Both self and slots | Send-first dispatch plus early slots; no prefill or notify-pack changes |
 | `init` | `DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT` | Fresh channel-metadata path only: omit valid-row top-k prefill because packed metadata writes every slot, including invalid `-1` entries |
 | `notify` | `DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER` | Channel-metadata pack: two independent input UB tiles and event pairs; GM output layout is unchanged |
 | `all` / `off` | All four / none | Matched combined treatment / control |
@@ -669,3 +671,69 @@ bit 0 = cached pack, bit 1 = direct output, bit 2 = omitted top-k output.
 The older overlap experiments remain off in this comparison. CPU tests validate
 addressing and control flow; CANN compilation and NPU precision/performance
 must be checked on the target environment before enabling these options.
+
+### Generic sender pipeline and local copies
+
+`clos_sender_pipeline_version=1` identifies the rebuilt native module. The
+following paths use data-layout/resource eligibility rather than exact EP,
+hidden, channel-count or core-count matches:
+
+* `DEEPEP_CLOS_DISPATCH_OVERLAP_SELF` defaults to `1`. Ordinary peer dispatch
+  without spare metadata AIVs or scales first submits payload (including the
+  short tail), then publishes SIMT metadata, then final SO markers, then copies
+  self before incoming wait/quiet. Packed UDMA metadata is still sent before
+  SO markers. The original collective still completes SIMT stores and all local
+  copies. Spare metadata AIVs retain their parallel path. `EARLY_SLOTS` also
+  defaults to `1`; source-handle construction still waits for received metadata.
+* `DEEPEP_CLOS_CACHED_CHANNEL` defaults to `1`. Cached two-byte payloads without
+  scales use exact peer/channel counts and compact plan lists, avoiding repeated
+  input-token-window scans. Payload remains row WQEs with unchanged visit and
+  batch size. The old `DEEPEP_CLOS_CACHED_CHANNEL_EP16` variable is a fallback
+  only when the new variable is unset. Explicit `0` now disables the whole-channel
+  path for every EP, including EP8. Removing windows can change peer interleaving;
+  less scanning alone is not evidence of lower communication latency.
+* `DEEPEP_CLOS_COMBINE_COMPACT_SELF` defaults to `1`. Ordinary split peer BF16
+  combine copies dense local input rows into a compact local-contributor slice.
+  The reducer translates only its own contributor through the existing channel
+  prefix/ordinal mapping; remote slices and handle format are unchanged. Core
+  counts for communication and reduction may differ. Token scheduling,
+  early-single and aggregate pipeline retain their existing paths.
+
+Ownership and scratch ledger: dispatch payload QP/peer owners and metadata
+channel owners are unchanged. Local writes occupy disjoint receive-row ranges;
+early slots retain their original per-core token ownership. Dispatch reserves
+`DispatchLiveSendUbBytes(capacity,qps)` for sender state and index windows:
+12,832 bytes for capacity 8/Q1, 80,928 for capacity 64/Q1, and 93,216 for capacity
+64/Q2. Deferred local scratch starts after that aligned region. Host gating
+requires at least 32 KiB remaining and a payload row that fits; all local DMA
+slots drain before reuse. Compact combine reuses a 64 KiB tile at UB offset
+2,048 only before sender setup or after all final WQEs have been submitted and
+MTE3 has released staging (or on an auxiliary AIV). Quiet uses retained queue
+state, not overwritten WQE staging. GM input buffers remain live until completion.
+No completion barrier, source-lifetime requirement or sparse-CQE credit wait is
+removed.
+
+The stage benchmark accepts EP2..256 with experts divisible by EP. Reuse one
+Buffer per EP, run automatic 8/32-core plans, and hold reduce at 48 cores:
+
+```bash
+torchrun <site-launch-arguments> benchmarks/clos/bench_dispatch_stages.py \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 32 \
+  --dispatch-plans auto --metadata-modes 0 --metadata-output-modes off \
+  --cached-channel-modes 0 1 --overlap-modes off send \
+  --combine-diagnostics --compact-self-modes 0 1 --reduce-cores 48 \
+  --warmup 10 --samples 30 --trace-warmup 5 --trace-samples 3 \
+  --flush-l2 --huge-pages --output <shared-result-directory>
+```
+
+The independent reference retains zero tolerance. Masked/invalid/skewed routes,
+empty ranks, tails, cached reuse and expanded consumers are checked outside
+timing. Each configuration runs in both orders. Dispatch notify, communication,
+complete API and combine communication/reduce/API are separate; combine's outer
+alignment notify is not part of its measured API. Formal sampling disables
+diagnostic instrumentation. The trace decoder accepts metadata either before
+payload or between payload and final publication, and labels the observed order.
+CPU oracle coverage includes EP4..256, independent 8/32/48/64-core reduction,
+empty/tail copies, preserved remote partitions and scheduler callback order.
+These checks do not replace CANN compilation, device precision/stress or measured
+end-to-end performance on the target topology.

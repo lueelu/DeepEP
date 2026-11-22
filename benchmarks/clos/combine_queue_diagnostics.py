@@ -11,6 +11,7 @@ import time
 from stage_metrics import prepare_v2_sample
 
 TRACE_ENV = "DEEPEP_CLOS_COMBINE_DEVICE_TIMING"
+COMPACT_ENV = "DEEPEP_CLOS_COMBINE_COMPACT_SELF"
 
 
 def capture_combine_stages(directory, samples):
@@ -61,7 +62,12 @@ def run_combine_diagnostics(
     expected_x = (cpu_x.float() * multiplicity[:, None]).to(cpu_x.dtype)
     expected_w = cpu_w.masked_fill(owners < 0, 0)
     results = []
-    configs = [(core, weighted) for core in args.cores for weighted in (False, True)]
+    configs = [
+        (core, weighted, compact)
+        for core in args.cores
+        for weighted in (False, True)
+        for compact in args.compact_self_modes
+    ]
     os.environ[TRACE_ENV] = "0"
 
     def done(value):
@@ -78,8 +84,9 @@ def run_combine_diagnostics(
             raise AssertionError("unweighted combine returned weights")
 
     try:
-        for turn, (core, weighted) in enumerate(configs + configs[::-1]):
-            group.agree(["combine_diagnostic", turn, core, weighted])
+        for turn, (core, weighted, compact) in enumerate(configs + configs[::-1]):
+            group.agree(["combine_diagnostic", turn, core, weighted, compact])
+            os.environ[COMPACT_ENV] = str(compact)
             # Prepare input outside all measured passes, without a second Buffer.
             received = done(
                 buffer.dispatch(
@@ -117,7 +124,7 @@ def run_combine_diagnostics(
                 start = time.perf_counter_ns()
                 invoke()
                 api.append((time.perf_counter_ns() - start) / 1000)
-            capture = out / f"combine_round{turn}_aiv{core}_weighted{int(weighted)}"
+            capture = out / f"combine_round{turn}_aiv{core}_weighted{int(weighted)}_compact{compact}"
             prof = torch_npu.profiler
             with prof.profile(
                 activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
@@ -182,6 +189,7 @@ def run_combine_diagnostics(
                     cores=core,
                     reduce_cores=args.reduce_cores,
                     weighted=weighted,
+                    compact_self=compact,
                     policy=asdict(plan),
                     stats_us=stats,
                     payload_bytes_per_rank=payload,
@@ -192,4 +200,5 @@ def run_combine_diagnostics(
             (out / "combine_summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     finally:
         os.environ[TRACE_ENV] = "0"
+        os.environ[COMPACT_ENV] = "0"
     group.agree("combine_diagnostics_passed")

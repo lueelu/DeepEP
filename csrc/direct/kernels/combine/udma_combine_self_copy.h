@@ -8,8 +8,9 @@
 
 namespace ascend_deepep::udma {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-// Both ends of each field are dense and 32-byte aligned (checked on the host).
-// Drain both MTEs before giving the shared scratch back to the sender.
+// Both fields have dense row strides (checked on the host). GM endpoints may
+// have element alignment; the UB tile is 32-byte aligned. Drain both MTEs
+// before giving the shared scratch back to the sender.
 template <class Resource>
 __aicore__ inline void CopySelfField(Resource& resource, GM_ADDR source, GM_ADDR destination, uint64_t bytes)
 {

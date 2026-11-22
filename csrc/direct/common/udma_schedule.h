@@ -61,7 +61,8 @@ ASCEND_DEEPEP_SCHEDULE_FN uint64_t TokenPeerMask(uint32_t rank, uint32_t peer)
     return rank == peer ? 0 : (uint64_t{1} << kQpCount) - 1U;
 }
 // Spare AIVs own all metadata channels; if every AIV owns a QP, each core
-// handles its metadata before sending payload, without changing QP ownership.
+// handles its metadata itself, without changing QP ownership. The peer sender
+// can defer this work until after payload submission when private UB fits.
 ASCEND_DEEPEP_SCHEDULE_FN uint32_t MetadataFirst(uint32_t world, uint32_t peers, uint32_t cores,
     uint32_t order = kRankOrder, uint32_t ranks_per_group = 0, uint32_t workers_per_peer = 1)
 {

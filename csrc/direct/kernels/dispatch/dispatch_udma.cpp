@@ -186,11 +186,12 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
 
     // With spare cores, payload owners skip this helper and immediately start
     // UDMA while the other cores build metadata and copy self channels.
-    ascend_deepep::udma::DispatchMetadata(resource, x, dispatch_scales, topk_idx, topk_weights,
-        dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head,
-        tiling, core_idx, core_num, kDispatchStageBytes, recv_x, recv_x_scales, trace,
-        !tiling.dispatch_self_after_submit);
-    trace.Mark(Trace::MetadataDone);
+    if (!tiling.dispatch_self_after_submit) {
+        ascend_deepep::udma::DispatchMetadata(resource, x, dispatch_scales, topk_idx, topk_weights,
+            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head,
+            tiling, core_idx, core_num, kDispatchStageBytes, recv_x, recv_x_scales, trace);
+        trace.Mark(Trace::MetadataDone);
+    }
     if (tiling.udma_token_schedule) {
         ascend_deepep::udma::DispatchTokenRemote(resource, x, dispatch_scales,
             dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num);

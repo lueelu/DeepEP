@@ -60,6 +60,7 @@ __aicore__ inline void WaitPackedScaleReady(const DispatchTilingData& td, uint32
 }
 
 struct NoDispatchOverlapWork {
+    __aicore__ void BeforePublish(uint32_t) {}
     __aicore__ void operator()(uint32_t) {}
 };
 
@@ -80,8 +81,7 @@ __aicore__ inline void DispatchRemoteImpl(
     rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
     channel_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix));
     const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
-    const bool cached_channel = td.cached_mode && !td.has_x_scales && (td.world_size == 8 || (td.world_size == 16 && td.cached_channel_ep16)) &&
-        cores == 8 && td.x_element_bytes == 2;
+    const bool cached_channel = td.cached_mode && !td.has_x_scales && td.cached_channel && td.x_element_bytes == 2;
     trace.Set(DispatchDeviceTrace::PayloadPeers, sender.Count());
     trace.Set(DispatchDeviceTrace::WholeChannel, cached_channel);
     const uint32_t max_tile = cached_channel ? channel_tokens :
@@ -211,11 +211,15 @@ __aicore__ inline void DispatchRemoteImpl(
             }
         }
     }
+    // Submit the short tail before same-core SIMT metadata. Neither this callback
+    // nor the local work below may overwrite live sender headers/descriptors.
+    sender.Flush();
     trace.Mark(DispatchDeviceTrace::PayloadQueued);
-    sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
-    trace.Mark(DispatchDeviceTrace::Published);
     constexpr uint32_t self_offset = DispatchLiveSendUbBytes(Capacity, Qps);
     static_assert(self_offset == sender_bytes + Capacity * kTileTokens * sizeof(int32_t));
+    post_submit.BeforePublish(self_offset);
+    sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
+    trace.Mark(DispatchDeviceTrace::Published);
     post_submit(self_offset);
     trace.Mark(DispatchDeviceTrace::IncomingBegin);
     WaitIncoming<true>(workspace, td, core, cores, td.udma_workers_per_peer * Qps);

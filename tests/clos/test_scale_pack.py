@@ -23,6 +23,7 @@ def test_serial_aggregate_self_copy_native_gate(tmp_path):
         r"""
 #include <cassert>
 #include <cstdlib>
+#include <initializer_list>
 #include <stdexcept>
 #define TORCH_CHECK(condition, ...) do { if (!(condition)) throw std::runtime_error("gate"); } while (0)
 namespace ascend_deepep::udma {
@@ -61,7 +62,12 @@ int main() {
     executable = tmp_path / "combine_gate"
     path.write_text(harness)
     subprocess.run([compiler, "-std=c++17", "-O2", str(path), "-o", str(executable)], check=True, timeout=60)
-    subprocess.run([str(executable)], check=True, timeout=30)
+    try:
+        subprocess.run([str(executable)], check=True, timeout=30)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
 
 
 def test_batched_notify_count_tiles_and_source_ownership(tmp_path):

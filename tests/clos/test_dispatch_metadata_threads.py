@@ -21,7 +21,7 @@ def test_metadata_vf_thread_variants(tmp_path):
     begin = host.index("    const bool metadata_src_256")
     options += host[begin : host.index("    const bool host_prep", begin)]
     begin = host.index("    tiling.metadata_src_threads =")
-    fields = host[begin : host.index("    const bool cached_channel_ep16", begin)]
+    fields = host[begin : host.index("    // Keep the old experiment variable", begin)]
     compiler = shutil.which("g++") or shutil.which("clang++")
     if not compiler:
         pytest.skip("C++17 compiler required for production VF oracle")

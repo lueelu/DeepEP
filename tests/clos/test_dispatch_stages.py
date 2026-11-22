@@ -197,7 +197,7 @@ def test_overlap_gm_members_use_pointer_macro(tmp_path, broken_declaration):
         pytest.skip("C++17 compiler required")
     source = (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_metadata.h").read_text()
     start = source.index("template <class Resource, class Trace>\nstruct DispatchOverlapWork")
-    fields = source[start : source.index("    __aicore__ void operator()", start)] + "};"
+    fields = source[start : source.index("    __aicore__ void BeforePublish", start)] + "};"
     names = (
         "x",
         "scales",
@@ -284,20 +284,22 @@ template<HardEvent> void WaitFlag(int) { assert(pending); pending=false; }
 template<auto Fn, class... Args> void asc_vf_call(dim3 n, Args... args) {
     for(threadIdx.x=0;threadIdx.x<n.x;++threadIdx.x)Fn(args...);
 }
-struct Resource { unsigned calls=0, offset=0; };
+struct Resource { unsigned calls=0, metadata=0, offset=0; };
 struct Trace {
-    static constexpr int SlotsCycles=1;
+    static constexpr int SlotsCycles=1, MetadataDone=2;
     unsigned slots=0;
+    void Mark(int field) { assert(field==MetadataDone); }
     uint64_t Now() { return 1; }
     void Add(int field, uint64_t) { assert(field==SlotsCycles); ++slots; }
 };
 // SLOTS
 // METADATA_SIGNATURE
 {
-    assert(copy_self && !publish_metadata);
+    assert(copy_self != publish_metadata);
     assert(stage_bytes + scratch_offset == platform::kKernelUbBytes);
     assert(scratch_offset % 32 == 0 && stage_bytes >= 32768);
-    ++resource.calls;
+    if (copy_self) ++resource.calls;
+    else ++resource.metadata;
     resource.offset=scratch_offset;
 }
 // CALLBACK
@@ -324,18 +326,21 @@ int main() {
     for(unsigned mask=0;mask<4;++mask) {
         td.dispatch_self_after_submit=mask&1; td.dispatch_early_slots=(mask>>1)&1;
         std::fill(output.begin(),output.end(),-99);
-        unsigned copies=0,slots=0;
+        unsigned copies=0,slots=0,metadata=0;
         for(unsigned core=0;core<8;++core) {
             Resource resource; Trace trace;
             DispatchOverlapWork<Resource,Trace> work{resource,trace,nullptr,nullptr,
                 reinterpret_cast<GM_ADDR>(idx.data()),nullptr,nullptr,nullptr,
                 reinterpret_cast<GM_ADDR>(prefix.data()),nullptr,reinterpret_cast<GM_ADDR>(head.data()),
                 nullptr,nullptr,td,core,8};
+            work.BeforePublish(DispatchLiveSendUbBytes(8,1));
             work(DispatchLiveSendUbBytes(8,1));
             copies+=resource.calls; slots+=trace.slots;
+            metadata+=resource.metadata;
             assert(!AscendC::pending);
         }
         assert(copies==((mask&1)?8U:0U));
+        assert(metadata==copies);
         assert(slots==((mask&2)?8U:0U));
         if(mask&2) assert(output==expected);
         else for(auto v:output)assert(v==-99);
@@ -376,7 +381,7 @@ def test_dispatch_calls_compile_against_actual_helper_signatures(tmp_path, drop_
         definition = cpp_functions((kernels / filename).read_text(), name)
         declarations.append(definition.split("{", 1)[0] + " {}")
     source = (kernels / "dispatch_udma.cpp").read_text()
-    start = source.index("    ascend_deepep::udma::DispatchMetadata(")
+    start = source.index("    if (!tiling.dispatch_self_after_submit)")
     calls = source[start : source.index("    const int32_t actual_recv_tokens", start)]
     if drop_peer_trace:
         assert "tiling, core_idx, core_num, trace, overlap);" in calls

@@ -378,9 +378,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.topk_weights_row_stride = static_cast<uint32_t>(workspace.topk_weights_row_stride);
     // Keep this rank's contribution in dispatch order. Only the local reader
     // uses this layout; remote senders retain their original token addressing.
-    tiling.compact_self_rows =
+    const char* compact_self = std::getenv("DEEPEP_CLOS_COMBINE_COMPACT_SELF");
+    TORCH_CHECK(!compact_self || std::strcmp(compact_self, "0") == 0 || std::strcmp(compact_self, "1") == 0,
+                "DEEPEP_CLOS_COMBINE_COMPACT_SELF must be 0 or 1");
+    const bool compact_self_enabled = !compact_self || std::strcmp(compact_self, "1") == 0;
+    tiling.compact_self_rows = compact_self_enabled &&
         use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens &&
-        !expanded_x.has_value() && world_size == 8 && resolved_num_aiv == 8 && num_channels == 8 &&
+        !expanded_x.has_value() &&
         x.scalar_type() == torch::kBFloat16 && workspace.x_row_stride == hidden_bytes &&
         (!topk_weights.has_value() || workspace.topk_weights_row_stride == topk_weights_row_bytes);
     tiling.x_buffer_offset = static_cast<uint64_t>(workspace.x_buffer_offset);

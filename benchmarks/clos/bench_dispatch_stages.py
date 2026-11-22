@@ -1,4 +1,4 @@
-"""Matched fresh/cached dispatch: one Buffer, core/EP16 channel A/B and separate traces.
+"""Matched fresh/cached dispatch: one Buffer, channel A/B and separate traces.
 
 Run with torchrun. This is a dispatch diagnostic, not a MoE end-to-end benchmark.
 """
@@ -22,7 +22,8 @@ from bench_fused_notify import store_topology_collective
 from stage_metrics import L2CacheFlush, prepare_v2_sample
 
 TRACE_ENV = "DEEPEP_CLOS_DISPATCH_DEVICE_TIMING"
-CHANNEL_ENV = "DEEPEP_CLOS_CACHED_CHANNEL_EP16"
+CHANNEL_ENV = "DEEPEP_CLOS_CACHED_CHANNEL"
+COMPACT_ENV = "DEEPEP_CLOS_COMBINE_COMPACT_SELF"
 METADATA_ENV = "DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA"
 METADATA_TILE_ENV = "DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS"
 
@@ -70,7 +71,7 @@ OVERLAP_ENVS = (
     "DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT",
     "DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER",
 )
-OVERLAP_MODES = {"off": 0, "self": 1, "slots": 2, "init": 4, "notify": 8, "all": 15}
+OVERLAP_MODES = {"off": 0, "self": 1, "slots": 2, "send": 3, "init": 4, "notify": 8, "all": 15}
 
 
 def set_overlap_mode(mode):
@@ -108,6 +109,7 @@ def benchmark_session(buffer, group):
         set_overlap_mode("off")
         os.environ[TRACE_ENV] = "0"
         os.environ["DEEPEP_CLOS_COMBINE_DEVICE_TIMING"] = "0"
+        os.environ[COMPACT_ENV] = "0"
         os.environ[METADATA_ENV] = "0"
         os.environ[METADATA_TILE_ENV] = "0"
     # An exception thrown through yield exits after finally, skipping this
@@ -349,12 +351,18 @@ def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us,
             raise ValueError("trace identity or effective whole-channel gate mismatch")
         if row["version"] == 2 and row.get("operation") != operation:
             raise ValueError("trace operation mismatch")
-        stamps = [row[k] for k in TIMELINE]
+        # Send-first dispatch publishes SIMT metadata after payload submission.
+        # Retain both legal orders; do not silently accept other timestamp inversions.
+        timeline = list(TIMELINE)
+        metadata_after_payload = operation == 0 and row["metadata_done"] > row["payload_queued"]
+        if metadata_after_payload:
+            timeline[2], timeline[3] = timeline[3], timeline[2]
+        stamps = [row[k] for k in timeline]
         if stamps != sorted(stamps) or stamps[0] < 0 or not row["entry_cycles"]:
             raise ValueError("invalid trace timeline")
         previous = 0
         intervals = {}
-        for name in TIMELINE:
+        for name in timeline:
             intervals[name + "_interval_us"] = (row[name] - previous) / cycles_per_us
             previous = row[name]
         intervals.update(
@@ -397,6 +405,7 @@ def decode_trace(raw, fields, rank, cores, cached, whole_channel, cycles_per_us,
                 if name in row:
                     intervals[name + "_us"] = row[name] / cycles_per_us
             queue = dict(
+                metadata_after_payload=metadata_after_payload,
                 mean_batch_wqes=row["wqes"] / row["flushes"] if row["flushes"] else 0,
                 short_batch_fraction=row["short_flushes"] / row["flushes"] if row["flushes"] else 0,
                 blocked_admission_fraction=row["credit_blocked"] / row["credit_checks"] if row["credit_checks"] else 0,
@@ -475,11 +484,21 @@ def main(argv=None):
     parser.add_argument("--trace-warmup", type=int, default=5)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--trace-samples", type=int, default=3, help="0 for formal timing only/older baseline")
+    parser.add_argument(
+        "--trace-samples", type=int, default=3, help="0 for formal timing only (without combine diagnostics)"
+    )
     parser.add_argument(
         "--combine-diagnostics", action="store_true", help="also trace ordinary combine in the same Buffer"
     )
     parser.add_argument("--reduce-cores", type=int, default=48)
+    parser.add_argument(
+        "--compact-self-modes",
+        type=int,
+        nargs="+",
+        choices=[0, 1],
+        default=[0, 1],
+        help="combine diagnostics: compare scatter/compact local copies with one Buffer",
+    )
     parser.add_argument("--flush-l2", action="store_true")
     parser.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--control-port", type=int, default=29881)
@@ -503,12 +522,14 @@ def main(argv=None):
     from bandwidth_multinode import library_identity
 
     rank, world, device = (int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
-    if world not in (8, 16) or args.experts % world or args.topk > args.experts:
-        parser.error("this experiment requires EP8/16 and experts divisible by EP")
+    if not 2 <= world <= 256 or args.experts % world or args.topk > args.experts:
+        parser.error("this experiment requires EP2..256 and experts divisible by EP")
     if "zeng" in args.dispatch_plans and (world != 8 or args.cores != [8] or args.hidden != 2816):
         parser.error("zeng dispatch comparison requires EP8, --cores 8 and --hidden 2816")
     torch.npu.set_device(device)
     native = load_native_module()
+    if getattr(native, "clos_sender_pipeline_version", 0) != 1:
+        raise RuntimeError("rebuild host and kernel libraries for generalized sender/channel/compact-copy comparisons")
     if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
     if args.combine_diagnostics and (
@@ -545,6 +566,7 @@ def main(argv=None):
         TRACE_ENV,
         "DEEPEP_CLOS_COMBINE_DEVICE_TIMING",
         CHANNEL_ENV,
+        COMPACT_ENV,
         METADATA_ENV,
         METADATA_TILE_ENV,
         "DEEPEP_CLOS_DISPATCH_SRC_IDX_256",
@@ -645,7 +667,9 @@ def main(argv=None):
         return outputs
 
     with benchmark_session(buffer, group):
-        if 1 in args.metadata_modes or any(mode != "off" for mode in args.metadata_output_modes):
+        # Include masked/empty/reused handles for the generic channel/copy paths,
+        # even when metadata packing/direct-output experiments are disabled.
+        if args.cached_channel_modes:
             precision_cases = []
             for routing in ("masked", "invalid", "skew", "empty_local"):
                 sizes = [min(args.tokens, 65)] * world
@@ -655,21 +679,34 @@ def main(argv=None):
                 dx, di, dw = cpu_x.npu(), cpu_idx.to(dtype=topk_idx_t, device="npu"), cpu_w.npu()
                 for core in args.cores:
                     for weighted in (False, True):
-                        for mode, tile, plan_name, overlap_mode, output_mode in itertools.product(
+                        for mode, tile, plan_name, overlap_mode, output_mode, channel_mode in itertools.product(
                             args.metadata_modes,
                             args.metadata_tile_tokens,
                             args.dispatch_plans,
                             args.overlap_modes,
                             args.metadata_output_modes,
+                            args.cached_channel_modes,
                         ):
                             group.agree(
-                                ["precision", routing, core, weighted, mode, tile, plan_name, overlap_mode, output_mode]
+                                [
+                                    "precision",
+                                    routing,
+                                    core,
+                                    weighted,
+                                    mode,
+                                    tile,
+                                    plan_name,
+                                    overlap_mode,
+                                    output_mode,
+                                    channel_mode,
+                                ]
                             )
                             set_overlap_mode(overlap_mode)
                             set_metadata_output_mode(output_mode)
                             launch_policy.variant = plan_name
                             os.environ[METADATA_ENV] = str(mode)
                             os.environ[METADATA_TILE_ENV] = str(tile)
+                            os.environ[CHANNEL_ENV] = str(channel_mode)
                             prepare_v2_sample(buffer, flush)
                             result = done(
                                 buffer.dispatch(
@@ -731,18 +768,22 @@ def main(argv=None):
                             effective_tile = native.last_dispatch_channel_metadata_tile_tokens()
                             if (not mode and effective_tile != 0) or (mode and tile and effective_tile != tile):
                                 raise RuntimeError("precision launch used the wrong metadata tile")
-                            if output_mode != "off":
+                            if output_mode != "off" or args.combine_diagnostics:
                                 for expanded in (False, True) if plan_name == "auto" else (False,):
                                     set_metadata_output_mode("off")
+                                    os.environ[COMPACT_ENV] = "0"
                                     expected = consumer_snapshot(dx, di, dw if weighted else None, core, expanded)
                                     set_metadata_output_mode(output_mode)
-                                    actual = consumer_snapshot(dx, di, dw if weighted else None, core, expanded)
-                                    for got, want in zip(actual, expected):
-                                        if want is None:
-                                            if got is not None:
-                                                raise AssertionError("metadata optimization changed optional outputs")
-                                        else:
-                                            torch.testing.assert_close(got, want, rtol=0, atol=0)
+                                    for compact in args.compact_self_modes:
+                                        os.environ[COMPACT_ENV] = str(compact)
+                                        actual = consumer_snapshot(dx, di, dw if weighted else None, core, expanded)
+                                        for got, want in zip(actual, expected):
+                                            if want is None:
+                                                if got is not None:
+                                                    raise AssertionError("optimization changed optional outputs")
+                                            else:
+                                                torch.testing.assert_close(got, want, rtol=0, atol=0)
+                                    os.environ[COMPACT_ENV] = "0"
                             precision_cases.append(
                                 dict(
                                     routing=routing,
@@ -754,6 +795,7 @@ def main(argv=None):
                                     plan=plan_name,
                                     overlap_mode=overlap_mode,
                                     metadata_output_mode=output_mode,
+                                    cached_channel=channel_mode,
                                     overlap_effective=(
                                         native.last_dispatch_overlap_options()
                                         if hasattr(native, "last_dispatch_overlap_options")
@@ -979,7 +1021,7 @@ def main(argv=None):
                                     rank,
                                     core,
                                     op.startswith("cached"),
-                                    op.startswith("cached") and core == 8 and (world == 8 or flag == 1),
+                                    op.startswith("cached") and flag == 1,
                                     native.dispatch_device_timing_cycles_per_us,
                                 )
                             )

@@ -184,8 +184,8 @@ __aicore__ inline void InitializeDispatchTopk(
 }
 
 // The payload owner/QP mapping is unchanged. Spare AIVs own whole logical
-// channels for metadata and self-copy; when none are spare, every core does its
-// metadata channel before entering the payload sender. No collective belongs
+// channels for metadata and self-copy; without spare cores the peer sender can
+// defer these independent channels until after payload submission. No collective belongs
 // inside this helper: payload cores must be able to run while metadata runs.
 template <class Resource, class Trace>
 __aicore__ inline void DispatchMetadata(
@@ -343,6 +343,16 @@ struct DispatchOverlapWork {
     GM_ADDR recv_scales;
     const DispatchTilingData& td;
     uint32_t core, cores;
+
+    __aicore__ void BeforePublish(uint32_t scratch_offset)
+    {
+        if (td.dispatch_self_after_submit) {
+            DispatchMetadata(resource, x, scales, topk, weights, plan, ranks, channels,
+                workspace, head, td, core, cores, platform::kKernelUbBytes - scratch_offset,
+                recv_x, recv_scales, trace, false, true, scratch_offset);
+            trace.Mark(Trace::MetadataDone);
+        }
+    }
 
     __aicore__ void operator()(uint32_t scratch_offset)
     {

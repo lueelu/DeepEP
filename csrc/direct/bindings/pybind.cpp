@@ -31,6 +31,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.attr("dispatch_channel_metadata_version") = 2;
     m.def("last_dispatch_overlap_options", [] { return ascend_deepep::ops::LastDispatchOverlapOptions(); });
     m.attr("dispatch_overlap_version") = 1;
+    m.attr("clos_sender_pipeline_version") = 1;
     m.def("last_dispatch_metadata_options", [] { return ascend_deepep::ops::LastDispatchMetadataOptions(); });
     m.attr("dispatch_metadata_output_version") = 1;
     m.attr("dispatch_device_timing_version") = 2;
