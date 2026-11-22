@@ -202,13 +202,20 @@ __aicore__ inline void CombinePipelineImpl(
                 x, weights, a, static_cast<int32_t>(begin), static_cast<int32_t>(end));
             // Range drains every actual MTE3/V operation, including mapped
             // values, before the ordered ready store on the same MTE3 pipeline.
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
+            StoreAggregateReady(td.pipeline_ready, chunk, 1, flag);
+        }
+        // Publish all aggregate chunks before independent local copies so a
+        // self row cannot delay a remote producer's ready notification.
+        for (uint32_t chunk = core - senders; chunk < chunks; chunk += cores - senders) {
+            const uint32_t begin = chunk * td.pipeline_chunk_tokens;
+            const uint32_t end = begin + td.pipeline_chunk_tokens < td.num_recv_tokens ?
+                begin + td.pipeline_chunk_tokens : td.num_recv_tokens;
             const uint32_t local_begin = begin > self_begin ? begin : self_begin;
             const uint32_t local_end = end < self_end ? end : self_end;
             if (local_begin < local_end)
                 CopyAggregateSelf(resource, x, weights, src_idx, workspace, td, local_begin, local_end);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
-            StoreAggregateReady(td.pipeline_ready, chunk, 1, flag);
         }
     }
     // Producers have no QP peers, but must join all original completion waits.

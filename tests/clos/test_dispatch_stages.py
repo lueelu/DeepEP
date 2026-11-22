@@ -114,7 +114,15 @@ def test_benchmark_session_only_destroys_after_successful_agreement(monkeypatch,
             "agreement": ["work", "ready_to_destroy"],
         }[failure]
     )
-    assert all(os.environ[name] == "0" for name in envs)
+    assert os.environ[bench.OVERLAP_ENVS[0]] == "1"
+    assert all(os.environ[name] == "0" for name in envs if name != bench.OVERLAP_ENVS[0])
+
+
+@pytest.mark.parametrize("mode", bench.OVERLAP_MODES)
+def test_no_benchmark_mode_disables_send_first(monkeypatch, mode):
+    monkeypatch.setenv(bench.OVERLAP_ENVS[0], "0")
+    bench.set_overlap_mode(mode)
+    assert os.environ[bench.OVERLAP_ENVS[0]] == "1"
 
 
 def test_failed_worker_preserves_traceback_without_collective_or_destructors(tmp_path):
@@ -271,12 +279,12 @@ def test_post_submit_slots_and_private_ub(tmp_path):
 using namespace ascend_deepep;
 using namespace ascend_deepep::udma;
 #define GM_ADDR __gm__ uint8_t*
-constexpr int EVENT_ID6=6;
+constexpr int EVENT_ID2=2, EVENT_ID6=6;
 struct { unsigned x; } threadIdx;
 struct dim3 { unsigned x; explicit dim3(unsigned v):x(v){} };
 void asc_threadfence() {}
 namespace AscendC {
-enum class HardEvent { V_S };
+enum class HardEvent { V_S, MTE3_MTE2 };
 bool pending=false;
 template<HardEvent> void SetFlag(int) { assert(!pending); pending=true; }
 template<HardEvent> void WaitFlag(int) { assert(pending); pending=false; }
@@ -323,7 +331,9 @@ int main() {
     td.rank=rank; td.world_size=W; td.num_max_tokens_per_rank=capacity*W;
     td.num_local_experts=2; td.num_topk=K; td.num_tokens=T; td.num_channels=C;
     td.v2_dst_slots=reinterpret_cast<uint64_t>(output.data());
+    for(unsigned bytes : {5632U, 192U*1024U})
     for(unsigned mask=0;mask<4;++mask) {
+        td.hidden=bytes/2; td.x_element_bytes=2;
         td.dispatch_self_after_submit=mask&1; td.dispatch_early_slots=(mask>>1)&1;
         std::fill(output.begin(),output.end(),-99);
         unsigned copies=0,slots=0,metadata=0;
@@ -333,8 +343,10 @@ int main() {
                 reinterpret_cast<GM_ADDR>(idx.data()),nullptr,nullptr,nullptr,
                 reinterpret_cast<GM_ADDR>(prefix.data()),nullptr,reinterpret_cast<GM_ADDR>(head.data()),
                 nullptr,nullptr,td,core,8};
-            work.BeforePublish(DispatchLiveSendUbBytes(8,1));
-            work(DispatchLiveSendUbBytes(8,1));
+            work.BeforePublish(DispatchLiveSendUbBytes(64,2));
+            work(DispatchLiveSendUbBytes(64,2));
+            if(mask&1) assert(resource.offset ==
+                (bytes > platform::kKernelUbBytes-DispatchLiveSendUbBytes(64,2) ? 0U : DispatchLiveSendUbBytes(64,2)));
             copies+=resource.calls; slots+=trace.slots;
             metadata+=resource.metadata;
             assert(!AscendC::pending);
@@ -494,7 +506,7 @@ def test_zeng_dispatch_override_preserves_metadata_and_auto_policy():
         wrapper.variant = 'zeng'
         plan = wrapper.for_launch(8, 5632, 'dispatch', bf16=True)
         assert (plan.peer_order, plan.peers_per_worker, plan.workers_per_peer,
-                plan.qps_per_worker, plan.wqes_per_visit, plan.self_copy, plan.weight_mode) == (0,2,1,1,32,0,0)
+                plan.qps_per_worker, plan.wqes_per_visit, plan.self_copy, plan.weight_mode) == (0,2,1,1,32,2,0)
         assert plan.send_workers == 4
         wrapper.variant = 'auto'
         assert wrapper.for_launch(8, 5632, 'dispatch', bf16=True) == automatic

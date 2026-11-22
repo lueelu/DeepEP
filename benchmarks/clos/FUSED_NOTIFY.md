@@ -569,23 +569,24 @@ for dispatch; combine's outer alignment notify is excluded from its measured API
 
 ## Dispatch overlap experiments
 
-Rebuild both host and kernel libraries; the tiling ABI has changed. The self
-and slots switches now default to `1` on eligible paths; init and notify remain
-opt-in. Explicit `0` selects the control. Peer order, P/W/Q, visit, payload UDMA,
+Rebuild both host and kernel libraries. Send-before-self is mandatory; the old
+`DEEPEP_CLOS_DISPATCH_OVERLAP_SELF=0` no longer selects copy-first. Slots defaults
+to `1`; init and notify remain opt-in. Peer order, P/W/Q, visit, payload UDMA,
 combine and reduce core policies are unchanged.
 
 | Benchmark mode | Environment variable set to `1` | Effective scope |
 | --- | --- | --- |
-| `self` | `DEEPEP_CLOS_DISPATCH_OVERLAP_SELF` | Peer dispatch without auxiliary metadata/copy AIVs or scales, with sufficient private UB: submit remote payload/metadata and terminal flags, then copy self before incoming wait/quiet |
+| `self` | Legacy overlap variable, always `1` in the runner | Mandatory send-before-self; no optional slots/init/notify changes |
 | `slots` | `DEEPEP_CLOS_DISPATCH_EARLY_SLOTS` | Fresh peer dispatch: build local V2 destination slots after submission/self work; Source still waits for received metadata |
 | `send` | Both self and slots | Send-first dispatch plus early slots; no prefill or notify-pack changes |
 | `init` | `DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT` | Fresh channel-metadata path only: omit valid-row top-k prefill because packed metadata writes every slot, including invalid `-1` entries |
 | `notify` | `DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER` | Channel-metadata pack: two independent input UB tiles and event pairs; GM output layout is unchanged |
-| `all` / `off` | All four / none | Matched combined treatment / control |
+| `all` / `off` | All optional work / no optional work | Both retain mandatory send-before-self; `off` cannot restore copy-first |
 
 Auxiliary AIVs retain parallel self-copy. A live sender's descriptors, headers,
-completion records and index windows are reserved throughout post-submit work;
-local-copy scratch starts after that region. No incoming wait, quiet, collective,
+completion records and index windows are reserved through final submission;
+local-copy scratch prefers the suffix and can reuse released staging for large
+rows after an MTE3 drain. No incoming wait, quiet, collective,
 output padding initialization or completion publication is removed. Double-buffer
 tile selection checks **two** tiles against UB capacity; an explicit oversized
 tile fails instead of silently changing the experiment.
@@ -674,16 +675,18 @@ must be checked on the target environment before enabling these options.
 
 ### Generic sender pipeline and local copies
 
-`clos_sender_pipeline_version=1` identifies the rebuilt native module. The
+`clos_sender_pipeline_version=2` identifies the rebuilt native module. The
 following paths use data-layout/resource eligibility rather than exact EP,
 hidden, channel-count or core-count matches:
 
-* `DEEPEP_CLOS_DISPATCH_OVERLAP_SELF` defaults to `1`. Ordinary peer dispatch
-  without spare metadata AIVs or scales first submits payload (including the
+* Send-before-self is enforced. Ordinary peer dispatch
+  without spare metadata AIVs first submits payload (including the
   short tail), then publishes SIMT metadata, then final SO markers, then copies
   self before incoming wait/quiet. Packed UDMA metadata is still sent before
   SO markers. The original collective still completes SIMT stores and all local
-  copies. Spare metadata AIVs retain their parallel path. `EARLY_SLOTS` also
+  copies. Scale normalization/packing remains before sends because it produces
+  their source data; the independent self copy is deferred. Spare metadata AIVs
+  retain their parallel path. `EARLY_SLOTS` also
   defaults to `1`; source-handle construction still waits for received metadata.
 * `DEEPEP_CLOS_CACHED_CHANNEL` defaults to `1`. Cached two-byte payloads without
   scales use exact peer/channel counts and compact plan lists, avoiding repeated
@@ -697,17 +700,22 @@ hidden, channel-count or core-count matches:
   The reducer translates only its own contributor through the existing channel
   prefix/ordinal mapping; remote slices and handle format are unchanged. Core
   counts for communication and reduction may differ. Token scheduling,
-  early-single and aggregate pipeline retain their existing paths.
+  early-single and aggregate pipeline retain their existing row layouts. Peer
+  communication/fused/remaining phases copy only after publication; token sends
+  copy after their final peer window is published. Pipeline producers publish
+  ready chunks before independent self copies. Legacy `self_copy=0` is an alias
+  for after-submit and `DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT=0` cannot opt out.
 
 Ownership and scratch ledger: dispatch payload QP/peer owners and metadata
 channel owners are unchanged. Local writes occupy disjoint receive-row ranges;
 early slots retain their original per-core token ownership. Dispatch reserves
 `DispatchLiveSendUbBytes(capacity,qps)` for sender state and index windows:
 12,832 bytes for capacity 8/Q1, 80,928 for capacity 64/Q1, and 93,216 for capacity
-64/Q2. Deferred local scratch starts after that aligned region. Host gating
-requires at least 32 KiB remaining and a payload row that fits; all local DMA
-slots drain before reuse. Compact combine reuses a 64 KiB tile at UB offset
-2,048 only before sender setup or after all final WQEs have been submitted and
+64/Q2. Deferred local scratch starts after that aligned region when at least
+32 KiB remains and a row fits. Otherwise it reuses full UB after final publication
+and an MTE3 drain; UB pressure never restores copy-first. All local DMA slots
+drain before reuse. Compact combine reuses a 64 KiB tile at UB offset
+2,048 after all final WQEs have been submitted and
 MTE3 has released staging (or on an auxiliary AIV). Quiet uses retained queue
 state, not overwritten WQE staging. GM input buffers remain live until completion.
 No completion barrier, source-lifetime requirement or sparse-CQE credit wait is
@@ -720,7 +728,7 @@ Buffer per EP, run automatic 8/32-core plans, and hold reduce at 48 cores:
 torchrun <site-launch-arguments> benchmarks/clos/bench_dispatch_stages.py \
   --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 32 \
   --dispatch-plans auto --metadata-modes 0 --metadata-output-modes off \
-  --cached-channel-modes 0 1 --overlap-modes off send \
+  --cached-channel-modes 0 1 --overlap-modes send \
   --combine-diagnostics --compact-self-modes 0 1 --reduce-cores 48 \
   --warmup 10 --samples 30 --trace-warmup 5 --trace-samples 3 \
   --flush-l2 --huge-pages --output <shared-result-directory>
@@ -737,3 +745,8 @@ CPU oracle coverage includes EP4..256, independent 8/32/48/64-core reduction,
 empty/tail copies, preserved remote partitions and scheduler callback order.
 These checks do not replace CANN compilation, device precision/stress or measured
 end-to-end performance on the target topology.
+
+The benchmark defaults to `--overlap-modes send`. An older command containing
+`--overlap-modes off` still sends before copying and only disables optional
+slots/init/notify work. Compare with an older commit to measure copy-first versus
+send-first; that old execution order is no longer selectable in this library.

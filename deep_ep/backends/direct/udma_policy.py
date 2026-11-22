@@ -98,8 +98,14 @@ class UdmaPolicy:
     ranks_per_group: int = 0
     topology_known: bool = False
     peer_order: int = 0
-    self_copy: int = 0  # 0: before send; 1: spare AIVs; 2: after submit.
+    self_copy: int = 2  # 1: spare AIVs; 2: after submit; legacy 0 aliases 2.
     weight_mode: int = 0  # 0: legacy; 1: UDMA; 2: SIMT when spare AIVs exist.
+
+    def __post_init__(self):
+        # Historical profiles/manual callers may still supply 0. Never report
+        # or submit a copy-before-send plan, including the fixed EP128 profile.
+        if self.self_copy == 0:
+            object.__setattr__(self, "self_copy", 2)
 
     @property
     def send_workers(self):
@@ -218,8 +224,8 @@ class UdmaPolicy:
         plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
         if self.world_size == 128 and cores >= 16:
             # One fixed EP128 schedule for every row size and operation. Match
-            # the measured rank/P8/W1/Q1/visit16 candidate, including its legacy
-            # self-copy and weight paths. Smaller budgets keep the capacity
+            # the measured rank/P8/W1/Q1/visit16 candidate and weight path.
+            # Legacy self-copy 0 is normalized to after-submit. Smaller budgets keep the capacity
             # fallback selected by for_num_aiv().
             plan = replace(
                 base,

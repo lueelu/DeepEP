@@ -9,6 +9,9 @@
 
 #define __aicore__
 #define __gm__
+#define __ubuf__
+#define __simt_vf__
+#define __launch_bounds__(n)
 #define ASCEND_DEEPEP_ARCH 3510
 #include "common/types.h"
 #include "common/platform.h"
@@ -23,7 +26,8 @@ constexpr unsigned kOutputSrcWord=6, kOutputWeightWord=7;
 static unsigned list_loads;
 void trap() { assert(false); }
 namespace AscendC {
-enum class HardEvent { V_S, MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S, S_MTE3 };
+enum class HardEvent { V_S, MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S, S_MTE3, MTE2_V, S_V };
+template <bool> void SyncAll() {}
 inline uint64_t GetSystemCycle()
 {
     static uint64_t tick = 1000;
@@ -56,6 +60,7 @@ struct GlobalTensor {
 template <class T>
 struct LocalTensor {
     T* data{};
+    T* GetPhyAddr() { return data; }
     T GetValue(uint64_t i) const
     {
         return data[i];
@@ -104,6 +109,17 @@ struct Resource {
 
 static unsigned sender_phase;
 static bool pending_rows;
+static bool in_combine;
+static unsigned combine_phase, combine_rows, combine_copies;
+static bool combine_expects_copy;
+static bool token_combine;
+static unsigned token_windows, token_published;
+struct dim3 { unsigned x; explicit dim3(unsigned n) : x(n) {} };
+static dim3 threadIdx(0);
+template <auto Fn, class... Args>
+void asc_vf_call(dim3 threads, Args... args) {
+    for (threadIdx.x = 0; threadIdx.x < threads.x; ++threadIdx.x) Fn(args...);
+}
 struct NoDispatchOverlapWork {
     void BeforePublish(uint32_t offset) {
         assert(sender_phase == 0 && !pending_rows && offset % 32 == 0);
@@ -173,10 +189,133 @@ void WaitIncoming(GM_ADDR, const DispatchTilingData&, uint32_t, uint32_t, uint32
 {
     assert(sender_phase == 3); sender_phase = 4;
 }
-void aclshmemx_sync_vec_all() { assert(sender_phase == 5); }
+void aclshmemx_sync_vec_all() { assert(in_combine ? combine_phase == 5 : sender_phase == 5); }
+
+bool CombineSimtWeightsEnabled(const CombineTilingData&) { return false; }
+void CombineRemoteWeights(GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, const CombineTilingData&, uint32_t) { assert(false); }
+void WaitAggregateReady(const CombineTilingData&, uint32_t, uint32_t) { assert(combine_phase == 0); }
+template <bool>
+void WaitIncoming(GM_ADDR, const CombineTilingData&, uint32_t, uint32_t, uint32_t) {
+    if (token_combine) {
+        assert(combine_copies == 1 && combine_phase == (token_windows ? 5U : 3U));
+    } else {
+        assert(combine_phase == (combine_expects_copy ? 3U : 2U));
+    }
+    combine_phase = 4;
+}
+template <class R>
+void CombineSelfCopy(R&, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
+                     const CombineTilingData&, int32_t) {
+    assert(combine_phase == 2); // Fail if even one copy precedes final publication.
+    if (token_combine) assert(token_published == token_windows);
+    ++combine_copies;
+    combine_phase = 3;
+}
+template <uint32_t Capacity, uint32_t Qps, class Trace>
+struct CombineSenderT {
+    CombineSenderT(const CombineTilingData&, uint32_t, uint8_t*, GM_ADDR, GM_ADDR, GM_ADDR,
+                   uint32_t, uint32_t, uint32_t, uint32_t, bool) { combine_phase = 0; }
+    uint32_t Count() const { return 1; }
+    uint32_t Rank(uint32_t) const { return 1; }
+    void SetTrace(Trace*) {}
+    void BeginVisit(uint32_t) { assert(combine_phase == 0); }
+    template <uint32_t Phase>
+    uint32_t PutSelectedRows(uint32_t, int32_t*, uint32_t, uint32_t, uint32_t count) {
+        assert(combine_phase == 0);
+        combine_rows += count;
+        return count;
+    }
+    void Flush() { assert(combine_phase == 0); }
+    void FlushForIndex() { Flush(); }
+    void Publish(GM_ADDR, uint64_t, uint32_t, uint32_t) { assert(combine_phase == 0); combine_phase = 2; }
+    void Quiet() { assert(combine_phase == 4); combine_phase = 5; }
+};
+
+constexpr uint32_t kCombineSenderBytes = kHeadersOffset + kMaxPeers * (2U * kWqeBytes + sizeof(uint64_t));
+struct CombineSender {
+    unsigned first, count;
+    CombineSender(const CombineTilingData& td, uint32_t, uint8_t*, GM_ADDR, GM_ADDR, GM_ADDR,
+                  uint32_t start, uint32_t, uint32_t, uint32_t)
+        : first(start), count(std::min(kMaxPeers, td.world_size - 1 - start)) { combine_phase = 0; }
+    unsigned Count() const { return count; }
+    unsigned Rank(unsigned p) const { return first + p + 1; }
+    template <uint32_t Phase>
+    unsigned PutSelectedRows(unsigned, int32_t*, unsigned, unsigned, unsigned count) {
+        assert(combine_phase == 0 && combine_copies == 0);
+        combine_rows += count;
+        return count;
+    }
+    void Flush() { assert(combine_phase == 0); }
+    void Publish(GM_ADDR, uint64_t, uint32_t, uint32_t) {
+        assert(combine_phase == 0);
+        ++token_published;
+        combine_phase = 2;
+    }
+    void Quiet() {
+        assert(combine_phase == (token_published == token_windows ? 3U : 2U));
+        combine_phase = 5;
+    }
+};
 
 // PRODUCTION_TRACE
 // PRODUCTION_FUNCTIONS
+
+template <unsigned Phase>
+void CheckTokenCombineOrdering() {
+    for (unsigned world : {2U, 16U, 64U, 128U, 256U})
+        for (unsigned rows : {0U, 3U, 65U})
+            for (bool weighted : {false, true}) {
+                CombineTilingData td{};
+                td.world_size = world;
+                td.block_dim = 8;
+                td.udma_wqes_per_visit = 8;
+                td.has_topk_weights = weighted;
+                std::vector<int32_t> indices(world * rows + 32), prefix(world * world);
+                for (unsigned peer = 0; peer < world; ++peer) prefix[peer * world] = (peer + 1) * rows;
+                for (unsigned core = 0; core < td.block_dim; ++core) {
+                    Resource resource;
+                    token_combine = true;
+                    token_published = combine_copies = combine_rows = 0;
+                    token_windows = core < TokenWorkers(td.block_dim) ? (world - 2) / kMaxPeers + 1 : 0;
+                    combine_phase = 2; // Helpers own no payload windows.
+                    CombineTokenRemote<Phase>(resource, nullptr, nullptr,
+                        reinterpret_cast<GM_ADDR>(indices.data()), reinterpret_cast<GM_ADDR>(prefix.data()),
+                        nullptr, nullptr, td, core);
+                    assert(combine_copies == unsigned(Phase != 1));
+                    token_combine = false;
+                }
+            }
+}
+
+template <unsigned Phase>
+void CheckCombineOrdering()
+{
+    for (unsigned rows : {0U, 3U, 65U, 513U})
+        for (bool weighted : {false, true})
+            for (bool legacy_after : {false, true}) {
+                CombineTilingData td{};
+                td.world_size = 2;
+                td.block_dim = 8;
+                td.udma_workers_per_peer = 1;
+                td.udma_wqes_per_visit = 8;
+                td.pipeline_chunk_tokens = 32;
+                td.has_topk_weights = weighted;
+                td.udma_self_copy_after_submit = legacy_after;
+                std::vector<int32_t> indices(rows + 8), prefix{0, 0, int32_t(rows), 0};
+                Resource resource;
+                DisabledDispatchDeviceTrace trace(0);
+                in_combine = true;
+                combine_rows = combine_copies = 0;
+                combine_expects_copy = Phase == 0 || Phase == 2;
+                CombineRemoteImpl<64, Phase, 2>(resource, nullptr, nullptr,
+                    reinterpret_cast<GM_ADDR>(indices.data()), reinterpret_cast<GM_ADDR>(prefix.data()),
+                    nullptr, nullptr, td, 0, trace);
+                assert(combine_rows == rows * (weighted ? 2U : 1U));
+                assert(combine_copies == unsigned(combine_expects_copy));
+                assert(combine_phase == (Phase == 1 ? 0U : 5U));
+                in_combine = false;
+            }
+}
 
 void CheckCopyAndReduction()
 {
@@ -395,5 +534,12 @@ int main()
     CheckTrace();
     CheckCopyAndReduction();
     CheckCachedDispatch();
+    CheckCombineOrdering<0>();
+    CheckCombineOrdering<1>();
+    CheckCombineOrdering<2>();
+    CheckCombineOrdering<3>();
+    CheckTokenCombineOrdering<0>();
+    CheckTokenCombineOrdering<1>();
+    CheckTokenCombineOrdering<2>();
     CheckHostGate();
 }

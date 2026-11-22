@@ -23,6 +23,12 @@ def test_eight_aiv_production_bodies(tmp_path):
     )
     functions += cpp_functions((source / "kernels/combine/combine_udma.cpp").read_text(), "ContributorSlot")
     functions += cpp_functions((source / "kernels/dispatch/udma_dispatch_schedule.h").read_text(), "DispatchRemoteImpl")
+    functions += cpp_functions((source / "kernels/combine/udma_combine_schedule.h").read_text(), "CombineRemoteImpl")
+    functions += cpp_functions(
+        (source / "kernels/combine/udma_token_combine_schedule.h").read_text(),
+        "GatherTokenIndices",
+        "CombineTokenRemote",
+    )
     host = (source / "ops/combine.cpp").read_text()
     begin = host.index("    tiling.compact_self_rows =")
     gate = host[begin : host.index(";", begin) + 1]

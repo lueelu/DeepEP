@@ -324,7 +324,8 @@ __aicore__ inline void DispatchMetadata(
         trace.SelfDone(self_started);
     }
 }
-// Post-submit work has private UB; GM payload sources stay immutable until Quiet.
+// Prefer private UB after submission; once final WQEs release staging, a large
+// row may reuse full UB. GM payload sources stay immutable until Quiet.
 template <class Resource, class Trace>
 struct DispatchOverlapWork {
     Resource& resource;
@@ -357,6 +358,18 @@ struct DispatchOverlapWork {
     __aicore__ void operator()(uint32_t scratch_offset)
     {
         if (td.dispatch_self_after_submit) {
+            const uint32_t payload_bytes = td.hidden * td.x_element_bytes;
+            const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
+            const uint32_t row_bytes = payload_bytes > scale_bytes ? payload_bytes : scale_bytes;
+            if (platform::kKernelUbBytes - scratch_offset < 32U * 1024U ||
+                row_bytes > platform::kKernelUbBytes - scratch_offset) {
+                // Publish has consumed every descriptor/header. Quiet only uses
+                // retained queue state. Drain MTE3 before reusing the full UB;
+                // UDMA still reads immutable GM sources asynchronously.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                scratch_offset = 0;
+            }
             DispatchMetadata(resource, x, scales, topk, weights, plan, ranks, channels,
                 workspace, head, td, core, cores, platform::kKernelUbBytes - scratch_offset,
                 recv_x, recv_scales, trace, true, false, scratch_offset);

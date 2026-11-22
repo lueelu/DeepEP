@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kernels/combine/udma_combine_sender.h"
+#include "kernels/combine/udma_combine_self_copy.h"
 #include "common/types.h"
 
 namespace ascend_deepep::udma {
@@ -82,10 +83,22 @@ __aicore__ inline void CombineTokenRemote(
                 sender.Flush();
             } else {
                 sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core);
+                if (first + kMaxPeers >= td.world_size - 1) {
+                    // The final peer window is submitted; overlap this owner's
+                    // local rows with its final quiet instead of waiting first.
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                    CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
+                }
                 sender.Quiet();
             }
         }
     if constexpr (Phase != 1) {
+        // Non-sending AIVs reach this directly and copy in parallel. Sending
+        // AIVs already copied exactly once after publishing their final window.
+        if (core >= workers || td.world_size <= 1) {
+            CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
+        }
         WaitIncoming<false>(workspace, td, core, td.block_dim, workers);
     }
     // WaitIncoming's all-core barrier includes drained local self copies.

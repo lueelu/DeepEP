@@ -71,7 +71,9 @@ OVERLAP_ENVS = (
     "DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT",
     "DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER",
 )
-OVERLAP_MODES = {"off": 0, "self": 1, "slots": 2, "send": 3, "init": 4, "notify": 8, "all": 15}
+# "off" is retained for older commands, but only disables optional work.
+# Send-before-self is mandatory in every mode, including this legacy alias.
+OVERLAP_MODES = {"off": 1, "self": 1, "slots": 3, "send": 3, "init": 5, "notify": 9, "all": 15}
 
 
 def set_overlap_mode(mode):
@@ -479,7 +481,13 @@ def main(argv=None):
         default=["auto"],
         help="zeng: EP8/AIV8/H2816 rank/P2/W1/Q1/visit32; metadata path unchanged",
     )
-    parser.add_argument("--overlap-modes", nargs="+", choices=list(OVERLAP_MODES), default=["off"])
+    parser.add_argument(
+        "--overlap-modes",
+        nargs="+",
+        choices=list(OVERLAP_MODES),
+        default=["send"],
+        help="send-first in every mode; off only disables optional slots/init/notify optimizations",
+    )
     parser.add_argument("--metadata-output-modes", nargs="+", choices=list(METADATA_OUTPUT_MODES), default=["off"])
     parser.add_argument("--trace-warmup", type=int, default=5)
     parser.add_argument("--samples", type=int, default=30)
@@ -528,8 +536,8 @@ def main(argv=None):
         parser.error("zeng dispatch comparison requires EP8, --cores 8 and --hidden 2816")
     torch.npu.set_device(device)
     native = load_native_module()
-    if getattr(native, "clos_sender_pipeline_version", 0) != 1:
-        raise RuntimeError("rebuild host and kernel libraries for generalized sender/channel/compact-copy comparisons")
+    if getattr(native, "clos_sender_pipeline_version", 0) != 2:
+        raise RuntimeError("rebuild host and kernel libraries for mandatory send-before-self ordering")
     if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
     if args.combine_diagnostics and (

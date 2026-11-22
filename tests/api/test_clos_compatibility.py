@@ -542,7 +542,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 plan = base.for_launch(*args, bf16=True)
                 assert plan is base.for_launch(*args, bf16=True)
                 assert plan.native_plan()[:7] == [1, order, group, p, w, q, visit]
-                assert plan.self_copy == copy
+                assert plan.self_copy == (copy or 2)
                 assert plan.send_workers <= cores and plan.send_workers * q <= 32
                 assert plan.valid_group_capacity()
                 assert base.signature() == before
@@ -552,7 +552,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 for kwargs in ({'expanded': True}, {'v2': False}, {'bf16': False}):
                     options = {'bf16': True, **kwargs}
                     fallback = base.for_launch(*args, **options)
-                    assert fallback.peer_order == 0 and fallback.self_copy == fallback.weight_mode == 0
+                    assert fallback.peer_order == 0 and fallback.self_copy == 2 and fallback.weight_mode == 0
         base = resolve_udma_policy(True, 32, 'udma', None, None, None, None, None)
         for known, group in ((True,16), (False,8)):
             policy = replace(base, ranks_per_group=group, topology_known=known)
@@ -607,8 +607,8 @@ def test_ep16_weight_row_limit_preserves_payload_plan_across_core_budgets():
                         assert replace(plan,weight_mode=1) == reference
         # Reproduce the compared payload configuration, without a 48-core rule.
         policy = replace(base,ranks_per_group=8,topology_known=True)
-        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,0,2]
-        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,0,1]
+        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,2,2]
+        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,2,1]
     """)
 
 
@@ -654,7 +654,7 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
                 assert p.peer_order == 0 and p.weight_mode == 2
             for opts in ({'expanded':True}, {'v2':False}, {'bf16':False}):
                 p = base.for_launch(32,8192,'weighted',**{'bf16':True,**opts})
-                assert p.native_plan()[1:] == [0,group,4,1,1,32,0,0]
+                assert p.native_plan()[1:] == [0,group,4,1,1,32,2,0]
             assert base.signature() == before
     """)
 
@@ -759,7 +759,11 @@ def test_reported_300_operator_plans_remain_unchanged():
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                            ranks_per_group=group, topology_known=True)
             plan = base.for_launch(cores,hidden*2,op,bf16=True)
-            assert plan.native_plan() == json.loads(row['native_plan']), (key, op, plan)
+            historical = json.loads(row['native_plan'])
+            # This change intentionally removes copy-first; all send/weight
+            # strategy fields in the 300-case historical fixture stay intact.
+            historical[7] = historical[7] or 2
+            assert plan.native_plan() == historical, (key, op, plan)
             assert plan.send_workers == int(row['send_aivs']), (key, op, plan)
         assert len(cases) == 60
         assert all(len(ops) == 5 and set(ops) == operations for ops in cases.values())
@@ -804,7 +808,7 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
                 for size in (2048,5632,12288,14336):
                     plan = base.for_launch(8,size,op,bf16=True)
                     mode = (2 if ep == 4 and size <= 7168 else 1) if op == 'weighted' else 0
-                    assert plan.native_plan() == [1,order,group,p,w,1,32,0 if op == 'dispatch' else 2,mode]
+                    assert plan.native_plan() == [1,order,group,p,w,1,32,2,mode]
 
         # No fixed half-core split, and no change to the all-senders fallback.
         base = replace(resolve_udma_policy(True,64,'udma',None,None,None,None,None),
@@ -831,7 +835,7 @@ def test_ep32_dispatch_profile_survives_extra_cores_with_separate_combine_tiers(
             assert base.config(cores).num_aiv == cores
             for size in (5632,8192,12288):
                 plan = base.for_launch(cores,size,'dispatch',bf16=True)
-                assert plan.native_plan() == [1,1,8,4,1,1,32,0,0]
+                assert plan.native_plan() == [1,1,8,4,1,1,32,2,0]
                 report = effective_udma_config(buffer,num_aiv=cores,row_bytes=size,bf16=True)
                 assert report['operation_plans']['dispatch'] == asdict(plan)
             for size in (1024,2048,4096,14336):
@@ -864,7 +868,7 @@ def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
                     plan = policy.for_launch(cores,row_bytes,'combine',bf16=True)
                     expected = 1 if cores-plan.send_workers >= plan.send_workers else 2
                     if ep == 128 and cores >= 16:
-                        expected = 0  # Preserve the fixed rank/P8/visit16 candidate.
+                        expected = 2  # Fixed rank/P8/visit16, but never copy before sending.
                     assert plan.self_copy == expected
         # Two QPs still belong to one payload sender AIV.
         q2 = replace(base, workers_per_peer=1, qps_per_worker=2, topology_known=False)
@@ -873,7 +877,7 @@ def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
         # EP128 keeps the complete fixed candidate with larger core budgets.
         large = replace(base, world_size=128, ranks_per_group=16)
         plan = large.for_launch(48,5632,'combine',bf16=True)
-        assert plan.send_workers == 16 and plan.self_copy == 0
+        assert plan.send_workers == 16 and plan.self_copy == 2
     """)
 
 
@@ -884,7 +888,7 @@ def test_ep128_defaults_preserve_fixed_candidate_across_shapes_and_budgets():
         base = replace(resolve_udma_policy(True,128,'udma',None,None,None,None,None),
                        ranks_per_group=16, topology_known=True)
         before = base.signature()
-        native = [1,0,16,8,1,1,16,0,0]
+        native = [1,0,16,8,1,1,16,2,0]
         assert (base.peers_per_worker, base.wqes_per_visit) == (8,16)
         for op in ('dispatch','combine','weighted'):
             for cores in (0,16,20,30,32,34,48,64):
@@ -1095,4 +1099,9 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
         timeout=60,
     )
     assert built.returncode == 0, built.stdout + built.stderr
-    subprocess.run([str(binary)], check=True, timeout=60)
+    try:
+        subprocess.run([str(binary)], check=True, timeout=60)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise

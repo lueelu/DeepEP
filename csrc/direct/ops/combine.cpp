@@ -347,17 +347,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
     // Serial aggregate materializes every self row; remote single-source rows
     // may still read expanded_x through the sender's existing slot mapping.
-    // Early-single and pipeline paths retain their original copy ordering.
+    // Every sending AIV posts before its self copy, including fused/remaining
+    // and token paths. Legacy mode 0 and the old AFTER_SUBMIT=0 cannot opt out.
+    tiling.udma_self_copy_after_submit = use_udma;
     if (use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens) {
         const char* overlap = std::getenv("DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY");
-        const char* after_submit = std::getenv("DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT");
         const bool use_spare_aivs = udma_launch.self_copy >= 0 ? udma_launch.self_copy == 1
                                                                : overlap && overlap[0] == '1' && overlap[1] == '\0';
-        tiling.udma_self_copy_after_submit = udma_launch.self_copy >= 0
-                                                 ? udma_launch.self_copy == 2
-                                                 : after_submit && after_submit[0] == '1' && after_submit[1] == '\0';
-        TORCH_CHECK(!(use_spare_aivs && tiling.udma_self_copy_after_submit),
-                    "combine self-copy modes are mutually exclusive");
         // After-submit retains each AIV's self-copy channels, including weights.
         // Spare-AIV self-copy is still unweighted-only: weighted peers already
         // use spare AIVs for SIMT stores and must keep their original ownership.

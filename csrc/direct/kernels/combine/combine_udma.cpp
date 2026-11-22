@@ -123,12 +123,7 @@ __aicore__ inline void V1CombineUdmaImpl(
         }
 
         trace.Mark(Trace::BeginDone);
-        if (!tiling.udma_self_copy_after_submit) {
-            const uint64_t started = trace.Now();
-            ascend_deepep::udma::CombineSelfCopy(resource, x, topk_weights, src_idx, rank_prefix_matrix,
-                channel_prefix_matrix, symmetric_buffer, tiling, core_idx);
-            trace.SelfDone(started);
-        }
+        // Self copies belong to the sender's post-submit phase, never its entry.
         trace.Mark(Trace::MetadataDone);
         if (tiling.udma_token_schedule) {
             ascend_deepep::udma::CombineTokenRemote<Phase>(resource, x, topk_weights, src_idx, rank_prefix_matrix,

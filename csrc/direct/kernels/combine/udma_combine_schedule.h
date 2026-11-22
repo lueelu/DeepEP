@@ -115,23 +115,21 @@ __aicore__ inline void CombineRemoteImpl(
         trace.Mark(Trace::PayloadQueued);
         sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
         trace.Mark(Trace::Published);
-        if constexpr (Phase == 0) {
-            if (td.udma_self_copy_after_submit) {
-                const uint64_t self_started = trace.Now();
-                // SIMT weight AIVs finish CombineRemoteWeights (V_S) above before
-                // copying their self channels. Payload AIVs have posted all
-                // UDMA requests, including weights when no spare AIV exists.
-                // Self writes use this rank's capacity-sized partition (with
-                // compact row indices when compact_self_rows is enabled);
-                // remote contributors use their own rank slots, so neither
-                // payload nor weight self stores collide with incoming writes.
-                // The SQ now owns the WQEs. Finish MTE3's reads of the reused
-                // UB before self-copy loads use it, while UDMA reads GM payload.
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
-                CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
-                trace.SelfDone(self_started);
-            }
+        if constexpr (Phase == 0 || Phase == 2) {
+            const uint64_t self_started = trace.Now();
+            // SIMT weight AIVs finish CombineRemoteWeights (V_S) above before
+            // copying their self channels. Payload AIVs have posted all
+            // UDMA requests, including weights when no spare AIV exists.
+            // Self writes use this rank's capacity-sized partition (with
+            // compact row indices when compact_self_rows is enabled);
+            // remote contributors use their own rank slots, so neither
+            // payload nor weight self stores collide with incoming writes.
+            // The SQ now owns the WQEs. Finish MTE3's reads of the reused
+            // UB before self-copy loads use it, while UDMA reads GM payload.
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+            CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
+            trace.SelfDone(self_started);
         }
         trace.Mark(Trace::IncomingBegin);
         WaitIncoming<false>(workspace, td, core, td.block_dim, td.udma_workers_per_peer * Qps);

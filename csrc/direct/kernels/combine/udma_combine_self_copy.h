@@ -204,7 +204,7 @@ __aicore__ inline void CombineSelfCopy(
         }
     }
 
-    // Drain local writes before sending or entering the completion path.
+    // Drain local writes before entering the completion path.
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
     // Also order a subsequent sender's scalar stores to the reused UB.
