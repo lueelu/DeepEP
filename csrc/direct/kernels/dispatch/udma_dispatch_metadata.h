@@ -6,59 +6,30 @@
 #include "device_simt/shmem_device_simt_instance.h"
 
 #include "kernels/common/udma_shared_sender.h"
+#include "kernels/dispatch/channel_metadata.h"
 #include "common/types.h"
 #include "simt_api/device_sync_functions.h"
 
 namespace ascend_deepep::udma {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-__simt_vf__ __launch_bounds__(128) inline void CopySelfChannelWordsVf(
-    const __ubuf__ uint32_t* input, __gm__ uint32_t* output, uint32_t words)
-{
-    for (uint32_t i = threadIdx.x; i < words; i += 128) output[i] = input[i];
-    asc_threadfence();
-}
-
 template <class Resource>
 __aicore__ inline void CopySelfChannelMetadata(Resource& resource, GM_ADDR plan, GM_ADDR workspace,
     const DispatchTilingData& td, uint32_t channel, uint32_t row, uint32_t count, uint32_t stride, uint32_t scratch_offset = 0)
 {
     if (!count) return;
-    // Use exact word stores for compact channel boundaries, which may share a
-    // 32-byte GM line. No remote operation or padded write touches another owner.
-    constexpr uint32_t tile_bytes = 32 * 1024;
-    auto tile = resource.template GetBufferByByte<uint32_t>(scratch_offset);
-    const uint64_t slot = (uint64_t(td.rank) * td.num_channels + channel) * stride;
-    for (uint32_t field = td.cached_mode ? 1U : 0U; field < (td.has_topk_weights ? 3U : 2U); ++field) {
-        const uint32_t width = field == 0 ? 4U : td.num_topk * (field == 1 ? uint32_t(sizeof(topk_idx_t)) : 4U);
-        const uint64_t source = field == 0 ? reinterpret_cast<uint64_t>(plan) :
-            (field == 1 ? td.packed_channel_indices : td.packed_channel_weights);
-        const uint64_t offset = field == 0 ? td.src_idx_buffer_offset :
-            (field == 1 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset);
-        AscendC::GlobalTensor<uint32_t> input;
-        input.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(source + slot * width));
-        const uint64_t destination = td.metadata_direct_output && field == 0 ? td.metadata_src_output :
-            (td.metadata_direct_output && field == 2 ? td.metadata_weight_output : reinterpret_cast<uint64_t>(workspace) + offset);
-        if (td.metadata_direct_output && (row > td.num_output_tokens || count > td.num_output_tokens - row)) {
-            trap(); return;
-        }
-        auto* output = reinterpret_cast<__gm__ uint32_t*>(destination + uint64_t(row) * width);
-        const uint64_t words = uint64_t(count) * width / 4U;
-        for (uint64_t start = 0; start < words; start += tile_bytes / 4U) {
-            const uint32_t n = words - start < tile_bytes / 4U ? uint32_t(words - start) : tile_bytes / 4U;
-            AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
-            AscendC::DataCopyPad(tile, input[start], AscendC::DataCopyExtParams{1, n * 4U, 0, 0, 0},
-                AscendC::DataCopyPadExtParams<uint32_t>{false, 0, 0, 0});
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
-            asc_vf_call<CopySelfChannelWordsVf>(dim3(128),
-                reinterpret_cast<__ubuf__ uint32_t*>(tile.GetPhyAddr()), output + start, n);
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
-            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
-        }
+    if (row > td.num_output_tokens || count > td.num_output_tokens - row) {
+        trap(); return;
     }
+    const uint64_t base = reinterpret_cast<uint64_t>(workspace);
+    const uint64_t src = td.metadata_direct_output ? td.metadata_src_output : base + td.src_idx_buffer_offset;
+    const uint64_t weights = td.metadata_weight_output;
+    // Top-k remains in the handle builder's internal consumer region. Weight
+    // always uses its final tensor; src uses it when all-source direct mode is
+    // enabled. No local packed-GM write/read round trip in either mode.
+    ascend_deepep::PackPeerChannelMetadata(resource, plan, td, td.rank, channel, count, stride,
+        base + td.topk_idx_buffer_offset + uint64_t(row) * td.num_topk * sizeof(topk_idx_t),
+        td.has_topk_weights ? weights + uint64_t(row) * td.num_topk * sizeof(float) : 0,
+        td.cached_mode ? 0 : src + uint64_t(row) * sizeof(int32_t), scratch_offset);
 }
 
 // Notify already chose the stable ordinal. Metadata workers only publish it.

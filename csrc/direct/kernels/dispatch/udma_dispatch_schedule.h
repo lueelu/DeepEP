@@ -3,6 +3,7 @@
 #include "kernels/dispatch/dispatch_device_trace.h"
 
 #include "kernels/dispatch/udma_dispatch_sender.h"
+#include "kernels/dispatch/channel_metadata.h"
 #include "common/platform.h"
 #include "common/types.h"
 #include "simt_api/device_sync_functions.h"
@@ -181,9 +182,14 @@ __aicore__ inline void DispatchRemoteImpl(
         }
     }
     if (td.channel_metadata) {
-        // Immutable notify staging is ready before this same-stream kernel.
-        // No index-window refill or metadata VF can overwrite pending WQEs.
+        // Start payload transfer before preparing metadata. Every peer/channel
+        // keeps its original sender owner; packing only touches private UB and
+        // that owner's immutable GM staging. No extra collective is required.
         sender.Flush();
+        const uint64_t pack_started = trace.Now();
+        ascend_deepep::PackRemoteChannelMetadata<Capacity>(resource, sender, plan, channel_prefix,
+            td, core, DispatchLiveSendUbBytes(Capacity, Qps));
+        trace.Add(Trace::TopkCycles, pack_started);
         for (uint32_t p = 0; p < sender.Count(); ++p) {
             const uint32_t peer = sender.Rank(p);
             const uint32_t rank_base = td.rank ? rank_gm.GetValue((td.rank - 1) * td.world_size + peer) : 0;

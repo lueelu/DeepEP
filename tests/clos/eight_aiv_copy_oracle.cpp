@@ -109,6 +109,13 @@ struct Resource {
 
 static unsigned sender_phase;
 static bool pending_rows;
+static bool metadata_packed;
+namespace ascend_deepep {
+template <uint32_t Capacity, class R, class... Args> void PackRemoteChannelMetadata(R&, Args...) {
+    assert(sender_phase == 0 && !pending_rows && !metadata_packed);
+    metadata_packed = true;
+}
+}
 static bool in_combine;
 static unsigned combine_phase, combine_rows, combine_copies;
 static bool combine_expects_copy;
@@ -139,6 +146,7 @@ struct DispatchSenderT {
     {
         sender_phase = 0;
         pending_rows = false;
+        metadata_packed = false;
     }
     uint32_t Count() const
     {
@@ -155,7 +163,7 @@ struct DispatchSenderT {
     }
     uint32_t PutRows(uint32_t p, const int32_t* plan, uint32_t row, uint32_t field, uint32_t n)
     {
-        assert(sender_phase == 0);
+        assert(sender_phase == 0 && !metadata_packed);
         pending_rows = true;
         assert(field == 0);
         n = std::min(n, 7U);  // Exercise partial progress, not only full visits.
@@ -173,10 +181,12 @@ struct DispatchSenderT {
     void Publish(GM_ADDR, uint64_t, uint32_t, uint32_t) {
         assert(sender_phase == 1 && !pending_rows); sender_phase = 2;
     }
-    void PutChannelOutput(uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) { assert(false); }
+    void PutChannelOutput(uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) {
+        assert(sender_phase == 0 && metadata_packed);
+    }
     void PutChannelField(uint32_t, GM_ADDR, uint64_t, uint64_t, uint32_t)
     {
-        assert(false);
+        assert(sender_phase == 0 && metadata_packed);
     }
     void Quiet() { assert(sender_phase == 4); sender_phase = 5; }
 };
@@ -414,7 +424,7 @@ void CheckCachedDispatch()
             for (unsigned cores : {8U, 16U})
                 for (unsigned tokens : {0U, 3U, 513U, 2049U})
                     for (unsigned visit : {4U, 8U, 16U, 32U})
-                        for (unsigned workers : {1U, 2U}) {
+                        for (unsigned workers : {1U, 2U}) for (bool metadata : {false, true}) {
                             DispatchTilingData td{};
                             td.world_size = world;
                             td.cached_channel = opt_in;
@@ -423,6 +433,10 @@ void CheckCachedDispatch()
                             td.x_element_bytes = 2;
                             td.udma_workers_per_peer = workers;
                             td.udma_wqes_per_visit = visit;
+                            td.channel_metadata = metadata;
+                            td.has_topk_weights = metadata;
+                            td.num_topk = 8;
+                            td.metadata_direct_output = opt_in;
                             const unsigned width = (tokens + 7) / 8, stride = (width + 7) / 8 * 8;
                             std::vector<int32_t> plan(world * 8 * stride, -1), rp(world * world), cp(world * 8);
                             std::vector<Row> expected;

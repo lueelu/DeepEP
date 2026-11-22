@@ -428,8 +428,8 @@ def capture_stages(directory, samples, cached, cached_weighted=False, cached_pac
     if not cached:
         names.append("dispatch_layout_kernel")
     notify = "cached_notify_dispatch_kernel" if cached else "notify_dispatch_kernel"
-    if cached_weighted and cached_pack:
-        notify = "cached_notify_dispatch_packed_kernel"
+    # Version 3 prepares metadata in dispatch after payload submission. Cached
+    # weighted packing therefore uses the same alignment-only notify kernel.
     names.append(notify)
     if cached_weighted and not cached_pack:
         names.append("cached_dispatch_plan_kernel")
@@ -536,15 +536,15 @@ def main(argv=None):
         parser.error("zeng dispatch comparison requires EP8, --cores 8 and --hidden 2816")
     torch.npu.set_device(device)
     native = load_native_module()
-    if getattr(native, "clos_sender_pipeline_version", 0) != 2:
-        raise RuntimeError("rebuild host and kernel libraries for mandatory send-before-self ordering")
+    if getattr(native, "clos_sender_pipeline_version", 0) != 3:
+        raise RuntimeError("rebuild host and kernel libraries for post-submit plan packing and direct self metadata")
     if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
     if args.combine_diagnostics and (
         args.trace_samples < 1 or getattr(native, "combine_device_timing_version", 0) != 2
     ):
         raise RuntimeError("combine diagnostics requires trace samples and version-2 host/kernel libraries")
-    if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 2:
+    if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 3:
         raise RuntimeError("rebuild host and kernel libraries for channel metadata")
     if any(mode != "off" for mode in args.overlap_modes) and getattr(native, "dispatch_overlap_version", 0) != 1:
         raise RuntimeError("rebuild host and kernel libraries for overlap experiments")

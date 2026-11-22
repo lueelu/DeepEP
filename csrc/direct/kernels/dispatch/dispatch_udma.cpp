@@ -140,7 +140,8 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             recv_x, recv_x_scales, tiling.num_output_tokens,
             static_cast<uint32_t>(rank_prefix_gm.GetValue((world_size - 1) * world_size + rank)),
             hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0, tiling.instance_id,
-            tiling.metadata_src_output, tiling.metadata_weight_output,
+            tiling.metadata_direct_output ? tiling.metadata_src_output : 0,
+            tiling.metadata_direct_output ? tiling.metadata_weight_output : 0,
             tiling.metadata_direct_output && !tiling.cached_mode ? sizeof(int32_t) : 0U,
             tiling.metadata_direct_output && tiling.has_topk_weights ? topk_weights_row_bytes : 0U);
     }
@@ -279,11 +280,25 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
                 static_cast<uint64_t>(worker_tokens) * topk_idx_row_bytes, staging_pingpong_ub, staging_capacity);
         }
         if (tiling.has_topk_weights != 0 && !tiling.metadata_direct_output) {
-            trace.Accumulate(Trace::WeightOutputBytes, uint64_t(worker_tokens) * topk_weights_row_bytes);
-            ascend_deepep::CopyDispatchRecvToGm(
-                recv_topk_weights, symmetric_buffer, tiling.topk_weights_buffer_offset,
-                static_cast<uint64_t>(recv_token_begin) * topk_weights_row_bytes,
-                static_cast<uint64_t>(worker_tokens) * topk_weights_row_bytes, staging_pingpong_ub, staging_capacity);
+            // Channel packing generated self weights directly into recv output.
+            // Copy only remote contributors; stale self SHMEM must never overwrite
+            // the final tensor. Rank prefixes define one contiguous self interval.
+            const int32_t self_begin = tiling.channel_metadata && rank > 0
+                ? rank_prefix_gm.GetValue((rank - 1) * world_size + rank) : 0;
+            const int32_t self_end = tiling.channel_metadata
+                ? rank_prefix_gm.GetValue(rank * world_size + rank) : 0;
+            for (uint32_t part = 0; part < 2; ++part) {
+                const int32_t begin = part == 0 ? recv_token_begin :
+                    (recv_token_begin > self_end ? recv_token_begin : self_end);
+                const int32_t end = part == 0 ? DispatchMin(recv_token_begin + worker_tokens, self_begin)
+                                             : recv_token_begin + worker_tokens;
+                if (end <= begin) continue;
+                trace.Accumulate(Trace::WeightOutputBytes, uint64_t(end - begin) * topk_weights_row_bytes);
+                ascend_deepep::CopyDispatchRecvToGm(
+                    recv_topk_weights, symmetric_buffer, tiling.topk_weights_buffer_offset,
+                    static_cast<uint64_t>(begin) * topk_weights_row_bytes,
+                    static_cast<uint64_t>(end - begin) * topk_weights_row_bytes, staging_pingpong_ub, staging_capacity);
+            }
         }
     }
 

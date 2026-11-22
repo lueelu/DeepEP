@@ -171,11 +171,13 @@ def test_real_metadata_and_wqe_bodies_constexpr(tmp_path, bits, corrupt, tile):
     if compiler is None:
         pytest.skip("C++17 compiler required")
     kernels = ROOT / "csrc/direct/kernels"
-    functions = vf_as_constexpr((kernels / "notify/notify_channel_metadata.h").read_text(), "PackChannelMetadataVf")
+    functions = vf_as_constexpr((kernels / "dispatch/channel_metadata.h").read_text(), "PackPlanMetadataVf")
+    functions += vf_as_constexpr((kernels / "dispatch/channel_metadata.h").read_text(), "PackRemoteMetadataVf")
     functions += vf_as_constexpr((kernels / "common/udma_shared_sender.h").read_text(), "BuildWqes")
-    functions += vf_as_constexpr((kernels / "dispatch/udma_dispatch_metadata.h").read_text(), "CopySelfChannelWordsVf")
     if corrupt:
-        functions = functions.replace("uint32_t(ordinal)", "uint32_t(ordinal) + 1U")
+        functions = functions.replace(
+            "expert - topk_idx_t(peer * experts_per_rank)", "expert - topk_idx_t(peer * experts_per_rank) + 1"
+        )
     source = r"""
 #include <cstdint>
 #include <array>
@@ -218,9 +220,35 @@ constexpr bool pack_check() {
     }
     for(unsigned start=0;start<Tokens;start+=TILE_TOKENS) {
         unsigned n=Tokens-start<TILE_TOKENS?Tokens-start:TILE_TOKENS;
+        for(unsigned peer=0;peer<World;++peer) {
+            std::array<int32_t,Tokens+1> plan{};
+            unsigned rows=0, first=0;
+            for(unsigned t=start;t<start+n;++t) if(heads[t*World+peer]>=0) {
+                if(!rows) first=heads[t*World+peer];
+                plan[rows++]=t;
+            }
+            const unsigned dest=((peer*C+Ch)*S+first)*K;
+            for(unsigned tid=0;tid<128;++tid)
+                PackPlanMetadataVf(plan.data(),idx.data()+start*K,weights.data()+start*K,
+                    output.data()+dest,ow.data()+dest,nullptr,rows,start,K,peer,16,Weighted,tid);
+        }
+    }
+    for(unsigned i=0;i<output.size();++i) if(output[i]!=expected[i] || ow[i]!=ew[i])return false;
+    for(unsigned i=0;i<output.size();++i) { output[i]=-77; ow[i]=-77; }
+    for(unsigned start=0;start<Tokens;start+=TILE_TOKENS) {
+        const unsigned n=Tokens-start<TILE_TOKENS?Tokens-start:TILE_TOKENS;
+        std::array<int32_t,World*TILE_TOKENS> plans{};
+        std::array<uint32_t,World*3> desc{};
+        for(unsigned p=0;p<World;++p) {
+            desc[p*3]=p;
+            for(unsigned t=start;t<start+n;++t) if(heads[t*World+p]>=0) {
+                if(!desc[p*3+1])desc[p*3+2]=heads[t*World+p];
+                plans[p*TILE_TOKENS+desc[p*3+1]++]=t;
+            }
+        }
         for(unsigned tid=0;tid<128;++tid)
-            PackChannelMetadataVf(heads.data()+start*World,idx.data()+start*K,weights.data()+start*K,
-                output.data(),ow.data(),n,K,World,16,C,Ch,S,Weighted,tid);
+            PackRemoteMetadataVf(plans.data(),desc.data(),idx.data()+start*K,weights.data()+start*K,
+                output.data(),ow.data(),World,TILE_TOKENS,start,K,16,C,Ch,S,Weighted,tid);
     }
     for(unsigned i=0;i<output.size();++i) if(output[i]!=expected[i] || ow[i]!=ew[i])return false;
     return true;
@@ -241,11 +269,6 @@ constexpr bool wqe_check() {
         if(wqes[i*8+5]!=requests[i*4] || wqes[i*8+6]!=requests[i*4+2] || wqes[i*8+7]!=requests[i*4+1])return false;
     }
     for(unsigned i=24*8;i<32*8;++i)if(wqes[i])return false;
-    uint32_t input[129]{}, output[131]{};
-    for(unsigned i=0;i<129;++i)input[i]=i+3;
-    for(unsigned tid=0;tid<128;++tid)CopySelfChannelWordsVf(input,output+1,129,tid);
-    if(output[0] || output[130])return false;
-    for(unsigned i=0;i<129;++i)if(output[i+1]!=input[i])return false;
     return true;
 }
 static_assert(pack_check<8,0,false>());
@@ -281,21 +304,11 @@ def test_pack_and_local_copy_pipeline(tmp_path):
     if compiler is None:
         pytest.skip("C++17 compiler required")
     kernels = ROOT / "csrc/direct/kernels"
-    functions = cpp_functions(
-        (kernels / "notify/notify_channel_metadata.h").read_text(),
-        "PackChannelMetadataVf",
-        "LoadChannelMetadataInput",
-        "PackChannelMetadataDoubleBuffered",
-        "PackChannelMetadata",
+    functions = cpp_functions((kernels / "dispatch/udma_dispatch_metadata.h").read_text(), "CopySelfChannelMetadata")
+    harness = (
+        (Path(__file__).with_name("eight_aiv_copy_oracle.cpp")).read_text().split("static unsigned sender_phase;", 1)[0]
     )
-    functions += cpp_functions(
-        (kernels / "dispatch/udma_dispatch_metadata.h").read_text(), "CopySelfChannelWordsVf", "CopySelfChannelMetadata"
-    )
-    harness = (Path(__file__).with_name("eight_aiv_copy_oracle.cpp")).read_text().split("using Row =", 1)[0]
-    harness = harness.replace("enum class HardEvent {", "enum class HardEvent { MTE2_V, V_MTE2,").replace(
-        "    T GetValue(uint64_t i) const",
-        "    T* GetPhyAddr() const { return data; }\n    T GetValue(uint64_t i) const",
-    )
+    harness = harness.replace("enum class HardEvent {", "enum class HardEvent { V_MTE2,")
     harness = harness.replace(
         "template <HardEvent>\nvoid SetFlag(int)\n{\n}",
         "static int credits[16][8]{};\nstatic unsigned event_sets;\n"
@@ -306,20 +319,18 @@ def test_pack_and_local_copy_pipeline(tmp_path):
         "template <HardEvent E> void WaitFlag(int e) { assert(credits[int(E)][e]==1); credits[int(E)][e]=0; }",
     )
     harness += r"""
-#define __simt_vf__
-#define __launch_bounds__(n)
-#define __ubuf__
 #include "common/dispatch_channel_metadata.h"
+using namespace ascend_deepep;
 struct { unsigned x; } threadIdx;
 void asc_threadfence() {}
 struct dim3 { unsigned x; explicit dim3(unsigned value):x(value){} };
 template<auto Fn, class... Args> void asc_vf_call(dim3 n, Args... args) {
     for(threadIdx.x=0;threadIdx.x<n.x;++threadIdx.x)Fn(args...);
 }
+#define __CCE_KT_TEST__
+#include "kernels/dispatch/channel_metadata.h"
+namespace ascend_deepep {
 // FUNCTIONS
-void check(Resource& resource, GM_ADDR head, GM_ADDR plan, GM_ADDR workspace, const DispatchTilingData& td) {
-    PackChannelMetadata(resource,head,td,0);
-    CopySelfChannelMetadata(resource,plan,workspace,td,0,3,17,32);
 }
 """
     path = tmp_path / "channel_calls.cpp"
@@ -358,8 +369,18 @@ def test_dynamic_metadata_tile_layout_constexpr(tmp_path):
         pytest.skip("C++17 compiler required")
     source = r"""
 #include "common/dispatch_channel_metadata.h"
+#include "common/udma_schedule.h"
 using namespace ascend_deepep;
 constexpr bool check() {
+    for(unsigned capacity:{8U,64U}) for(unsigned qps:{1U,2U})
+    for(unsigned slots:{1U,2U}) for(unsigned k:{1U,8U,128U})
+    for(unsigned index_bytes:{4U,8U}) for(bool weighted:{false,true}) {
+        const unsigned live=udma::DispatchLiveSendUbBytes(capacity,qps);
+        const unsigned descriptors=(capacity*12+31)/32*32;
+        const unsigned budget=(221120-live)/slots-descriptors;
+        const auto tile=SelectChannelMetadataTile(0,capacity,k,index_bytes,weighted,budget);
+        if(!tile.tokens || live+slots*(descriptors+tile.bytes)>221120)return false;
+    }
     for (unsigned world : {1U, 8U, 16U, 256U})
     for (unsigned k : {1U, 8U, 128U})
     for (unsigned bytes : {4U, 8U})
@@ -395,6 +416,61 @@ static_assert(SelectChannelMetadataTile(0,8,129,8,true,221120).tokens == 0);
     path.write_text("#include <initializer_list>\n" + source)
     result = subprocess.run(
         [compiler, "-std=c++17", "-c", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(tmp_path / "tile.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_self_weight_output_is_not_overwritten_by_staging_constexpr(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    kernel = (ROOT / "csrc/direct/kernels/dispatch/dispatch_udma.cpp").read_text()
+    begin = kernel.index("            const int32_t self_begin = tiling.channel_metadata")
+    end = kernel.index("\n        }\n    }\n\n    trace.FinishOutput();", begin)
+    body = kernel[begin:end]
+    source = r"""
+#include <array>
+#include <cstdint>
+constexpr int DispatchMin(int a,int b) { return a<b?a:b; }
+struct Trace { enum {WeightOutputBytes}; constexpr void Accumulate(int,uint64_t) {} };
+struct Prefix { int begin,end; constexpr int GetValue(int i) const {return i==1?begin:end;} };
+namespace ascend_deepep {
+constexpr void CopyDispatchRecvToGm(std::array<unsigned,16>& out,int,int,uint64_t start,uint64_t bytes,int,int) {
+    for(unsigned i=start/4;i<(start+bytes)/4;++i) ++out[i];
+}
+}
+constexpr bool check(int recv_token_begin,int worker_tokens,int sb,int se,bool channel) {
+    std::array<unsigned,16> recv_topk_weights{};
+    struct {bool channel_metadata;int topk_weights_buffer_offset;} tiling{channel,0};
+    const Prefix rank_prefix_gm{sb,se};
+    constexpr int rank=1,world_size=4,topk_weights_row_bytes=4;
+    constexpr int symmetric_buffer=0,staging_pingpong_ub=0,staging_capacity=0;
+    Trace trace;
+// BODY
+    for(int row=0;row<16;++row) {
+        const bool expected=row>=recv_token_begin && row<recv_token_begin+worker_tokens &&
+            !(channel && row>=sb && row<se);
+        if(recv_topk_weights[row]!=unsigned(expected))return false;
+    }
+    return true;
+}
+constexpr bool all() {
+    for(int sb=0;sb<=16;++sb) for(int se=sb;se<=16;++se)
+    for(int begin=0;begin<=16;++begin) for(int count=0;count<=16-begin;++count)
+        if(!check(begin,count,sb,se,true)||!check(begin,count,sb,se,false))return false;
+    return true;
+}
+static_assert(all());
+"""
+    path = tmp_path / "self_output.cpp"
+    path.write_text(source.replace("// BODY", body))
+    version = subprocess.run([compiler, "--version"], capture_output=True, text=True, timeout=30).stdout.lower()
+    limit = "-fconstexpr-steps=100000000" if "clang" in version else "-fconstexpr-ops-limit=100000000"
+    result = subprocess.run(
+        [compiler, "-std=c++17", limit, "-c", str(path), "-o", str(tmp_path / "self.o")],
         capture_output=True,
         text=True,
         timeout=180,

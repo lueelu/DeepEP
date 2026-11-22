@@ -613,11 +613,16 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                         "DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS must be 0(auto), 32, 64, 128 or 256");
             requested_tile = static_cast<uint32_t>(std::atoi(tile_option));
         }
+        const uint32_t peer_capacity = udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder
+            ? ascend_deepep::udma::kGroupPeerCapacity : ascend_deepep::udma::kMaxPeers;
+        const uint32_t packing_ub = ascend_deepep::platform::kKernelUbBytes -
+            ascend_deepep::udma::DispatchLiveSendUbBytes(peer_capacity, udma_launch.qps);
+        const uint32_t descriptor_bytes = AlignUpInt64(peer_capacity * 3U * sizeof(uint32_t), 32);
         const auto metadata_tile = ascend_deepep::SelectChannelMetadataTile(requested_tile,
-            world_size, num_topk, sizeof(ascend_deepep::topk_idx_t), topk_weights.has_value(),
-            ascend_deepep::platform::kKernelUbBytes / (metadata_double_buffer ? 2U : 1U));
+            peer_capacity, num_topk, sizeof(ascend_deepep::topk_idx_t), topk_weights.has_value(),
+            packing_ub / (metadata_double_buffer ? 2U : 1U) - descriptor_bytes);
         tiling.channel_metadata_double_buffer = metadata_double_buffer;
-        TORCH_CHECK(metadata_tile.tokens, "requested channel metadata tile exceeds available UB");
+        TORCH_CHECK(metadata_tile.tokens, "requested channel metadata tile exceeds private sender UB");
         tiling.channel_metadata_tile_tokens = metadata_tile.tokens;
         LastDispatchChannelMetadataTileTokens() = metadata_tile.tokens;
         const int64_t length = CheckedAddInt64(num_tokens, num_channels - 1, "metadata channel length") / num_channels;
@@ -875,7 +880,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // Dispatch writes every valid source index. Fixed-capacity tails are
     // unspecified; consumers select valid rows by rank/channel prefixes.
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
-    if (tiling.metadata_direct_output) {
+    if (tiling.channel_metadata) {
         tiling.metadata_src_output = cached_mode ? 0 : reinterpret_cast<uint64_t>(recv_src_idx.data_ptr());
         tiling.metadata_weight_output = recv_topk_weights.has_value()
             ? reinterpret_cast<uint64_t>(recv_topk_weights->data_ptr()) : 0;

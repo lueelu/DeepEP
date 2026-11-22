@@ -165,7 +165,7 @@ run_worker(work)
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_cached_weighted_profiler_accounts_for_plan_rebuild(tmp_path, packed):
-    notify = "cached_notify_dispatch_packed_kernel" if packed else "cached_notify_dispatch_kernel"
+    notify = "cached_notify_dispatch_kernel"
     names = ["cached_notify_combine_kernel", notify]
     if not packed:
         names.append("cached_dispatch_plan_kernel")

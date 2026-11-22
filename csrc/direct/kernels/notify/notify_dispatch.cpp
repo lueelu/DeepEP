@@ -6,7 +6,6 @@
 
 #include "kernels/notify/notify_recv_prefix.h"
 #include "kernels/notify/notify_dispatch_plan.h"
-#include "kernels/notify/notify_channel_metadata.h"
 #include "kernels/notify/notify_fused_layout.h"
 #include "kernels/common/v2_handle.h"
 #include "common/launch.h"
@@ -594,8 +593,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         // kernel completion still gates every payload consumer.
         ascend_deepep::BuildDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
     }
-    if (tiling.channel_metadata)
-        ascend_deepep::PackChannelMetadata(resource, send_head, tiling, core_idx);
+    // Metadata packing is owned by dispatch after its payload submission.
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
@@ -619,27 +617,11 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     aclshmemx_sync_vec_all();
 }
 
-// One cached-notify launch in either mode. Keep the default kernel's small
-// argument block and zero-UB launch unchanged when packing is disabled.
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_packed_kernel(
-    ascend_deepep::DispatchTilingData td, uint64_t ffts_addr)
-{
-    aclshmemx_instance_ctx_set(td.instance_id);
-    util_set_ffts_config(ffts_addr);
-    aclshmemx_sync_vec_all();
-    ascend_deepep::UbWorkspace resource;
-    const uint32_t channel = get_block_idx() * get_subblockdim() + get_subblockid();
-    ascend_deepep::PackChannelMetadata(resource, reinterpret_cast<GM_ADDR>(td.cached_metadata_head), td, channel);
-}
-
 extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
-    if (td->cached_weight_pack)
-        cached_notify_dispatch_packed_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kNotifyDispatchUbBytes), stream>>>(*td, ffts_addr);
-    else
-        cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, td->instance_id);
+    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, td->instance_id);
 }
 
 // Legacy six-tensor handles have no private plan. Rebuild locally on the same
