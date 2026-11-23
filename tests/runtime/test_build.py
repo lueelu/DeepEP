@@ -417,6 +417,11 @@ def source_native(build, monkeypatch, tmp_path):
     (destination / ".libs").mkdir()
     for name in build.SHMEM_RUNTIME_LIBRARIES:
         (destination / ".libs" / name).write_bytes(b"SDK")
+    # Device kernel sources are bundled for DeepJIT; both layouts resolve them
+    # through the same package-relative path.
+    kernel_src = destination / "_kernel_src"
+    (kernel_src / "csrc").mkdir(parents=True)
+    (kernel_src / "csrc" / "kernel.hpp").write_bytes(b"first:kernel")
     return package, destination, names
 
 
@@ -436,6 +441,8 @@ def test_source_native_snapshot_survives_staging_removal_and_refresh(build, sour
     assert all((package / name).read_bytes() == b"second" for name in names)
     assert (package / ".libs").is_symlink()
     assert all((package / ".libs" / name).read_bytes() == b"SDK" for name in build.SHMEM_RUNTIME_LIBRARIES)
+    assert (package / "_kernel_src").is_symlink()
+    assert (package / "_kernel_src" / "csrc" / "kernel.hpp").read_bytes() == b"first:kernel"
 
 
 @pytest.mark.parametrize("missing", [None, "libshmem_utils.so", "aclshmem_bootstrap_uid.so"])

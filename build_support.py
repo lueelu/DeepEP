@@ -250,14 +250,10 @@ def build_configuration(environment=None):
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     ll_reference_profile = env.get("DEEPEP_LL_REFERENCE_PROFILE", "OFF")
-    ll_stage_timer = env.get("DEEPEP_LL_STAGE_TIMER", "OFF")
-    if ll_reference_profile not in {"ON", "OFF"} or ll_stage_timer not in {"ON", "OFF"}:
-        raise RuntimeError("LL reference/stage diagnostic options accept ON or OFF only")
-    if ll_reference_profile == "ON" and ll_stage_timer == "ON":
-        raise RuntimeError("The reference profile requires legacy LL stage tracing OFF")
+    if ll_reference_profile not in {"ON", "OFF"}:
+        raise RuntimeError("LL reference profile option accepts ON or OFF only")
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine(),
-              "ll_reference_profile": ll_reference_profile == "ON",
-              "ll_stage_timer": ll_stage_timer == "ON"}
+              "ll_reference_profile": ll_reference_profile == "ON"}
     default_shmem = ROOT / "third-party/shmem/install/shmem"
 
     result["build_type"] = env.get("DEEPEP_BUILD_TYPE", "RelWithDebInfo" if lineinfo else "Release")
@@ -450,9 +446,13 @@ def publish_source_native(destination):
         "libdeepep_kernels.so",
         "libdeepep_clos_kernels.so",
         "_build_info.json",
+        "_kernel_src",
     ]
     for name in names:
-        if not (destination / name).is_file():
+        if name == "_kernel_src":
+            if not (destination / name).is_dir():
+                raise RuntimeError(f"Incomplete native build: {destination / name}")
+        elif not (destination / name).is_file():
             raise RuntimeError(f"Incomplete native build: {destination / name}")
     for name in SHMEM_RUNTIME_LIBRARIES:
         if not (destination / ".libs" / name).is_file():
@@ -475,7 +475,7 @@ def publish_source_native(destination):
     storage.mkdir(parents=True, exist_ok=True)
     snapshot = Path(tempfile.mkdtemp(prefix="build-", dir=storage)).resolve()
     for name in names:
-        if name == ".libs":
+        if name in {".libs", "_kernel_src"}:
             shutil.copytree(destination / name, snapshot / name)
         else:
             shutil.copy2(destination / name, snapshot / name)
@@ -483,7 +483,7 @@ def publish_source_native(destination):
     # the previous snapshot until the anchor is atomically replaced.
     for name in names:
         if name not in managed:
-            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name == ".libs")
+            (package / name).symlink_to(Path(".native-build") / name, target_is_directory=name in {".libs", "_kernel_src"})
     pending = snapshot / "anchor"
     pending.symlink_to(os.path.relpath(snapshot, package), target_is_directory=True)
     os.replace(pending, anchor)
@@ -491,6 +491,27 @@ def publish_source_native(destination):
         if name not in names:
             path.unlink()
     print(f"Prepared source native links in {package}")
+
+
+def bundle_kernel_sources(destination, shmem_root):
+    """Ship the device headers the installed wheel compiles through DeepJIT."""
+    kernel_src = destination / "_kernel_src"
+    csrc_out = kernel_src / "csrc"
+    for path in (ROOT / "csrc").rglob("*"):
+        if path.is_file() and path.suffix in {".h", ".hpp"}:
+            target = csrc_out / path.relative_to(ROOT / "csrc")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+    include_out = destination / "include"
+    for path in (ROOT / "deep_ep" / "include").rglob("*.hpp"):
+        target = include_out / path.relative_to(ROOT / "deep_ep" / "include")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    shmem_source = Path(shmem_root)
+    for sub in ("include", "src"):
+        source = shmem_source / sub
+        if source.is_dir():
+            shutil.copytree(source, kernel_src / "shmem" / sub, dirs_exist_ok=True)
 
 
 class CMakeBuild(build_ext):
@@ -532,7 +553,6 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DDEEPEP_LL_REFERENCE_PROFILE={'ON' if configuration.get('ll_reference_profile', False) else 'OFF'}",
-            f"-DDEEPEP_LL_STAGE_TIMER={'ON' if configuration.get('ll_stage_timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
@@ -573,6 +593,7 @@ class CMakeBuild(build_ext):
         info["compiler"] = json.loads((directory / "compiler-info.json").read_text())
         info.update(json.loads((directory / "capabilities.json").read_text(encoding="utf-8")))
         info["shmem_runtime"] = bundle_shmem_runtime(configuration["SHMEM_ROOT"], destination)
+        bundle_kernel_sources(destination, configuration["SHMEM_ROOT"])
         (destination / "_build_info.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

@@ -1,12 +1,12 @@
 // Copyright (c) 2026, Lu Lu
 #pragma once
-#include "../../kernels/dispatch/low_latency/common/ll_group_policy.h"
+#include <deep_ep/common/compiled.hpp>
 
 namespace UbxDispatch {
-using DispatchDedup::kLlPhysicalRanksPerHost;
-using DispatchDedup::kLlMaxRanksPerGroup;
-using DispatchDedup::LlGroupForWorld;
-using DispatchDedup::LlTilingKeyForWorld;
-using DispatchDedup::LlTilingKeyValid;
-using DispatchDedup::LlSameHost;
+constexpr uint32_t kLlPhysicalRanksPerHost = deep_ep::kNumRanksPerHost;
+constexpr uint32_t kLlMaxRanksPerGroup = deep_ep::kNumMaxRanksPerGroup;
+using deep_ep::LlGroupForWorld;
+using deep_ep::LlTilingKeyForWorld;
+using deep_ep::LlTilingKeyValid;
+using deep_ep::LlSameHost;
 }  // namespace UbxDispatch

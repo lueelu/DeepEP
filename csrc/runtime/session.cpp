@@ -3,8 +3,8 @@
 #include "runtime/session.hpp"
 #ifdef DEEPEP_LL_RDMA
 #include "runtime/ll_core_config.hpp"
+#include <deep_ep/common/compiled.hpp>
 #include "runtime/ll_rdma_qp_config.hpp"
-#include "kernels/dispatch/low_latency/common/ll_rdma_layout.h"
 #endif
 #include <cstring>
 #include <cstdlib>
@@ -172,10 +172,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     if (ll_rdma_) {
         if (bytes != (8ULL << 30)) throw std::invalid_argument("RDMA LL requires the 8 GiB workspace");
         ll_rdma_qps_ = query_ll_core_config().active;
-        validate_ll_rdma_qps(ll_rdma_qps_, size > int(DispatchDedup::kLlPhysicalRanksPerHost));
+        validate_ll_rdma_qps(ll_rdma_qps_, size > int(deep_ep::kNumRanksPerHost));
         low_latency_cores_ = ll_rdma_qps_;
-        const uint64_t used_staging = uint64_t(ll_rdma_qps_) * LlRdma::kCoreBytes;
-        if (size > int(DispatchDedup::kLlPhysicalRanksPerHost))
+        const uint64_t used_staging = uint64_t(ll_rdma_qps_) * deep_ep::rdma::kCoreBytes;
+        if (size > int(deep_ep::kNumRanksPerHost))
             staging_bytes = (used_staging + alignment - 1U) / alignment * alignment;
     }
 #endif
@@ -190,7 +190,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.option_attr.data_op_engine_type =
         udma ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA) : ACLSHMEM_DATA_OP_MTE;
 #ifdef DEEPEP_LL_RDMA
-    if (ll_rdma_) attr.option_attr.data_op_engine_type = size > int(DispatchDedup::kLlPhysicalRanksPerHost)
+    if (ll_rdma_) attr.option_attr.data_op_engine_type = size > int(deep_ep::kNumRanksPerHost)
         ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE) : ACLSHMEM_DATA_OP_MTE;
 #endif
     attr.option_attr.shm_init_timeout = timeout;
@@ -209,7 +209,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool runtime_started = false;
     try {
 #ifdef DEEPEP_LL_RDMA
-        if (ll_rdma_ && size > int(DispatchDedup::kLlPhysicalRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
+        if (ll_rdma_ && size > int(deep_ep::kNumRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
 #endif
         if (options.dedicated_peer_qp) {
             // MegaMoE owns one UDMA QP per peer and does not use shared Clos

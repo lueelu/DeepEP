@@ -5,8 +5,8 @@
 #define COMBINE_DEDUP_EP_COMBINE_MEMORY_SERVER_DEDUP_KERNEL_H
 
 #include "kernel_operator.h"
-#include "../../dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h"
-#include "../../dispatch/low_latency/common/comm_args.h"
+#include <deep_ep/layout/ep/workspace.hpp>
+#include <deep_ep/comm/comm_args.hpp>
 #include "ep_memory_server_dedup_buffer_layout.h"
 #include "ep_memory_server_dedup_combine_config.h"
 #include "combine_server_dedup_partial.h"
@@ -28,7 +28,7 @@ public:
     {
         (void)quantMode;
         core_ = GetBlockIdx();
-        args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
+        args_ = reinterpret_cast<const __gm__ deep_ep::CommArgs*>(commArgs);
         enableDedup_ = enableDedup;
         h_ = h;
         topK_ = topK;
@@ -72,7 +72,7 @@ public:
         blocks_ = (h_ * 2U + 479U) / 480U;
         laneBytes_ = blocks_ * 480U;
         resultStride_ = blocks_ * 512U;
-        window_ = (uint64_t(magic) % 2U) * DispatchDedup::kEpServerDedupWindowBytes;
+        window_ = (uint64_t(magic) % 2U) * deep_ep::kEpServerDedupWindowBytes;
         control_ = window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_CONTROL_OFFSET;
         stageStride_ = (uint64_t(h_) * 2U + 511U) / 512U * 512U;
         stageBase_ = window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET + uint64_t(bs) * topK * resultStride_;
@@ -424,7 +424,7 @@ private:
     uint32_t partialTasks_ = 0U;
     TPipe pipe_;
     TBuf<> arena_;
-    const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
+    const __gm__ deep_ep::CommArgs* args_ = nullptr;
     GM_ADDR expertAddr_ = nullptr;
     GM_ADDR typesAddr_ = nullptr;
     GM_ADDR tableAddr_ = nullptr;

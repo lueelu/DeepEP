@@ -22,9 +22,8 @@ class ReferenceTrace:
         from .._native import require_native
         import torch
         native = require_native('LL dispatch reference profile')
-        if (getattr(native, 'low_latency_reference_profile_enabled', None) is not True or
-                getattr(native, 'low_latency_stage_timer_enabled', None) is not False):
-            raise RuntimeError('Rebuild the complete wheel with DEEPEP_LL_REFERENCE_PROFILE=ON and DEEPEP_LL_STAGE_TIMER=OFF')
+        if getattr(native, 'low_latency_reference_profile_enabled', None) is not True:
+            raise RuntimeError('Rebuild the complete wheel with DEEPEP_LL_REFERENCE_PROFILE=ON')
         expected = dict(schema=SCHEMA, slots=SLOTS, fields=FIELDS, words=list(WORDS))
         layout = native.low_latency_reference_profile_layout()
         if (layout != expected or any(type(layout.get(key)) is not int for key in ('schema', 'slots', 'fields'))):
@@ -65,10 +64,9 @@ class ReferenceTrace:
 @contextmanager
 def capture(buffer, operation='dispatch', mode='reference', frequency_hz=DEFAULT_FREQUENCY_HZ,
             *, prepared=None, defer_complete=False):
-    from . import ll_stage_timer
     active = getattr(_state, 'active', {})
-    if id(buffer) in active or id(buffer) in getattr(ll_stage_timer._state, 'active', {}):
-        raise RuntimeError('Nested reference/stage contexts for the same buffer are unsupported')
+    if id(buffer) in active:
+        raise RuntimeError('Nested reference contexts for the same buffer are unsupported')
     trace = prepared if prepared is not None else ReferenceTrace(buffer, operation, mode, frequency_hz)
     if prepared is not None and (not isinstance(trace, ReferenceTrace) or trace.buffer is not buffer or
                                  trace.operation != operation or trace.mode != mode or
@@ -93,8 +91,6 @@ def attach(buffer, tensors, operation):
         return
     if operation != 'dispatch' or trace.operation != operation or trace.launches:
         raise RuntimeError('Reference profiling accepts exactly one LL dispatch, never combine')
-    if any(tensors.get(key) is not None for key in ('ll_stage_timer', 'll_expert_timer')):
-        raise RuntimeError('Reference profiling cannot run with legacy stage/expert tracing')
     if trace.tensor.device != tensors['input'].device:
         raise ValueError('Reference profile and LL input must be on the same NPU')
     trace.launches += 1

@@ -7,8 +7,8 @@ Modified by Joyce_An 2026
 
 - `notify/notify.cpp`：路由元数据计算与交换。
 - `dispatch/dispatch.cpp`、`combine/combine.cpp`：高吞吐 dispatch/combine。
-- `dispatch/low_latency.cpp`、`combine/low_latency.cpp`：低时延入口。
-- `dispatch/low_latency/`、`combine/low_latency/`：低时延设备实现、Host/Device 共用布局和启动声明。
+- `combine/low_latency.cpp`：低时延 combine 入口；LL dispatch 由 DeepJIT 从 `deep_ep/include` 编译。
+- `combine/low_latency/`：低时延 combine 设备实现；共享布局位于 `deep_ep/include/deep_ep/`。
 - `launch.hpp`：LL 的导出和启动宏；`common.hpp`：Notify/combine 的 rank 调度映射。
 
 Host 封装位于 `csrc/ops`，本目录的设备入口由 `cmake/device/CMakeLists.txt` 构建到同一个

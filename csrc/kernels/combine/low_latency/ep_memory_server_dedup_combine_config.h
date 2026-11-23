@@ -13,6 +13,10 @@
 
 namespace CombineDedup {
 constexpr uint32_t kEpServerDedupCombineSendCoreNum = COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM;
+// Combine-only dtype codes. They are the historical tiling ABI values and only
+// select the 16-bit aggregation type; Dispatch carries no dtype enum.
+constexpr uint8_t kEpServerDedupDtypeFp16 = 3U;
+constexpr uint8_t kEpServerDedupDtypeBf16 = 11U;
 static_assert(kEpServerDedupCombineSendCoreNum >= 16U && kEpServerDedupCombineSendCoreNum <= 56U &&
                   kEpServerDedupCombineSendCoreNum % 4U == 0U,
               "COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM must be 16..56 in steps of 4");

@@ -4,6 +4,7 @@
 #include <memory>
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
+#include "runtime/jit.hpp"
 #include "runtime/session.hpp"
 #ifdef DEEPEP_BUILD_MEGAMOE
 #include "runtime/megamoe_session.hpp"
@@ -28,6 +29,7 @@ PYBIND11_MODULE(_C, module)
         }
         return std::string(info.dli_fname);
     });
+    module.def("init_jit", &deep_ep::init_jit, py::arg("root"));
     module.def("runtime_busy", &deepep::Session::busy, py::call_guard<py::gil_scoped_release>());
     module.def(
         "create_mpi_runtime",

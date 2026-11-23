@@ -35,7 +35,6 @@ find_path(DEVICE_RT_INCLUDE rt.h HINTS
 # compile-time identity: the device never enables them from a runtime flag.
 set(_ll_sources
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/runtime/clock_alignment.cpp"
-    "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/low_latency.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/low_latency.cpp")
 # Other device kernels keep the upstream multi-backend build unchanged.
 set(_other_sources
@@ -45,9 +44,6 @@ set(_other_sources
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/reuse.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine_ep8.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/ubx/kernels/combine.cpp")
-if(DEEPEP_LL_STAGE_TIMER)
-    message(FATAL_ERROR "Legacy LL tracing was removed; use DEEPEP_LL_REFERENCE_PROFILE=ON")
-endif()
 add_library(deepep_kernel_ll_plain OBJECT ${_ll_sources})
 add_library(deepep_kernel_ll_reference OBJECT ${_ll_sources})
 set_target_properties(deepep_kernel_ll_plain deepep_kernel_ll_reference
@@ -73,6 +69,7 @@ set(_device_includes
     "${_sdk_include}" "${_arch_include}"
     "${_tikcpp}" "${_tikcpp}/tikcfw"
     "${_tikcpp}/tikcfw/impl" "${_tikcpp}/tikcfw/interface"
+    "${DEEPEP_SOURCE_DIR}/csrc" "${DEEPEP_SOURCE_DIR}/deep_ep/include"
     "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src" "${SHMEM_ROOT}/src/device"
     "${SHMEM_ROOT}/src/device_simt")
 if(DEVICE_RT_INCLUDE)

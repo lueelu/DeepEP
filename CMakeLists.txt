@@ -14,6 +14,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# DeepJIT headers use std::format and are included as <deep_ep/...>.
+include_directories(${CMAKE_SOURCE_DIR}/csrc)
 option(DEEPEP_BUILD_EP_GMM_FUSED "Build Ascend950 communication/GMM experiment" OFF)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
@@ -21,17 +23,43 @@ include(cmake/Dependencies.cmake)
 option(DEEPEP_BUILD_MEGAMOE "Build the optional MegaMoE Beta" OFF)
 option(DEEPEP_MEGAMOE_TIMER "Compile MegaMoE device tracing" OFF)
 include(cmake/Device.cmake)
-pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp
-    csrc/ops/combine.cpp csrc/ops/low_latency.cpp csrc/ubx/v2.cpp)
-target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
+include(cmake/DeepJIT.cmake)
+# DeepJIT's Ascend backend includes torch_npu stream headers. Resolve both
+# packages by their real installation directory: a venv that inherits system
+# site-packages keeps torch outside the venv's purelib, so concatenating the
+# venv path would point at a directory that does not exist. find_spec only
+# locates the package (it never executes torch_npu, which would initialize the
+# device and print to stdout that we capture here).
+execute_process(COMMAND "${Python_EXECUTABLE}" -c
+    "import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec('torch').submodule_search_locations[0]).resolve())"
+    OUTPUT_VARIABLE _deepep_torch OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${Python_EXECUTABLE}" -c
+    "import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec('torch_npu').submodule_search_locations[0]).resolve())"
+    OUTPUT_VARIABLE _deepep_torch_npu OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+list(APPEND CMAKE_PREFIX_PATH "${_deepep_torch}/share/cmake")
+find_package(Torch REQUIRED)
+set(TORCH_NPU_PATH "${_deepep_torch_npu}")
+pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp
+    csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp csrc/ubx/v2.cpp)
+set_target_properties(_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+target_include_directories(_C PRIVATE csrc "${CMAKE_SOURCE_DIR}/deep_ep/include" "${ASCEND_HOME_PATH}/include"
+    "${SHMEM_ROOT}/include" "${TORCH_NPU_PATH}/include" "${TORCH_NPU_PATH}/include/third_party/acl/inc"
+    ${TORCH_INCLUDE_DIRS})
 find_path(DEEPEP_PLATFORM_INCLUDE tiling/platform/platform_ascendc.h
     HINTS "${ASCEND_HOME_PATH}/asc/include" "${ASCEND_HOME_PATH}/include/op_common"
           "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include" NO_DEFAULT_PATH REQUIRED)
 target_include_directories(_C PRIVATE "${DEEPEP_PLATFORM_INCLUDE}")
-target_link_directories(_C PRIVATE "${ASCEND_HOME_PATH}/lib64")
+target_link_directories(_C PRIVATE "${ASCEND_HOME_PATH}/lib64" "${TORCH_NPU_PATH}/lib" ${TORCH_LIBRARY_DIRS})
 target_link_libraries(_C PRIVATE platform tiling_api unified_dlog)
 target_compile_definitions(_C PRIVATE DEEPEP_LL_RDMA=1)
-target_link_libraries(_C PRIVATE ascendcl shmem deepep_device ${CMAKE_DL_LIBS})
+# The JIT builds device code for the same SDK as this host module, so it must
+# use the doorbell mode recorded in the SDK identity instead of a fixed value.
+target_compile_definitions(_C PRIVATE DEEPEP_JIT_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP})
+if(DEEPEP_LL_REFERENCE_PROFILE)
+    target_compile_definitions(_C PRIVATE DEEPEP_LL_REFERENCE_PROFILE=1)
+endif()
+target_link_libraries(_C PRIVATE ascendcl shmem deepep_device torch_npu ${TORCH_LIBRARIES} ${CMAKE_DL_LIBS})
+deepep_apply_deepjit(_C)
 target_compile_options(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -Wall -Wextra -Werror -fstack-protector-strong)
 target_compile_options(_C PRIVATE "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
     "-ffile-prefix-map=${SHMEM_ROOT}=SHMEM_SDK" "-ffile-prefix-map=${ASCEND_HOME_PATH}=CANN_SDK")

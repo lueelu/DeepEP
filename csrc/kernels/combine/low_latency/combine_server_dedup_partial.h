@@ -5,7 +5,7 @@
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 
 #include "kernel_operator.h"
-#include "../../dispatch/low_latency/common/comm_args.h"
+#include <deep_ep/comm/comm_args.hpp>
 #include "ep_memory_server_dedup_buffer_layout.h"
 #include "ep_memory_server_dedup_combine_config.h"
 #include "combine_server_dedup_select.h"
@@ -17,7 +17,7 @@ using namespace AscendC;
 // addresses and completion events remain live through the M5 handoff.
 class ServerDedupPartial {
 public:
-    __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch,
+    __aicore__ inline void Init(const __gm__ deep_ep::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch,
                                 GM_ADDR expert, GM_ADDR table2, GM_ADDR table3, GM_ADDR types, uint32_t tokens,
                                 uint32_t bs, uint32_t h, uint32_t k, uint32_t experts, uint8_t dtype, uint64_t window,
                                 const EpCombineM45WorkspaceLayout& layout)
@@ -85,7 +85,7 @@ public:
                     Trap();
                     return completed;
                 }
-                if (dtype_ == DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP16)
+                if (dtype_ == kEpServerDedupDtypeFp16)
                     Aggregate<half>(row, source, members + 1U);
                 else
                     Aggregate<bfloat16_t>(row, source, members + 1U);
@@ -252,7 +252,7 @@ private:
         SetFlag<HardEvent::MTE3_V>(lane);
     }
 
-    const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
+    const __gm__ deep_ep::CommArgs* args_ = nullptr;
     TPipe* pipe_ = nullptr;
     LocalTensor<uint8_t> scratch_, outputs_, scan_;
     LocalTensor<int32_t> rows_, table2Ub_;
