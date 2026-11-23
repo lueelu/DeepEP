@@ -75,6 +75,9 @@ struct GMMAddrInfo {
     __gm__ int32_t* dispatchToGmm1Flag;
     __gm__ int32_t* gmm2CombineSyncCounter;
     __gm__ int32_t* gmmToEpilogueFlag;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    __gm__ int32_t* routedConsumed = nullptr;
+#endif
     __gm__ int32_t* gmm1TileStatus;
     __gm__ int32_t* sharedExpertGmm2TileCounter;
     // 仅 Wave 调试采集设置；其他调用保持空指针。
@@ -131,6 +134,9 @@ struct BlockJobContext {
 struct BlockWorkspaceContext {
     uint32_t blockIdx;
     uint32_t blockNum;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    bool shared = false;
+#endif
 };
 
 template <typename T>
@@ -159,6 +165,9 @@ struct GmmExecutionConfig {
     BlockJobContext blockJob;
     int32_t groupedMatmulMode;
     bool isPerExpertWeightTensor;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    bool sharedWeightList = false;
+#endif
 };
 
 // 各流水阶段在同步 workspace 中为每个专家预留的 slot 数量。

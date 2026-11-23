@@ -3,7 +3,7 @@ Copyright (c) 2026, Lu Lu
 Modified by Joyce_An 2026
 -->
 
-# MegaMoE Prefill Beta
+# MegaMoE Prefill / Decode Beta
 
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
@@ -37,11 +37,7 @@ def fp8_fp4_mega_moe(
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
 
-`recipe/activation/fast_math` 当前仅支持签名中的默认值。
-`activation_clamp` 支持非负 FP32 上限；`None` 或正无穷等价于 FLT_MAX。
-MTE/URMA 均在 SwiGLU 前将 gate 上截断至 limit，up 截断至 [-limit, limit]，路由和共享专家均适用。
-例如 `fp8_fp4_mega_moe(y, w1, w2, buffer, activation_clamp=7.0)`。
-CPU Golden 和级联参考同步应用该限制。MTE SwiGLU 使用与级联参考一致的 FP32 sigmoid 后乘 gate 顺序，随后才进行 BF16 舍入/MX 量化。所有张量在 buffer 所在 NPU 上。
+`activation_clamp` 可传非负有限 host 实数，None 使用 FP32 最大有限值。GMM1 的 BF16 输出转 FP32 后，gate 只裁上限，up 裁到 [−C, C]，随后计算 SwiGLU。C 是每次调用按值捕获的参数。其余 recipe、activation、fast_math 参数使用默认值。所有张量在 buffer 所在 NPU 上。
 FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示打包，不是重新量化。
 
 权重在测试/推理前转换一次，转换过程不计入性能测量：
@@ -52,7 +48,7 @@ FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示
 | GMM2 | `[L,H,I/2]` | `[L,H,I/64,2]` |
 
 调用 `w1, w2 = transform_weights_for_mega_moe(raw_w1, raw_w2)` 得到 Ascend NZ 权重。FP4 routed GMM1 一次准备两套 weight/scale：实际 B≤256 使用 `[gate128, up128]` 融合布局，B>256 使用 `[gate | up]` 配对布局。转换不进入计时区间，但额外保留一份 GMM1 权重和 scale；GMM2 不复制。
-请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。共享专家将首维 L 换成 S，并传入 `shared=True`，使用 planar 权重布局。
+请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。共享专家将首维 L 换成 S，并传入 `shared=True`，FP4 使用 planar；原生 E4M3 的两层保持 ND，第一层同时交织 gate/up 与 E8M0 scale。
 不能直接传入已经做过 CUDA 专用重排的权重。
 
 buffer 的构造参数如下，模型参数含义与测试 JSON 相同：
@@ -63,7 +59,7 @@ from deep_ep_experimental.megamoe import (
 )
 
 # torchrun 启动后先 torch.npu.set_device(local_rank)。
-group = StoreGroup.from_env()  # 主机协调用 TCPStore，算子通信用 SHMEM + MTE
+group = StoreGroup.from_env()  # 主机协调用 TCPStore，算子通信用 SHMEM
 buffer = SymmBuffer(
     group, num_experts=384, num_max_tokens_per_rank=4096, num_topk=6,
     hidden=7168, intermediate_hidden=3072,
@@ -78,13 +74,19 @@ buffer = SymmBuffer(
 
 约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
-各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 是保留入口，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
+下面的 16 卡跨机路径另限 EP32、W4A8（A8W4）和实际 B=1～256。
+各 rank 同序、同 B 推理。图捕获前准备全部计划，保持输入、输出、权重 owner 和 buffer 存活至最后一次 replay 完成。
+`mma_type="fp8xfp8"` 使用 A8W8 路由专家，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
 
-兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
-接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
-输入 buffer 是普通 NPU 存储，需要打包进入通信区。路由权重在 GMM2 后施加，
-与在中间量化前施加权重的实现不保证数值等价；CPU 参考遵循本实现的计算顺序。
+### 共享计划和权重更新
+
+两机 EP32、每机 16 rank 且最大 BS≤256 时，默认容量为 16 个 (view, BS) 计划。显式 `num_max_configs=1` 沿用单计划工作区。用 `SymmBuffer(group, ..., base=root)` 创建同设备、同组的 view。root 的 E、最大 BS、K、H 需要逐维覆盖每个 view。各 rank 在首次 forward 前按相同顺序调用各 view 的 `prepare(bs)`。不同 view 或图串行使用共享 payload，最后一个 view 的 `destroy()` 关闭通信资源。
+
+`owner = prepare_weights_for_mega_moe(l1, l2, shared=False, input_layout="nd")` 接受连续权重对或两组逐专家的 (weight, scale) 列表。两个投影传 `owner.l1, owner.l2`。routed FP4 也可从 `planar_nz` 生成 fused 布局，或用 `prepared` 和 `planar_l1` 导入两份已有布局。路由 ID 使用 EPLB 映射后的物理专家号。
+
+框架在 capture 外按设备事件先排空旧读者，再更新权重和映射。连续 owner 用 `update`，列表用 `update_experts(indices=slots, l1=l1, l2=l2, replace=True)` 更换存储并保留表地址。索引也可用位置参数或 `experts=` 传入。同一次调用只传一种索引。每个投影可给逐专家的 `[(weight, scale), …]`，或给 `(weights, scales)`，其中两个序列各自可为 list 或 tuple。列表内的权重和 scale 各自可省略 expert 维或保留长度为 1 的首维；按单专家导入的 NZ 权重须占有完整独立分配。连续的线性 FP8 权重与 E8M0 scale 接受格式码 0、2、30；已准备的 packed FP4 权重仍须为 NZ。通过 `expert_views(layout="planar")` / `expert_views(layout="fused")` 可取得整组 W1、W2 及各自 scale，`expert_views(i)` 仍可取单专家视图。列表可用 `refresh_gmm1(indices, source_layout="planar")` 局部刷新，连续 owner 整批刷新。写入一份 GMM1 后调用 `refresh_gmm1(source="planar")` 或 `source="fused"` 同步另一份，全部权重与 scale 已写完时调用 `commit_prepared_update()`。最后一次旧图读取和异步复制完成后可调用 `release_retired()`。
+
+列表模式下，批量导出的 FP4 NZ 权重是原始物理分配。独立的二维或三维权重保持原 rank；二维 NZ 上增加的逻辑单专家维会解析回原二维对象。可直接对这些对象做 packed FP4 format cast，并在物理形状一致时原地 `copy_`。scale 和按索引取得的专家仍按单专家视图导出。替换专家后需重新获取该槽的视图。
 
 ### 共享专家策略
 
@@ -150,6 +152,34 @@ dist.destroy_process_group()
 ```
 
 接口语义参考 [ops-transformer MegaMoE](https://gitcode.com/cann/ops-transformer/blob/master/mc2/mega_moe/docs/torchapi_mega_moe.md)。
+
+### 双机 EP32 decode
+
+每机 16 个连续 rank，HNS_1825，两端安装相同的 wheel 和 SHMEM SDK。UBX 在 EP4/8/16、
+每 rank 容量不超过 256 时选基础 MTE，更大的容量选 URMA。双机 EP32 decode 采用分层 MTE + RoCE。
+在 28 AIC / 56 AIV 上，BS96、H5120、I2304、K6、每 rank 13 个 routed FP4 专家和 1 个原生 FP8 shared 专家的 BF16 输入默认启用优化调度。公共输入屏障后，AIV0 执行 shared SwiGLU，AIV1 可同时推进 routed Dispatch。
+
+```bash
+DEEPEP_MEGAMOE_TIMER=OFF bash experiments/megamoe/scripts/build.sh --rdma-backend HNS_1825
+```
+
+对照基线用 `87d1ccc` 已启用 BF16 BS96 优化的 wheel。两版使用同一份验收脚本和输入，均应报告协议 5、8 个 Dispatch QP、24 个 Combine QP、wave 5。每次切换 wheel 后重新启动作业。生成用例使用固定种子，在共享目录准备一次 CPU golden。复测历史数据时，两版均使用 `--bank "$CASE/bank"` 加载同一份 map136 输入。
+以下命令中的 `NODE_RANK` 在两机分别为 0 和 1，`MASTER_ADDR` 指向第 0 节点。
+
+```bash
+script=experiments/megamoe/scripts/check_ep32_replay.py
+python "$script" golden --input bf16 --golden "$CASE/golden"
+launch=(torchrun --nnodes=2 --nproc-per-node=16 --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR")
+# 两机均安装对照 wheel
+"${launch[@]}" "$script" fixed --golden "$CASE/golden" --out "$CASE/before"
+# 两机均切换到当前 wheel
+"${launch[@]}" "$script" fixed --golden "$CASE/golden" --reference "$CASE/before" --out "$CASE/after"
+```
+
+`fixed` 按实际物理路由独立核对专家计数，每个 rank 的 `fixed_metrics.json` 记录逐位不一致数、最大绝对误差和相对 RMSE。另测 graph replay 时，对照版用 `eager`，当前版用 `replay`，使用新的输出目录。脚本比对全 32 rank 的 160 轮输出摘要及 8 轮交替调用。
+用 `--input fp8` 重复 golden、eager 和 replay 可复查调用方提供 scale 的路径。
+性能作业在 timer-off 的两套 wheel 上按 A/B/B/A 顺序运行 `perf --out 新目录`；
+历史输入对照需在四批作业中传入同一 `--bank`。每批预热 20 次、采集 30 次，`fixed_perf.json` 保存每次的 32 个 rank 耗时和后 15 轮汇总。
 
 ## 2. 编译安装
 

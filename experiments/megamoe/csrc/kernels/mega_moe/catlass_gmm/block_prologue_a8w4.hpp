@@ -25,6 +25,68 @@
 #include "tla/tensor.hpp"
 
 namespace Catlass::Gemm::Block {
+struct PackedNzFp4 {
+    static constexpr uint32_t UB_STAGES = 4;
+
+    __aicore__ static inline void Decode(__ubuf__ uint8_t* in, __ubuf__ uint8_t* out, uint16_t vectors)
+    {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (vectors > 1U && vectors % 2U == 0U) {
+            RegComputeNz<true>(in, out, vectors / 2U);
+            return;
+        }
+#endif
+        RegComputeNz<false>(in, out, vectors);
+    }
+
+    template <class Element>
+    __aicore__ static inline void StoreL1(const AscendC::LocalTensor<Element>& dst,
+                                         const AscendC::LocalTensor<Element>& src, uint16_t vectors)
+    {
+        constexpr uint16_t blocks = AscendC::GetVecLen() / 32U;
+        AscendC::DataCopyParams gather(vectors, blocks, (UB_STAGES - 1U) * blocks, 0);
+        AscendC::DataCopy(dst, src, gather);
+    }
+
+private:
+    template <bool Pair>
+    CATLASS_DEVICE_SIMD_VF void RegComputeNz(__ubuf__ uint8_t* in, __ubuf__ uint8_t* out, uint16_t iterations)
+    {
+        using namespace AscendC::Reg;
+        constexpr uint32_t inStep = AscendC::GetVecLen() / 2U;
+        constexpr uint32_t outStep = AscendC::GetVecLen() * UB_STAGES;
+        // For a single vector in slot 3, even forming out + outStep can leave the slot.
+        auto in1 = in + (Pair ? inStep : 0U);
+        auto out1 = out + (Pair ? outStep : 0U);
+        auto all = CreateMask<uint8_t, MaskPattern::ALL>();
+        auto alternate = CreateMask<uint16_t, MaskPattern::ALL>();
+        RegTensor<int8_t> four, zero, shifts, right, bits, a, b;
+        Duplicate<int8_t, MaskMergeMode::ZEROING>(four, 4, all);
+        Duplicate<int8_t, MaskMergeMode::ZEROING>(zero, 0, all);
+        Duplicate<int8_t, MaskMergeMode::ZEROING>(right, 2, all);
+        Duplicate<int8_t, MaskMergeMode::ZEROING>(bits, static_cast<int8_t>(0x9C), all);
+        Select(shifts, four, zero, alternate);
+        for (uint16_t i = 0; i < iterations; ++i) {
+            auto src = CreateAddrReg<uint8_t>(i, (Pair ? 2U : 1U) * inStep);
+            auto dst = CreateAddrReg<uint8_t>(i, (Pair ? 2U : 1U) * outStep);
+            LoadAlign<uint8_t, LoadDist::DIST_US_B8>(reinterpret_cast<RegTensor<uint8_t>&>(a), in, src);
+            if constexpr (Pair) {
+                LoadAlign<uint8_t, LoadDist::DIST_US_B8>(reinterpret_cast<RegTensor<uint8_t>&>(b), in1, src);
+            }
+            ShiftLeft(a, a, shifts, all);
+            if constexpr (Pair) ShiftLeft(b, b, shifts, all);
+            ShiftRight(a, a, right, all);
+            if constexpr (Pair) ShiftRight(b, b, right, all);
+            And(a, a, bits, all);
+            if constexpr (Pair) And(b, b, bits, all);
+            StoreAlign<uint8_t, StoreDist::DIST_NORM_B8>(out, reinterpret_cast<RegTensor<uint8_t>&>(a), dst, all);
+            if constexpr (Pair) {
+                StoreAlign<uint8_t, StoreDist::DIST_NORM_B8>(out1, reinterpret_cast<RegTensor<uint8_t>&>(b), dst, all);
+            }
+        }
+    }
+};
+
 template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, class TileShapeL1_, class TileCopy_>
 struct MegaMoeBlockPrologueA8W4 {
 public:
@@ -46,16 +108,6 @@ public:
         MegaMoeResource& resource;
     };
 
-    struct VfParamsNz {
-        uint32_t loopKNum;
-        uint32_t innerLoopNum;
-        uint32_t loopKDstStride;
-        uint32_t innerDstStride;
-        uint32_t nRealSizeAlign;
-        __ubuf__ ElementIn* weightInUbAddr;
-        __ubuf__ ElementOut* weightOutUbAddr;
-    };
-
     static_assert(std::is_same_v<LayoutIn, layout::Weight4BitnZ>, "MegaMoE requires packed NZ weights");
     static_assert(tla::get<1>(TileShapeL1{}) * tla::get<2>(TileShapeL1{}) <= 64 * 1024,
                   "Single-AIV weight output exceeds its UB stage");
@@ -70,7 +122,11 @@ public:
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
+#ifdef DEEPEP_MEGAMOE_ROCE
+            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 256U * 1024U);
+#else
             l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
+#endif
         }
         // Packed inputs occupy [0,64KiB); the four
         // output slots interleave 256-byte vectors throughout [64,192KiB).
@@ -125,7 +181,12 @@ public:
         const auto kPlan =
             MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
         const uint32_t kL1Size = kPlan.kb;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        const uint32_t n16 = CeilDiv(static_cast<uint32_t>(actualBlockShape.n()), 16U) * 16U;
+        const uint32_t chunkK = Min(kL1Size / 2U, 64U * (32768U / (64U * n16)));
+#else
         const uint32_t halfK = kL1Size / 2U;
+#endif
         const uint32_t kGmLoop = CeilDiv(kSize, kL1Size);
 
         // AIV1 runs dispatch/epilogue concurrently and must never enter this pipeline.
@@ -136,6 +197,18 @@ public:
             uint32_t actualK = Min(kL1Size, kSize - kLoopIdx * kL1Size);
             auto layout = tla::MakeLayout<ElementOut, LayoutOut>(kL1Size, actualBlockShape.n());
             auto tensorL1B = tla::MakeTensor(l1BTensorList[l1BListId], layout, Arch::PositionL1{});
+#ifdef DEEPEP_MEGAMOE_ROCE
+            for (uint32_t offset = 0; offset < actualK; offset += chunkK) {
+                const uint32_t count = Min(chunkK, actualK - offset);
+                auto gmTile = GetTile(bGlobal, tla::MakeCoord(kLoopIdx * kL1Size + offset, 0),
+                                      tla::MakeShape(count, actualBlockShape.n()));
+                auto l1Tile =
+                    GetTile(tensorL1B, tla::MakeCoord(offset, 0), tla::MakeShape(count, actualBlockShape.n()));
+                ProcessL1Nz(l1Tile, gmTile, offset == 0U);
+                ubListId = (ubListId + 1U) % UB_STAGES;
+            }
+            // Publish only after all chunks are stored in the same L1 B slot.
+#else
             for (uint32_t offset = 0; offset < actualK; offset += halfK) {
                 const uint32_t count = Min(halfK, actualK - offset);
                 auto gmTile = GetTile(bGlobal, tla::MakeCoord(kLoopIdx * kL1Size + offset, 0),
@@ -146,6 +219,7 @@ public:
                 ubListId = (ubListId + 1U) % UB_STAGES;
             }
             // Publish only after both halves are stored in the same L1 B slot.
+#endif
             AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
             l1BListId = (l1BListId + 1) % L1B_STAGES;
         }
@@ -162,10 +236,8 @@ public:
         shapeK = tla::get<0, 0>(tensorIn.shape()) * tla::get<0, 1>(tensorIn.shape());
 
         auto layoutCastIn = tla::MakeLayout<ElementOut, layout::Weight4BitnZ>(shapeK, shapeN);
-        auto layoutCastOut = tla::MakeLayout<ElementOut, layout::nZ>(shapeK, shapeN);
 
         auto tensorCastIn = tla::MakeTensor(ubCastInTensor[ubListId], layoutCastIn, Catlass::Arch::PositionUB{});
-        auto tensorCastOut = tla::MakeTensor(ubCastOutTensor[ubListId], layoutCastOut, Catlass::Arch::PositionUB{});
 
         CopyNzInWeightTensor(tensorCastIn, tensorIn);
 
@@ -177,14 +249,19 @@ public:
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubEventList[ubListId]);
 
-        AntiQuantComputeNz(tensorCastOut, tensorCastIn);
+        const auto& shape = tensorCastIn.shape();
+        const uint16_t vectors = tla::get<0, 0>(shape) * tla::get<0, 1>(shape) * tla::get<1, 0>(shape) *
+                                 tla::get<1, 1>(shape) / AscendC::GetVecLen();
+        PackedNzFp4::Decode(reinterpret_cast<__ubuf__ uint8_t*>(tensorCastIn.data().GetPhyAddr()),
+                            reinterpret_cast<__ubuf__ uint8_t*>(ubCastOutTensor[ubListId].GetPhyAddr()), vectors);
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubEventList[ubListId]);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubEventList[ubListId]);
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubEventList[ubListId]);
 
-        CopyUb2L1(tensorOut, tensorCastOut);
+        auto dstOffset = tensorOut.layout()(tensorOut.coord());
+        PackedNzFp4::StoreL1(tensorOut.data()[dstOffset], ubCastOutTensor[ubListId], vectors);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubEventList[ubListId]);
     }
@@ -207,94 +284,11 @@ public:
         AscendC::DataCopyPad(dstTensor.data()[dstOffset], srcTensor.data()[srcOffset], repeatParams, padParams);
     }
 
-    template <class TensorCastOut, class TensorCastIn>
-    __aicore__ inline void AntiQuantComputeNz(const TensorCastOut& tensorCastOut, const TensorCastIn& tensorCastIn)
-    {
-        VfParamsNz params;
-        params.weightInUbAddr = (__ubuf__ ElementIn*)tensorCastIn.data().GetPhyAddr();
-        params.weightOutUbAddr = (__ubuf__ ElementOut*)tensorCastOut.data().GetPhyAddr();
-
-        params.loopKNum = tla::get<0, 1>(tensorCastIn.shape());
-        params.nRealSizeAlign = tla::get<1, 1>(tensorCastIn.shape()) * AscendC::BLOCK_CUBE;
-        params.innerDstStride = AscendC::GetVecLen() * UB_STAGES;
-        params.innerLoopNum = (params.nRealSizeAlign * tla::get<0, 0>(tensorCastIn.shape())) /
-                              static_cast<uint64_t>(AscendC::GetVecLen());
-        params.loopKDstStride = params.innerLoopNum * params.innerDstStride;
-
-        RegComputeNz<TensorCastOut, TensorCastIn>(params);
-    }
-
-    template <class TensorCastOut, class TensorCastIn>
-    CATLASS_DEVICE_SIMD_VF void RegComputeNz(VfParamsNz params)
-    {
-        AscendC::Reg::RegTensor<int8_t> wShrReg;
-        AscendC::Reg::RegTensor<int8_t> wShlReg;
-        AscendC::Reg::RegTensor<int8_t> wAndReg;
-        AscendC::Reg::RegTensor<int8_t> wLoad;
-        AscendC::Reg::RegTensor<int8_t> wShl;
-        AscendC::Reg::RegTensor<int8_t> wShr0;
-        AscendC::Reg::RegTensor<int8_t> wShr1;
-        AscendC::Reg::RegTensor<int8_t> wSel;
-        AscendC::Reg::RegTensor<int8_t> wAnd;
-
-        AscendC::Reg::MaskReg preg = AscendC::Reg::CreateMask<uint8_t, AscendC::Reg::MaskPattern::ALL>();
-        AscendC::Reg::MaskReg pregVsel = AscendC::Reg::CreateMask<uint16_t, AscendC::Reg::MaskPattern::ALL>();
-
-        AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wShrReg, E2M1_SHIFT_RIGHT_SIZE, preg);
-        AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wShlReg, SHIFT_LEFT_SIZE, preg);
-        AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wAndReg, E2M1_AND_MASK, preg);
-
-        for (uint16_t loopKIdx = 0; loopKIdx < params.loopKNum; ++loopKIdx) {
-            for (uint16_t innerLoopIdx = 0; innerLoopIdx < params.innerLoopNum; ++innerLoopIdx) {
-                // DIST_US_B8 load mode expands each packed B4 byte into lane-aligned B8 slots.
-                // Packed B4 address offset (bytes) = logical element index >> 1.
-                AscendC::Reg::AddrReg aregWeightB8In = AscendC::Reg::CreateAddrReg<uint8_t>(
-                    loopKIdx, (C0_SIZE_B8 * params.nRealSizeAlign) >> 1, innerLoopIdx, AscendC::GetVecLen() >> 1);
-                AscendC::Reg::LoadAlign<uint8_t, AscendC::Reg::LoadDist::DIST_US_B8>(
-                    (AscendC::Reg::RegTensor<uint8_t>&)wLoad, (__ubuf__ uint8_t*&)params.weightInUbAddr,
-                    aregWeightB8In);
-
-                AscendC::Reg::ShiftRight(wShr0, wLoad, wShrReg, preg);
-                AscendC::Reg::ShiftLeft(wShl, wLoad, wShlReg, preg);
-                AscendC::Reg::ShiftRight(wShr1, wShl, wShrReg, preg);
-                AscendC::Reg::Select(wSel, wShr1, wShr0, pregVsel);
-                AscendC::Reg::And(wAnd, wSel, wAndReg, preg);
-
-                AscendC::Reg::AddrReg aregWeightB8Out = AscendC::Reg::CreateAddrReg<uint8_t>(
-                    loopKIdx, params.loopKDstStride, innerLoopIdx, params.innerDstStride);
-                AscendC::Reg::StoreAlign<uint8_t, AscendC::Reg::StoreDist::DIST_NORM_B8>(
-                    (__ubuf__ uint8_t*&)params.weightOutUbAddr, (AscendC::Reg::RegTensor<uint8_t>&)wAnd,
-                    aregWeightB8Out, preg);
-            }
-        }
-    }
-
-    template <class TensorDst, class TensorSrc>
-    __aicore__ inline void CopyUb2L1(TensorDst const& dstTensor, TensorSrc const& srcTensor)
-    {
-        // VF stores one 256-byte vector every 1024 bytes. Gather this slot's
-        // vectors into contiguous NZ L1, skipping the other three UB slots.
-        constexpr uint32_t VECTOR_BYTES = 256U;
-        constexpr uint32_t BLOCK_BYTES = 32U;
-        const uint32_t elements = tla::get<0, 1>(srcTensor.shape()) * C0_SIZE_B8 * tla::get<1, 0>(srcTensor.shape()) *
-                                  tla::get<1, 1>(srcTensor.shape());
-        AscendC::DataCopyParams dataCopyParams(elements / VECTOR_BYTES, VECTOR_BYTES / BLOCK_BYTES,
-                                               (UB_STAGES - 1U) * VECTOR_BYTES / BLOCK_BYTES, 0);
-        auto dstOffset = dstTensor.layout()(dstTensor.coord());
-        AscendC::DataCopy(dstTensor.data()[dstOffset], srcTensor.data(), dataCopyParams);
-    }
-
-    static constexpr int32_t C0_SIZE_B8 = 32;
-
-    static constexpr uint32_t E2M1_SHIFT_RIGHT_SIZE = 0x2;
-    static constexpr uint32_t E2M1_AND_MASK = 0x9C;
-    static constexpr uint32_t SHIFT_LEFT_SIZE = 0x4;
-
     static constexpr int32_t SYNC_MODE = 4;
     constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
     constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
 
-    static constexpr int64_t UB_STAGES = 4;
+    static constexpr uint32_t UB_STAGES = PackedNzFp4::UB_STAGES;
 
     bool active_ = false;
     uint32_t l1BListId{0};

@@ -82,8 +82,13 @@ public:
     __aicore__ inline void Init(Params const& params);
     __aicore__ inline auto GetTopkWeightTensor();
     // 计算并写回一个激活/量化 tile，不包含流水通知。
+#ifdef DEEPEP_MEGAMOE_ROCE
+    __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
+                                      uint16_t pingpongIdx = 0, bool packedGateUp = false, bool direct = false);
+#else
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
                                       uint16_t pingpongIdx = 0);
+#endif
     __aicore__ inline void UpdateGlobalAddr(const BlockCoord& baseOffset);
     __aicore__ inline void UpdateNextProblem(const ProblemShape& problemShape);
 
@@ -378,6 +383,15 @@ __aicore__ inline auto BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
     return weightUb_;
 }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
+          bool IsInterleaved_>
+__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
+                                                      IsInterleaved_>::operator()(const BlockShape& blockShape,
+                                                                                  const BlockCoord& blockCoord,
+                                                                                  uint16_t pingpongIdx, bool packedGateUp, bool direct)
+{
+#else
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
           bool IsInterleaved_>
 __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
@@ -385,6 +399,7 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
                                                                                   const BlockCoord& blockCoord,
                                                                                   uint16_t pingpongIdx)
 {
+#endif
     uint32_t tileRowCount = Get<M_VALUE>(blockShape);     // 128
     uint32_t tileColumnCount = Get<N_VALUE>(blockShape);  // 256
 
@@ -404,6 +419,11 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         (__ubuf__ uint16_t*)maxExp_.GetPhyAddr(), (__ubuf__ uint16_t*)halfScale_.GetPhyAddr(), tileColumnCount,
         pingpongIdx);
     uint32_t outputRowStrideElements = Ops::Base::CeilAlign(tileColumnCount, static_cast<uint32_t>(ONE_BLK_SIZE));
+#ifdef DEEPEP_MEGAMOE_ROCE
+    // Packed tiles keep the existing TileN stride, with up in the second half of each row.
+    if (direct) ubPointers.firstInput = reinterpret_cast<__ubuf__ DataTypeIn*>(ROUTED_UB_BASE);
+    if (packedGateUp) ubPointers.secondInput = ubPointers.firstInput + tileColumnCount;
+#endif
     RunGatedActivationTile(ubPointers.firstInput, ubPointers.secondInput, ubPointers.activationOutput,
                            static_cast<uint16_t>(tileRowCount), static_cast<uint16_t>(tileColumnCount),
                            outputRowStrideElements);

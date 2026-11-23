@@ -9,7 +9,7 @@ import pytest
 
 from deep_ep import _runtime
 from deep_ep._store import StoreGroup
-from deep_ep_experimental.megamoe.api import _MegaRuntime
+from deep_ep_experimental.megamoe._runtime import _MegaRuntime
 
 
 @pytest.mark.parametrize("backend", ["store", "gloo"])
@@ -50,7 +50,7 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
         elif case == "device":
             peer[6] = 0
         elif case == "engine":
-            peer[7] = 1
+            peer[-1] = 1
         return [local, peer]
 
     if backend == "store":

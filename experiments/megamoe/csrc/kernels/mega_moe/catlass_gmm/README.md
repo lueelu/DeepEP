@@ -15,17 +15,9 @@ GMM 使用 CATLASS 的 `PackedMxA8W4TileCopyTla`、MX MMAD 和 NZ 权重反量�
 - `resource.hpp`：本地存储的非拥有视图；不创建 TPipe，不重置 Wave 中其他阶段的事件。
 
 AIC 以 mode 4 的 flag 8/9 发布 L1 B 空闲，AIV0 以 flag 6/7 发布权重就绪。
-AIC 不发送或等待 AIV1 的 `+16` 标志。AIV0 在 slice 结束时排空两个空闲标志，AIC/Vector block 在 `End()` 中回收内部事件。
-路由 GMM1 的 `gmm1CatlassContext_` 由 `MegaMoeA8W4Wave` 持有，跨专家切片和 Wave 复用同一个
-`CatlassGmm1` 及其 `BlockMmad`/Prologue 成员。固定缓冲区视图和 event ID 只在构造时设置一次；
-专家切换通过 `UpdateProblem()` 更新 M/N/K、scaleK、GM 地址和权重布局。
-`Begin()`/`End()` 管理每个 slice 的事件启动/排空、MM layout 切换和 ping-pong 起点，
-因此 GMM2 可以继续使用同一组 L1/L0/UB 和 event ID；对象存活不等于持续占用硬件事件。
-AIV1 的 context 保持休眠，不建立 prologue 缓冲区视图、不操作 CATLASS 同步标志，继续执行 Dispatch、SwiGLU 和 Combine。
-GMM2 使用独立的 `CatlassGmm2` 局部对象。GMM1/GMM2 只共用内部的 AIC/AIV0 pipeline；
-gate/up 合并投影及输出偏移由 `CatlassGmm1` 管理，单投影和行主序输出由 `CatlassGmm2` 管理。
-L1 分配为两组 B64KiB、两组 A128KiB、两组 scaleA32KiB 和两组 scaleB32KiB，共 512 KiB。
-L1 地址分配：B 在 0/384 KiB，A 在 128/256 KiB，scaleA 在 64/448 KiB，scaleB 在 96/480 KiB。
+EP32 BF16 BS96 的 routed GMM1/GMM2 共用这两个 L1 槽和 AIV0 的四个解码槽。投影或专家切换时更新权重、激活、scale 和输出地址，最后一个 routed wave 完成后归还 credit，再进入 shared 尾部。其他路径按 slice 归还资源。
+符合条件的 GMM1 短切片（至多 64 行，gate/up 各 128 列）可用同一 FP32×64 到 BF16 的 FIX 转换写入 AIV1 的 208–240 KiB UB。在 248 KiB UB 上，输入 AllGather 临时区位于 RoCE scratch 下方，输入 barrier 后可复用。AIC 的 mode 4 flag 26 对应 AIV1 flag 10。AIV1 按来源序号取数，量化输出和 scale 写回后归还消费序号。槽忙、空间不足或 tile 不符合条件时使用 GM。
+EP32 将 512 KiB L1 分成两个 256 KiB 槽。每槽的 B、A、scaleA、scaleB 分别从 0、128、192、224 KiB 开始。
 UB 的 FP4 输入在 0/16/32/48 KiB；FP8 输出从 64 KiB 开始，每个 256 字节向量按四个 stage 交错，步长 1024 字节。
 VF 和 UB→L1 DMA 使用相同的交错步长，DMA 将当前 stage 的向量收集为连续 NZ 数据。
 AIV0 在第一半块反量化前等待对应 L1 B 槽位空闲。
@@ -38,7 +30,7 @@ A 与 scale 的事件独立保护各自窗口，B 由跨核标志保护。64 对
 
 路由 GMM1 按实际 BS 选择布局和任务粒度，AIC、AIV0、AIV1 和 GMM2 ready 使用同一个 `FuseGateUp` 特化：
 
-- BS≤256：GM 权重和 scale 离线重排为 `[gate128, up128]`。逻辑 N128 tile 只调用一次 `ComputeProjection`，以 `2*n` 为列偏移计算物理 N256；AIV0 同样只调用一次反量化，结果写回交错 workspace。
+- BS≤256：GM 权重和 scale 离线重排为 `[gate128, up128]`。逻辑 N128 tile 只调用一次 `ComputeProjection`，以 `2*n` 为列偏移计算物理 N256；AIV0 同样只调用一次反量化。符合直送条件时 FIX 写入 AIV1 UB，其余结果写回交错 workspace。
 - BS>256：GM 权重和 scale 保留 `[gate | up]`。逻辑 N256 tile 分别在 `n`、`n+I` 进行 gate/up 投影及反量化，结果写回 planar workspace；两次投影完成后发布一个逻辑 tile 标志。尾 tile 按实际 N 处理。
 
 SwiGLU 根据同一布局取数、写回逻辑 N 列；路由 GMM2 就绪计数分别按 N128/N256 计算，不改变 GMM2 的任务粒度。
@@ -52,6 +44,7 @@ GMM2 写回行主序结果。共享专家的 A8W4 调用也复用此 kernel。
 所有 GMM 后端均使用 CATLASS。
 后处理位于 `../epilogue`。
 
-设备验收需要覆盖完整 K/尾 K、gate/up 列偏移、跨专家复用、共享专家和不同 BS。
+在配置过 MegaMoE 的 Ascend950 构建目录运行 `cmake --build . --target megamoe_check_fp4_l1` 可核对四个 UB 槽在单向量、奇数尾块和完整块上的逐字节解码及 L1 写回。
+设备验收还需覆盖完整 K/尾 K、gate/up 列偏移、跨专家复用、共享专家和不同 BS。
 CPU 接口及数值参考测试见 [MegaMoE 使用说明](../../../../README.md#4-测试与验证范围)，
 不能替代 Ascend950 的设备编译、FP8/FP4 精度、跨核同步和性能验证。

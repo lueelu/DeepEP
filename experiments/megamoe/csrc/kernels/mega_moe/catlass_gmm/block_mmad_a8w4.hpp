@@ -15,6 +15,7 @@
 
 #include "kernels/mega_moe_common/catlass_gmm/resource.hpp"
 #include "a8w4_k_plan.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/numeric_size.hpp"
@@ -27,6 +28,9 @@
 namespace Catlass::Gemm::Block {
 
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+#ifdef DEEPEP_MEGAMOE_ROCE
+constexpr AscendC::FixpipeConfig ROUTED_ROW_MAJOR_UB{AscendC::CO2Layout::ROW_MAJOR, true};
+#endif
 
 // Based on CATLASS example 74. Only AIV0 produces the complete L1 B tile.
 template <class DispatchPolicy_, class L1TileShape_, class L0TileShape_, class ElementA_, class ElementB_,
@@ -93,9 +97,15 @@ public:
     static constexpr uint32_t L0_TILE_K = tla::get<2>(L0TileShape{});
 
     // L1 tile size
+#ifdef DEEPEP_MEGAMOE_ROCE
+    // Two 64-KiB A slots provide an independent kaL1 window.
+    static constexpr uint32_t L1A_TILE_SIZE = 64U * 1024U;
+    static constexpr uint32_t L1B_TILE_SIZE = 128U * 1024U;
+#else
     // Two 128-KiB A slots provide an independent kaL1 window.
     static constexpr uint32_t L1A_TILE_SIZE = 128U * 1024U;
     static constexpr uint32_t L1B_TILE_SIZE = L1_TILE_N * L1_TILE_K * SizeOfBits<ElementB>::value / 8;
+#endif
     static constexpr uint32_t L1SCALEA_TILE_SIZE =
         L1_TILE_M * L1_TILE_K / MX_SCALE_GROUP_NUM * sizeof(ElementMxScaleA) * L1_SCALE_FACTOR_K;
     static constexpr uint32_t L1SCALEB_TILE_SIZE =
@@ -107,10 +117,17 @@ public:
     static constexpr uint32_t L0B_TILE_SIZE = L0_TILE_K * L0_TILE_N * SizeOfBits<ElementL0B>::value / 8;
     static constexpr uint32_t L0C_TILE_SIZE = L1_TILE_M * L1_TILE_N * sizeof(ElementAccumulator);
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    static_assert(L1_TILE_M == 256 && L1_TILE_N == 256 && L1_TILE_K == 256 && L1A_STAGES == 2 && L1B_STAGES == 2 &&
+                      L1_SCALE_FACTOR_K == 16 && SizeOfBits<ElementA>::value == 8 && SizeOfBits<ElementB>::value == 8 &&
+                      !HAS_BIAS,
+                  "Adaptive A8W4 requires two A64KiB/B128KiB/scale32KiB slots and no bias");
+#else
     static_assert(L1_TILE_M == 256 && L1_TILE_N == 256 && L1_TILE_K == 256 && L1A_STAGES == 2 && L1B_STAGES == 2 &&
                       L1_SCALE_FACTOR_K == 16 && SizeOfBits<ElementA>::value == 8 && SizeOfBits<ElementB>::value == 8 &&
                       !HAS_BIAS,
                   "Adaptive A8W4 requires two A128KiB/B64KiB/scale32KiB slots and no bias");
+#endif
 
     // Check L0C_STAGES
     static_assert(!(ENABLE_UNIT_FLAG && L0C_STAGES != 1), "L0C_STAGES must be 1 when UnitFlag is true!");
@@ -181,15 +198,24 @@ public:
         uint32_t l1Offset = l1BufAddrStart;
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
+#ifdef DEEPEP_MEGAMOE_ROCE
+            l1BTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + i * 256U * 1024U);
+#else
             l1BTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + i * 384U * 1024U);
+#endif
             l1Offset += L1B_TILE_SIZE;
             // Assign event ID for each stages
             l1BEventList[i] = i + L1A_STAGES;
         }
         for (uint32_t i = 0; i < L1A_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
+#ifdef DEEPEP_MEGAMOE_ROCE
+            l1ATensorList[i] =
+                resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + 128U * 1024U + i * 256U * 1024U);
+#else
             l1ATensorList[i] =
                 resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + 128U * 1024U + i * L1A_TILE_SIZE);
+#endif
             l1Offset += L1A_TILE_SIZE;
             // Assign event ID for each stages
             l1AEventList[i] = i;
@@ -221,13 +247,23 @@ public:
             l0BiasTensor = resource.btBuf.template GetBufferByByte<ElementAccumulator>(0);
         }
         for (uint32_t i = 0; i < L1A_STAGES; i++) {
+#ifdef DEEPEP_MEGAMOE_ROCE
+            l1MxScaleATensorList[i] = resource.l1Buf.template GetBufferByByte<ElementMxScaleA>(
+                l1BufAddrStart + 192U * 1024U + i * 256U * 1024U);
+#else
             l1MxScaleATensorList[i] = resource.l1Buf.template GetBufferByByte<ElementMxScaleA>(
                 l1BufAddrStart + 64U * 1024U + i * 384U * 1024U);
+#endif
             l1Offset += L1SCALEA_TILE_SIZE;
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
+#ifdef DEEPEP_MEGAMOE_ROCE
+            l1MxScaleBTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementMxScaleB>(
+                l1BufAddrStart + 224U * 1024U + i * 256U * 1024U);
+#else
             l1MxScaleBTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementMxScaleB>(
                 l1BufAddrStart + 96U * 1024U + i * 384U * 1024U);
+#endif
             l1Offset += L1SCALEB_TILE_SIZE;
         }
 
@@ -311,7 +347,7 @@ public:
               class TensorBias = EmptyClass>
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
-                                   bool allowDynamicB = false, TensorBias const& tensorBias = {})
+                                   bool allowDynamicB = false, bool toAiv1 = false, TensorBias const& tensorBias = {})
     {
         // Check L1TileShape
         if constexpr (HAS_BIAS) {
@@ -529,11 +565,33 @@ public:
         if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
-            copyL0CToDst(tensorC, tensorL0C);
+        }
+        constexpr uint8_t unitFlag = ENABLE_UNIT_FLAG ? 0b11 : 0;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (toAiv1) {
+            // Store the packed [gate128, up128] rows with the same scaled BF16 conversion as GM.
+            AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> fix{};
+            fix.mSize = mL1Actual;
+            fix.nSize = fix.dstStride = nL1Actual;
+            fix.srcStride = tla::get<1, 1>(tensorL0C.stride()) / tla::get<0, 0>(tensorL0C.stride());
+            fix.unitFlag = unitFlag;
+            fix.dualDstCtl = 0U;
+            fix.subBlockId = 1U;
+            fix.reluEn = CopyL0CToDst::reluEn;
+            fix.quantPre = CopyL0CToDst::quantPre;
+            fix.deqScalar = static_cast<uint64_t>(*reinterpret_cast<int32_t*>(&copyL0CToDst.params.scale));
+            AscendC::LocalTensor<ElementC> dst(AscendC::TPosition::VECCALC, MegaMoeImpl::ROUTED_UB_BASE,
+                                               mL1Actual * nL1Actual);
+            AscendC::Fixpipe<ElementC, ElementAccumulator, ROUTED_ROW_MAJOR_UB>(dst, l0CTensorList[l0CListId], fix);
+            AscendC::CrossCoreSetFlag<4, PIPE_FIX>(16U + MegaMoeImpl::ROUTED_FIX_READY);
+        } else
+#endif
+        {
+            copyL0CToDst(tensorC, tensorL0C, unitFlag);
+        }
+        if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0CListId]);
             l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
-        } else {
-            copyL0CToDst(tensorC, tensorL0C, 0b11);
         }
     }
 

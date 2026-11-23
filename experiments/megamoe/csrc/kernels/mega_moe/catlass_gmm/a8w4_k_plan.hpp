@@ -12,13 +12,21 @@ struct A8W4KPlan {
 };
 __aicore__ constexpr inline A8W4KPlan MakeA8W4KPlan(uint32_t m, uint32_t n, bool allowDynamicB)
 {
+#ifdef DEEPEP_MEGAMOE_ROCE
+    const uint32_t kb = allowDynamicB && m <= 128U && n <= 256U ? 512U : 256U;
+#else
     const uint32_t kb = allowDynamicB && m <= 256U && n <= 128U ? 512U : 256U;
+#endif
     const uint32_t alignedM = (m + 15U) / 16U * 16U;
     if (alignedM == 0U || m >= n) {
         return {kb, kb};
     }
     const uint32_t balancedDepth = (n + 2U * alignedM - 1U) / (2U * alignedM);
+#ifdef DEEPEP_MEGAMOE_ROCE
+    const uint32_t capacityDepth = (64U * 1024U) / (alignedM * kb);
+#else
     const uint32_t capacityDepth = (128U * 1024U) / (alignedM * kb);
+#endif
     const uint32_t depth = balancedDepth < capacityDepth ? balancedDepth : capacityDepth;
     return {depth * kb, kb};
 }

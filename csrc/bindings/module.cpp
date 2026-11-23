@@ -5,6 +5,7 @@
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
 #include "runtime/session.hpp"
+#include "common/megamoe_combine_config.hpp"
 #ifdef DEEPEP_BUILD_MEGAMOE
 #include "runtime/megamoe_session.hpp"
 #endif
@@ -64,6 +65,11 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("peer_access_error", &deepep::Session::peer_access_error)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
+    module.attr("megamoe_combine_reduce_version") = deepep::megamoe_config::PROTOCOL;
+    module.attr("megamoe_combine_qps") = deepep::megamoe_config::COMBINE_QPS;
+    module.attr("megamoe_dispatch_qps") = deepep::megamoe_config::DISPATCH_QPS;
+    module.attr("megamoe_dispatch_workers") = deepep::megamoe_config::DISPATCH_WORKERS;
+    module.attr("shmem_rdma_backend") = "HNS_1825";
     module.def("create_megamoe_runtime", &deepep::megamoe::create_runtime, py::arg("rank"), py::arg("size"),
                py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("backend") = "mte",
                py::call_guard<py::gil_scoped_release>());

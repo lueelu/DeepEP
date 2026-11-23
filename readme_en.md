@@ -131,6 +131,11 @@ bash experiments/megamoe/scripts/build.sh
 
 The script prepares dependencies and builds and installs a wheel with MegaMoE and timer support. Subsequent builds reuse the validated SHMEM SDK. Direct `pip wheel` builds keep MegaMoE disabled by default. See the [MegaMoE guide](experiments/megamoe/README.md) for multi-node configuration and validation. Device compilation, accuracy and performance qualification remain outstanding.
 
+For EP32 decode on two hosts with 16 NPUs each, `ranks_per_node=16` selects local MTE and cross-host RoCE by default, supporting W4A8 (A8W4) and A8W8 routed experts with 1–32 tokens per rank.
+Select `mma_type="fp8xfp4"` or `"fp8xfp8"`. A8W8 does not yet support shared experts or the device timer; the existing benchmark remains W4A8 only.
+Build with `--rdma-backend XSCALE` or `--rdma-backend HNS_1825` for the installed NIC, adding `--rebuild-shmem` when changing an existing SDK backend.
+The existing eight-rank groups and a single 16-rank host keep MTE. NPU accuracy and performance qualification for the new path remain outstanding; see the guide above for deployment commands.
+
 ## Interfaces and examples
 
 ---

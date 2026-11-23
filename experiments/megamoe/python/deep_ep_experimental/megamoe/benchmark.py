@@ -23,7 +23,11 @@ def load_config(name, bs_values=None):
         path = files(__package__).joinpath("configs", name + ".json")
     config = json.loads(path.read_text(encoding="utf-8"))
     required = {"schema_version", "model", "bs_values", "warmup", "iters", "seed"}
-    if not required <= set(config) or set(config) - required - {"alignment"} or config["schema_version"] != 1:
+    if (
+        not required <= set(config)
+        or set(config) - required - {"alignment", "activation_clamp", "shared_dtype", "weight_mode"}
+        or config["schema_version"] != 1
+    ):
         raise ValueError("Invalid config schema; see the packaged smoke.json")
     if set(config["model"]) - {"shared_intermediate_hidden", "shared_output_rounding", "activation_clamp", "topk_weights_type"} != {
         "hidden",
@@ -50,6 +54,11 @@ def load_config(name, bs_values=None):
     for name, minimum in (("warmup", 0), ("iters", 1), ("seed", 0)):
         if type(config[name]) is not int or config[name] < minimum:
             raise ValueError(f"Invalid {name}")
+    if config.get("shared_dtype", "fp4") not in ("fp4", "fp8") or config.get("weight_mode", "tensor") not in (
+        "tensor",
+        "list",
+    ):
+        raise ValueError("Unknown shared_dtype or weight_mode")
     config["alignment"] = alignment_config(config)
     return config
 
@@ -233,7 +242,7 @@ def main():
 def run(args, config, group):
     from .backend import select_backend
 
-    backend = select_backend(group)
+    backend = select_backend(group, max(config["bs_values"]), int(os.environ["LOCAL_WORLD_SIZE"]))
     urma = backend == "urma"
     import torch
     from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
@@ -295,7 +304,7 @@ def run(args, config, group):
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         backend=backend,
-        device_communication="shmem_mte_udma" if urma else "shmem_mte",
+        device_communication=("shmem_mte_udma" if urma else "shmem_mte_roce" if world == 32 and int(os.environ["LOCAL_WORLD_SIZE"]) == 16 else "shmem_mte"),
         api="fp8_fp4_mega_moe",
         numerical_contract=("ascend_pre_quant_route_weight_v1" if config["model"].get("topk_weights_type", 0) else "ascend_post_gmm2_route_weight_v1"),
         created_utc=datetime.now(timezone.utc).isoformat(),
@@ -325,16 +334,33 @@ def run(args, config, group):
         **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
 
-    def device_pair(pair):
+    def device_pair(pair, fp8=False):
         data, scale = pair
-        return (torch.from_numpy(data).npu(), torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+        if fp8:
+            from .reference import fp4_to_fp8
+
+            data = torch.from_numpy(fp4_to_fp8(data)).npu().view(torch.float8_e4m3fn)
+        else:
+            data = torch.from_numpy(data).npu()
+        return (data, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
 
     if args.timer and not buffer.timer_enabled:
         raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
     raw = make_weights(
         model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank
     )
-    prepared = transform_weights_for_mega_moe(*map(device_pair, raw))
+
+    def prepare(raw, shared=False):
+        from .weights import prepare_weights_for_mega_moe
+
+        pairs = tuple(device_pair(pair, shared and (urma or config.get("shared_dtype") == "fp8")) for pair in raw)
+        if config.get("weight_mode") == "list":
+            groups = [list(zip(w.unbind(), sf.unbind(), strict=True)) for w, sf in pairs]
+            owner = prepare_weights_for_mega_moe(*groups, shared=shared)
+            return owner.l1, owner.l2
+        return transform_weights_for_mega_moe(*pairs, shared=shared)
+
+    prepared = prepare(raw)
     shared_raw, shared_kwargs = None, {}
     if model["num_shared_experts"]:
         shared_raw = make_weights(
@@ -343,16 +369,7 @@ def run(args, config, group):
             model.get("shared_intermediate_hidden", model["intermediate_hidden"]),
             config["seed"] + 100000,
         )
-
-        def shared_pair(pair):
-            if not urma:
-                return device_pair(pair)
-            from .reference import expand_fp4_to_fp8
-
-            data, scale = device_pair(expand_fp4_to_fp8(pair))
-            return data.view(torch.float8_e4m3fn), scale
-
-        shared = transform_weights_for_mega_moe(*map(shared_pair, shared_raw), shared=True)
+        shared = prepare(shared_raw, shared=True)
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
     cascade = None
     cascade_owned = False
@@ -396,7 +413,7 @@ def run(args, config, group):
                 cumulative_local_expert_recv_stats=stats,
                 x=activation,
                 timer=timer,
-                activation_clamp=model.get("activation_clamp"),
+                activation_clamp=config.get("activation_clamp", model.get("activation_clamp")),
                 **shared_kwargs,
             )
 

@@ -106,6 +106,9 @@ def decode(raw_path: Path, output_path: Path) -> None:
             if not 0 <= count <= MAX_DYNAMIC_ITER:
                 raise ValueError(f"{raw_path}: core={core} {name} count={count}; rebuild/increase timer capacity")
     names = event_names(dynamic_counts)
+    # Each Combine owner emits sync markers, including lanes with zero rows. QP n belongs to core group n-1.
+    sync_counts = dynamic_counts[DYNAMIC_NAMES.index("AIV_COMBINE_SYNC")::DYNAMIC_ITER_PER_CORE]
+    combine_qps = 24 if any(sync_counts[16 * 3:]) else 16
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
@@ -131,7 +134,7 @@ def decode(raw_path: Path, output_path: Path) -> None:
                 end = counters[base + logical_index * 2 + 1]
                 validate_event_lane(name, core_id, core_type, start, end)
                 duration = (end - start) / CYCLE_TO_US if end > start else 0.0
-                task = task_metadata(raw, core_id, logical_index) if end > start > 0 else {}
+                task = task_metadata(raw, core_id, logical_index, combine_qps) if end > start > 0 else {}
                 wave = raw[WAVE_ID_OFFSET + core_id * WAVE_ID_PER_CORE + logical_index]
                 if end > start > 0 and wave < -1:
                     raise ValueError(f"{raw_path}: core={core_id} {name} invalid wave ID {wave}")

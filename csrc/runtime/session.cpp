@@ -121,6 +121,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     ll_rdma_ = backend == "rdma";
     const bool udma = options.udma;
     const bool megamoe = options.megamoe;
+    megamoe_roce_ = options.roce_qps != 0;
+    if (megamoe_roce_ && (!megamoe || udma || size != 32))
+        throw std::invalid_argument("Hierarchical MegaMoE requires EP32 and the MTE/RoCE engines");
     const bool mpi = options.mpi;
     const bool combine_only = options.combine_only;
     const bool use_1g_huge_pages = options.use_1g_huge_pages;
@@ -193,6 +196,8 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     if (ll_rdma_) attr.option_attr.data_op_engine_type = size > int(DispatchDedup::kLlPhysicalRanksPerHost)
         ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE) : ACLSHMEM_DATA_OP_MTE;
 #endif
+    if (megamoe_roce_) attr.option_attr.data_op_engine_type =
+        static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_ROCE);
     attr.option_attr.shm_init_timeout = timeout;
     attr.option_attr.shm_create_timeout = timeout;
     attr.option_attr.control_operation_timeout = timeout;
@@ -211,6 +216,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
 #ifdef DEEPEP_LL_RDMA
         if (ll_rdma_ && size > int(DispatchDedup::kLlPhysicalRanksPerHost)) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ll_rdma_qps_), "ROCE QP configuration");
 #endif
+        if (megamoe_roce_) check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, options.roce_qps), "MegaMoE RoCE QPs");
         if (options.dedicated_peer_qp) {
             // MegaMoE owns one UDMA QP per peer and does not use shared Clos
             // SQs.  This branch is selected only by the MegaMoE factory.
@@ -261,13 +267,13 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             runtime_started = true;
             // Peer-table aggregate packets require physical 512B boundaries.
             init_trace(rank, "workspace allocation enter");
-            workspace_ = (udma || ll_rdma_) ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
+            workspace_ = (udma || ll_rdma_ || megamoe_roce_) ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
             init_trace(rank, "workspace allocation return");
         }
         if (workspace_ == nullptr) {
             throw std::runtime_error("SHMEM workspace allocation or translation failed");
         }
-        if (ll_rdma_ && reinterpret_cast<uintptr_t>(workspace_) % 512U)
+        if ((ll_rdma_ || megamoe_roce_) && reinterpret_cast<uintptr_t>(workspace_) % 512U)
             throw std::runtime_error("RDMA workspace requires 512-byte alignment");
         init_trace(rank, "workspace memset enter");
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
@@ -467,7 +473,7 @@ void Session::barrier(bool host_coordinated)
 {
     std::lock_guard<std::mutex> guard(runtime_mutex);
     check_context();
-    if (ll_rdma_) {
+    if (ll_rdma_ || megamoe_roce_) {
         if (!host_coordinated) throw std::runtime_error("NDR barrier requires HCCL Host coordination");
         return;
     }
@@ -482,9 +488,9 @@ void Session::close(bool host_coordinated)
         return;
     }
     check_context();
-    if (ll_rdma_ && !host_coordinated)
+    if ((ll_rdma_ || megamoe_roce_) && !host_coordinated)
         throw std::runtime_error("NDR close requires HCCL Host coordination");
-    try { if (!ll_rdma_) checked_barrier(rank_); }
+    try { if (!ll_rdma_ && !megamoe_roce_) checked_barrier(rank_); }
     catch (...) { poisoned_ = true; throw; }
     if (workspace_ != nullptr && !use_1g_huge_pages_) {
         aclshmem_free(workspace_);

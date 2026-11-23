@@ -32,6 +32,9 @@ struct WorkspaceInfo {
     GM_ADDR flagDispatchToGmm1Ptr;
     GM_ADDR flagSendCntCalToUpdParamsPtr;
     GM_ADDR flagGmmToEpiloguePtr{nullptr};
+#ifdef DEEPEP_MEGAMOE_ROCE
+    GM_ADDR routedConsumedPtr{nullptr};
+#endif
     GM_ADDR gmm2ReadyPtr{nullptr};
     GM_ADDR gmm2CombineSyncCounterPtr{nullptr};
     GM_ADDR cumsumInfoPtr{nullptr};
@@ -107,21 +110,35 @@ private:
             Ops::Base::CeilAlign(tilingData->moeExpertPerRank, static_cast<uint32_t>(INT_CACHELINE)));
         int64_t blockMajorCountBytes =
             blockMajorCountStride * static_cast<int64_t>(sizeof(int32_t)) * tilingData->aicNum;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        int64_t expertCountWorkspaceBytes =
+            UsesMteLayout(tilingData->topoType) ? blockMajorCountBytes : expertMajorPaddedCountBytes;
+#else
         int64_t expertCountWorkspaceBytes =
             tilingData->topoType == TOPO_TYPE_MTE ? blockMajorCountBytes : expertMajorPaddedCountBytes;
+#endif
         workspaceSize += Ops::Base::CeilAlign(expertCountWorkspaceBytes, ALIGN_512);
 
         metaInfoPtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(tilingData->maxOutputSize * ALIGN_32, ALIGN_512);
 
         // 以下三组 flag 仅由 MoE 专家使用；共享专家路径不使用这些 flag。
+#ifdef DEEPEP_MEGAMOE_ROCE
+        const bool useMteWaveCombine = UsesMteLayout(tilingData->topoType);
+#else
         const bool useMteWaveCombine = tilingData->topoType == TOPO_TYPE_MTE;
+#endif
         int64_t maxWavesPerExpert =
             Ops::Base::CeilDiv(static_cast<int64_t>(tilingData->maxOutputSize), static_cast<int64_t>(L1_TILE_M_256));
         int64_t waveFlagSlotsPerExpert = maxWavesPerExpert * static_cast<int64_t>(INT_CACHELINE);
         // MTE GMM2 按 256-token M group 消费 activation；URMA 只使用每个专家的首槽。
+#ifdef DEEPEP_MEGAMOE_ROCE
+        int64_t activationFlagSlotsPerExpert =
+            UsesMteLayout(tilingData->topoType) ? waveFlagSlotsPerExpert : static_cast<int64_t>(INT_CACHELINE);
+#else
         int64_t activationFlagSlotsPerExpert =
             tilingData->topoType == TOPO_TYPE_MTE ? waveFlagSlotsPerExpert : static_cast<int64_t>(INT_CACHELINE);
+#endif
         int64_t moeExpertCount = static_cast<int64_t>(tilingData->moeExpertPerRank);
 
         // 所有 Scalar 通知都放在同一段连续 workspace 中。每个逻辑槽独占一个 64B cache line，
@@ -142,14 +159,31 @@ private:
         bool isW4Mode = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
                         tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
                         tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (isW4Mode || (UsesMteLayout(tilingData->topoType) && tilingData->combineQuantMode == COMBINE_NO_QUANT)) {
+#else
         if (isW4Mode || (tilingData->topoType == TOPO_TYPE_MTE && tilingData->combineQuantMode == COMBINE_NO_QUANT)) {
+#endif
             flagGmmToEpiloguePtr = base + workspaceSize;
             workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
+#ifdef DEEPEP_MEGAMOE_ROCE
+            if (UseHierarchicalRoce(tilingData) && isW4Mode) {
+                routedConsumedPtr = base + workspaceSize;
+                workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
+            }
+#endif
         }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (UsesMteLayout(tilingData->topoType) &&
+            (tilingData->combineQuantMode != COMBINE_NO_QUANT ||
+             tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 || UseHierarchicalRoce(tilingData))) {
+            // Full-row Combine (W4A8 or hierarchical W8A8) owns one counter per slice's first M-group.
+#else
         if (tilingData->topoType == TOPO_TYPE_MTE && (tilingData->combineQuantMode != COMBINE_NO_QUANT ||
                                                       tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4)) {
             // A8W4 非量化 Combine：每个 slice 按首 M-group 独占一个 64B 计数槽。
+#endif
             // 用最大 M-group 数预留地址，避免跨 wave 复用槽而让快核提前放行旧 slice。
             // 本区仍位于连续 flag reset 范围内，每次算子调用统一清零；量化路径布局不变。
             gmm2ReadyPtr = base + workspaceSize;
@@ -198,10 +232,17 @@ private:
         cumsumInfoPtr = nullptr;
         gmm1MmadResPtr = nullptr;
         gmm2MmadResPtr = nullptr;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        bool activationOverwritesDispatchCumsum =
+            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
+            (UsesMteLayout(tilingData->topoType) && (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
+                                                     tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ));
+#else
         bool activationOverwritesDispatchCumsum =
             tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
             (tilingData->topoType == TOPO_TYPE_MTE && (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
                                                        tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ));
+#endif
         if (activationOverwritesDispatchCumsum) {
             // cumsumInfo：逐核备份 cumsum 状态，每核 moeExpertPerRank × epWorldSize 个 int32。
             cumsumInfoPtr = base + workspaceSize;

@@ -13,6 +13,13 @@ import json
 from pathlib import Path
 
 
+def validate_doorbell(build_info):
+    if build_info and build_info.get("rdma_backend") == "HNS_1825":
+        value = build_info.get("hns_1825_pi_on_chip")
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("HNS_1825 SDK must record hns_1825_pi_on_chip as integer 0 or 1")
+
+
 def record(sdk, revision, *, build_info=None):
     sdk = Path(sdk).resolve()
     lock = json.loads((Path(__file__).resolve().parents[1] / "dependencies.lock.json").read_text())
@@ -24,6 +31,7 @@ def record(sdk, revision, *, build_info=None):
         normalized = header.read_bytes().replace(b"\r\n", b"\n")
         if hashlib.sha256(normalized).hexdigest() != digest:
             raise ValueError(f"SDK public header mismatch: {relative}")
+    validate_doorbell(build_info)
     files = sorted(
         p
         for directory in ("include", "src")

@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from statistics import median
 
-from .protocol import CYCLE_TO_US
+from .protocol import COMBINE_PROGRESS_FIXED_NAMES, CYCLE_TO_US, STARTUP_FIXED_NAMES
 
 SYNC_ANCHOR_EVENT = "AIV_INPUT_CROSS_RANK_SYNC"
 
@@ -78,10 +78,17 @@ def apply_input_sync_mode(events, mode):
     return result
 
 
+RELAY_WAITS = {"packet_wait", "route_complete", "source_wait", "table_wait", "dispatch_backoff"}
+
+
 def apply_wait_mode(events, include_wait):
     if include_wait:
         return events
-    return [event for event in events if "WAIT" not in event["name"]]
+    return [
+        event
+        for event in events
+        if "WAIT" not in event["name"] and event.get("task", {}).get("relay_step") not in RELAY_WAITS
+    ]
 
 
 def raw_events_for_rank(path: Path, rank: int):
@@ -173,7 +180,12 @@ def trace_events(
     for event in selected:
         task = event.get("task", {})
         granularity = task.get("granularity")
+        family = event_family(event["name"])
         display_name = event["name"]
+        lane = f"group_{event['group_id']}_{event['core_type']}_{event['sub_id']}"
+        category = (
+            "dependency_wait" if "WAIT" in event["name"] else ("aic_op" if event["core_type"] == "AIC" else "aiv_op")
+        )
         wave_metadata = {}
         if "wave_id" in event:
             wave_id = event["wave_id"]
@@ -188,14 +200,79 @@ def trace_events(
                 "raw_event_name": event["name"],
                 "display_index_semantics": "per_core_per_family_per_wave_task_or_interval",
             }
+        if granularity == "rdma":
+            family = event_family(event["name"])
+            display_name = f"{family}_{task['phase']}_{task['kind']}_peer{task['peer_rank']}_{task['bytes']}B"
+            # Progress can run inside a compute tile. Use its own lane to avoid
+            # overlapping X events on the compute track; clocks stay unchanged.
+            if task.get("qp"):
+                display_name += f"_qp{task['qp']}"
+            lane += "/RDMA"
+            category = "rdma_wait" if "WAIT" in family else "rdma_post"
+            wave_metadata["display_index_semantics"] = "per_core_rdma_operation"
+        if family in STARTUP_FIXED_NAMES or granularity == "startup_dependency":
+            lane += "/STARTUP"
+            category = "startup_wait" if "WAIT" in family else "startup"
+            display_name = family
+            if granularity == "startup_dependency" and "source_rank" in task:
+                display_name += f"_source{task['source_rank']}_gateway{task['gateway_rank']}_seq{task['sequence']}"
+            wave_metadata["display_index_semantics"] = "per_core_startup_phase_or_dependency"
+        if granularity == "relay_step":
+            lane += "/RELAY"
+            category = "relay_wait" if task["relay_step"] in RELAY_WAITS else "relay"
+            display_name = f"RELAY_{task['relay_step']}"
+            if "source_rank" in task:
+                display_name += f"_source{task['source_rank']}"
+            if "first_expert" in task:
+                display_name += f"_experts{task['first_expert']}+{task['expert_count']}"
+            if "source_host" in task:
+                display_name += f"_host{task['source_host']}"
+            if "source_ranks" in task:
+                display_name += (
+                    f"_rank{task['consumer_rank']}_{len(task['source_ranks'])}sources_{task['row_count']}rows"
+                )
+            elif "consumer_rank" in task:
+                display_name += f"_rank{task['consumer_rank']}_rows{task['row_start']}+{task['row_count']}"
+            wave_metadata["display_index_semantics"] = "per_core_relay_step"
+        if granularity == "combine_run":
+            lane += "/COMBINE_RUN"
+            category = "combine_run"
+            display_name = (
+                f"COMBINE_{task['decision']}_rows{task['run_start']}+{task['run_rows']}_{task['stop_reason']}"
+            )
+            wave_metadata["display_index_semantics"] = "per_core_combine_run"
+        if granularity == "combine_async":
+            # Lifetime includes delayed software retirement; it is not exact
+            # hardware DMA duration. Separate slots make overlap readable.
+            phase = {"row_lifetime": "ASYNC", "issue": "ISSUE", "reuse_wait": "REUSE_WAIT"}[task["scope"]]
+            lane += f"/COMBINE_{phase}"
+            if phase == "ASYNC" and "buffer_slot" in task:
+                lane += f"/slot{task['buffer_slot']}"
+            category = f"combine_{task['scope']}"
+            display_name = f"COMBINE_{phase}_expert{task['expert_id']}_row{task['row_start']}"
+        if granularity == "combine_ready":
+            lane += "/COMBINE_READY"
+            category = "combine_ready_snapshot"
+            display_name = f"COMBINE_READY_qp{task['qp_index']}_token{task['token_index']}"
+        if granularity == "combine_sync":
+            lane += "/COMBINE_SYNC"
+            category = "combine_sync_marker"
+            display_name = f"COMBINE_SYNC_qp{task['qp_index']}_{task['sync_phase']}"
+        if family in COMBINE_PROGRESS_FIXED_NAMES or granularity in ("combine_progress", "combine_drain"):
+            lane += "/COMBINE_PROGRESS"
+            category = "combine_wait" if "WAIT" in family else "combine_progress"
+            if family in COMBINE_PROGRESS_FIXED_NAMES:
+                display_name = family
+            # Progress encloses scan/control and RDMA posts; Drain encloses
+            # child progress calls and backoff. Initialization is independent.
+            # Parent elapsed time is not additive with its child intervals.
+            wave_metadata["display_index_semantics"] = "per_core_combine_phase_or_call"
         result.append(
             {
                 "ph": "X",
-                "cat": "dependency_wait"
-                if "WAIT" in event["name"]
-                else ("aic_op" if event["core_type"] == "AIC" else "aiv_op"),
+                "cat": category,
                 "pid": f"rank{event['rank']}",
-                "tid": (f"group_{event['group_id']}_{event['core_type']}_{event['sub_id']}"),
+                "tid": lane,
                 "name": display_name,
                 "ts": round((event["start_cycle"] - base_cycle) / CYCLE_TO_US, 6),
                 "dur": round(

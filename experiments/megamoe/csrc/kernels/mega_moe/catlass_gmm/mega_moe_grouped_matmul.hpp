@@ -107,24 +107,30 @@ class A8W4MatmulPipeline {
     } addr_;
     GM_ADDR output_ = nullptr;
     bool active_ = false;
+#ifdef DEEPEP_MEGAMOE_ROCE
+    bool bypassWeight_ = false;
+#endif
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+    template <class Element, class Layout>
+    __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout, bool bypass = false)
+    {
+#else
     template <class Element, class Layout>
     __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout)
     {
+#endif
         AscendC::GlobalTensor<Element> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(address));
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (bypass) gm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+#endif
         return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
     }
 
 public:
     // Construct fixed buffer views once, without touching shared hardware events.
     __aicore__ inline A8W4MatmulPipeline() : block_(resource_) {}
-    __aicore__ inline A8W4MatmulPipeline(const Config& config, const GMMAddrInfo& addr, GM_ADDR output)
-        : A8W4MatmulPipeline()
-    {
-        UpdateProblem(config, addr, output);
-        Begin();
-    }
     A8W4MatmulPipeline(const A8W4MatmulPipeline&) = delete;
     A8W4MatmulPipeline& operator=(const A8W4MatmulPipeline&) = delete;
     __aicore__ inline ~A8W4MatmulPipeline()
@@ -144,6 +150,11 @@ public:
                           std::is_same_v<SA, typename Next::ElementMxScaleAType> &&
                           std::is_same_v<SB, typename Next::ElementMxScaleBType>,
                       "Cannot change GMM element types");
+#ifdef DEEPEP_MEGAMOE_ROCE
+        bypassWeight_ = !Next::IS_SHARED && config.m <= 128U &&
+                        ((config.k == 3584U && config.n == 2560U) || (config.k == 1280U && config.n == 3584U) ||
+                         (config.k == 5120U && config.n == 4608U) || (config.k == 2304U && config.n == 5120U));
+#endif
         config_.m = config.m;
         config_.n = config.n;
         config_.k = config.k;
@@ -168,8 +179,7 @@ public:
         }
     }
 
-    // Preserve the old slice boundary: GMM2/other stages may reuse the same
-    // event IDs and L1/L0/UB storage while this C++ object remains alive.
+    // Release shared event IDs and scratch before a different pipeline takes ownership.
     __aicore__ inline void End(bool outputDrained = false)
     {
         if (active_) {
@@ -180,7 +190,7 @@ public:
 
 protected:
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
-                                             uint32_t outputN)
+                                             uint32_t outputN, bool toAiv1 = false)
     {
         auto a = Tensor<A>(addr_.aGlobal, tla::MakeLayout<A, LayoutA>(config_.m, config_.k));
         auto sa =
@@ -192,12 +202,16 @@ protected:
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
         auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
-        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U);
+        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U, toAiv1);
     }
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
     {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB, bypassWeight_);
+#else
         auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB);
+#endif
         auto tileB = tla::GetTile(b, tla::MakeCoord(0, weightN), tla::MakeShape(config_.k, cols));
         block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params, config_.m < 256U);
     }
@@ -207,7 +221,7 @@ protected:
 
 // Routed GMM1 consumes offline-packed [gate128, up128] in one N256 projection.
 // Shared GMM1 retains planar weights and its independently scheduled N192 tiles.
-// The object may remain alive across expert slices; Begin/End delimit scratch ownership.
+// Routed GMM2 uses a single down projection on the same pipeline when its wave owns the scratch.
 template <class Config>
 class CatlassGmm1 : private detail::A8W4MatmulPipeline<Config> {
     bool fused_ = false;
@@ -221,18 +235,18 @@ public:
     using Pipeline::End;
 
     template <class ProblemConfig>
-    __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr)
+    __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr, bool down = false)
     {
-        Pipeline::UpdateProblem(config, addr, addr.gmm1OutGlobal);
-        fused_ = ProblemConfig::FUSED_GATE_UP;
-        planarSingle_ = config.sharedPolicy.decode;
+        Pipeline::UpdateProblem(config, addr, down ? addr.gmm2OutGlobal : addr.gmm1OutGlobal);
+        fused_ = !down && ProblemConfig::FUSED_GATE_UP;
+        planarSingle_ = down || config.sharedPolicy.decode;
         halfN_ = config.outputN;
     }
-    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
+    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols, bool toAiv1 = false)
     {
         // Logical activation columns map to contiguous gate/up pairs in GM.
         if (fused_) {
-            Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U);
+            Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, toAiv1);
         } else {
             Pipeline::ComputeProjection(m, n, rows, cols, n);
             if (!planarSingle_) {
@@ -250,27 +264,6 @@ public:
                 Pipeline::DequantizeWeight(n + halfN_, rows, cols);
             }
         }
-    }
-};
-
-// GMM2 owns the down projection and always writes row-major output.
-template <class Config>
-class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config> {
-    using Pipeline = detail::A8W4MatmulPipeline<Config>;
-
-public:
-    __aicore__ inline CatlassGmm2(const Config& config, const GMMAddrInfo& addr)
-        : Pipeline(config, addr, addr.gmm2OutGlobal)
-    {
-    }
-
-    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
-    {
-        Pipeline::ComputeProjection(m, n, rows, cols, n);
-    }
-    __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
-    {
-        Pipeline::DequantizeWeight(n, rows, cols);
     }
 };
 

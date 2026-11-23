@@ -19,7 +19,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from build_shmem import cann_version, prepare  # noqa: E402
 
 
-def build(root=ROOT, *, rebuild_shmem=False):
+def build(root=ROOT, *, rebuild_shmem=False, rdma_backend=None):
+    if rdma_backend not in (None, "HNS_1825"):
+        raise ValueError("The pinned SHMEM SDK requires HNS_1825")
     root = Path(root).resolve()
     if platform.system() != "Linux" or sys.version_info < (3, 11):
         raise RuntimeError("Build requires Linux and Python >= 3.11")
@@ -95,7 +97,7 @@ def build(root=ROOT, *, rebuild_shmem=False):
     run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", str(wheels[0])])
     probe = "from deep_ep._native import require_native; require_native('build smoke')"
     if beta == "ON":
-        probe += "; import torch, torch_npu; import deep_ep_experimental.megamoe._C"
+        probe += "; import torch, torch_npu; import deep_ep_experimental.megamoe._C, deep_ep_experimental.megamoe._ep32_C"
     # -I 不从源码目录/PYTHONPATH 导入；这里只加载扩展，不分配 NPU 或启动通信。
     run([sys.executable, "-I", "-c", probe], cwd=wheel_dir)
     print(f"[BUILD] Installed: {wheels[0]}", flush=True)
@@ -111,5 +113,6 @@ if __name__ == "__main__":
         action="store_true",
         help="Regenerate bundled SHMEM build/install; stop all users of that SDK first",
     )
+    parser.add_argument("--rdma-backend", choices=("HNS_1825",))
     args = parser.parse_args()
-    build(rebuild_shmem=args.rebuild_shmem)
+    build(rebuild_shmem=args.rebuild_shmem, rdma_backend=args.rdma_backend)

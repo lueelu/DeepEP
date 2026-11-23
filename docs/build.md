@@ -193,3 +193,7 @@ python scripts/validate_package.py --output /path/to/another-new-directory \
 当前仓库未配置自动 CI 流水线。请手动运行 pre-commit，并按变更范围运行 CPU API、参考、运行时和构建预检。CPU fault-injection 使用 Linux/g++，不等于 CANN ABI 或 NPU 测试。检查命令见[开发指南](development.md#提交前检查与-ci)。
 
 在具备 CANN、SHMEM、框架与已分配 NPU 的环境执行本页验证命令。保留 `source-tests.xml`、`installed-tests.xml`、`validation.json` 和逐 rank 输出，wheel/sdist 作为独立产物归档。安装成功、CPU 通过和设备算子通过分别记录，不互相替代。
+
+### 双机 EP32 MegaMoE
+
+设置 `CATLASS_ROOT` 后运行 `bash experiments/megamoe/scripts/build.sh`。构建脚本使用锁文件中的 SHMEM `b41a8fa` 和 HNS_1825，并在安装后加载两种 MegaMoE 扩展。由旧 SDK 升级时，先停止使用它的作业，再向该命令追加 `--rebuild-shmem`。运行及接口示例见 [MegaMoE 说明](../experiments/megamoe/README.md)。
