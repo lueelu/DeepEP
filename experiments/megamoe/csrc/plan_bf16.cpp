@@ -4,7 +4,6 @@
 #include "plan.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -53,30 +52,6 @@ inline size_t CalcBf16EarlyTopkWeightWorkspaceSize(const MegaMoeBf16TilingData& 
 }
 
 }  // namespace optiling
-
-namespace {
-
-bool ResolveCompactTokenCountExchange(int64_t worldSize, int64_t expertPerRank)
-{
-    const char* rawMode = std::getenv("MEGAMOE_BF16_TOKEN_COUNT_EXCHANGE");
-    const std::string mode = rawMode == nullptr || rawMode[0] == '\0' ? "auto" : rawMode;
-    if (mode == "auto") {
-        return MegaMoeBF16Training::UseCompactTokenCountExchangeByDefault(static_cast<uint64_t>(worldSize),
-                                                                          static_cast<uint64_t>(expertPerRank));
-    }
-    if (mode == "dense") {
-        return false;
-    }
-    TORCH_CHECK(mode == "compact", "MEGAMOE_BF16_TOKEN_COUNT_EXCHANGE must be auto, dense or compact; got '", mode,
-                "'");
-    TORCH_CHECK(MegaMoeBF16Training::CanUseCompactTokenCountExchange(static_cast<uint64_t>(worldSize),
-                                                                     static_cast<uint64_t>(expertPerRank)),
-                "forced compact BF16 token-count exchange requires 2..1024 EP ranks, "
-                "1..8 local experts");
-    return true;
-}
-
-}  // namespace
 
 struct BufferSizes {
     uint64_t workspace_bytes;
@@ -157,7 +132,7 @@ BufferSizes MakeBf16Tiling(MegaMoeBf16TilingData& tiling, int64_t m, int64_t k, 
     TORCH_CHECK(Wave::ScratchFits(static_cast<uint32_t>(k), static_cast<uint32_t>(world_size),
                                   static_cast<uint32_t>(expert_per_rank)),
                 "BF16 forward Dispatch/Combine buffers and routing metadata exceed the AIV1 UB budget");
-    tiling.compactTokenCountExchange = ResolveCompactTokenCountExchange(world_size, expert_per_rank) ? 1U : 0U;
+    tiling.compactTokenCountExchange = UseCompactTokenCountExchange(world_size, expert_per_rank);
     const auto workspaceBytes = optiling::CalcWorkspaceSize(tiling);
     const CompactTokenCountExchangeLayout counts(world_size, expert_per_rank, tiling.compactTokenCountExchange != 0);
     const PeerPayloadLayout payload(counts.payloadOffset, m, k, topk, TopkWeightBytes(topk_weight_type));

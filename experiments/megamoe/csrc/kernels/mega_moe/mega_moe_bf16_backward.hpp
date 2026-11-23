@@ -23,15 +23,13 @@
  *   P5    Unpermute              FP32 sum_slot(ptrD) -> BF16 grad_x (AIV)
  *   P6    Reduce/route/unpermute  P1 dp partials -> grad_topk (AIV)
  *
- * P1 saved modes (BF16/MXFP8) write dHp to GM; each AIV waits for all AICs
- * to finish that expert before loading its assigned tiles and replacing
- * dHp with Hp in the same plane. The AIC reads dO using per-producer row
- * progress for eligible multi-M experts, or the complete-expert dispatch
- * flag otherwise. In save=none, P1 waits for complete-expert dispatch and
- * alternates dHp Fixpipe tiles between the paired AIV UB slots, with a
- * per-tile completion handshake. Both paths reduce FP32(dHp)*h over F for dp.
- * Every dispatch band publishes bwFlagDispatch_[expert], including those
- * using row progress. P0 staging occupies a fixed UB window above the
+ * P1 writes row-owned dHp to GM. Saved-mode Wave waits for each dO block;
+ * recompute waits for complete-expert dO and Gate/Up. Row-ready consumers
+ * may replace a 128-row block with Hp after its last dHp column is visible.
+ * The expert-ready GM path waits for all producers. The tiled recompute path
+ * hands dHp through the paired AIV UB slots instead.
+ * Whole-expert Dispatch publishes bwFlagDispatch_[expert]; Wave Dispatch
+ * publishes 128-row ready counters. P0 staging occupies a fixed UB window above the
  * P1/P2 work tiles (see StageUb), so dispatch can overlap earlier experts'
  * P1 work without a whole-stage UB ownership handover.
  *
@@ -49,6 +47,7 @@
 #include "common/mega_moe_bf16_context.hpp"
 #include "stage/mega_moe_combine_send.hpp"
 #include "stage/mega_moe_pack_bf16.hpp"
+#include "stage/peer_row_view.hpp"
 #include "stage/mega_moe_unpermute_bf16.hpp"
 #include "epilogue/block_epilogue_swiglu_bf16_backward.hpp"
 #include "catlass_gmm/mega_moe_bf16_catlass_impl_backward.hpp"
@@ -59,7 +58,7 @@ namespace MegaMoeImpl {
 
 using TupleShape = AscendC::Shape<int64_t, int64_t, int64_t, int64_t>;
 
-// In save=none, P1 alternates between the paired AIVs: AIC event 0 targets
+// With tiled save=none output, P1 alternates between the paired AIVs: AIC event 0 targets
 // AIV0 and event FLAG_ID_MAX targets AIV1; each AIV consumes local event 0.
 // Its P2 uses AIV0 with local ping-pong events 0/1. Saved modes use GM
 // completion counters instead of these per-tile output events.
@@ -85,7 +84,7 @@ public:
     __aicore__ inline void Init(GM_ADDR context, GM_ADDR gradY, GM_ADDR topkWeights, GM_ADDR weight1, GM_ADDR weight2,
                                 GM_ADDR gradX, GM_ADDR gradTopkWeights, GM_ADDR gradWeight1, GM_ADDR gradWeight2,
                                 GM_ADDR trainingSavedState, GM_ADDR dispatchOutput, GM_ADDR backwardWorkspace,
-                                MegaMoeBf16TilingData* tilingData, uint32_t splitExperts);
+                                MegaMoeBf16TilingData* tilingData);
     __aicore__ inline void Process();
     __aicore__ inline void SetTimer(MegaMoeTrainTimerDevice* timer)
     {
@@ -103,12 +102,21 @@ private:
     __aicore__ inline void ResetTokenPerExpert();
     __aicore__ inline void ClearEmptyExpertGradWeights();
     __aicore__ inline void ClearGradWeightPlane(GM_ADDR base, uint64_t planeElements, uint32_t expertIdx);
-    __aicore__ inline void DispatchTokensBackward(GM_ADDR dstBase, uint32_t expertIdx, uint32_t ordinal);
+    __aicore__ inline void DispatchTokensBackward(GM_ADDR dstBase, uint32_t expertIdx);
     using WavePlan = MegaMoeBF16Training::BackwardWavePlan;
     __aicore__ inline bool UseStagedWave(uint32_t ordinal) const
     {
         return MegaMoeBF16Training::UseBackwardStagedWave(savedGateUpMode_, n_ / 2) && params_.peerRowsGroups == 0U &&
                ordinal < splitExperts_;
+    }
+    __aicore__ inline bool UseRecomputeDhpRows(uint32_t ordinal) const
+    {
+        return ordinal < splitExperts_ && MegaMoeBF16Training::UseRecomputeDhpRowReady(savedGateUpMode_, n_ / 2);
+    }
+    // For row-ready recompute, the expert counter covers Gate/Up; dHp uses per-row slots.
+    __aicore__ inline __gm__ int32_t* RecomputeReady(uint32_t expert) const
+    {
+        return reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwFlagDHpReady) + expert * INT_CACHELINE;
     }
     // The host clears this slot for each backward. One AIV per expert publishes
     // a positive chunk size before dispatch; all three Wave stages read it.
@@ -121,7 +129,7 @@ private:
         if (!UseStagedWave(0) || aivCoreIdx_ >= expertPerRank_) return;
         const MegaMoeBF16Training::Wave::GmPeerPrefix prefix{
             reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM)};
-        MegaMoeBF16BackwardCatlassImpl::PreparedExpertCursor cursor;
+        MegaMoeBF16Training::PreparedExpertCursor cursor;
         for (uint32_t expert = 0; expert < expertPerRank_; ++expert) {
             uint32_t rows = 0, ordinal = 0;
             if (cursor.Next(groupList_.GetValue(expert), groupListType_, maxOutputSize_, rows, ordinal) &&
@@ -145,8 +153,7 @@ private:
     }
     __aicore__ inline void DispatchStagedBackward(GM_ADDR dstBase, uint32_t expert, const WavePlan& plan);
     template <class Prefix>
-    __aicore__ inline void DispatchWaveTokensBackward(GM_ADDR dstBase, uint32_t expertIdx, uint32_t ordinal,
-                                                      const Prefix& prefix);
+    __aicore__ inline void DispatchWaveTokensBackward(GM_ADDR dstBase, uint32_t expertIdx, const Prefix& prefix);
     __aicore__ inline void CopyDispatchedGradRows(GlobalTensor<QuantOutType> dst, uint32_t source, uint32_t sourceRow,
                                                   uint32_t rows, int32_t& ping);
     __aicore__ inline bool UpdateGroupParams(uint32_t expertIdx);
@@ -243,35 +250,6 @@ private:
     uint32_t aivCoreIdx_ = GetBlockIdx();
     uint32_t subBlockIdx_ = GetSubBlockIdx();
     int32_t dispatchCopyElementsPerPing_ = 0;
-    __aicore__ inline bool UseDispatchRowReady(uint32_t ordinal) const
-    {
-        return MegaMoeBF16Training::UseBackwardDispatchRowReady(savedGateUpMode_, ordinal, splitExperts_,
-                                                                static_cast<uint64_t>(Get<M_VALUE>(problemShape_)),
-                                                                MegaMoeBF16BackwardCatlassImpl::L1_TILE_M);
-    }
-    __aicore__ inline MegaMoeBF16BackwardCatlassImpl::BackwardDispatchReadyView MakeDispatchRowReady(
-        uint32_t expert, uint32_t ordinal) const
-    {
-        MegaMoeBF16BackwardCatlassImpl::BackwardDispatchReadyView v;
-        v.progressBase = reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwDispatchProgress);
-        v.cumsum = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM);
-        v.sources = worldSize_;
-        v.producersPerSource = dispatchBlockNumPerEP_;
-        v.experts = expertPerRank_;
-        v.expert = expert;
-        v.progressSlot = ordinal;
-        v.rowLimit = static_cast<uint32_t>(maxOutputSize_);
-        v.enabled = UseDispatchRowReady(ordinal);
-        if (params_.peerRowsGroups != 0U) {
-            const auto info = MegaMoeBF16Training::Wave::GetPeerExpert(params_, expert);
-            v.peerGroups = params_.peerRowsGroups;
-            v.peerRank = rankId_;
-            v.peerRows = info.rows;
-            v.peerFirstSliceRows = info.firstSliceRows;
-        }
-        return v;
-    }
-
     int32_t vecSetSyncCom_ = 0;
     uint16_t gmm2PingPongIdx_ = 0;
     uint32_t borrowedDw2Tiles_ = 0;
@@ -288,9 +266,9 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Init(GM_ADDR context, G
                                                               GM_ADDR gradTopkWeights, GM_ADDR gradWeight1,
                                                               GM_ADDR gradWeight2, GM_ADDR trainingSavedState,
                                                               GM_ADDR dispatchOutput, GM_ADDR backwardWorkspace,
-                                                              MegaMoeBf16TilingData* tilingData, uint32_t splitExperts)
+                                                              MegaMoeBf16TilingData* tilingData)
 {
-    splitExperts_ = splitExperts;
+    splitExperts_ = tilingData->backwardSplitExperts;
     m_ = tilingData->m;
     k_ = tilingData->k;
     n_ = tilingData->n;
@@ -341,22 +319,14 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Init(GM_ADDR context, G
     epilogueOp_.Init({gatePlane, upPlane, savedState_.ptrSavedGateScale, savedState_.ptrSavedUpScale,
                       savedState_.ptrSavedGateHigh, savedState_.ptrSavedUpLow, savedState_.ptrSavedUpHigh,
                       bwWs_.ptrGradZ, bwWs_.ptrHp, bwWs_.ptrDpProducts, params_.workspaceInfo.ptrDispatchedTopkWeights,
-                      0, 0, tilingData->swigluLimit, savedGateUpMode_});
+                      0, 0, tilingData->swigluLimit, savedGateUpMode_, bwWs_.ptrWideDp});
     epilogueOp_.UpdateNextProblem({0, n_, 0, 0});
 }
 
 // Fixed-position P0 staging window at the top of UB, above the P1/P2 tile
-// region [0, BW_STAGE_BASE_BYTES).  P0-A gather slots, the count-table
-// restore tile and the P0-B dispatch ring all bind here; they are
-// sequential in time on one lane, so one shared region serves all three.
-// Nothing in P0 goes through TPipe, so the staging region never overlaps
-// the CATLASS-managed tile area. In save=none, P1 can Fixpipe an early
-// expert's dHp tile into either paired AIV while P0 dispatch copies later
-// experts. The tile stays in the statically bound work region until that
-// lane's epilogue consumes it; CATLASS Resource TBufs that overlap the
-// region are allocation-only on the vector side (never written or zeroed).
-// The dO read dependency is separate: saved-mode AICs use row progress or
-// complete-expert dispatch readiness, while save=none uses the latter.
+// region [0, BW_STAGE_BASE_BYTES). P0-A gather, count restore and P0-B
+// dispatch run sequentially on each lane and share this region.
+// Saved Wave consumes dO by canonical M block. Other dHp paths wait for the expert.
 // Raw fixed-position binding, same pattern as the epilogue's own tile
 // members (VECIN raw tiles at fixed byte offsets, fed by plain DataCopy in
 // both directions).  The return type spells bfloat16_t, NOT the class alias
@@ -418,9 +388,6 @@ template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::RestoreTokenPerExpert()
 {
     MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_RESTORE_TABLE);
-    const bool prepareMetadata = params_.peerRowsGroups == 0U &&
-                                 MegaMoeBF16Training::UseGmForBackwardDataGrad(savedGateUpMode_) && splitExperts_ > 0 &&
-                                 !UseStagedWave(0);
     int32_t perRank = static_cast<int32_t>(perRankStridesInTokenPerExpert_);
     LocalTensor<int32_t> tmpBuffer = StageUb(perRank * sizeof(int32_t)).template ReinterpretCast<int32_t>();
     // P0 has no TPipe; SyncFunc would access an invalid pipe. Use explicit events.
@@ -432,41 +399,6 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::RestoreTokenPerExpert()
         DataCopy(tokenPerExpertWin_[sourceRank * perRank], tmpBuffer, perRank);
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-        if (prepareMetadata) {
-            MegaMoeBF16BackwardCatlassImpl::PreparedExpertCursor cursor;
-            for (uint32_t expert = 0; expert < expertPerRank_; ++expert) {
-                uint32_t rows = 0, ordinal = 0;
-                if (!cursor.Next(static_cast<int32_t>(groupList_.GetValue(expert)), groupListType_, maxOutputSize_,
-                                 rows, ordinal)) {
-                    continue;
-                }
-                if (!MegaMoeBF16Training::UseBackwardDispatchRowReady(savedGateUpMode_, ordinal, splitExperts_, rows,
-                                                                      MegaMoeBF16BackwardCatlassImpl::L1_TILE_M)) {
-                    continue;
-                }
-                MegaMoeBF16BackwardCatlassImpl::BackwardDispatchReadyView view;
-                view.progressBase = reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwDispatchProgress);
-                view.cumsum = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM);
-                view.sources = worldSize_;
-                view.producersPerSource = dispatchBlockNumPerEP_;
-                view.experts = expertPerRank_;
-                view.expert = expert;
-                view.progressSlot = ordinal;
-                view.rowLimit = static_cast<uint32_t>(maxOutputSize_);
-                view.enabled = true;
-                if (MegaMoeBF16BackwardCatlassImpl::ProducerPhaseSupported(view, blockNum_)) {
-                    MegaMoeBF16BackwardCatlassImpl::PrepareProducerPhaseSource(
-                        view, blockNum_, rows, static_cast<uint32_t>(sourceRank), nullptr);
-                }
-            }
-        }
-    }
-    if (prepareMetadata) {
-        // Retire scalar metadata before the AIV barrier; event 7 avoids ring events 0/1.
-        SetFlag<AscendC::HardEvent::S_MTE2>(7);
-        WaitFlag<AscendC::HardEvent::S_MTE2>(7);
-        SetFlag<AscendC::HardEvent::MTE2_S>(7);
-        WaitFlag<AscendC::HardEvent::MTE2_S>(7);
     }
 }
 
@@ -535,16 +467,12 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::CopyDispatchedGradRows(
 template <typename TopkWeightT>
 template <class Prefix>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchWaveTokensBackward(GM_ADDR dstBase, uint32_t expertIdx,
-                                                                                    uint32_t ordinal,
                                                                                     const Prefix& prefix)
 {
     using namespace MegaMoeBF16Training::Wave;
-    using MegaMoeBF16BackwardCatlassImpl::BackwardDispatchReadyView;
     const auto info =
         DescribePeerExpert(prefix, worldSize_, expertPerRank_, expertIdx, maxOutputSize_, params_.peerRowsGroups);
     const PeerCounts<Prefix> counts{prefix, expertPerRank_, expertIdx, info.rows};
-    const auto rowReady =
-        UseDispatchRowReady(ordinal) ? MakeDispatchRowReady(expertIdx, ordinal) : BackwardDispatchReadyView{};
     int32_t ping = 0;
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
@@ -566,15 +494,10 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchWaveTokensBackw
             const uint32_t begin = ownBegin > transfer.sourceOrdinalBegin ? ownBegin : transfer.sourceOrdinalBegin;
             const uint32_t ordinalEnd = transfer.sourceOrdinalBegin + transfer.rowCount;
             const uint32_t end = ownEnd < ordinalEnd ? ownEnd : ordinalEnd;
-            constexpr uint32_t readyRows = 256U;
-            for (uint32_t row = begin; row < end; row += readyRows) {
-                const uint32_t take = end - row < readyRows ? end - row : readyRows;
-                const uint32_t target = transfer.destinationRow + row - transfer.sourceOrdinalBegin;
-                CopyDispatchedGradRows(output[static_cast<uint64_t>(target) * k_], source, sourceBase + row, take,
-                                       ping);
-                SetFlag<HardEvent::MTE3_S>(EVENT_ID2);
-                WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
-                if (rowReady.enabled) AtomicAdd(rowReady.Slot(idx), static_cast<int32_t>(take));
+            if (begin < end) {
+                const uint32_t target = transfer.destinationRow + begin - transfer.sourceOrdinalBegin;
+                CopyDispatchedGradRows(output[static_cast<uint64_t>(target) * k_], source, sourceBase + begin,
+                                       end - begin, ping);
             }
         }
         SetFlag<HardEvent::MTE3_S>(EVENT_ID2);
@@ -621,8 +544,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchStagedBackward(
 }
 
 template <typename TopkWeightT>
-__aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchTokensBackward(GM_ADDR dstBase, uint32_t expertIdx,
-                                                                                uint32_t ordinal)
+__aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchTokensBackward(GM_ADDR dstBase, uint32_t expertIdx)
 {
     if (timer_ != nullptr) {
         timer_->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape_));
@@ -642,10 +564,10 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchTokensBackward(
                         DataCopyPadExtParams<int32_t>{false, 0U, 0U, 0U});
             SetFlag<HardEvent::MTE2_S>(EVENT_ID6);
             WaitFlag<HardEvent::MTE2_S>(EVENT_ID6);
-            DispatchWaveTokensBackward(dstBase, expertIdx, ordinal, UbPeerPrefix{prefixUb});
+            DispatchWaveTokensBackward(dstBase, expertIdx, UbPeerPrefix{prefixUb});
         } else {
             const GmPeerPrefix prefix{reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM)};
-            DispatchWaveTokensBackward(dstBase, expertIdx, ordinal, prefix);
+            DispatchWaveTokensBackward(dstBase, expertIdx, prefix);
         }
         return;
     }
@@ -677,28 +599,8 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchTokensBackward(
                 GlobalTensor<QuantOutType> aGlobalTensor;
                 int64_t gmOffsetA = rowDstOffsetPerCore * widthA;
                 aGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ QuantOutType*>(dstBase));
-                if (UseDispatchRowReady(ordinal)) {
-                    const auto ready = MakeDispatchRowReady(expertIdx, ordinal);
-                    constexpr int32_t tileRows = MegaMoeBF16BackwardCatlassImpl::L1_TILE_M;
-                    constexpr int32_t chunkRows = 256;
-                    // Only the first nonempty expert publishes progress at dHp tile boundaries.
-                    const bool alignToTile = ordinal == 0U && rowsPerCore >= tileRows;
-                    for (int32_t done = 0; done < rowsPerCore;) {
-                        const int32_t remaining = rowsPerCore - done;
-                        const int32_t limit =
-                            alignToTile ? tileRows - (rowDstOffsetPerCore + done) % tileRows : chunkRows;
-                        const int32_t count = remaining < limit ? remaining : limit;
-                        CopyDispatchedGradRows(aGlobalTensor[gmOffsetA + static_cast<int64_t>(done) * widthA],
-                                               dstRankIdx, rowSrcOffsetPerCore + done, count, pingpongId);
-                        SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
-                        WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
-                        AtomicAdd(ready.Slot(idx), count);
-                        done += count;
-                    }
-                } else {
-                    CopyDispatchedGradRows(aGlobalTensor[gmOffsetA], dstRankIdx, rowSrcOffsetPerCore, rowsPerCore,
-                                           pingpongId);
-                }
+                CopyDispatchedGradRows(aGlobalTensor[gmOffsetA], dstRankIdx, rowSrcOffsetPerCore, rowsPerCore,
+                                       pingpongId);
             }
         }
         // Complete MTE3 payload writes before publishing readiness on PIPE_S.
@@ -894,6 +796,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM1RecomputePhase()
     // by UpdateGroupParams; K=k_ and 2F=n_ are fixed here.
     Get<N_VALUE>(problemShape_) = n_;
     Get<K_VALUE>(problemShape_) = k_;
+    uint32_t ordinal = 0;
     for (uint32_t expertIdx = 0; expertIdx < expertPerRank_; expertIdx++) {
         const int64_t expertRowBase = cumMRows_;
         if (!UpdateGroupParams(expertIdx)) {
@@ -904,6 +807,14 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM1RecomputePhase()
             expertRowBase * (n_ / MegaMoeBF16BackwardCatlassImpl::SWIGLU_N_HALF) * sizeof(bfloat16_t);
         GroupMatmulRecompute(gmm1Params, problemShape_, gmmAddrInfo, bwWs_.ptrRecomputeGate + planeOffset,
                              bwWs_.ptrRecomputeUp + planeOffset, startBlockIdx, expertIdx);
+        if constexpr (g_coreType == AscendC::AIC) {
+            if (UseRecomputeDhpRows(ordinal)) {
+                SetFlag<HardEvent::FIX_S>(EVENT_ID0);
+                WaitFlag<HardEvent::FIX_S>(EVENT_ID0);
+                AtomicAdd(RecomputeReady(expertIdx), int32_t(1));
+            }
+        }
+        ++ordinal;
         cumMRows_ += Get<M_VALUE>(problemShape_);
     }
 }
@@ -919,7 +830,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM2GradPhase()
     vecSetSyncCom_ = 0;
     uint32_t nextTargetAiv = 0;
     const int32_t dispatchTarget = static_cast<int32_t>(worldSize_ * dispatchBlockNumPerEP_);
-    // GmOutput selects GM dHp output for saved modes. Otherwise the dual
+    // GmOutput selects GM dHp for saved Gate/Up or a row-owned recompute epilogue. Otherwise the dual
     // target copier selects a paired AIV UB slot through Fixpipe subBlockId;
     // the AIC keeps one BlockMmad instance and L1/L0 event state machine.
     BackwardGroupMatmulParam<RowMajor, WeightLayout, GmOutput ? 0U : DUAL_AIV_TARGET, GmOutput> gmm2Params;
@@ -940,7 +851,6 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM2GradPhase()
     uint32_t precedingTiles = 0;
     uint32_t donor = 0, donorStart = 0, donorDone = 0;
     int64_t donorBase = 0;
-    bool metadataKnown = false;
     for (uint32_t expertIdx = 0; expertIdx < expertPerRank_; expertIdx++) {
         const int64_t expertRowBase = cumMRows_;
         if (!UpdateGroupParams(expertIdx)) {
@@ -949,8 +859,23 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM2GradPhase()
         UpdateGlobalBuffer(gmmAddrInfo, BW_PHASE_GMM2GRAD, expertIdx);
         __gm__ int32_t* dispatchFlag = bwFlagDispatch_ + expertIdx * INT_CACHELINE;
         if constexpr (GmOutput) {
-            if (UseStagedWave(nonemptyOrdinal)) {
-                const auto plan = MakeWavePlan(expertIdx, Get<M_VALUE>(problemShape_), precedingTiles);
+            const bool recomputeRows = UseRecomputeDhpRows(nonemptyOrdinal);
+            if (recomputeRows || UseStagedWave(nonemptyOrdinal)) {
+                const auto rows = Get<M_VALUE>(problemShape_);
+                const auto plan = recomputeRows ? WavePlan(rows, n_ / 2, blockNum_, 0, precedingTiles)
+                                                : MakeWavePlan(expertIdx, rows, precedingTiles);
+                if (recomputeRows) {
+                    if (timer_) timer_->SetSlice(expertIdx, 0, rows);
+                    if constexpr (g_coreType == AscendC::AIC) {
+                        MegaMoeTrainTimerWaitScope wait(timer_, MegaMoeTrainTimer::AIC_BW_DHP_WAIT);
+                        while (ReadGmByPassDCache(dispatchFlag) < dispatchTarget) {
+                        }
+                    } else {
+                        MegaMoeTrainTimerWaitScope wait(timer_, MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD_WAIT);
+                        while (ReadGmByPassDCache(RecomputeReady(expertIdx)) < static_cast<int32_t>(blockNum_)) {
+                        }
+                    }
+                }
                 // Each AIC takes a prefix of its own P2 output tiles, preserving the complete expert K.
                 auto borrow = [&](__gm__ int32_t* priority, uint32_t arrivals) __aicore__ {
                     if constexpr (g_coreType == AscendC::AIC) {
@@ -1002,30 +927,20 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GMM2GradPhase()
                     }
                     return false;
                 };
-                GMM2GradStagedWave(
-                    gmm2Params, epilogueOp_, problemShape_, gmmAddrInfo,
-                    bwWs_.ptrHp + expertRowBase * (n_ / 2) * sizeof(bfloat16_t), expertIdx, expertRowBase, plan,
-                    RowSliceReady(bwWs_.ptrStagedReady, expertRowBase, expertIdx, L1_TILE_M), startBlockIdx, borrow);
+                GMM2GradStagedWave(gmm2Params, epilogueOp_, problemShape_, gmmAddrInfo,
+                                   bwWs_.ptrHp + expertRowBase * (n_ / 2) * sizeof(bfloat16_t), expertIdx,
+                                   expertRowBase, plan,
+                                   RowSliceReady(bwWs_.ptrStagedReady, expertRowBase, expertIdx, L1_TILE_M),
+                                   startBlockIdx, recomputeRows, borrow);
                 if (timer_) timer_->SetWave(MegaMoeTrainTimerSchema::NO_WAVE);
                 precedingTiles += plan.tiles;
                 const uint32_t columns = (n_ / 2 + L1_TILE_N - 1U) / L1_TILE_N;
                 startBlockIdx = (startBlockIdx + uint64_t(plan.tiles) * columns) % blockNum_;
             } else {
-                const auto rowReady = MakeDispatchRowReady(expertIdx, nonemptyOrdinal);
-                if constexpr (g_coreType == AscendC::AIC) {
-                    if (!metadataKnown && ProducerPhaseSupported(rowReady, blockNum_)) {
-                        // Wait once for restored count-table/producer metadata.
-                        // This flag does not signal completion of dO payload DMA.
-                        while (ReadGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwFlagDHpReady) + 1) !=
-                               1) {
-                        }
-                        metadataKnown = true;
-                    }
-                }
                 GMM2GradSwiGLUGradGM(
                     gmm2Params, epilogueOp_, problemShape_, gmmAddrInfo,
                     bwWs_.ptrHp + expertRowBase * (n_ / 2) * sizeof(bfloat16_t), startBlockIdx, nextTargetAiv,
-                    expertIdx, expertRowBase, dispatchFlag, dispatchTarget, rowReady,
+                    expertIdx, expertRowBase, dispatchFlag, dispatchTarget,
                     reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwFlagDHpReady) + expertIdx * INT_CACHELINE);
             }
             if constexpr (g_coreType == AscendC::AIV) {
@@ -1546,16 +1461,11 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
 
         RestoreTokenPerExpert();
         SyncAll<true>();
-        if (MegaMoeBF16Training::UseGmForBackwardDataGrad(savedGateUpMode_) && splitExperts_ > 0 && aivCoreIdx_ == 0) {
-            // Word1 of expert0's dHp flag cacheline signals that every AIV
-            // has finished count-table restore and producer metadata setup.
-            AtomicAdd(reinterpret_cast<__gm__ int32_t*>(bwWs_.ptrBwFlagDHpReady) + 1, int32_t(1));
-        }
 
         if (subBlockIdx_ == 0) {
             // AIV0s pull peers' raw route dY into packed dO for all experts.
-            // Every producer band publishes bwFlagDispatch_[expert]; eligible
-            // saved-mode experts also publish row progress. P1 AICs wait for
+            // Whole-expert Dispatch signals the expert; Wave Dispatch signals
+            // each canonical block. P1 AICs wait for
             // the selected readiness before reading dO, allowing earlier
             // experts' work to overlap later experts' dispatch.
             cumMRows_ = 0;
@@ -1573,7 +1483,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
                     DispatchStagedBackward(dst, expertIdx, plan);
                     precedingTiles += plan.tiles;
                 } else {
-                    DispatchTokensBackward(dst, expertIdx, nonemptyOrdinal);
+                    DispatchTokensBackward(dst, expertIdx);
                 }
                 ++nonemptyOrdinal;
                 cumMRows_ += Get<M_VALUE>(problemShape_);
@@ -1594,7 +1504,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
     }
 
     // ---- P1: GMM2 dHp + SwiGLU backward epilogue ----
-    // GM output: AICs read dO after producer-row or complete-expert readiness.
+    // GM output: AICs wait for a Wave block or a complete expert before reading dO.
     // AIVs wait for the dHp rows they consume when slice readiness is enabled;
     // otherwise they wait for all expert arrivals. Each owner replaces dHp
     // with Hp after its dP/Hp/dZ computation has consumed the original value.
@@ -1603,7 +1513,9 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
     // completion handshake before reuse. Gate/Up comes from P0-C scratch.
     // P0 staging is disjoint from both work paths.
     const bool useGmDataGrad = MegaMoeBF16Training::UseGmForBackwardDataGrad(savedGateUpMode_);
-    if (useGmDataGrad) {
+    // For recompute, only P1 needs GM dHp so one AIV can reduce a full row.
+    // The later dX/Combine and dW phases keep their existing ownership.
+    if (useGmDataGrad || MegaMoeBF16Training::UseWholeRowTopkGrad(savedGateUpMode_, n_ / 2)) {
         if (params_.tilingData->transW) {
             GMM2GradPhase<true, true>();
         } else {

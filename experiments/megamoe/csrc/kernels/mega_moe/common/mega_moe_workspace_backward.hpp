@@ -16,13 +16,13 @@ namespace MegaMoeBF16Training {
 struct BackwardWorkspaceLayout {
     uint64_t doOffset, recomputeGateOffset, recomputeUpOffset;
     uint64_t dzOffset, hpOffset, dpOffset, dispatchReadyOffset, aivReadyOffset, hDoneOffset;
-    uint64_t dhpReadyOffset, dzReadyOffset, dxReadyOffset, doReleasedOffset, progressOffset;
+    uint64_t dhpReadyOffset, dzReadyOffset, dxReadyOffset, doReleasedOffset;
     uint64_t controlOffset, totalBytes;
-    uint64_t stagedReadyOffset;
+    uint64_t stagedReadyOffset, wideDpOffset;
     bool gmDataGrad, recompute;
     MEGA_MOE_WORKSPACE_HD constexpr BackwardWorkspaceLayout(uint64_t e, uint64_t r, uint64_t h, uint64_t n,
-                                                            uint64_t world, uint64_t producers, uint32_t splitExperts,
-                                                            uint32_t savedMode)
+                                                            uint32_t splitExperts, uint32_t savedMode,
+                                                            uint32_t vectorCores)
         : doOffset(0),
           recomputeGateOffset(0),
           recomputeUpOffset(0),
@@ -36,10 +36,10 @@ struct BackwardWorkspaceLayout {
           dzReadyOffset(0),
           dxReadyOffset(0),
           doReleasedOffset(0),
-          progressOffset(0),
           controlOffset(0),
           totalBytes(0),
           stagedReadyOffset(0),
+          wideDpOffset(0),
           gmDataGrad(UseGmForBackwardDataGrad(savedMode)),
           recompute(savedMode == kSaveNone)
     {
@@ -54,6 +54,10 @@ struct BackwardWorkspaceLayout {
         offset += AlignUp(r * n, 512);
         dpOffset = offset;
         offset += AlignUp(4 * r * BackwardTopkPartialCount(savedMode, n / 2), 512);
+        if (UseStreamedTopkGrad(savedMode, n / 2)) {
+            wideDpOffset = offset;
+            offset += vectorCores * (n / 2) * sizeof(float);
+        }
         controlOffset = offset;
         dispatchReadyOffset = offset;
         offset += AlignUp(4 * e * 16, 128);
@@ -69,17 +73,16 @@ struct BackwardWorkspaceLayout {
         offset += AlignUp(4 * e * 16, 128);
         doReleasedOffset = offset;
         if (gmDataGrad) offset += AlignUp(4 * e * 16, 128);
-        progressOffset = AlignUp(offset, 64);
-        totalBytes = BackwardDispatchProgressLayout::TotalBytes(offset, splitExperts, world, producers, savedMode);
-        if (splitExperts && UseBackwardStagedWave(savedMode, n / 2)) {
+        totalBytes = offset;
+        if (splitExperts && (UseBackwardStagedWave(savedMode, n / 2) || UseRecomputeDhpRowReady(savedMode, n / 2))) {
             stagedReadyOffset = AlignUp(totalBytes, 64);
             totalBytes = stagedReadyOffset + ((r + 127U) / 128U + e) * 64;
         }
     }
     template <typename Tiling>
-    MEGA_MOE_WORKSPACE_HD explicit BackwardWorkspaceLayout(const Tiling& t, uint32_t splitExperts)
-        : BackwardWorkspaceLayout(t.expertPerRank, t.maxOutputSize, t.k, t.n, t.epWorldSize, t.blockNumPerEP,
-                                  splitExperts, t.savedGateUpMode)
+    MEGA_MOE_WORKSPACE_HD explicit BackwardWorkspaceLayout(const Tiling& t, uint32_t splitExperts, uint32_t vectorCores)
+        : BackwardWorkspaceLayout(t.expertPerRank, t.maxOutputSize, t.k, t.n, splitExperts, t.savedGateUpMode,
+                                  vectorCores)
     {
     }
 };

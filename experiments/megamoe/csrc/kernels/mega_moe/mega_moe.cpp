@@ -187,7 +187,7 @@ __mix__(1, 2) __global__ __aicore__
     timer.Start(MegaMoeTrainTimer::KERNEL_TIMING);
     MegaMoeBF16Backward<TopkWeightT> op;
     op.Init(context, gradY, topkWeights, weight1, weight2, gradX, gradTopkWeights, gradWeight1, gradWeight2,
-            trainingSavedState, dispatchOutput, backwardWorkspace, &tilingData, tilingData.backwardSplitExperts);
+            trainingSavedState, dispatchOutput, backwardWorkspace, &tilingData);
     op.SetTimer(timer.Enabled() ? &timer : nullptr);
     op.Process();
     if (timer.Enabled()) AscendC::PipeBarrier<PIPE_ALL>();

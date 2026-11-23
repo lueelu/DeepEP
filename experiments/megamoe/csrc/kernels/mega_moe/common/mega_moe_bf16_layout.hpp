@@ -79,8 +79,7 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr bool CanUseCompactTokenCountExchange(uint64_
            expertPerRank <= kCompactTokenCountMaxLocalExperts;
 }
 
-MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseCompactTokenCountExchangeByDefault(uint64_t worldSize,
-                                                                               uint64_t expertPerRank)
+MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseCompactTokenCountExchange(uint64_t worldSize, uint64_t expertPerRank)
 {
     return worldSize >= kCompactTokenCountAutoMinEp && CanUseCompactTokenCountExchange(worldSize, expertPerRank);
 }
@@ -134,15 +133,26 @@ struct PeerPayloadLayout {
 enum SavedGateUpMode : uint32_t { kSaveNone = 1, kSaveBf16 = 2, kSaveMxFp8 = 3 };
 
 // A complete row uses 6F bytes of BF16 inputs, 4F bytes of FP32 products
-// and a padded scalar result. Wider rows keep the tiled partial path.
+// and a padded scalar result. All three save modes stream wider rows through
+// one reusable FP32 row per AIV and apply the same reduction tree.
+MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseStreamedTopkGrad(uint32_t mode, uint64_t f)
+{
+    return (mode == kSaveNone || mode == kSaveBf16 || mode == kSaveMxFp8) && f > 16384 && f % 256 == 0;
+}
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseWholeRowTopkGrad(uint32_t mode, uint64_t f)
 {
-    return mode == kSaveBf16 && f > 0 && f <= 16384 && f % 64 == 0;
+    return UseStreamedTopkGrad(mode, f) ||
+           (f > 0 && f <= 16384 &&
+            ((mode == kSaveMxFp8 && f % 256 == 0) || ((mode == kSaveBf16 || mode == kSaveNone) && f % 64 == 0)));
+}
+MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseRecomputeDhpRowReady(uint32_t mode, uint64_t f)
+{
+    return mode == kSaveNone && UseWholeRowTopkGrad(mode, f) && !UseStreamedTopkGrad(mode, f);
 }
 constexpr uint32_t kWholeRowTopkResultBytes = 8U * 1024U;
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseBackwardStagedWave(uint32_t mode, uint64_t f)
 {
-    return UseWholeRowTopkGrad(mode, f) || (mode == kSaveMxFp8 && f > 0 && f % 32 == 0);
+    return f > 0 && f <= 16384 && ((mode == kSaveBf16 && f % 64 == 0) || (mode == kSaveMxFp8 && f % 32 == 0));
 }
 MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t TopkGradBatchRows(uint32_t columns)
 {
@@ -154,24 +164,56 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t TopkGradBatchRows(uint32_t columns)
 // CANN's FP32 contiguous AR sum first selects an A tile by core occupancy,
 // then splits R to fit its four input buffers. The rank's complete routed
 // row count is needed: one-row AR can have a different addition tree.
-MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t TopkGradReductionWidth(uint64_t rows, uint32_t columns, uint32_t cores)
+struct TopkGradReductionPlan {
+    uint32_t width;
+    uint32_t stripesPerGroup;
+};
+MEGA_MOE_BF16_HOST_DEVICE constexpr TopkGradReductionPlan MakeTopkGradReductionPlan(uint64_t rows, uint32_t columns,
+                                                                                    uint32_t cores)
 {
-    if (rows == 0 || columns == 0 || cores == 0) return columns;
+    if (rows == 0 || columns == 0 || cores == 0) return {columns, 1};
     constexpr uint64_t elements = (248U * 1024U - 16U * 1024U - 2U * 512U) / 16U;
-    const uint64_t rTasks = (columns + 63U) / 64U;
+    auto ceilDiv = [](uint64_t n, uint64_t d) { return (n + d - 1U) / d; };
+    auto occupancy = [&](uint64_t outerA, uint64_t stripes) {
+        const uint64_t tasks = outerA * stripes;
+        const uint64_t active = tasks / ceilDiv(tasks, cores);
+        return active > outerA ? active / outerA * outerA : active;
+    };
+    // CANN 9.2 ReduceSum selects split sizes above 95% AIV occupancy.
+    constexpr uint32_t occupancyPercent = 95U;
+    const uint64_t rTasks = ceilDiv(columns, 64U);
     uint64_t best = 0, aTile = 1;
     for (uint64_t candidate = 1; candidate <= rows && candidate <= 128U; ++candidate) {
-        const uint64_t outerA = (rows + candidate - 1U) / candidate;
-        const uint64_t tasks = outerA * rTasks;
-        uint64_t active = tasks / ((tasks + cores - 1U) / cores);
-        if (active > outerA) active = active / outerA * outerA;
-        if (active * 100U > cores * 85U && active > best) aTile = candidate;
+        const uint64_t active = occupancy(ceilDiv(rows, candidate), rTasks);
+        if (active * 100U > cores * occupancyPercent && active > best) aTile = candidate;
         best = active > best ? active : best;
     }
-    if (aTile * columns <= elements) return columns;
-    uint32_t width = static_cast<uint32_t>(elements / aTile) / 8U * 8U;
-    while (width > 1U && columns % width != 0U) --width;
-    return width;
+    if (aTile * columns <= elements) return {columns, 1};
+    const uint64_t outerA = ceilDiv(rows, aTile);
+    const uint32_t capacity = static_cast<uint32_t>(elements / aTile);
+    uint32_t width = capacity / 8U * 8U;
+    for (uint32_t w = width; w > 64U; w -= 8U) {
+        if (occupancy(outerA, ceilDiv(columns, w)) * 100U > cores * occupancyPercent) {
+            width = w;
+            break;
+        }
+    }
+    // CANN looks for an even divisor down to half the available R capacity,
+    // then aligns to a 32-byte block. The last stripe can be shorter.
+    for (uint32_t w = width; w >= capacity / 2U; --w) {
+        if (columns % w == 0) {
+            width = w / 8U * 8U;
+            break;
+        }
+    }
+    const uint32_t stripes = static_cast<uint32_t>(ceilDiv(columns, width));
+    const uint64_t tasks = outerA * stripes;
+    uint64_t blocks = ceilDiv(tasks, ceilDiv(tasks, cores));
+    if (blocks > outerA) {
+        const uint64_t up = ceilDiv(blocks, outerA) * outerA;
+        blocks = up <= cores ? up : blocks / outerA * outerA;
+    }
+    return {width, static_cast<uint32_t>(ceilDiv(stripes, ceilDiv(blocks, outerA)))};
 }
 
 MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t BackwardTopkPartialCount(uint32_t mode, uint64_t f)
@@ -181,17 +223,6 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t BackwardTopkPartialCount(uint32_t m
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseGmForBackwardDataGrad(uint32_t savedMode)
 {
     return savedMode != kSaveNone;
-}
-
-// The caller supplies the effective (capacity-clipped) local expert rows.
-// A single M tile has no inter-row-tile pipeline to overlap with Dispatch.
-// ordinal still counts every non-empty expert; a fallback does not promote
-// a later expert into the first k selected experts.
-MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseBackwardDispatchRowReady(uint32_t savedMode, uint32_t ordinal,
-                                                                     uint32_t splitExperts, uint64_t effectiveRows,
-                                                                     uint64_t computeRows)
-{
-    return UseGmForBackwardDataGrad(savedMode) && ordinal < splitExperts && effectiveRows > computeRows;
 }
 
 // v2 appends three uint32 bit planes only for explicit MXFP8 with clipping.
@@ -393,32 +424,11 @@ struct ForwardTransientWorkspaceLayout {
     }
 };
 
-// Backward-only per-producer row-progress suffix; preceding workspace and
-// saved-state offsets remain fixed. Host allocation zeros these counters
-// before backward Dispatch publishes readiness. These are synchronization
-// counters used for dispatch readiness.
-struct BackwardDispatchProgressLayout {
-    static constexpr uint64_t kSlotBytes = 64;
-    MEGA_MOE_BF16_HOST_DEVICE static constexpr uint64_t ExtraBytes(uint64_t experts, uint64_t sources,
-                                                                   uint64_t producersPerSource, uint32_t savedMode)
-    {
-        return UseGmForBackwardDataGrad(savedMode) ? experts * sources * producersPerSource * kSlotBytes : 0;
-    }
-    MEGA_MOE_BF16_HOST_DEVICE static constexpr uint64_t TotalBytes(uint64_t legacyBytes, uint64_t experts,
-                                                                   uint64_t sources, uint64_t producersPerSource,
-                                                                   uint32_t savedMode)
-    {
-        return UseGmForBackwardDataGrad(savedMode) && experts != 0
-                   ? AlignUp(legacyBytes, kSlotBytes) + ExtraBytes(experts, sources, producersPerSource, savedMode)
-                   : legacyBytes;
-    }
-};
-
-// Backward uses row readiness for up to seven local experts; larger expert counts use whole-expert readiness.
-MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t DefaultBackwardDispatchSplitExperts(uint32_t savedMode,
-                                                                                 uint32_t localExperts)
+// Saved Wave and row-ready recompute allocate a counter for each canonical M block.
+MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t BackwardDispatchSplitExperts(uint32_t mode, uint64_t f,
+                                                                          uint32_t localExperts)
 {
-    return UseGmForBackwardDataGrad(savedMode) && localExperts <= 7U ? localExperts : 0U;
+    return UseBackwardStagedWave(mode, f) || UseRecomputeDhpRowReady(mode, f) ? localExperts : 0U;
 }
 
 }  // namespace MegaMoeBF16Training

@@ -6,7 +6,6 @@
 #include "kernel_launch.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <limits>
 
 #include "kernels/mega_moe/common/mega_moe_bf16_layout.hpp"
@@ -116,20 +115,9 @@ BackwardResult BF16Plan::backward(torch::Tensor gradY, torch::Tensor topkWeights
     TORCH_CHECK(static_cast<std::size_t>(trainingSavedState.numel()) * trainingSavedState.element_size() >=
                     savedStateLayout.totalBytes,
                 "MegaMoe BF16 training_saved_state is too small: need ", savedStateLayout.totalBytes, " bytes");
-    uint32_t splitExperts = MegaMoeBF16Training::DefaultBackwardDispatchSplitExperts(
-        tiling.savedGateUpMode, static_cast<uint32_t>(expertPerRank));
-    if (MegaMoeBF16Training::UseBackwardStagedWave(tiling.savedGateUpMode, tiling.n / 2)) {
-        splitExperts = static_cast<uint32_t>(expertPerRank);
-    }
-    // Set to zero to wait for a complete expert throughout backward.
-    const char* override = std::getenv("MEGAMOE_BF16_BWD_DISPATCH_SPLIT_EXPERTS");
-    if (override != nullptr) {
-        const std::string policy(override);
-        TORCH_CHECK(policy == "auto" || policy == "0",
-                    "MEGAMOE_BF16_BWD_DISPATCH_SPLIT_EXPERTS accepts auto or 0 (whole expert)");
-        if (policy == "0") splitExperts = 0;
-    }
-    const MegaMoeBF16BackwardWorkspaceLayout backwardLayout(tiling, splitExperts);
+    const uint32_t splitExperts = MegaMoeBF16Training::BackwardDispatchSplitExperts(
+        tiling.savedGateUpMode, tiling.n / 2, static_cast<uint32_t>(expertPerRank));
+    const MegaMoeBF16BackwardWorkspaceLayout backwardLayout(tiling, splitExperts, platform_.aic * 2);
     auto backwardWorkspace = AllocateBackwardWorkspace(backwardLayout, gradY);
 
     // P5 unpermutes and sums packed dX into every gradX token row; P6 writes

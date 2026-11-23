@@ -192,15 +192,15 @@ BF16 支持 EP=2～1024，E 须能被 EP 整除，每卡 1～32 个路由专家�
 
 | `gmm1_save_type` | Gate/Up 来源与计算方式 |
 | --- | --- |
-| `bf16` | 读取保存的 BF16 Gate/Up。整行路径一次读取 dHp、Gate、Up，计算 dP、Hp 和 dZ。I 为 64 的倍数且 I ≤ 16384 时使用反向 Wave。 |
-| `mxfp8` | 按行读取每 32 列的量化值和 scale，以 FP32 解码后舍入到 BF16。启用 clipping 时读取同行的掩码。支持 32 列分组的路径使用反向 Wave。 |
-| `none` | 从前向保存或框架重建的 X 中取每个专家的连续行，按整专家重算 GMM1，随后计算梯度。 |
+| `bf16` | 直接读取前向保存的 BF16 Gate/Up，结合 dHp 计算 dP、Hp 和 dZ。 |
+| `mxfp8` | 按行读取每 32 列的量化值和 scale，以 FP32 解码后舍入到 BF16。启用 clipping 时读取同行的掩码。 |
+| `none` | 使用前向保存或框架重建的 X，按整专家重算 GMM1。SwiGLUGrad 等重算的 Gate/Up 和对应的 dHp 就绪后计算。 |
 
-反向 Wave 将每个专家的 dO 按规范行序划为 128 行块，尾块取实际行数。每个专家只选一次块序，Dispatch、dHp、SwiGLUGrad 共用。令 `Cmax` 为接收容量截断后单个源 rank 发给该专家的最大行数。专家行数一波可覆盖、最长源段不足一波，或所有块只占一组时，从本 rank 的起始块依次访问并回绕。其余情况每 `ceil(Cmax / 128)` 块一组，先访问各组第一个块，再访问各组第二个块。访问顺序只影响搬运和计算的先后，各块始终写回自己的规范行地址。
+保存 Gate/Up 时，反向可使用 Wave 调度。每个专家的 dO 按规范行序划为 128 行块，尾块取实际行数。每个专家只选一次块序，Dispatch、dHp、SwiGLUGrad 共用。令 `Cmax` 为接收容量截断后单个源 rank 发给该专家的最大行数。专家的有效行数不超过一波容量时，从本 rank 的起始块依次访问并回绕。超过一波容量时，每 `ceil(Cmax / 128)` 块一组，先访问各组第一个块，再访问各组第二个块。只有一组或每组仅一块时，自然按顺序访问。各块始终写回自己的规范行地址。
 
-AIV 写完本块 dO 后发布 ready。AIC 等本块就绪再算 dHp；SwiGLUGrad 等对应 dHp 列就绪。AIC 等 dO 时可为已有完整 dO 和 Hp 的前序专家算一个 dW2 输出 tile，算完重查 dO。后续 dW2 跳过已完成的 tile。dW1、dW2 的每个输出 tile 始终沿整专家的行做归约。各 rank 设置 `MEGAMOE_BF16_BWD_DISPATCH_SPLIT_EXPERTS=0` 可切换到等整专家 dO 就绪，dW2 全部在原阶段计算。
+AIV 写完本块 dO 后发布 ready。AIC 等本块就绪再算 dHp；SwiGLUGrad 等对应 dHp 列就绪。AIC 等 dO 时可为已有完整 dO 和 Hp 的前序专家算一个 dW2 输出 tile，算完重查 dO。后续 dW2 跳过已完成的 tile。dW1、dW2 的每个输出 tile 始终沿整专家的行做归约。
 
-本行 dP 算完后 Hp 才可覆盖 dHp；dHp 和 dW2 读完该专家的 dO 后 dX 才可覆盖 dO。dP 按全 rank 的路由行数和全部 AIV 划分归约任务。各专家按源 rank 前缀将结果写入独立 SHMEM 回传区，每条 route 的 dP 与输入 p 同类型。跨卡发送核回读确认后进入屏障，源卡再恢复原 token 和 TopK slot 顺序。
+每个元素的 dHp 参与乘积后，Hp 才可覆盖同一位置。dHp 和 dW2 读完该专家的 dO 后 dX 才可覆盖 dO。三种保存模式的 dP 均按对应设备小算子的 FP32 整行求和顺序归约。各专家按源 rank 前缀将结果写入独立 SHMEM 回传区，每条 route 的 dP 与输入 p 同类型。跨卡发送核回读确认后进入屏障，源卡再恢复原 token 和 TopK slot 顺序。
 
 ## 2. 编译安装
 

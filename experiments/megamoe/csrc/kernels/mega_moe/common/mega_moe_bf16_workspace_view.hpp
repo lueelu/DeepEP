@@ -215,6 +215,7 @@ struct BackwardWorkspaceInfo {
     GM_ADDR ptrGradZ;
     GM_ADDR ptrHp;
     GM_ADDR ptrDpProducts;
+    GM_ADDR ptrWideDp;
     GM_ADDR ptrDX;
     GM_ADDR ptrBwFlagDOReleased;
     GM_ADDR ptrBwFlagDZReady;
@@ -223,7 +224,6 @@ struct BackwardWorkspaceInfo {
     GM_ADDR ptrBwFlagDispatchToGmm2Grad;
     GM_ADDR ptrBwFlagAiv1Ready;
     GM_ADDR ptrBwFlagHDone;
-    GM_ADDR ptrBwDispatchProgress;
     GM_ADDR ptrStagedReady;
     int64_t workspaceSize;
 
@@ -232,11 +232,13 @@ struct BackwardWorkspaceInfo {
     __aicore__ inline BackwardWorkspaceInfo(GM_ADDR base, const MegaMoeBf16TilingData* tilingData,
                                             uint32_t splitExperts)
     {
-        const MegaMoeBF16Training::BackwardWorkspaceLayout layout(*tilingData, splitExperts);
+        const MegaMoeBF16Training::BackwardWorkspaceLayout layout(*tilingData, splitExperts,
+                                                                  2U * AscendC::GetBlockNum());
         ptrDO = base + layout.doOffset;
         ptrGradZ = base + layout.dzOffset;
         ptrHp = base + layout.hpOffset;
         ptrDpProducts = base + layout.dpOffset;
+        ptrWideDp = layout.wideDpOffset ? base + layout.wideDpOffset : nullptr;
         ptrBwFlagDispatchToGmm2Grad = base + layout.dispatchReadyOffset;
         ptrBwFlagAiv1Ready = base + layout.aivReadyOffset;
         ptrBwFlagHDone = base + layout.hDoneOffset;
@@ -247,7 +249,6 @@ struct BackwardWorkspaceInfo {
         ptrRecomputeUp = layout.recompute ? base + layout.recomputeUpOffset : nullptr;
         ptrDX = layout.gmDataGrad ? ptrDO : nullptr;
         ptrBwFlagDOReleased = layout.gmDataGrad ? base + layout.doReleasedOffset : nullptr;
-        ptrBwDispatchProgress = layout.gmDataGrad && splitExperts ? base + layout.progressOffset : nullptr;
         ptrStagedReady = layout.stagedReadyOffset ? base + layout.stagedReadyOffset : nullptr;
         workspaceSize = layout.totalBytes;
     }

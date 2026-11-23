@@ -7,7 +7,6 @@
 from ctypes import c_float
 from dataclasses import dataclass
 import math
-import os
 
 import torch
 from ._autograd import BF16Function
@@ -60,7 +59,6 @@ def prepare_plan(b, bs, limit, save_type):
         b.max_recv_tokens,
         b.topk_weights.dtype,
         b.need_grad,
-        os.environ.get("MEGAMOE_BF16_TOKEN_COUNT_EXCHANGE", "auto"),
         mode,
         limit,
     )

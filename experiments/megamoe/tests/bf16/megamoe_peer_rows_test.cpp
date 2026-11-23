@@ -29,6 +29,16 @@ struct Prefix {
 static void CheckBackwardWaveRows()
 {
     constexpr uint32_t cores = 32, experts = 4;
+    // Each peer falls three rows short of a wave. The first wave still
+    // draws one complete canonical tile from each of six different peers.
+    const std::vector<uint32_t> peerEnds{765, 1530, 2295, 3060, 3825, 4590, 5355, 6120};
+    const MegaMoeBF16Training::BackwardWavePlan geometry(peerEnds.back(), 3072, cores, 0, 0);
+    const auto chunk = geometry.SelectChunkTiles(Prefix{peerEnds}, 8, 1, 0);
+    const MegaMoeBF16Training::BackwardWavePlan firstWave(peerEnds.back(), 3072, cores, 0, 0, chunk);
+    for (uint32_t i = 0; i < firstWave.groups; ++i) {
+        const auto row = firstWave.TileOffset(i) * firstWave.tileM;
+        assert(row >= i * 765 && row + firstWave.tileM <= peerEnds[i]);
+    }
     std::mt19937 rng(20261120);
     for (uint32_t ep : {8U, 16U, 32U, 128U}) {
         for (uint32_t scenario = 0; scenario < 10; ++scenario) {
@@ -155,8 +165,26 @@ static void CheckDhpWaveOwnership()
     assert(std::all_of(work.begin(), work.end(), [](unsigned count) { return count == 108; }));
 }
 
+static void CheckTokenCountExchange()
+{
+    using namespace MegaMoeBF16Training;
+    static_assert(!UseCompactTokenCountExchange(8, 4));
+    static_assert(UseCompactTokenCountExchange(512, 4));
+    static_assert(!UseCompactTokenCountExchange(512, 9));
+    constexpr CompactTokenCountExchangeLayout dense(8, 4, false);
+    constexpr CompactTokenCountExchangeLayout compact(8, 4, true);
+    static_assert(compact.enabled && !dense.enabled);
+    static_assert(compact.packetBytes >= 8 * kCompactTokenCountPacketBytes);
+    static_assert(compact.blockSumsOffset == compact.packetOffset + compact.packetBytes);
+    static_assert(compact.tokenCountsOffset == compact.blockSumsOffset + compact.blockSumsBytes);
+    static_assert(compact.payloadOffset - dense.payloadOffset == compact.packetBytes + compact.blockSumsBytes);
+    static_assert(compact.tokenCountStride == dense.tokenCountStride &&
+                  compact.tokenCountsBytes == dense.tokenCountsBytes);
+}
+
 int main()
 {
+    CheckTokenCountExchange();
     CheckBackwardWaveRows();
     CheckDhpWaveOwnership();
     // A prefix above 2^32 still rotates the remainder to the correct worker.
@@ -181,23 +209,25 @@ int main()
     static_assert(fp32Payload.totalBytes == fp32Payload.topkGradOffset + 2048);
     static_assert(bf16Payload.totalBytes == bf16Payload.topkGradOffset + 1024);
     using MegaMoeBF16Training::BackwardWorkspaceLayout;
-    const BackwardWorkspaceLayout largeEp(4, 24576, 7168, 6144, 128, 32, 4, MegaMoeBF16Training::kSaveBf16);
-    const BackwardWorkspaceLayout smallEp(4, 24576, 7168, 6144, 8, 32, 4, MegaMoeBF16Training::kSaveBf16);
-    assert(largeEp.dzOffset == 24576ULL * 7168U * sizeof(uint16_t));
-    assert(smallEp.dzOffset == largeEp.dzOffset);
-    assert(largeEp.stagedReadyOffset != 0);
-    assert(largeEp.totalBytes - largeEp.stagedReadyOffset == (24576 / 128 + 4) * 64);
-    const BackwardWorkspaceLayout mx(4, 24576, 7168, 6144, 128, 32, 4, MegaMoeBF16Training::kSaveMxFp8);
-    const BackwardWorkspaceLayout none(4, 24576, 7168, 6144, 128, 32, 4, MegaMoeBF16Training::kSaveNone);
-    assert(mx.stagedReadyOffset != 0);
-    assert(none.stagedReadyOffset == 0);
+    const BackwardWorkspaceLayout saved(4, 24576, 7168, 6144, 4, MegaMoeBF16Training::kSaveBf16, 64);
+    assert(saved.dzOffset == 24576ULL * 7168U * sizeof(uint16_t));
+    assert(saved.stagedReadyOffset != 0);
+    assert(saved.totalBytes - saved.stagedReadyOffset == (24576 / 128 + 4) * 64);
     using namespace MegaMoeBF16Training;
     static_assert(UseBackwardStagedWave(kSaveBf16, 2048) && UseBackwardStagedWave(kSaveMxFp8, 2080));
+    static_assert(UseBackwardStagedWave(kSaveBf16, 16384) && UseBackwardStagedWave(kSaveMxFp8, 16384));
+    static_assert(!UseBackwardStagedWave(kSaveMxFp8, 16416));
     static_assert(!UseBackwardStagedWave(kSaveBf16, 2080) && !UseBackwardStagedWave(kSaveBf16, 16448));
     static_assert(!UseBackwardStagedWave(kSaveNone, 2048) && !UseBackwardStagedWave(kSaveMxFp8, 0));
-    for (auto mode : {kSaveBf16, kSaveMxFp8}) {
-        const BackwardWorkspaceLayout escape(16, 24576, 7168, 4096, 32, 32, 0, mode);
-        const BackwardWorkspaceLayout wave(16, 24576, 7168, 4096, 32, 32, 16, mode);
+    static_assert(UseRecomputeDhpRowReady(kSaveNone, 3072) && !UseRecomputeDhpRowReady(kSaveNone, 16640));
+    static_assert(!UseRecomputeDhpRowReady(kSaveNone, 2080) && !UseRecomputeDhpRowReady(kSaveBf16, 3072));
+    for (auto mode : {kSaveBf16, kSaveMxFp8, kSaveNone}) {
+        for (auto localExperts : {4U, 8U}) {
+            assert(BackwardDispatchSplitExperts(mode, 16384, localExperts) == localExperts);
+            assert(BackwardDispatchSplitExperts(mode, 16640, localExperts) == 0U);
+        }
+        const BackwardWorkspaceLayout escape(16, 24576, 7168, 4096, 0, mode, 64);
+        const BackwardWorkspaceLayout wave(16, 24576, 7168, 4096, 16, mode, 64);
         assert(!escape.stagedReadyOffset && wave.stagedReadyOffset);
     }
     assert(MetadataFits(128, 4));
@@ -205,13 +235,25 @@ int main()
     assert(MetadataBytes(8, 4) == 4096 && MetadataBytes(1024, 2) == 16384);
     assert(ScratchFits(7168, 1024, 2));
     assert(!ScratchFits(32768, 8, 4));
+    for (auto mode : {kSaveBf16, kSaveNone, kSaveMxFp8}) {
+        const BackwardWorkspaceLayout wide(4, 128, 256, 2 * 16640, 0, mode, 64);
+        assert(wide.stagedReadyOffset == 0);
+        assert(wide.wideDpOffset && wide.controlOffset - wide.wideDpOffset == 64U * 16640U * sizeof(float));
+        assert(MegaMoeBF16Training::BackwardTopkPartialCount(mode, 16640) == 1);
+    }
     static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveBf16, 3072) == 1);
-    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveNone, 3072) == 12);
-    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveMxFp8, 3072) == 12);
+    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveNone, 3072) == 1);
+    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveMxFp8, 3072) == 1);
     // These reduction widths reproduce the reference sum order for dP.
-    static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24467, 3072, 64) == 3072);
-    static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24258, 3072, 64) == 1536);
-    static_assert(MegaMoeBF16Training::TopkGradReductionWidth(24693, 3072, 64) == 1536);
+    static_assert(MegaMoeBF16Training::MakeTopkGradReductionPlan(24467, 3072, 64).width == 3072);
+    static_assert(MegaMoeBF16Training::MakeTopkGradReductionPlan(24258, 3072, 64).width == 1536);
+    static_assert(MegaMoeBF16Training::MakeTopkGradReductionPlan(24693, 3072, 64).width == 1536);
+    constexpr auto grouped = MegaMoeBF16Training::MakeTopkGradReductionPlan(1539, 16640, 64);
+    static_assert(grouped.width == 256 && grouped.stripesPerGroup == 33);
+    constexpr auto shortTail = MegaMoeBF16Training::MakeTopkGradReductionPlan(498, 2560, 64);
+    static_assert(shortTail.width == 504 && shortTail.stripesPerGroup == 6);
+    constexpr auto fourGroups = MegaMoeBF16Training::MakeTopkGradReductionPlan(486, 1024, 64);
+    static_assert(fourGroups.width == 256 && fourGroups.stripesPerGroup == 1);
     for (uint32_t f = 64; f <= 16384; f += 64) {
         const auto batch = MegaMoeBF16Training::TopkGradBatchRows(f);
         assert(batch >= 1);
@@ -276,7 +318,7 @@ int main()
     }
     for (uint32_t mode : {1U, 2U, 3U}) {
         for (uint64_t capacity : {1ULL, 127ULL, 128ULL, 129ULL, 24576ULL}) {
-            const MegaMoeBF16Training::BackwardWorkspaceLayout layout(4, capacity, 7168, 6144, 8, 4, 4, mode);
+            const MegaMoeBF16Training::BackwardWorkspaceLayout layout(4, capacity, 7168, 6144, 4, mode, 64);
             assert(layout.doOffset == 0 && layout.controlOffset < layout.totalBytes);
             assert(layout.dzOffset % 512 == 0 && layout.hpOffset % 512 == 0 && layout.dpOffset % 512 == 0);
             assert(layout.dhpReadyOffset < layout.dzReadyOffset && layout.dzReadyOffset < layout.dxReadyOffset);

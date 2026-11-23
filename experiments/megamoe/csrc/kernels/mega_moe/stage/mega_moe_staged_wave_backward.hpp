@@ -11,6 +11,26 @@
 #endif
 
 namespace MegaMoeBF16Training {
+// Track capacity-clipped rows and the ordinal of each nonempty expert in group-list order.
+struct PreparedExpertCursor {
+    int64_t previousGroupEnd = 0;
+    uint64_t consumedRows = 0;
+    uint32_t nextOrdinal = 0;
+    MEGAMOE_BWD_WAVE_HD inline bool Next(int32_t value, uint32_t listType, uint64_t capacity, uint32_t& rows,
+                                         uint32_t& ordinal)
+    {
+        const int64_t routed = listType == 0 ? static_cast<int64_t>(value) - previousGroupEnd : value;
+        if (listType == 0) previousGroupEnd = value;
+        rows = 0;
+        if (routed <= 0 || consumedRows >= capacity) return false;
+        const uint64_t available = capacity - consumedRows, positive = static_cast<uint64_t>(routed);
+        rows = static_cast<uint32_t>(positive < available ? positive : available);
+        ordinal = nextOrdinal++;
+        consumedRows += rows;
+        return true;
+    }
+};
+
 // Split a canonical expert-local interval at source-rank boundaries. The
 // destination is the original row index even when a wave visits this tile early.
 template <class Prefix, class Copy>
@@ -58,8 +78,8 @@ struct BackwardWavePlan {
     {
     }
 
-    // Interleave chunks when a single peer can fill a wave. Size each chunk from
-    // the longest capacity-clipped peer range. A unit chunk keeps sequential visits.
+    // Size chunks from the longest capacity-clipped peer range to spread a wave
+    // across sources. A unit chunk keeps sequential visits.
     template <class Prefix>
     MEGAMOE_BWD_WAVE_HD inline uint32_t SelectChunkTiles(const Prefix& prefix, uint32_t sources, uint32_t experts,
                                                          uint32_t expert) const
@@ -74,7 +94,7 @@ struct BackwardWavePlan {
             begin = end;
         }
         const uint32_t size = maxRows / tileM + (maxRows % tileM != 0);
-        return maxRows >= groups * tileM && size < tiles ? size : 1U;
+        return size < tiles ? size : 1U;
     }
 
     MEGAMOE_BWD_WAVE_HD inline uint32_t TileOffset(uint32_t visit) const
