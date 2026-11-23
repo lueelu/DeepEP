@@ -72,7 +72,6 @@ struct BlockCommSchedulerGmmAllToAllVTargetOrder {
     uint32_t commLoops{0};
 
     uint32_t inputGroupNum[MoeConstraints::EP_SIZE_LIMIT]{};
-    uint32_t inputGroupNumInLocalExpert[MoeConstraints::EP_SIZE_LIMIT][MoeConstraints::LOCAL_EXPERT_NUM_LIMIT]{};
     uint32_t inputRowOffset[MoeConstraints::EP_SIZE_LIMIT]{};
     uint32_t outputGroupNum[MoeConstraints::RANK_SIZE_LIMIT]{};
 
@@ -98,7 +97,6 @@ struct BlockCommSchedulerGmmAllToAllVTargetOrder {
             for (uint32_t localExpertIdx = 0; localExpertIdx < problemShape.localExpertNum(); ++localExpertIdx) {
                 uint32_t tokens = problemShape.localTokensPerExpert(epIdx, localExpertIdx);
                 uint32_t groups = CeilDiv(tokens, blockM);
-                inputGroupNumInLocalExpert[epIdx][localExpertIdx] = groups;
                 inputGroupNum[epIdx] += groups;
                 inputRows += tokens;
             }
@@ -138,7 +136,7 @@ struct BlockCommSchedulerGmmAllToAllVTargetOrder {
         for (uint32_t localExpertIdx = 0; localExpertIdx < problemShape.localExpertNum() && remainingGroups != 0;
              ++localExpertIdx) {
             uint32_t tokens = problemShape.localTokensPerExpert(srcEpIdx, localExpertIdx);
-            uint32_t expertGroups = inputGroupNumInLocalExpert[srcEpIdx][localExpertIdx];
+            uint32_t expertGroups = CeilDiv(tokens, blockM);
             if (skipGroups >= expertGroups) {
                 consumedRows += tokens;
                 skipGroups -= expertGroups;

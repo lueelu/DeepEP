@@ -245,6 +245,9 @@ def default_tiling(case):
                 values = [128, 256, 256, 16, 16, 0, 2, 1]
         elif case["world_size"] == 4 and case["expert_num"] == 28 and n == 3584 and k in (3072, 6144):
             values = [256, 256, 256, 8, 8, 2048, 3 if k == 3072 else 2, 8]
+        elif case["world_size"] == 64 and case["expert_num"] == 896 and n == 3584 and k in (3072, 6144):
+            # Same performance-selected EP64 profiles as the native launcher.
+            values = [128, 256, 256, 1, 1 if k == 3072 else 16, 256, 3, 1]
         # Native fallback caps the requested copy rows to the compiled UB size.
         capacity = (UB_BYTES - UDMA_SCRATCH_BYTES) // (4 * _aligned(n, 16))
         values[4] = min(values[4], capacity)

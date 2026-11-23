@@ -7,6 +7,7 @@
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
@@ -215,7 +216,8 @@ void InitializeAndLaunch(const TilingProfile& tiling, const Catlass::GemmCoord& 
                          uint32_t worldSize, uint32_t epSize, uint32_t expertNum, uint32_t outputRows, uint8_t* x,
                          uint8_t* weight, uint8_t* output, uint8_t* localTokensPerExpert,
                          uint8_t* globalTokensPerLocalExpert, uint8_t* workspace, uint8_t* allToAllVOutput,
-                         uint8_t* routeMetadata, uint32_t blockDim, aclrtStream stream, uint64_t fftsAddress)
+                         uint8_t* routeMetadata, uint32_t blockDim, aclrtStream stream, uint64_t fftsAddress,
+                         const at::Tensor& tensorAnchor)
 {
     using DeviceOp = typename Config::Device;
     using Kernel = typename Config::Kernel;
@@ -253,12 +255,32 @@ void InitializeAndLaunch(const TilingProfile& tiling, const Catlass::GemmCoord& 
     DeviceOp deviceOp;
     const Catlass::Status initializeStatus = deviceOp.Initialize(arguments);
     TORCH_CHECK(initializeStatus == Catlass::Status::kSuccess, "failed to initialize the CatCCOS device operator");
-    const typename DeviceOp::Params params = deviceOp.params();
-    auto launch = [=]() -> int {
-        LaunchAllToAllVGroupedMatMulUdma<Kernel>(params, blockDim, stream, fftsAddress);
-        return 0;
-    };
-    at_npu::native::OpCommand::RunOpApi("AllToAllVGroupedMatMulUdma", launch);
+    if constexpr (Config::kUseGmScheduler) {
+        using Scheduler = typename Config::BlockMmadScheduler;
+        const int64_t schedulerBytes =
+            static_cast<int64_t>(static_cast<uint64_t>(blockDim) * Scheduler::WORKSPACE_BYTES);
+        const auto schedulerWorkspace = at::empty({schedulerBytes}, tensorAnchor.options().dtype(at::kByte));
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(schedulerWorkspace.data_ptr()) % 64 == 0,
+                    "scheduler workspace must be cache-line aligned");
+        c10_npu::NPUCachingAllocator::recordStream(schedulerWorkspace.storage().data_ptr(),
+                                                   c10_npu::getCurrentNPUStream());
+        typename DeviceOp::Params params = deviceOp.params();
+        params.ptrSchedulerWorkspace = reinterpret_cast<uint8_t*>(schedulerWorkspace.data_ptr());
+        auto launch = [=]() -> int {
+            // Keep the allocation alive while RunOpApi queues the launch callback.
+            (void)schedulerWorkspace;
+            LaunchAllToAllVGroupedMatMulUdma<Kernel>(params, blockDim, stream, fftsAddress);
+            return 0;
+        };
+        at_npu::native::OpCommand::RunOpApi("AllToAllVGroupedMatMulUdma", launch);
+    } else {
+        const typename DeviceOp::Params params = deviceOp.params();
+        auto launch = [=]() -> int {
+            LaunchAllToAllVGroupedMatMulUdma<Kernel>(params, blockDim, stream, fftsAddress);
+            return 0;
+        };
+        at_npu::native::OpCommand::RunOpApi("AllToAllVGroupedMatMulUdma", launch);
+    }
 }
 
 at::Tensor AllToAllVGroupedMatMulUdmaImpl(
@@ -394,18 +416,29 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
                 "self_copy_cores exceeds the available AIV worker pool");
     const uint64_t fftsAddress = runtime.FftsAddress();
     auto launchWithConfig = [&](auto configTag) {
-        using SelectedConfig = typename decltype(configTag)::type;
-        InitializeAndLaunch<SelectedConfig>(
-            tiling, shape, static_cast<uint32_t>(runtime.Rank()), static_cast<uint32_t>(worldSize),
-            static_cast<uint32_t>(epSize), static_cast<uint32_t>(expertNum), receivedRows,
-            // UDMA PUT reads its local source directly from ordinary NPU GM.
-            reinterpret_cast<uint8_t*>(x.data_ptr()), reinterpret_cast<uint8_t*>(weight.data_ptr()),
-            reinterpret_cast<uint8_t*>(output.data_ptr()), reinterpret_cast<uint8_t*>(localTokensPerExpert.data_ptr()),
-            reinterpret_cast<uint8_t*>(globalTokensPerLocalExpert.data_ptr()), runtime.Workspace(),
-            allToAllVOutputOptional.has_value() ? reinterpret_cast<uint8_t*>(allToAllVOutput.data_ptr()) : nullptr,
-            routeMetadataOptional.has_value() ? reinterpret_cast<uint8_t*>(routeMetadataOptional.value().data_ptr())
-                                              : nullptr,
-            blockDim, stream, fftsAddress);
+        using Config = typename decltype(configTag)::type;
+        auto launchSelected = [&](auto selectedTag) {
+            using SelectedConfig = typename decltype(selectedTag)::type;
+            InitializeAndLaunch<SelectedConfig>(
+                tiling, shape, static_cast<uint32_t>(runtime.Rank()), static_cast<uint32_t>(worldSize),
+                static_cast<uint32_t>(epSize), static_cast<uint32_t>(expertNum), receivedRows,
+                // UDMA PUT reads its local source directly from ordinary NPU GM.
+                reinterpret_cast<uint8_t*>(x.data_ptr()), reinterpret_cast<uint8_t*>(weight.data_ptr()),
+                reinterpret_cast<uint8_t*>(output.data_ptr()),
+                reinterpret_cast<uint8_t*>(localTokensPerExpert.data_ptr()),
+                reinterpret_cast<uint8_t*>(globalTokensPerLocalExpert.data_ptr()), runtime.Workspace(),
+                allToAllVOutputOptional.has_value() ? reinterpret_cast<uint8_t*>(allToAllVOutput.data_ptr()) : nullptr,
+                routeMetadataOptional.has_value() ? reinterpret_cast<uint8_t*>(routeMetadataOptional.value().data_ptr())
+                                                  : nullptr,
+                blockDim, stream, fftsAddress, x);
+        };
+        if (worldSize <= 8) {
+            // A distinct R8/E64 kernel preserves the original stack and peer schedule.
+            using LegacyConfig = typename Config::template WithScheduler<false>;
+            launchSelected(TypeTag<LegacyConfig>{});
+        } else {
+            launchSelected(configTag);
+        }
     };
     auto launchByMSplit = [&](auto mSplit1, auto mSplit2, auto mSplit4) {
         if (tiling.mSplit == 2) {

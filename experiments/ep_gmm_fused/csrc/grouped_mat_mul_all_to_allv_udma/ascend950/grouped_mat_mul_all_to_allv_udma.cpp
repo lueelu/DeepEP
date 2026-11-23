@@ -7,10 +7,14 @@
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
 #include "grouped_mat_mul_all_to_allv_udma_device.hpp"
+#include "large_ep_pipeline_launch.hpp"
+#include <cstdlib>
+#include <cstring>
 #include "../../all_to_allv_grouped_mat_mul_udma/ascend950/udma_runtime.hpp"
 #include "../../tiling_validation.hpp"
 #include "../../tensor_validation.hpp"
@@ -65,12 +69,25 @@ constexpr TilingProfile kEp4K3072N3584Tiling{
 constexpr TilingProfile kEp4K6144N3584Tiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 16, 16, 1, 16, 2048, 2, 8, 8};
 
+// EP64 / 896 experts, 2026-11-15 Event search: c21e4912f8fac930 / 2ef5abd707b6fd40.
+// Performance-selected profiles; full numerical validation remains pending.
+constexpr TilingProfile kEp64K3072N3584Tiling{KernelVariant::kM0_128, 128, 256, 256, 1, 2, 64, 1, 16, 256, 3, 1, 1};
+constexpr TilingProfile kEp64K6144N3584Tiling{KernelVariant::kM0_128, 128, 256, 256, 1, 32, 64, 1, 16, 256, 3, 16, 1};
+
 TilingProfile SelectTiling(uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum)
 {
     // The local GMM input rows equal sum(global_tokens) and may differ across
     // ranks under imbalanced routing. UDMA peers must nevertheless use the same
     // M0 and communication schedule, so selection may only depend on topology
     // and K/N, which are rank-invariant for one collective launch.
+    if (worldSize == 64 && expertNum == 896 && n == 3584) {
+        if (k == 3072) {
+            return kEp64K3072N3584Tiling;
+        }
+        if (k == 6144) {
+            return kEp64K6144N3584Tiling;
+        }
+    }
     const bool isFourRank28ExpertCase = worldSize == 4 && expertNum == 28;
     if (isFourRank28ExpertCase && n == 3584) {
         if (k == 3072) {
@@ -122,7 +139,7 @@ TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef 
     return result;
 }
 
-constexpr uint32_t kMaxLocalExperts = 32;
+constexpr uint32_t kMaxLocalExperts = 64;
 constexpr uint32_t kBf16UbAlignElements = 16;
 
 uint32_t TargetOrderLocalCopyColumns(uint32_t columns)
@@ -274,6 +291,24 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     Catlass::MatrixCoord commBlockShape{tiling.commBlockM, static_cast<uint32_t>(n64)};
     Catlass::MatrixCoord commTileShape{localCopyRows, localCopyColumns};
     const uint64_t fftsAddress = runtime.FftsAddress();
+    // This measured specialization is confined to EP16; larger groups retain GM scheduling.
+    uint32_t pipelineChunks = 0;
+    if (worldSize == 16) {
+        const char* setting = std::getenv("DEEPEP_LARGE_EP_PIPELINE_CHUNKS");
+        if (setting && *setting && std::strcmp(setting, "0") != 0) {
+            TORCH_CHECK(
+                std::strcmp(setting, "1") == 0 || std::strcmp(setting, "2") == 0 || std::strcmp(setting, "4") == 0,
+                "DEEPEP_LARGE_EP_PIPELINE_CHUNKS must be 0, 1, 2 or 4");
+            pipelineChunks = static_cast<uint32_t>(setting[0] - '0');
+        }
+    }
+    const bool useLargeEpPipeline = pipelineChunks != 0;
+    TORCH_CHECK(!useLargeEpPipeline ||
+                    (blockDim == 32 && localExpertNum == 32 && m == 9216 && k == 1024 && n == 384 && tiling.m0 == 256 &&
+                     tiling.n0 == 128 && tiling.k0 == 256 && tiling.workspaceStages == 2 &&
+                     tiling.selfCopyCores <= 16 && (stageRows == 8192 || stageRows == 2816)),
+                "EP16 pipeline requires the measured S1/M3 shape and M256/N128/K256, WS2 tiling");
+    const bool wholeRound = useLargeEpPipeline && stageRows == 2816 && pipelineChunks == 1;
     auto launchWithConfig = [&](auto configTag) {
         using SelectedConfig = typename decltype(configTag)::type;
         using SelectedDeviceOp = typename SelectedConfig::Device;
@@ -305,29 +340,62 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
         SelectedDeviceOp deviceOp;
         const Catlass::Status initializeStatus = deviceOp.Initialize(arguments);
         TORCH_CHECK(initializeStatus == Catlass::Status::kSuccess, "failed to initialize the CatCCOS device operator");
-        const typename SelectedDeviceOp::Params params = deviceOp.params();
+        typename SelectedDeviceOp::Params params = deviceOp.params();
+        at::Tensor schedulerWorkspace;
+        if constexpr (SelectedConfig::kUseGmScheduler) {
+            if (!useLargeEpPipeline) {
+                using Scheduler = typename SelectedConfig::BlockMmadScheduler;
+                const int64_t schedulerBytes =
+                    static_cast<int64_t>(static_cast<uint64_t>(blockDim) * Scheduler::WORKSPACE_BYTES);
+                schedulerWorkspace = at::empty({schedulerBytes}, x.options().dtype(at::kByte));
+                TORCH_CHECK(reinterpret_cast<uintptr_t>(schedulerWorkspace.data_ptr()) % 64 == 0,
+                            "scheduler workspace must be cache-line aligned");
+                c10_npu::NPUCachingAllocator::recordStream(schedulerWorkspace.storage().data_ptr(),
+                                                           c10_npu::getCurrentNPUStream());
+                params.ptrSchedulerWorkspace = reinterpret_cast<uint8_t*>(schedulerWorkspace.data_ptr());
+            }
+        }
         auto launch = [=]() -> int {
+            // Keep the allocation alive while RunOpApi queues the launch callback.
+            (void)schedulerWorkspace;
+            if constexpr (std::is_same_v<SelectedConfig, LargeEpN128Config>) {
+                if (useLargeEpPipeline) {
+                    LaunchLargeEpN128(LargeEpN128Params{params, pipelineChunks}, wholeRound, blockDim, stream,
+                                      fftsAddress);
+                    return 0;
+                }
+            }
             LaunchGroupedMatMulAllToAllVUdma<SelectedKernel>(params, blockDim, stream, fftsAddress);
             return 0;
         };
         at_npu::native::OpCommand::RunOpApi("GroupedMatMulAllToAllVUdma", launch);
     };
+    auto launchWithScheduler = [&](auto configTag) {
+        using GmConfig = typename decltype(configTag)::type;
+        // Preserve the complete pre-expansion path for its original EP/expert
+        // range. New small-EP configurations with more experts retain GM.
+        if (worldSize <= 8 && localExpertNum <= 32) {
+            launchWithConfig(TypeTag<typename GmConfig::template WithScheduler<false>>{});
+        } else {
+            launchWithConfig(configTag);
+        }
+    };
     if (tiling.kernelVariant == KernelVariant::kM0_256N0_256) {
         if (tiling.workspaceStages == 3) {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256WS3Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256WS3Config>{});
         } else {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256N0_256Config>{});
         }
     } else if (tiling.kernelVariant == KernelVariant::kM0_256) {
         if (tiling.workspaceStages == 3) {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256WS3Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256WS3Config>{});
         } else {
-            launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaM0_256Config>{});
+            launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaM0_256Config>{});
         }
     } else if (tiling.workspaceStages == 3) {
-        launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaDefaultWS3Config>{});
+        launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaDefaultWS3Config>{});
     } else {
-        launchWithConfig(TypeTag<GroupedMatMulAllToAllVUdmaDefaultConfig>{});
+        launchWithScheduler(TypeTag<GroupedMatMulAllToAllVUdmaDefaultConfig>{});
     }
     return output;
 }

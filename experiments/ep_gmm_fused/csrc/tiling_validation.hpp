@@ -149,6 +149,9 @@ inline const char* CheckHardware(uint32_t worldSize, uint32_t coreCount, uint64_
     if (worldSize == 0 || worldSize > kMaxRanks || coreCount == 0) {
         return "tiling requires world_size in [1, 128] and a positive AI-core count";
     }
+    if (worldSize <= 8 && coreCount < worldSize) {
+        return "EP up to 8 requires at least one AI core per rank";
+    }
     if (ubBytes <= kWqeScratchBytes) {
         return "failed to query a usable device UB capacity";
     }

@@ -6,6 +6,8 @@
 #ifndef DEEPEP_EP_GMM_FUSED_GROUPED_MAT_MUL_ALL_TO_ALLV_UDMA_DEVICE_HPP
 #define DEEPEP_EP_GMM_FUSED_GROUPED_MAT_MUL_ALL_TO_ALLV_UDMA_DEVICE_HPP
 
+#include <type_traits>
+
 #include "info.h"
 #include "../../tiling_validation.hpp"
 
@@ -22,19 +24,21 @@
 #include "catccos/comm/block/comm_block.hpp"
 #include "catccos/comm/block/comm_block_mte_udma.hpp"
 #include "catccos/comm/block/comm_block_scheduler_gmm_alltoallv_target_order.hpp"
+#include "catccos/comm/block/comm_block_scheduler_gmm_alltoallv_target_order_legacy.hpp"
 #include "catccos/comm/comm_dispatch_policy.hpp"
 #include "catccos/comm/tile/tile_remote_copy.hpp"
 #include "catccos/comm/tile/tile_remote_copy_udma_2d.hpp"
 #include "catccos/detail/remote_copy_type.hpp"
 #include "catccos/dgemm/alltoallv_allgather_problem_shape.hpp"
 #include "catccos/dgemm/block/block_scheduler_gmm_alltoallv_target_order.hpp"
+#include "catccos/dgemm/block/block_scheduler_gmm_alltoallv_target_order_gm.hpp"
 #include "catccos/dgemm/device/device_dgemm.hpp"
 #include "catccos/dgemm/kernel/grouped_matmul_alltoallv_tla.hpp"
 
 namespace deepep::ep_gmm_fused {
 
 template <class ElementA, class LayoutA, class ElementB, class LayoutB, class ElementC, class LayoutC, uint32_t M0,
-          uint32_t N0, uint32_t K0, uint32_t WorkspaceStages = 2>
+          uint32_t N0, uint32_t K0, uint32_t WorkspaceStages = 2, bool UseGmScheduler = true>
 struct GroupedMatMulAllToAllVUdmaConfig {
     static_assert(WorkspaceStages == 2 || WorkspaceStages == 3,
                   "Ascend950 BF16 UDMA MoE supports two or three workspace stages");
@@ -44,6 +48,10 @@ struct GroupedMatMulAllToAllVUdmaConfig {
     static constexpr uint32_t kN0 = N0;
     static constexpr uint32_t kK0 = K0;
     static constexpr uint32_t kWorkspaceStages = WorkspaceStages;
+    static constexpr bool kUseGmScheduler = UseGmScheduler;
+    template <bool UseGm>
+    using WithScheduler = GroupedMatMulAllToAllVUdmaConfig<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC, M0,
+                                                           N0, K0, WorkspaceStages, UseGm>;
     using MmadDispatchPolicy = Catlass::Gemm::MmadPingpong<ArchTag, true, false, 1, false, 2, 2, 2, 2>;
     using L1TileShape = tla::Shape<tla::Int<M0>, tla::Int<N0>, tla::Int<K0>>;
     using L0TileShape = tla::Shape<tla::Int<M0>, tla::Int<N0>, tla::Int<64>>;
@@ -52,13 +60,20 @@ struct GroupedMatMulAllToAllVUdmaConfig {
     using BlockMmad = Catlass::Gemm::Block::BlockMmadTla<MmadDispatchPolicy, L1TileShape, L0TileShape, ElementA,
                                                          ElementB, ElementC, void, TileCopy>;
 
-    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, TilingValidation::kMaxRanks, 32>;
+    using MoeConstraints =
+        std::conditional_t<UseGmScheduler, Catccos::DGemm::MoeConstraints<1, TilingValidation::kMaxRanks, 64>,
+                           Catccos::DGemm::MoeConstraints<1, 8, 32>>;
     static constexpr bool kIsDynamic = true;
     static constexpr uint32_t kUbStages = 2;
     static constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);
-    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>;
-    using BlockCommScheduler =
-        Catccos::CommEpilogue::Block::BlockCommSchedulerGmmAllToAllVTargetOrder<MoeConstraints, kIsDynamic>;
+    using BlockMmadScheduler =
+        std::conditional_t<UseGmScheduler,
+                           Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrderGm<MoeConstraints>,
+                           Catccos::DGemm::Block::BlockMmadSchedulerGmmAllToAllVTargetOrder<MoeConstraints>>;
+    using BlockCommScheduler = std::conditional_t<
+        UseGmScheduler,
+        Catccos::CommEpilogue::Block::BlockCommSchedulerGmmAllToAllVTargetOrder<MoeConstraints, kIsDynamic>,
+        Catccos::CommEpilogue::Block::BlockCommSchedulerGmmAllToAllVTargetOrderLegacy<MoeConstraints, kIsDynamic>>;
     using CType = Catlass::Gemm::GemmType<ElementC, LayoutC>;
     using TileLocalCopy =
         Catccos::Comm::Tile::TileRemoteCopy<ArchTag, kIsDynamic, CType, CType, void, Catccos::detail::CopyDirect::Get,
@@ -74,9 +89,10 @@ struct GroupedMatMulAllToAllVUdmaConfig {
     using BlockComm = Catccos::Comm::Block::CommBlockMteUdma<BlockLocalComm, BlockRemoteComm>;
 
     using ProblemShape = Catccos::DGemm::AllToAllVAllGatherProblemShape;
-    using Kernel = Catccos::DGemm::Kernel::GroupedMatmulAllToAllVTla<ProblemShape, BlockMmad, BlockComm,
-                                                                     BlockMmadScheduler, BlockCommScheduler,
-                                                                     kWorkspaceStages, kSymmetricDataBytes, true>;
+    using Kernel =
+        Catccos::DGemm::Kernel::GroupedMatmulAllToAllVTla<ProblemShape, BlockMmad, BlockComm, BlockMmadScheduler,
+                                                          BlockCommScheduler, kWorkspaceStages, kSymmetricDataBytes,
+                                                          true, UseGmScheduler>;
     using Device = Catccos::DGemm::Device::DeviceDGemm<Kernel>;
 };
 

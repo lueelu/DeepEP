@@ -26,7 +26,7 @@ using Catlass::MatrixCoord;
 
 template <class ProblemShape_, class BlockMmad_, class BlockComm_, class BlockMmadScheduler_, class BlockCommScheduler_,
           uint32_t WORKSPACE_STAGES_, uint64_t SYMMETRIC_DATA_BYTES_ = 1000UL * 1024 * 1024,
-          bool TARGET_ORDER_STAGING_ = false>
+          bool TARGET_ORDER_STAGING_ = false, bool USE_GM_SCHEDULER_ = true>
 class GroupedMatmulAllToAllVTla {
 public:
     using ProblemShape = ProblemShape_;
@@ -56,6 +56,7 @@ public:
     static constexpr uint32_t WORKSPACE_STAGES = WORKSPACE_STAGES_;
     static constexpr uint64_t SYMMETRIC_DATA_BYTES = SYMMETRIC_DATA_BYTES_;
     static constexpr bool TARGET_ORDER_STAGING = TARGET_ORDER_STAGING_;
+    static constexpr bool USE_GM_SCHEDULER = USE_GM_SCHEDULER_;
     static constexpr uint32_t L1_TILE_M = tla::get<0>(L1TileShape{});
     static constexpr uint32_t L1_TILE_N = tla::get<1>(L1TileShape{});
     static constexpr uint32_t L1_TILE_K = tla::get<2>(L1TileShape{});
@@ -74,6 +75,8 @@ public:
         LayoutC layoutC;
         LayoutTagComm layoutTagComm;
         GM_ADDR ptrSymmetric;
+        // Ordinary local GM, one private scheduling table per AIC.
+        GM_ADDR ptrSchedulerWorkspace{nullptr};
         GM_ADDR syncMmadFinish;
         GM_ADDR syncCommFinish;
         uint32_t selfCopyCores;
@@ -387,6 +390,20 @@ public:
 
 private:
     CATLASS_DEVICE
+    BlockMmadScheduler MakeTargetOrderScheduler(Params const& params, uint32_t groupsPerCommInRank,
+                                                MatrixCoord const& blockShape) const
+    {
+        if constexpr (USE_GM_SCHEDULER) {
+            const uint64_t schedulerOffset =
+                static_cast<uint64_t>(AscendC::GetBlockIdx()) * BlockMmadScheduler::WORKSPACE_BYTES;
+            GM_ADDR schedulerWorkspace = params.ptrSchedulerWorkspace + schedulerOffset;
+            return BlockMmadScheduler{params.problemShape, groupsPerCommInRank, blockShape, schedulerWorkspace};
+        } else {
+            return BlockMmadScheduler{params.problemShape, groupsPerCommInRank, blockShape};
+        }
+    }
+
+    CATLASS_DEVICE
     void RunTargetOrderAic(Params const& params)
     {
         uint32_t rankSize = params.problemShape.rankSize();
@@ -398,7 +415,7 @@ private:
             groupsPerCommInRank = Max<uint32_t>(1U, tilePerCommInRank / nLoops);
         }
         GemmCoord mmadBlockShape{L1_TILE_M, L1_TILE_N, L1_TILE_K};
-        BlockMmadScheduler scheduler{params.problemShape, groupsPerCommInRank, mmadBlockShape.GetCoordMN()};
+        auto scheduler = MakeTargetOrderScheduler(params, groupsPerCommInRank, mmadBlockShape.GetCoordMN());
 
         uint32_t stageRows = groupsPerCommInRank * L1_TILE_M;
         auto layoutTagSymmetric =
@@ -464,6 +481,132 @@ private:
 
     CATLASS_DEVICE
     void RunTargetOrderAiv(Params const& params)
+    {
+        if constexpr (USE_GM_SCHEDULER) {
+            RunTargetOrderAivGm(params);
+        } else {
+            RunTargetOrderAivLegacy(params);
+        }
+    }
+
+    CATLASS_DEVICE
+    void RunTargetOrderAivLegacy(Params const& params)
+    {
+        uint32_t aicoreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        uint32_t subcoreIdx = AscendC::GetSubBlockIdx();
+        uint32_t rankSize = params.problemShape.rankSize();
+        uint32_t rankIdx = params.problemShape.rankIdx();
+        uint32_t coreCount = AscendC::GetBlockNum();
+        uint32_t availableSelfCores = coreCount >= rankSize ? coreCount - rankSize + 1 : 1;
+        uint32_t selfCopyCores = params.selfCopyCores == 0 ? 1U : Min(params.selfCopyCores, availableSelfCores);
+        bool isPrimaryPeerCore = aicoreIdx < rankSize;
+        bool isExtraSelfCopyCore = aicoreIdx >= rankSize && aicoreIdx < rankSize + selfCopyCores - 1;
+        uint32_t srcRankIdx = isExtraSelfCopyCore ? rankIdx : aicoreIdx;
+        uint32_t selfWorkerIdx = isExtraSelfCopyCore ? aicoreIdx - rankSize + 1 : 0;
+        uint32_t srcEpIdx = srcRankIdx % params.problemShape.epSize();
+
+        uint32_t groupsPerCommInRank = params.stageRows / L1_TILE_M;
+        if (params.stageRows == 0) {
+            uint32_t blockPerComm = AscendC::GetBlockNum() * params.commInterval;
+            uint32_t tilePerCommInRank = blockPerComm / rankSize;
+            uint32_t nLoops = CeilDiv(params.problemShape.n(), L1_TILE_N);
+            groupsPerCommInRank = Max<uint32_t>(1U, tilePerCommInRank / nLoops);
+        }
+        uint32_t stageRows = groupsPerCommInRank * L1_TILE_M;
+        GemmCoord mmadBlockShape{L1_TILE_M, L1_TILE_N, L1_TILE_K};
+        MatrixCoord commBlockShape = params.blockCommParams.BlockShape();
+        MatrixCoord commCoreSplit = params.blockCommSchedulerParams.CoreSplit();
+        BlockCommScheduler scheduler{params.problemShape,         groupsPerCommInRank, srcEpIdx,
+                                     mmadBlockShape.GetCoordMN(), commBlockShape,      commCoreSplit};
+        BlockComm blockRemoteCopy(resource, params.blockCommParams);
+
+        auto layoutSymmetric = Catlass::layout::RowMajor(stageRows, params.problemShape.n());
+        auto ptrSymmetric = reinterpret_cast<__gm__ ElementC*>(params.ptrSymmetric);
+        AscendC::GlobalTensor<ElementC> gmSymmetricList[WORKSPACE_STAGES];
+        for (uint32_t stageIdx = 0; stageIdx < WORKSPACE_STAGES; ++stageIdx) {
+            uint32_t stageRankIdx = stageIdx * rankSize + rankIdx;
+            gmSymmetricList[stageIdx].SetGlobalBuffer(ptrSymmetric + stageRankIdx * layout::Capacity(layoutSymmetric));
+        }
+
+        AscendC::GlobalTensor<ElementC> gmC;
+        gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC*>(params.ptrC));
+        auto const& layoutC = params.layoutTagComm;
+
+        bool isSyncCore = (subcoreIdx == 0) && (srcRankIdx == rankIdx);
+        // Only the primary self core owns synchronization. Extra self-copy
+        // workers map to the same source rank but must not duplicate it.
+        isSyncCore = isSyncCore && isPrimaryPeerCore;
+        bool isCommCore = (subcoreIdx == 0) && (isPrimaryPeerCore || isExtraSelfCopyCore);
+        auto syncMmadFinish = reinterpret_cast<__gm__ int32_t*>(params.syncMmadFinish);
+        if (isCommCore) {
+            syncMmadFinish = static_cast<__gm__ int32_t*>(aclshmem_ptr(params.syncMmadFinish, srcRankIdx));
+        }
+        auto syncCommFinish = reinterpret_cast<__gm__ int32_t*>(params.syncCommFinish);
+
+        if (isSyncCore) {
+            aclshmemx_signal_op(syncMmadFinish, 0, ACLSHMEM_SIGNAL_SET, rankIdx);
+            aclshmemx_signal_op(syncCommFinish, 0, ACLSHMEM_SIGNAL_SET, rankIdx);
+        }
+        aclshmemx_barrier_all_vec();
+
+        uint32_t receiveAccum = 0;
+        uint32_t commLoops = scheduler.GetCommLoops();
+        for (uint32_t commIdx = 0; commIdx < commLoops; ++commIdx) {
+            uint32_t stageIdx = commIdx % WORKSPACE_STAGES;
+            scheduler.UpdateCommContext(commIdx);
+            receiveAccum += scheduler.GetActualReceiveAccum(commIdx);
+
+            Catlass::Arch::CrossCoreWaitFlag(flagAicFinishStore[stageIdx]);
+            AscendC::SyncAll<true>();
+            if (isSyncCore) {
+                aclshmemx_signal_op(syncMmadFinish, commIdx + 1, ACLSHMEM_SIGNAL_SET, rankIdx);
+            }
+
+            if (isCommCore && scheduler.HasInput()) {
+                aclshmem_signal_wait_until(syncMmadFinish, ACLSHMEM_CMP_EQ, commIdx + 1);
+
+                uint32_t actualRows = scheduler.GetActualRows();
+                uint32_t workerRowOffset = 0;
+                if (srcRankIdx == rankIdx) {
+                    uint32_t rowsPerWorker = CeilDiv(actualRows, selfCopyCores);
+                    workerRowOffset = selfWorkerIdx * rowsPerWorker;
+                    actualRows = Min(rowsPerWorker, ClipSub(actualRows, workerRowOffset));
+                }
+                if (actualRows != 0) {
+                    MatrixCoord actualShape{actualRows, params.problemShape.n()};
+                    MatrixCoord stageOffset{workerRowOffset, 0};
+                    auto gmBlockSrc = gmSymmetricList[stageIdx][layoutSymmetric.GetOffset(stageOffset)];
+                    auto layoutBlockSrc = layoutSymmetric.GetTileLayout(actualShape);
+                    MatrixCoord outputOffset{scheduler.GetOutputRowOffset() + workerRowOffset, 0};
+                    auto gmBlockDst = gmC[layoutC.GetOffset(outputOffset)];
+                    auto layoutBlockDst = layoutC.GetTileLayout(actualShape);
+
+                    blockRemoteCopy.InitBlockLoop();
+                    blockRemoteCopy(gmBlockSrc, layoutBlockSrc, gmBlockDst, layoutBlockDst, actualShape, srcRankIdx);
+                    blockRemoteCopy.FinalizeBlockLoop();
+
+                    // Remote peers already have one queue owner. For the
+                    // multi-core self copy, only worker 0 publishes the
+                    // receive completion; the loop-end hardware barrier
+                    // joins the remaining row slices before AIC is released.
+                    if (srcRankIdx != rankIdx || selfWorkerIdx == 0) {
+                        aclshmemx_mte_quiet();
+                        aclshmemx_signal_op(syncCommFinish, 1, ACLSHMEM_SIGNAL_ADD, srcRankIdx);
+                    }
+                }
+            }
+
+            if (isSyncCore) {
+                aclshmem_signal_wait_until(syncCommFinish, ACLSHMEM_CMP_EQ, receiveAccum);
+            }
+            AscendC::SyncAll<true>();
+            if (commIdx + WORKSPACE_STAGES < commLoops) {
+                Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(flagAivFinishComm[stageIdx]);
+            }
+        }
+    }
+    CATLASS_DEVICE
+    void RunTargetOrderAivGm(Params const& params)
     {
         uint32_t aicoreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
         uint32_t subcoreIdx = AscendC::GetSubBlockIdx();
