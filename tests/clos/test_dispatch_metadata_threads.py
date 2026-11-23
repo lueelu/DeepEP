@@ -17,7 +17,7 @@ def test_metadata_vf_thread_variants(tmp_path):
     functions = cpp_functions(source, "DispatchSourceIndicesVf", "DispatchTopkScatterSimtVf")
     host = (ROOT / "csrc/direct/ops/dispatch.cpp").read_text()
     begin = host.index("    const auto enabled_option =")
-    options = host[begin : host.index("    const bool cached_weight_pack", begin)]
+    options = host[begin : host.index("\n    };", begin) + len("\n    };")]
     begin = host.index("    const bool metadata_src_256")
     options += host[begin : host.index("    const bool host_prep", begin)]
     begin = host.index("    tiling.metadata_src_threads =")
