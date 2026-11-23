@@ -294,6 +294,7 @@ def test_actual_vf_bodies_against_histogram_oracle(tmp_path):
         r"""
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #define __ubuf__

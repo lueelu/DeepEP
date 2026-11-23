@@ -880,45 +880,6 @@ the performance acceptance criterion. CPU constexpr tests exercise production
 window decisions, WQE addressing and pending-index retention, including an
 intentionally corrupted retention path; they do not validate device ordering.
 
-### Source handle construction in UB
-
-Fresh UDMA dispatch now reuses the contiguous `v2_rank_prefix` produced by
-notify. Each active AIV loads that prefix once, walks its source-rank intervals,
-and builds `recv_src_metadata` in UB before contiguous output DMA. The existing
-eight-row core partition is unchanged: different AIVs never write the same
-32-byte output line, including odd top-k widths. Source indices and top-k rows
-are loaded in bounded tiles; SIMT no longer scans the strided GM rank matrix.
-The two encoded columns and the remaining `-1` mapping placeholders are each
-written once. Padding does not read source/top-k inputs. Public shape, dtype,
-row order, first-valid top-k selection, all-invalid semantics and the later
-expand mapping are preserved.
-
-The reused UB arena contains `align32(EP * 4)` prefix bytes followed by source
-indices, top-k rows and output rows. Tile capacity is the largest multiple of
-eight up to 256 that fits the existing kernel UB budget (including compiler
-reserve). At EP16/K8 with 64-bit top-k, the layout uses 27,712 bytes. Rank
-boundaries and core tails can shorten a tile. If eight rows cannot fit, the
-legacy GM VF remains available. Its valid rows also avoid writing the first
-two columns twice. There is no new environment switch, tensor allocation,
-collective, sender rule or earlier consumption of remote data.
-
-The builder still runs after the existing transport completion and output-copy
-drains. `MTE2_S` protects prefix reads; `MTE2_V` protects input consumption;
-`V_MTE3` publishes the UB result. `MTE3_V` and `V_MTE2` protect reuse, and final
-`MTE3_S` completes output stores before subsequent UB reuse. This revision does
-not pipeline Source tiles or move Source ahead of receive completion.
-
-Compare against 55daa23 with identical options, starting at EP16, T4096,
-H2816/K8/E256/BF16, communication 8 AIV and reduce 48. Also cover EP8/32 and
-communication 32 AIV. Keep direct/staged metadata and fresh expand=0/1 precision
-checks, zero receive, skewed/invalid routing, tails and continuous handle reuse.
-Use diagnostic `source_cycles` at the same last-rank/last-AIV aggregation to
-locate the change, then trace-off communication and API mean/P95 to judge gain.
-CPU tests exercise the production builder and VF with both top-k widths,
-checked DMA bounds, one output write per element, empty ranks, padding and UB
-fallback; constexpr tests include a deliberately incorrect master encoding.
-These checks do not establish CANN compilation, device ordering or NPU gains.
-
 ### Cached whole-channel WQE indices in UB
 
 The BF16 cached whole-channel peer sender now loads compact token indices into
