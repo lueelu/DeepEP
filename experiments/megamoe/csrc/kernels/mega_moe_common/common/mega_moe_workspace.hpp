@@ -32,6 +32,9 @@ struct WorkspaceInfo {
     GM_ADDR flagDispatchToGmm1Ptr;
     GM_ADDR flagSendCntCalToUpdParamsPtr;
     GM_ADDR flagGmmToEpiloguePtr{nullptr};
+#ifdef DEEPEP_MEGAMOE_ROCE
+    GM_ADDR routedConsumedPtr{nullptr};
+#endif
     GM_ADDR gmm2ReadyPtr{nullptr};
     GM_ADDR gmm2CombineSyncCounterPtr{nullptr};
     GM_ADDR cumsumInfoPtr{nullptr};
@@ -163,6 +166,12 @@ private:
 #endif
             flagGmmToEpiloguePtr = base + workspaceSize;
             workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
+#ifdef DEEPEP_MEGAMOE_ROCE
+            if (UseHierarchicalRoce(tilingData) && isW4Mode) {
+                routedConsumedPtr = base + workspaceSize;
+                workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
+            }
+#endif
         }
 
 #ifdef DEEPEP_MEGAMOE_ROCE

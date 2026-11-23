@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-WORLD, BS, STEPS = 32, 96, 160
+WORLD, STEPS = 32, 160
 TAIL = (159, 0, 80, 1, 158, 2, 79, 3)
 
 
@@ -28,7 +28,7 @@ def input_at(folder, config, kind, rank, step):
         with np.load(folder / f"input_{step}.npz") as data:
             return tuple(data[k] for k in fields)
     sample = dict(config, seed=config["seed"] + 65537 * step)
-    x, ids, coeff = inputs(sample, rank, BS, "balanced", world=WORLD)
+    x, ids, coeff = inputs(sample, rank, config["bs_values"][0], "balanced", world=WORLD)
     ids = (ids + step) % config["model"]["num_experts"]
     if kind == "bf16":
         return (x.view(np.uint32) >> 16).astype(np.uint16), ids, coeff
@@ -54,13 +54,13 @@ def weights(folder, config, rank, role, torch):
     for w, sf in pairs:
         hashes.append(digest((w, sf)))
         dtype = torch.float8_e4m3fn if shared else torch.uint8
-        groups.append([(torch.from_numpy(wi).npu().view(dtype), torch.from_numpy(si).npu().view(torch.float8_e8m0fnu))
-                       for wi, si in zip(w, sf, strict=True)])
+        groups.append(([torch.from_numpy(wi).npu().view(dtype) for wi in w],
+                       [torch.from_numpy(si).npu().view(torch.float8_e8m0fnu) for si in sf]))
     owner = prepare_weights_for_mega_moe(*groups, shared=shared)
     return owner, hashes
 
 
-def profile(torch, group, forward, dest):
+def profile(torch, group, forward, dest, bs):
     from deep_ep_experimental.megamoe.performance import DEFAULT_ALIGNMENT, collect_profile, summarize_rounds
 
     cfg = dict(iters=30, alignment=DEFAULT_ALIGNMENT)
@@ -69,7 +69,7 @@ def profile(torch, group, forward, dest):
     flush = torch.zeros(256 * 1024**2 // 4, device="npu", dtype=torch.int32)
     total = torch.empty((), device="npu", dtype=torch.int32)
     torch.sum(flush, dim=(0,), dtype=torch.int32, out=total)
-    samples = collect_profile(lambda _: forward(None), group, torch, cfg, prefix, dest / "profiler", BS,
+    samples = collect_profile(lambda _: forward(None), group, torch, cfg, prefix, dest / "profiler", bs,
                               method="legacy-read", flush_buffer=flush, sum_out=total)
     rows = group.all_gather([s["duration_us"] for s in samples], "fixed device times")
     if group.rank() == 0:
@@ -83,6 +83,7 @@ def run(args, config, group, torch):
     from deep_ep_experimental.megamoe.api import _extension
     from deep_ep_experimental.megamoe.reference import error_metrics
 
+    bs = config["bs_values"][0]
     rank = group.rank()
     if group.size() != WORLD or int(os.environ["LOCAL_WORLD_SIZE"]) != 16:
         raise ValueError("Requires two hosts with 16 ranks each")
@@ -98,14 +99,15 @@ def run(args, config, group, torch):
     weight_hashes = dict(routed=rh, shared=sh)
     if meta and weight_hashes != meta["weights"]:
         raise ValueError("Weight bank checksum mismatch")
-    opts = dict(ranks_per_node=16, num_max_tokens_per_rank=BS, num_max_configs=16, **config["model"])
+    opts = dict(ranks_per_node=16, num_max_tokens_per_rank=bs, num_max_configs=16, **config["model"])
     root = SymmBuffer(group, **opts)
     buf = SymmBuffer(group, base=root, **opts)
-    root.prepare(BS)
-    buf.prepare(BS)
+    root.prepare(bs)
+    buf.prepare(bs)
     y = torch.empty_like(buf.x, dtype=torch.bfloat16)
     x = torch.empty_like(y) if kind == "bf16" else None
     experts = config["model"]["num_experts"]
+    expected_active = kind == "bf16" and bs == 96 and (experts == 416 or not args.baseline_b78fd2c)
     stats = torch.zeros(experts // WORLD, dtype=torch.int32, device="npu")
 
     def install(target, step):
@@ -139,13 +141,13 @@ def run(args, config, group, torch):
                     wave=buf._plan.effective_wave, bf16_bs96_active=buf._plan.bf16_bs96_active, extension=ext.__file__)
         (dest / "plan.json").write_text(json.dumps(plan))
         if (plan["protocol"], plan["dispatch_qps"], plan["combine_qps"], plan["wave"], plan["bf16_bs96_active"]) != (
-            5, 8, 24, 5, kind == "bf16"
+            5, 8, 24, 5, expected_active
         ):
             raise ValueError(f"Unexpected schedule: {plan}")
         if args.mode == "perf":
             if buf.timer_enabled or kind != "bf16":
                 raise ValueError("Performance comparison requires a BF16 bank and timer-off wheel")
-            profile(torch, group, forward, dest)
+            profile(torch, group, forward, dest, bs)
         else:
             if folder:
                 with np.load(folder / "golden.npz") as data:
@@ -153,7 +155,7 @@ def run(args, config, group, torch):
                 if digest((gy, gc)) != meta["golden_sha256"]:
                     raise ValueError("Invalid bank golden")
             else:
-                spec = golden.contract(config, WORLD, BS, kind, "balanced", 0)
+                spec = golden.contract(config, WORLD, bs, kind, "balanced", 0)
                 gy, gc, _ = golden.load(args.golden, spec, rank)
             install(root, 0)
             stats.zero_()
@@ -168,6 +170,12 @@ def run(args, config, group, torch):
                 stats.zero_()
                 forward(target=root, activation=None)
                 mixed = digest((y.float().cpu().numpy(), stats.cpu().numpy()))
+                if root._plan.bf16_bs96_active:
+                    raise ValueError("Prequantized input selected the BF16 path")
+                stats.zero_()
+                forward(target=root)
+                if root._plan.bf16_bs96_active != expected_active or digest((y.float().cpu().numpy(), stats.cpu().numpy())) != root_result:
+                    raise ValueError("Same-plan BF16 re-entry changed the schedule or result")
             replay = args.mode == "replay"
             if replay:
                 graph = torch.npu.NPUGraph()
@@ -219,16 +227,20 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("golden", "fixed", "eager", "replay", "perf"))
+    parser.add_argument("--experts", type=int, choices=(384, 416), default=416)
+    parser.add_argument("--bs", type=int, choices=(96, 128), default=96)
+    parser.add_argument("--baseline-b78fd2c", action="store_true", help="Expect the E384 fallback on the original wheel")
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument("--bank", type=Path, help="Existing fixed input bank, overrides generated inputs")
     for key in ("golden", "reference", "out"):
         parser.add_argument("--" + key, type=Path)
     args = parser.parse_args()
-    config = dict(load_config("ep32_bs96"), shared_fixture="native-fp8")
+    config = dict(load_config("ep32_bs96", str(args.bs)), shared_fixture="native-fp8")
+    config["model"]["num_experts"] = args.experts
     if args.mode == "golden":
         if not args.golden:
             parser.error("golden requires --golden")
-        golden.prepare(config, WORLD, BS, list(range(WORLD)), args.golden, input_kind=args.input)
+        golden.prepare(config, WORLD, args.bs, list(range(WORLD)), args.golden, input_kind=args.input)
         return
     if not args.out or (args.mode != "perf" and not (args.bank or args.golden)) or (args.mode == "replay" and not args.reference):
         parser.error("Specify --out, --bank or --golden for accuracy, and --reference for replay")

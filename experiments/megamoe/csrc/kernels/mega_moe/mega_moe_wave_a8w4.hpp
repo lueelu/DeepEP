@@ -84,6 +84,26 @@ private:
 #ifdef DEEPEP_MEGAMOE_ROCE
     CrossExpertCombinePipeline combinePipeline_;
 #endif
+    __aicore__ inline auto RoutedPipeline()
+    {
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if constexpr (FuseGateUp && !TopkWeightsPrefetch && CombineQuantMode == COMBINE_NO_QUANT &&
+                      std::is_same_v<QuantOutType, ActivationQuantOutType>) {
+            return params_.tilingData->bf16Bs96 ? &gmm1CatlassContext_ : nullptr;
+        } else
+#endif
+        {
+            return nullptr;
+        }
+    }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    __aicore__ inline __gm__ int32_t* RoutedConsumed()
+    {
+        return RoutedPipeline() == nullptr ? nullptr :
+            reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.routedConsumedPtr) +
+                gmmExecutionConfig_.blockJob.jobIndex * INT_CACHELINE;
+    }
+#endif
     __aicore__ inline bool NextAivSlice(AivTaskCursor& cursor, bool activation);
 #ifdef DEEPEP_MEGAMOE_ROCE
     __aicore__ inline bool IsActivationReady(const AivTaskCursor& cursor, int32_t readySequence);
@@ -146,6 +166,9 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
                                     A_ELEMS_PER_BYTE, true, TopkWeightsPrefetch>(
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_,
         gmmAddrInfo, state, tokenStartIndexInExpert, gmm1TilesPerMGroup);
+#ifdef DEEPEP_MEGAMOE_ROCE
+    gmmAddrInfo.routedConsumed = RoutedConsumed();
+#endif
     gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
     ProblemShape sliceProblemShape = state.problemShape;
     Get<M_VALUE>(sliceProblemShape) = sliceTokenCount;
@@ -336,15 +359,19 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunRead
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_, addr,
         state, begin.tokenIndexInExpert, tilesPerM);
     addr.timer = timer_.Enabled() ? &timer_ : nullptr;
+    auto consumed = RoutedConsumed();
+    const bool direct = consumed && AscendC::ReadGmByPassDCache(addr.gmmToEpilogueFlag + 1) == readySequence + 1;
     timer_.SetWave(static_cast<int64_t>(cursor.wave));
     timer_.SetSlice(begin.expertIdx, begin.tokenIndexInExpert, rows);
     RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
                                    GMM1_TILE_M, TopkWeightsPrefetch, FuseGateUp>(
         epilogueOp_, state.problemShape, addr, gmmExecutionConfig_.blockJob, cursor.nextTile,
-        static_cast<uint32_t>(begin.globalTokenIndex), AscendTimer::AIV_SWIGLU, params_.tilingData->bf16Bs96);
+        static_cast<uint32_t>(begin.globalTokenIndex), AscendTimer::AIV_SWIGLU, params_.tilingData->bf16Bs96, direct);
     timer_.ClearSlice();
     if constexpr (!TopkWeightsPrefetch) {
         ++readySequence;
+        // The epilogue has retired both MTE3 output stores, including for GM fallback tiles.
+        if (consumed) AscendC::WriteGmByPassDCache(consumed, readySequence);
     }
 }
 #else
@@ -591,7 +618,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
             // W4 的 GMM2/Combine 调度集中在基类，派生模板只负责提供当前专家 slice。
             this->template RunGmm2CombineForExpert<FuseGateUp>(
                 gmm2State, gmm2AddrInfo, startBlockIdx, sliceTokenStartIndexInExpert, sliceTokenCount,
-                combineBufferConfig, combineRowSequence, gmm1TileReadySequence, isFinalCombine, true);
+                combineBufferConfig, combineRowSequence, gmm1TileReadySequence, isFinalCombine, true, RoutedPipeline());
         }
     }
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
@@ -797,6 +824,9 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                                    gmm1TileReadySequence);
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM2, ++gmm2Count);
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    gmm1CatlassContext_.End(true);  // All routed GMM2 tiles have published after FIX.
+#endif
     timer_.SetWave(AscendTimer::NO_WAVE);
 }
 

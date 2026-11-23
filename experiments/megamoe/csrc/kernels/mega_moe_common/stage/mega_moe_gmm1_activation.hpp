@@ -270,10 +270,24 @@ __aicore__ inline void Gmm1AicMmadA8W4(BlockMmad& blockMmad, WorkSet& workSet, c
             lastWaveWaited = waveIdx;
         }
 
+#ifdef DEEPEP_MEGAMOE_ROCE
+        const bool direct = gmmAddrInfo.routedConsumed && config.m <= ROUTED_UB_MAX_ROWS &&
+                            Get<N_VALUE>(actualShape) == GMM1_FUSED_TILE_N &&
+                            params.tilingData->roceScratchUbOffset >= ROUTED_UB_END &&
+                            AscendC::ReadGmByPassDCache(gmmAddrInfo.routedConsumed) == gmm1TileReadySequence;
+        blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape), direct);
+#else
         blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape));
-
+#endif
         AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (direct) {
+            // Word 1 of the producer's cache line identifies the only outstanding UB tile.
+            AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag + 1, gmm1TileReadySequence + 1);
+            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        }
+#endif
         if constexpr (TopkWeightsPrefetch) {
             NotifyGmm1TileStatus(gmmAddrInfo, expertIdx, loopIdx);
         } else if (gmmAddrInfo.gmmToEpilogueFlag != nullptr) {
@@ -506,14 +520,14 @@ __aicore__ inline void Gmm1Aiv1PrefetchEpilogueTileA8W4(ActivationQuantOp& activ
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(0);
 }
 
-// 非 Prefetch 路径的 AIV1 从 GM 取回完整 A8W4 GMM1 tile 并执行 SwiGLU/量化。
+// AIV1 consumes the completed gate/up pair before publishing GMM2 readiness.
 #ifdef DEEPEP_MEGAMOE_ROCE
 template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, typename TensorC, typename ActivationQuantOp,
           typename Config, typename ActualShape>
 __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQuantOp, TensorC& l0cOutGm,
                                                 const GMMAddrInfo& gmmAddrInfo, const Config& config,
                                                 const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc,
-                                                bool packShortTile = false)
+                                                bool packShortTile = false, bool direct = false)
 {
 #else
 template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, typename TensorC, typename ActivationQuantOp,
@@ -526,39 +540,44 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
     if (Get<M_VALUE>(actualShape) == 0U) {
         return;
     }
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
-    const uint32_t gateLoc = Config::FUSED_GATE_UP ? nLoc * ACTIVATION_N_HALF : nLoc;
-    const uint32_t upLoc = gateLoc + (Config::FUSED_GATE_UP ? Get<N_VALUE>(actualShape) : config.outputN);
-    auto tensorBlockGmFirst = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
-                                             Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
-    auto tensorBlockGmSecond =
-        l0cOutGm.Slice(Te::MakeCoord(mLoc, upLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
-    auto layoutL0cUb = MakeLayoutC{}(config.tileM, L1_TILE_N);
-    int64_t ubOffsetFirst = 0;
-    uint32_t ubBufferSize =
-        config.tileM == L1_TILE_M_128 ? MAX_SINGLE_MN_ALIGN32_NUM_128 : MAX_SINGLE_MN_ALIGN32_NUM_256;
-    int64_t ubOffsetSecond = static_cast<int64_t>(ubBufferSize) * sizeof(ElementC);
-    auto tensorBlockUbFirst = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetFirst), layoutL0cUb);
-    auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);
-    auto copyGm2Ub = AscendC::Te::MakeCopy(AscendC::Te::CopyGM2UB{});
 #ifdef DEEPEP_MEGAMOE_ROCE
     const bool packed = packShortTile && Config::FUSED_GATE_UP && Get<N_VALUE>(actualShape) * 2 == L1_TILE_N &&
                         Get<M_VALUE>(actualShape) <= L1_TILE_M_128;
-    if (packed) {
-        auto pair = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
-                                   Te::MakeShape(Get<M_VALUE>(actualShape), 2 * Get<N_VALUE>(actualShape)));
-        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, pair);
-    } else {
-        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
-        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
-    }
-#else
-    AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
-    AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+    if (direct) {
+        AscendC::CrossCoreWaitFlag<4, PIPE_V>(ROUTED_FIX_READY);
+    } else
 #endif
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+    {
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
+        const uint32_t gateLoc = Config::FUSED_GATE_UP ? nLoc * ACTIVATION_N_HALF : nLoc;
+        const uint32_t upLoc = gateLoc + (Config::FUSED_GATE_UP ? Get<N_VALUE>(actualShape) : config.outputN);
+        auto tensorBlockGmFirst = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
+                                                 Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
+        auto tensorBlockGmSecond =
+            l0cOutGm.Slice(Te::MakeCoord(mLoc, upLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
+        auto layoutL0cUb = MakeLayoutC{}(config.tileM, L1_TILE_N);
+        int64_t ubOffsetFirst = 0;
+        uint32_t ubBufferSize =
+            config.tileM == L1_TILE_M_128 ? MAX_SINGLE_MN_ALIGN32_NUM_128 : MAX_SINGLE_MN_ALIGN32_NUM_256;
+        int64_t ubOffsetSecond = static_cast<int64_t>(ubBufferSize) * sizeof(ElementC);
+        auto tensorBlockUbFirst = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetFirst), layoutL0cUb);
+        auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);
+        auto copyGm2Ub = AscendC::Te::MakeCopy(AscendC::Te::CopyGM2UB{});
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (packed) {
+            auto pair = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
+                                       Te::MakeShape(Get<M_VALUE>(actualShape), 2 * Get<N_VALUE>(actualShape)));
+            AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, pair);
+        } else
+#endif
+        {
+            AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
+            AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+    }
     Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape),
                                                                  0, 0};
     Std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
@@ -571,7 +590,7 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
         0};
     AscendC::SetCtrlSpr<60, 60>(0);
 #ifdef DEEPEP_MEGAMOE_ROCE
-    activationQuantOp(epilogueShape, epilogueOffset, 0U, packed);
+    activationQuantOp(epilogueShape, epilogueOffset, 0U, packed, direct);
 #else
     activationQuantOp(epilogueShape, epilogueOffset);
 #endif
@@ -784,7 +803,7 @@ __aicore__ inline void Gmm1Aiv1EpilogueA8W4(WorkSet& workSet, const GMMAddrInfo&
     }
 }
 
-// Kernel lifetime is independent of scratch ownership: each slice begins and drains events.
+// A routed wave can hold the pipeline across slices; a standalone slice drains it here.
 template <bool IsShared, bool TopkWeightsPrefetch, typename Config, typename WorkSet>
 __aicore__ inline void RunGmm1CatlassTiles(CatlassGmm1<Config>& kernel, WorkSet& workSet, const Params& params,
                                            const GMMAddrInfo& addr, const Config& config, uint32_t startLoopIdx,
@@ -795,11 +814,13 @@ __aicore__ inline void RunGmm1CatlassTiles(CatlassGmm1<Config>& kernel, WorkSet&
     if constexpr (g_coreType == AscendC::AIC) {
         Gmm1AicMmadA8W4<CatlassGmm1<Config>, IsShared, TopkWeightsPrefetch>(
             kernel, workSet, params, addr, config, startLoopIdx, tileNum, readySequence, expertIdx);
-        kernel.End(true);  // Tile readiness publication already drained FIX.
     } else {
         Gmm1Aiv0PrologueA8W4(kernel, workSet.scheduler, config, startLoopIdx, tileNum);
-        kernel.End();
     }
+#ifdef DEEPEP_MEGAMOE_ROCE
+    if (addr.routedConsumed != nullptr) return;  // The wave owns both routed projections.
+#endif
+    kernel.End(g_coreType == AscendC::AIC);  // GMM1 publishes after FIX retires.
 }
 
 // 根据 GM 地址建立执行资源，并执行 A8W4 GMM1/SwiGLU 阶段。
@@ -954,7 +975,8 @@ template <typename ElementA, typename ElementB, typename ElementC, typename Elem
 __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
     ActivationQuantOp& activationQuantOp, const ProblemShape& problemShape, const GMMAddrInfo& gmmAddrInfo,
     const BlockJobContext& blockJob, uint32_t loopIdx, uint32_t expertBeforeCnt,
-    DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType timingType = DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_SWIGLU, bool packShortTile = false)
+    DEEPEP_MEGAMOE_TIMER_NAMESPACE::DynamicTimingType timingType = DEEPEP_MEGAMOE_TIMER_NAMESPACE::AIV_SWIGLU,
+    bool packShortTile = false, bool direct = false)
 {
 #else
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,
@@ -990,7 +1012,7 @@ __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
     } else {
 #ifdef DEEPEP_MEGAMOE_ROCE
         GmmKernel::Gmm1Aiv1EpilogueTileA8W4<ElementC, typename GmmConfig::MakeLayoutC, true>(
-            activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n, packShortTile);
+            activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n, packShortTile, direct);
 #else
         GmmKernel::Gmm1Aiv1EpilogueTileA8W4<ElementC, typename GmmConfig::MakeLayoutC, true>(
             activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n);

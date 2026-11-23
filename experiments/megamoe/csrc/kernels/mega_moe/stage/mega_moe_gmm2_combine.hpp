@@ -850,51 +850,38 @@ template <typename ElementC, bool IsShared, bool IsLayered, bool NotifyCombineTi
 __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmmAddrInfo, const Config& config,
                                     uint32_t startLoopIdx, uint32_t tileNum, uint32_t expertTokenCount,
                                     uint32_t rowOffsetInExpert, const Params* params = nullptr,
-                                    int32_t* gmTileSequence = nullptr)
+                                    int32_t* gmTileSequence = nullptr, CatlassGmm1<Config>* routed = nullptr)
 {
     using KernelConfig = typename Config::KernelConfig;
-    using ElementA = typename KernelConfig::ElementAType;
-    using ElementB = typename KernelConfig::ElementBType;
-    using ElementMxScaleA = typename KernelConfig::ElementMxScaleAType;
-    using ElementMxScaleB = typename KernelConfig::ElementMxScaleBType;
-    using BiasType = typename KernelConfig::BiasType;
-
-    auto layouts = KernelConfig::BuildLayouts(config);
-    auto gmC = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementC*>(gmmAddrInfo.gmm2OutGlobal)), layouts.c);
-    auto gmA = Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementA*>(gmmAddrInfo.aGlobal)),
-                              layouts.a);
-    auto gmB = Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementB*>(gmmAddrInfo.bGlobal)),
-                              layouts.b);
-    auto gmScaleA = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementMxScaleA*>(gmmAddrInfo.aScaleGlobal)),
-        layouts.scaleA);
-    auto gmScaleB = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementMxScaleB*>(gmmAddrInfo.bScaleGlobal)),
-        layouts.scaleB);
-    auto gmBias =
-        Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ BiasType*>(0UL)), layouts.bias);
-
-    using WorkSetType = GroupMatmulWorkSet<Scheduler, decltype(gmA), decltype(gmB), decltype(gmScaleA),
-                                           decltype(gmScaleB), decltype(gmBias), decltype(gmC)>;
-    WorkSetType workSet{scheduler, gmA, gmB, gmScaleA, gmScaleB, gmBias, gmC};
-
-    if constexpr (g_coreType == AscendC::AIC) {
-        CatlassGmm2<Config> blockMmad(config, gmmAddrInfo);
-        Gmm2AicMmadA8W4<IsShared, IsLayered, NotifyCombineTileReady, TokenCombine>(
-            blockMmad, workSet.scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, expertTokenCount,
-            rowOffsetInExpert, gmTileSequence);
-    } else {
-        if (GetSubBlockIdx() == 0U) {
-            AscendTimerSpanScope prologueTimer(IsShared ? gmmAddrInfo.timer : nullptr,
-                                               AscendTimer::AIV_SHARED_GMM2_PROLOGUE);
-            CatlassGmm2<Config> blockPrologue(config, gmmAddrInfo);
-            Gmm2Aiv0PrologueA8W4(blockPrologue, workSet.scheduler, config, startLoopIdx, tileNum);
-        } else if constexpr (NotifyCombineTileReady) {
-            using MakeLayoutC = typename KernelConfig::MakeLayoutC;
-            CombineTokenRange<ElementC, MakeLayoutC>(workSet.scheduler, workSet.gmC, *params, gmmAddrInfo,
-                                                     *gmTileSequence, config, startLoopIdx, tileNum);
+    if constexpr (g_coreType == AscendC::AIV) {
+        if (GetSubBlockIdx() == 1U) {
+            if constexpr (NotifyCombineTileReady) {
+                using MakeLayoutC = typename KernelConfig::MakeLayoutC;
+                auto gmC = Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(
+                    reinterpret_cast<__gm__ ElementC*>(gmmAddrInfo.gmm2OutGlobal)), MakeLayoutC{}(config.m, config.n));
+                CombineTokenRange<ElementC, MakeLayoutC>(scheduler, gmC, *params, gmmAddrInfo, *gmTileSequence,
+                                                         config, startLoopIdx, tileNum);
+            }
+            return;
         }
+    }
+    AscendTimerSpanScope timing(IsShared && g_coreType == AscendC::AIV ? gmmAddrInfo.timer : nullptr,
+                               AscendTimer::AIV_SHARED_GMM2_PROLOGUE);
+    auto run = [&](auto& kernel) {
+        kernel.UpdateProblem(config, gmmAddrInfo, true);
+        kernel.Begin();
+        if constexpr (g_coreType == AscendC::AIC) {
+            Gmm2AicMmadA8W4<IsShared, IsLayered, NotifyCombineTileReady, TokenCombine>(kernel, scheduler, gmmAddrInfo,
+                config, startLoopIdx, tileNum, expertTokenCount, rowOffsetInExpert, gmTileSequence);
+        } else {
+            Gmm2Aiv0PrologueA8W4(kernel, scheduler, config, startLoopIdx, tileNum);
+        }
+    };
+    if (routed) {
+        run(*routed);
+    } else {
+        CatlassGmm1<Config> local;
+        run(local);
     }
 }
 
@@ -963,12 +950,12 @@ __aicore__ inline void RunGmm2Generic(const AscendC::Shape<int64_t, int64_t, int
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,
           uint32_t Gmm1TileM = L1_TILE_M_256, bool TopkWeightsPrefetch = false, bool IsShared = false,
           bool IsLayered = false, bool IsWaveFlagGrained = false, bool NotifyCombineTileReady = false,
-          bool TokenCombine = false, bool SourceGmm1Fused = false>
+          bool TokenCombine = false, bool SourceGmm1Fused = false, class RoutedKernel = decltype(nullptr)>
 __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
                                    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
                                    const BlockJobContext& blockJob, uint32_t expertTokenCount,
                                    uint32_t rowOffsetInExpert, const Params* params = nullptr,
-                                   int32_t* gmTileSequence = nullptr, bool reverseBlocks = false)
+                                   int32_t* gmTileSequence = nullptr, bool reverseBlocks = false, RoutedKernel routed = nullptr)
 {
     static_assert(!IsShared || !NotifyCombineTileReady, "Shared expert GMM2 has its own completion counter");
     static_assert(!IsLayered || !NotifyCombineTileReady, "Layered GMM2 selects its synchronization through IsLayered");
@@ -997,7 +984,7 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
     GmmKernel::Gmm2ExecA8W4<ElementC, IsShared, IsLayered, NotifyCombineTileReady, TokenCombine,
                             GmmKernel::BlockScheduler, decltype(config)>(scheduler, gmmAddrInfo, config, startLoopIdx,
                                                                          tileNum, expertTokenCount, rowOffsetInExpert,
-                                                                         params, gmTileSequence);
+                                                                         params, gmTileSequence, routed);
 
     startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
 }

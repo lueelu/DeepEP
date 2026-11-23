@@ -126,8 +126,7 @@ __aicore__ inline void BroadcastRouteBlock(GM_ADDR* peers, uint64_t offset, GM_A
 {
     GlobalTensor<uint8_t> src, dst;
     src.SetGlobalBuffer(source);
-    LocalTensor<uint8_t> block(TPosition::VECCALC, params.tilingData->roceScratchUbOffset + HIERARCHICAL_ROCE_UB_BYTES,
-                               bytes);
+    LocalTensor<uint8_t> block(TPosition::VECCALC, params.tilingData->routeStripeUbOffset, bytes);
     DataCopy(block, src[0], bytes);
     SyncFuncStatic<HardEvent::MTE2_MTE3, MEGAMOE_ROCE_EVENT_ID>();
     for (uint32_t i = 0; i < 4U; ++i) {

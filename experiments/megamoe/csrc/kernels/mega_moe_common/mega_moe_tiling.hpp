@@ -236,13 +236,12 @@ struct MegaMoeTilingData {
     // 物理每机 EP rank 数，rank 按机器连续编号；0 表示未知，仅关闭刀片交错；peer均衡及wave轮换仍有效。
     uint32_t dispatchRanksPerNode;
 #ifdef DEEPEP_MEGAMOE_ROCE
-    // Dynamic stage budgets exclude these final 256 UB bytes. Fixed activation
-    // scratch may alias them between calls: each RoCE API drains its scratch use
-    // before returning, and progress runs only at drained tile/slice boundaries.
     uint32_t roceScratchUbOffset;
     // Nonzero invocation ID owned by SymmBuffer, independent of BS-specific Plans
     // and of the original 7-bit route/count epoch. Never wrap in a live buffer.
     uint32_t hierarchicalSequence;
+    // Gather stripes retire at the input barrier. RoCE and probes also run during routed GMM.
+    uint32_t routeStripeUbOffset;
     MegaMoeArenaOffsets arena;
 #endif
 };

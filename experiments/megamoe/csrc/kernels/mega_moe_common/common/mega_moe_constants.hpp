@@ -50,6 +50,12 @@ constexpr uint64_t IDX_GMM2_OFFSET = 13UL;
 constexpr int32_t INT_CACHELINE = 16;
 constexpr uint32_t RANK_SYNC_COUNTER_OFFSET_BYTES = 48U * 1024U;
 constexpr uint32_t RANK_SYNC_COUNTER_SLOT_BYTES = 64U;
+#ifdef DEEPEP_MEGAMOE_ROCE
+constexpr uint32_t ROUTED_UB_BASE = 208U * 1024U;
+constexpr uint32_t ROUTED_UB_MAX_ROWS = 64U;
+constexpr uint32_t ROUTED_UB_END = ROUTED_UB_BASE + ROUTED_UB_MAX_ROWS * 256U * 2U;
+constexpr uint16_t ROUTED_FIX_READY = 10U;  // Mode 4: AIC flag 26 maps to AIV1 flag 10.
+#endif
 constexpr uint64_t INT32_PER_256B = 8U;
 constexpr uint32_t BITS_PER_BYTE = 8U;
 constexpr int32_t MXFP_DIVISOR_SIZE = 64;

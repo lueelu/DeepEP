@@ -117,6 +117,13 @@ add_custom_command(OUTPUT "${ep32_library}"
         "${PROJECT_SOURCE_DIR}/csrc/common/megamoe_combine_config.hpp"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 add_custom_target(megamoe_ep32_device DEPENDS "${ep32_library}")
+set(fp4_check_flags ${ep32_flags})
+list(REMOVE_ITEM fp4_check_flags -shared -Wl,-soname,libmegamoe_ep32_kernel.so)
+add_custom_target(megamoe_check_fp4_l1
+    COMMAND "${BISHENG}" ${fp4_check_flags} tests/check_fp4_l1.cpp "-L${ASCEND_HOME_PATH}/lib64"
+        -lruntime -lascendcl -lstdc++ -lm -o "${CMAKE_CURRENT_BINARY_DIR}/check_fp4_l1"
+    COMMAND "${CMAKE_CURRENT_BINARY_DIR}/check_fp4_l1"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 pybind11_add_module(megamoe_ep32_ext csrc_ep32/bindings.cpp csrc_ep32/forward.cpp)
 set_target_properties(megamoe_ep32_ext PROPERTIES OUTPUT_NAME _ep32_C
     INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)

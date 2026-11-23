@@ -107,7 +107,7 @@ HOST_DEVICE bool UseRouteAllGather(const MegaMoeTilingData* t)
                         t->topK == 8U && t->moeExpertPerRank == 12U;
     const bool dsv = (t->bs == 96U || t->bs == 128U) && t->h == 5120U && t->topK == 6U && t->moeExpertPerRank == 13U &&
                      t->sharedExpertNum <= 1U;
-    return UseHierarchicalRoce(t) && t->blockAivNum >= 8U && (common || dsv);
+    return UseHierarchicalRoce(t) && t->blockAivNum >= 8U && (common || dsv || t->bf16Bs96);
 }
 
 HOST_DEVICE uint32_t NextDomainSequence(uint32_t previous, uint32_t domain, uint32_t bits)
@@ -168,8 +168,9 @@ HOST_DEVICE uint32_t HierarchicalCombineOwnerCount(const MegaMoeTilingData* t)
 
 HOST_DEVICE bool IsDsv96CombineShape(const MegaMoeTilingData* t)
 {
-    return t->bs == 96U && t->h == 5120U && t->hiddenDim == 4608U && t->moeExpertPerRank == 13U &&
-           t->topK == 6U && t->sharedExpertNum == 1U && t->sharedFp8 &&
+    return t->bs == 96U && t->h == 5120U && t->hiddenDim == 4608U &&
+           (t->moeExpertPerRank == 12U || t->moeExpertPerRank == 13U) &&
+           t->topK == 6U && t->sharedExpertNum == 1U &&
            t->dispatchRanksPerNode == HIERARCHICAL_RANKS_PER_HOST &&
            t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 && t->combineQuantMode == COMBINE_NO_QUANT &&
            t->topkWeightsPrefetch == 0 && t->epWorldSize == 32U && t->aicNum >= 16U && t->aicNum <= 32U &&
@@ -178,12 +179,18 @@ HOST_DEVICE bool IsDsv96CombineShape(const MegaMoeTilingData* t)
 
 HOST_DEVICE bool UseAiv0CombineOwners(const MegaMoeTilingData* t)
 {
-    return UseHierarchicalRoce(t) && !IsDsv96CombineShape(t);
+    return UseHierarchicalRoce(t) && !t->bf16Bs96 &&
+           !(t->moeExpertPerRank == 13U && t->sharedFp8 && IsDsv96CombineShape(t));
+}
+
+HOST_DEVICE bool SupportsBf16Bs96(const MegaMoeTilingData* t)
+{
+    return UseHierarchicalRoce(t) && IsDsv96CombineShape(t) && t->aicNum == 28U;
 }
 
 HOST_DEVICE bool UseBf16Bs96(const MegaMoeTilingData* t, bool prequantized)
 {
-    return !prequantized && UseHierarchicalRoce(t) && IsDsv96CombineShape(t) && t->aicNum == 28U;
+    return !prequantized && t->sharedFp8 && SupportsBf16Bs96(t);
 }
 
 // Each active Combine QP has one physical owner. The input barrier closes Dispatch's use of QP1..8.

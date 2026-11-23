@@ -84,7 +84,7 @@ public:
     // 计算并写回一个激活/量化 tile，不包含流水通知。
 #ifdef DEEPEP_MEGAMOE_ROCE
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
-                                      uint16_t pingpongIdx = 0, bool packedGateUp = false);
+                                      uint16_t pingpongIdx = 0, bool packedGateUp = false, bool direct = false);
 #else
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
                                       uint16_t pingpongIdx = 0);
@@ -389,7 +389,7 @@ template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t 
 __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
                                                       IsInterleaved_>::operator()(const BlockShape& blockShape,
                                                                                   const BlockCoord& blockCoord,
-                                                                                  uint16_t pingpongIdx, bool packedGateUp)
+                                                                                  uint16_t pingpongIdx, bool packedGateUp, bool direct)
 {
 #else
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
@@ -421,6 +421,7 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
     uint32_t outputRowStrideElements = Ops::Base::CeilAlign(tileColumnCount, static_cast<uint32_t>(ONE_BLK_SIZE));
 #ifdef DEEPEP_MEGAMOE_ROCE
     // Packed tiles keep the existing TileN stride, with up in the second half of each row.
+    if (direct) ubPointers.firstInput = reinterpret_cast<__ubuf__ DataTypeIn*>(ROUTED_UB_BASE);
     if (packedGateUp) ubPointers.secondInput = ubPointers.firstInput + tileColumnCount;
 #endif
     RunGatedActivationTile(ubPointers.firstInput, ubPointers.secondInput, ubPointers.activationOutput,

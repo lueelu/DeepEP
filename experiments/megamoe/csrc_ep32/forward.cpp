@@ -147,42 +147,10 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
     return c;
 }
 
-uint64_t HostFlagElements(const MegaMoeTilingData& t)
-{
-    const uint64_t waves = CeilDiv<uint64_t>(t.maxOutputSize, 256U);
-    const uint64_t wave_slots = waves * MegaMoeImpl::INT_CACHELINE;
-    uint64_t count = static_cast<uint64_t>(t.moeExpertPerRank) *
-                     (wave_slots + wave_slots + static_cast<uint64_t>(MegaMoeImpl::INT_CACHELINE) * t.aicNum);
-    const bool is_w4 = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ;
-    if (is_w4 || (MegaMoeImpl::UsesMteLayout(t.topoType) && t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT)) {
-        // Pairwise GMM2/combine publishes one sequence per AIC.
-        count += static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
-    }
-    if (MegaMoeImpl::UsesMteLayout(t.topoType) &&
-        (t.combineQuantMode != MegaMoeImpl::COMBINE_NO_QUANT ||
-         t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 || MegaMoeImpl::UseHierarchicalRoce(&t))) {
-        // Match WorkspaceInfo: full-row Combine owns one counter per M-group,
-        // while quantized Combine retains one ready slot per AIC.
-        const uint64_t ready_slots_per_expert = t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT
-                                                    ? wave_slots
-                                                    : static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
-        count += static_cast<uint64_t>(t.moeExpertPerRank) * ready_slots_per_expert;
-    }
-    if (t.sharedExpertNum > 0U) {
-        count += CeilDiv<uint64_t>(t.bs, 256U) * t.sharedExpertNum * MegaMoeImpl::INT_CACHELINE;
-        if (MegaMoeImpl::UsesMteLayout(t.topoType) && t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4) {
-            count += 4ULL * t.aicNum * MegaMoeImpl::INT_CACHELINE;
-        }
-    }
-    return count;
-}
-
 void SetSendMaskConfigs(MegaMoeTilingData& t, uint32_t ub)
 {
-    const uint32_t reset_per_core =
-        static_cast<uint32_t>(CeilDiv(HostFlagElements(t), static_cast<uint64_t>(t.blockAivNum)));
+    const auto flags = MegaMoeImpl::WorkspaceInfo(nullptr, &t).flagResetElementCount;
+    const uint32_t reset_per_core = static_cast<uint32_t>(CeilDiv<int64_t>(flags, t.blockAivNum));
     const uint32_t reset_count = std::min(reset_per_core, static_cast<uint32_t>(DISPATCH_RESET_BATCH));
     const uint32_t reset_bytes = AlignUp(reset_count, uint32_t{MegaMoeImpl::INT32_PER_256B}) * 4U;
     const uint32_t quant_out = AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U);
@@ -296,19 +264,27 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
 #endif
     const uint32_t packets = MegaMoeImpl::DispatchPacketCount(AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U));
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
-    const uint32_t stripe = MegaMoeImpl::UseRouteAllGather(&t)
+    const bool bf16Shape = MegaMoeImpl::SupportsBf16Bs96(&t);
+    const uint32_t stripe = (MegaMoeImpl::UseRouteAllGather(&t) || bf16Shape)
                                 ? static_cast<uint32_t>(4U * MegaMoeImpl::CalcRailTopkIdsSlotDataBytes(t.bs, t.topK))
                                 : 0U;
     // The row probe reserves at least eight 32-byte trailers plus its 32-byte result. Between slices
     // the gateway helper uses eight lane trailers and the next 32-byte line for its broadcast.
     const uint32_t probeBytes = (MegaMoeImpl::DISPATCH_PROBE_ROWS * packets + 1U) * 32U;
-    const uint32_t reserved = AlignUp(MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES + std::max(stripe, probeBytes), 256U);
+    const uint32_t probeReserve = AlignUp(MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES + probeBytes, 256U);
+    const uint32_t sharedReserve = AlignUp(MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES + std::max(stripe, probeBytes), 256U);
+    // On a 248 KiB UB the full input stripe would push the concurrent RoCE scratch below 240 KiB.
+    // Place the stripe below RoCE only when this makes the routed handoff fit. Its DMA drains at the input barrier.
+    const bool splitStripe = bf16Shape && p.ub >= MegaMoeImpl::ROUTED_UB_END + probeReserve &&
+                             p.ub < MegaMoeImpl::ROUTED_UB_END + sharedReserve;
+    const uint32_t reserved = splitStripe ? stripe + probeReserve : sharedReserve;
     TORCH_CHECK(!hierarchical || p.ub > reserved, "Not enough UB for RoCE and Dispatch probes");
     TORCH_CHECK(!hierarchical || packets * 512U <= 2U * t.h, "packet staging exceeds retired BF16 input");
     const uint32_t stage_ub = hierarchical ? p.ub - reserved : p.ub;
     TORCH_CHECK(!hierarchical || stage_ub >= MegaMoeImpl::CalcGatewayCombineReduceUbBytes(&t),
                 "Not enough UB for gateway readiness and FP32 reduction");
-    t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
+    t.roceScratchUbOffset = hierarchical ? stage_ub + (splitStripe ? stripe : 0U) : 0U;
+    t.routeStripeUbOffset = splitStripe ? stage_ub : t.roceScratchUbOffset + MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES;
     t.combineSyncSlotCountPerExpert = 0;
     t.topkWeightsPrefetch = 0;
     t.maxTilesPerExpert = 0;
@@ -330,10 +306,10 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
             CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 4U, gmm1_tiles), CeilDiv<uint64_t>(p.aic, gmm2_tiles)));
     }
     t.isPerExpertWeightTensor = false;
-    t.dispatchBufferConfig = DispatchConfig(t, stage_ub);
+    t.dispatchBufferConfig = DispatchConfig(t, bf16Shape ? std::min(stage_ub, MegaMoeImpl::ROUTED_UB_BASE) : stage_ub);
     SetSendMaskConfigs(t, stage_ub);
     SetUnpermuteConfigs(t, stage_ub);
-    if (MegaMoeImpl::UseSharedRouteTable(&t)) {
+    if (MegaMoeImpl::UseSharedRouteTable(&t) || bf16Shape) {
         const uint64_t record = MegaMoeImpl::CalcRailTopkIdsSlotDataBytes(t.bs, t.topK);
         const uint64_t table = AlignUp<uint64_t>(32ULL * t.moeExpertPerRank * 4U, 256U);
         const uint64_t masks = 2U * AlignUp<uint64_t>(t.bs, 8U) + 8U;
@@ -552,7 +528,9 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     const bool bf16Bs96 = MegaMoeImpl::UseBf16Bs96(&tiling_, prequantized);
     if (tiling_.bf16Bs96 != bf16Bs96) {
         tiling_.bf16Bs96 = bf16Bs96;
-        SetUnpermuteConfigs(tiling_, tiling_.roceScratchUbOffset);
+        const uint32_t stageUb = std::min(tiling_.routeStripeUbOffset, tiling_.roceScratchUbOffset);
+        SetSendMaskConfigs(tiling_, stageUb);
+        SetUnpermuteConfigs(tiling_, stageUb);
     }
     tiling_.mGroupsPerWave = default_wave_;
     if (is_a8w4 && bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {

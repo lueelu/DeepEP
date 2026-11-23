@@ -15,6 +15,7 @@
 
 #include "kernels/mega_moe_common/catlass_gmm/resource.hpp"
 #include "a8w4_k_plan.hpp"
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/numeric_size.hpp"
@@ -27,6 +28,9 @@
 namespace Catlass::Gemm::Block {
 
 #if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+#ifdef DEEPEP_MEGAMOE_ROCE
+constexpr AscendC::FixpipeConfig ROUTED_ROW_MAJOR_UB{AscendC::CO2Layout::ROW_MAJOR, true};
+#endif
 
 // Based on CATLASS example 74. Only AIV0 produces the complete L1 B tile.
 template <class DispatchPolicy_, class L1TileShape_, class L0TileShape_, class ElementA_, class ElementB_,
@@ -343,7 +347,7 @@ public:
               class TensorBias = EmptyClass>
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
-                                   bool allowDynamicB = false, TensorBias const& tensorBias = {})
+                                   bool allowDynamicB = false, bool toAiv1 = false, TensorBias const& tensorBias = {})
     {
         // Check L1TileShape
         if constexpr (HAS_BIAS) {
@@ -561,11 +565,33 @@ public:
         if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
-            copyL0CToDst(tensorC, tensorL0C);
+        }
+        constexpr uint8_t unitFlag = ENABLE_UNIT_FLAG ? 0b11 : 0;
+#ifdef DEEPEP_MEGAMOE_ROCE
+        if (toAiv1) {
+            // Store the packed [gate128, up128] rows with the same scaled BF16 conversion as GM.
+            AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> fix{};
+            fix.mSize = mL1Actual;
+            fix.nSize = fix.dstStride = nL1Actual;
+            fix.srcStride = tla::get<1, 1>(tensorL0C.stride()) / tla::get<0, 0>(tensorL0C.stride());
+            fix.unitFlag = unitFlag;
+            fix.dualDstCtl = 0U;
+            fix.subBlockId = 1U;
+            fix.reluEn = CopyL0CToDst::reluEn;
+            fix.quantPre = CopyL0CToDst::quantPre;
+            fix.deqScalar = static_cast<uint64_t>(*reinterpret_cast<int32_t*>(&copyL0CToDst.params.scale));
+            AscendC::LocalTensor<ElementC> dst(AscendC::TPosition::VECCALC, MegaMoeImpl::ROUTED_UB_BASE,
+                                               mL1Actual * nL1Actual);
+            AscendC::Fixpipe<ElementC, ElementAccumulator, ROUTED_ROW_MAJOR_UB>(dst, l0CTensorList[l0CListId], fix);
+            AscendC::CrossCoreSetFlag<4, PIPE_FIX>(16U + MegaMoeImpl::ROUTED_FIX_READY);
+        } else
+#endif
+        {
+            copyL0CToDst(tensorC, tensorL0C, unitFlag);
+        }
+        if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0CListId]);
             l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
-        } else {
-            copyL0CToDst(tensorC, tensorL0C, 0b11);
         }
     }
 
