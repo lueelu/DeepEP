@@ -89,9 +89,8 @@ def test_payload_wqe_headers_and_addresses(tmp_path):
         body = cpp_functions(text, f"Build{kind.capitalize()}Wqes")
         end = body.rfind(")", 0, body.index("{"))
         body = (body[:end] + ", uint32_t tid" + body[end:]).replace("threadIdx.x", "tid")
-        body = body.replace(
-            "reinterpret_cast<const __gm__ int32_t*>(span[0])[position / fields]", "index_at(position / fields)"
-        )
+        body = body.replace("reinterpret_cast<const __gm__ int32_t*>(span[0])[index]", "index_at(index)")
+        body = body.replace("reinterpret_cast<const __ubuf__ int32_t*>(span[0])[index]", "index_at(index)")
         body = body.replace(
             "reinterpret_cast<__ubuf__ int32_t*>(span[0])[position / fields * index_step]",
             "index_at(position / fields * index_step)",
@@ -153,3 +152,40 @@ static_assert(matrix());
         timeout=180,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("corrupt_retention", [False, True])
+def test_dispatch_index_windows_and_pending_batch_lifetime(tmp_path, corrupt_retention):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("C++17 compiler required")
+    sender = (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_sender.h").read_text()
+    schedule = (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_schedule.h").read_text()
+    helpers = cpp_functions(schedule, "ReuseDispatchIndexWindow", "DispatchIndexLowerBound")
+    methods = cpp_functions(sender, "PutRowsImpl", "PreserveIndices", "BuildDispatchWqes")
+    methods = methods.replace("reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset)", "this->spans.data()")
+    methods = methods.replace(
+        "reinterpret_cast<__ubuf__ int32_t*>(scratch_ + kSavedIndicesOffset)", "memory.data() + saved_base"
+    )
+    methods = methods.replace("reinterpret_cast<const __ubuf__ int32_t*>(span[0])", "(memory.data() + span[0])")
+    methods = methods.replace("reinterpret_cast<const __gm__ int32_t*>(span[0])", "(memory.data() + span[0])")
+    methods = methods.replace("reinterpret_cast<uint64_t>(saved + saved_indices_)", "saved_base + saved_indices_")
+    methods = methods.replace(
+        "uint32_t span_count, uint32_t count)", "uint32_t span_count, uint32_t count, uint32_t tid)"
+    )
+    methods = methods.replace("threadIdx.x", "tid")
+    if corrupt_retention:
+        methods = methods.replace("saved[saved_indices_ + t] = indices[t]", "saved[saved_indices_ + t] = 0")
+    program = Path(__file__).with_name("dispatch_index_oracle.cpp").read_text()
+    path = tmp_path / "dispatch_indices.cpp"
+    path.write_text(program.replace("// WINDOW_HELPERS", helpers).replace("// SENDER_METHODS", methods))
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "indices.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if corrupt_retention:
+        assert result.returncode != 0 and "static assertion" in result.stderr, result.stderr
+    else:
+        assert result.returncode == 0, result.stderr

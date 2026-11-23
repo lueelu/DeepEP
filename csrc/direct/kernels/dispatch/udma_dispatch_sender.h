@@ -8,12 +8,13 @@
 namespace ascend_deepep::udma {
 inline constexpr uint32_t kDispatchBasesOffset = kSenderScratchBytes;
 inline constexpr uint32_t kDispatchEpochOffset = kDispatchBasesOffset + kMaxPeers * kOutputRecordBytes;
-inline constexpr uint32_t kDispatchSenderBytes = kDispatchEpochOffset + 32;
+inline constexpr uint32_t kDispatchSenderBytes = kDispatchEpochOffset + 32 + kDispatchSavedIndexBytes;
 static_assert(kDispatchSenderBytes % 32 == 0);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-// Spans reference the immutable GM plan, so a list-window refill never forces
-// an extra short SQ batch or leaves SIMT reading overwritten UB indices.
+// span[3]: low 32 bits are the first WQE, bit 32 selects UB indices,
+// bit 33 marks indices retained in the sender-owned short-tail buffer.
+// GM spans remain available for cached whole-channel and token scheduling.
 __simt_vf__ __launch_bounds__(32) inline void BuildDispatchWqes(
     __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers, __ubuf__ uint64_t* remote_bases,
     uint64_t x, uint64_t scales, uint32_t x_bytes, uint32_t scale_bytes,
@@ -22,40 +23,55 @@ __simt_vf__ __launch_bounds__(32) inline void BuildDispatchWqes(
     const uint32_t i = threadIdx.x;
     if (i >= count)
         return;
-    for (uint32_t s = 0; s < span_count; ++s) {
-        auto* span = spans + s * 4U;
-        const uint32_t begin = static_cast<uint32_t>(span[3]);
-        const uint32_t length = static_cast<uint32_t>(span[1] >> 32U);
-        if (i < begin || i - begin >= length)
-            continue;
-        const uint32_t peer = static_cast<uint32_t>(span[2]);
-        const uint32_t position = static_cast<uint32_t>(span[2] >> 32U) + i - begin;
-        const uint64_t row = uint64_t(static_cast<uint32_t>(span[1])) + position / fields;
-        const int32_t token = reinterpret_cast<const __gm__ int32_t*>(span[0])[position / fields];
-        if (token < 0 || static_cast<uint32_t>(token) >= tokens) {
-            __asc_simt_vf::__trap();
-            return;
-        }
-        const bool scale = position % fields != 0;
-        const uint32_t bytes = scale ? scale_bytes : x_bytes;
-        auto* output = remote_bases + peer * kOutputRecordWords;
-        if (uint64_t(row) >= output[2]) {
-            __asc_simt_vf::__trap();
-            return;
-        }
-        auto* header = headers + peer * 2U * 8U;
-        auto* wqe = wqes + i * 8U;
-        wqe[0] = header[0];
-        wqe[1] = header[1];
-        wqe[2] = header[2];
-        wqe[3] = header[3];
-        wqe[4] = header[4];
-        wqe[5] = output[scale ? 1 : 0] + uint64_t(row) * bytes;
-        wqe[6] = bytes;
-        wqe[7] = (scale ? scales : x) + uint64_t(token) * bytes;
+    if (!span_count || (fields != 1U && fields != 2U)) {
+        __asc_simt_vf::__trap();
         return;
     }
-    __asc_simt_vf::__trap();
+    // The common single-span batch needs no lookup. Multi-span starts are
+    // strictly increasing, so find the owner without scanning every span.
+    uint32_t first = 0, last = span_count;
+    while (first + 1U < last) {
+        const uint32_t mid = first + (last - first) / 2U;
+        if (static_cast<uint32_t>(spans[mid * 4U + 3U]) <= i)
+            first = mid;
+        else
+            last = mid;
+    }
+    auto* span = spans + first * 4U;
+    const uint32_t begin = static_cast<uint32_t>(span[3]);
+    const uint32_t length = static_cast<uint32_t>(span[1] >> 32U);
+    if (i < begin || i - begin >= length) {
+        __asc_simt_vf::__trap();
+        return;
+    }
+    const uint32_t peer = static_cast<uint32_t>(span[2]);
+    const uint32_t position = static_cast<uint32_t>(span[2] >> 32U) + i - begin;
+    const uint32_t index = position >> (fields - 1U);
+    const uint64_t row = uint64_t(static_cast<uint32_t>(span[1])) + index;
+    const int32_t token = (span[3] & (uint64_t{1} << 32U)) ?
+        reinterpret_cast<const __ubuf__ int32_t*>(span[0])[index] :
+        reinterpret_cast<const __gm__ int32_t*>(span[0])[index];
+    if (token < 0 || static_cast<uint32_t>(token) >= tokens) {
+        __asc_simt_vf::__trap();
+        return;
+    }
+    const bool scale = fields == 2U && (position & 1U);
+    const uint32_t bytes = scale ? scale_bytes : x_bytes;
+    auto* output = remote_bases + peer * kOutputRecordWords;
+    if (uint64_t(row) >= output[2]) {
+        __asc_simt_vf::__trap();
+        return;
+    }
+    auto* header = headers + peer * 2U * 8U;
+    auto* wqe = wqes + i * 8U;
+    wqe[0] = header[0];
+    wqe[1] = header[1];
+    wqe[2] = header[2];
+    wqe[3] = header[3];
+    wqe[4] = header[4];
+    wqe[5] = output[scale ? 1 : 0] + uint64_t(row) * bytes;
+    wqe[6] = bytes;
+    wqe[7] = (scale ? scales : x) + uint64_t(token) * bytes;
 }
 
 template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, class Trace = DisabledDispatchDeviceTrace>
@@ -65,6 +81,7 @@ class DispatchSenderT : public SenderT<Capacity, Qps, Trace> {
     using Base::active_state_; using Base::last_;
     static constexpr uint32_t kDispatchBasesOffset = kHeadersOffset + Capacity * Qps * 2U * kWqeBytes;
     static constexpr uint32_t kDispatchEpochOffset = kDispatchBasesOffset + Capacity * Qps * kOutputRecordBytes;
+    static constexpr uint32_t kSavedIndicesOffset = kDispatchEpochOffset + 32U;
 public:
     __aicore__ DispatchSenderT(
         const DispatchTilingData& td, uint32_t core, AscendC::LocalTensor<uint8_t> scratch, GM_ADDR workspace, GM_ADDR x,
@@ -134,6 +151,40 @@ public:
 
     __aicore__ uint32_t PutRows(uint32_t p, const __gm__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count)
     {
+        return PutRowsImpl(p, reinterpret_cast<uint64_t>(indices), row, field, count, false);
+    }
+
+    __aicore__ uint32_t PutRowsUb(uint32_t p, const __ubuf__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count)
+    {
+        return PutRowsImpl(p, reinterpret_cast<uint64_t>(indices), row, field, count, true);
+    }
+
+    // Preserve only unbuilt UB spans before any list-window overwrite. No SQ
+    // flush is introduced: visits and partial batches can cross windows/channels.
+    // A span has at most one saved token per WQE, hence 32 int32 entries suffice.
+    __aicore__ void PreserveIndices()
+    {
+        auto* spans = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset);
+        auto* saved = reinterpret_cast<__ubuf__ int32_t*>(scratch_ + kSavedIndicesOffset);
+        const uint32_t fields = td_.has_x_scales && td_.num_scales != 0 && td_.scale_element_bytes != 0 && !td_.packed_peer_scales ? 2U : 1U;
+        for (uint32_t s = 0; s < spans_; ++s) {
+            auto* span = spans + s * 4U;
+            if ((span[3] >> 32U) != 1U) continue;
+            const uint32_t field = static_cast<uint32_t>(span[2] >> 32U);
+            const uint32_t count = static_cast<uint32_t>(span[1] >> 32U);
+            const uint32_t tokens = (field + count + fields - 1U) / fields;
+            if (saved_indices_ + tokens > kBatchWqes) { trap(); return; }
+            auto* indices = reinterpret_cast<const __ubuf__ int32_t*>(span[0]);
+            // At most 31 live indices at a refill, not a payload-sized scalar copy.
+            for (uint32_t t = 0; t < tokens; ++t) saved[saved_indices_ + t] = indices[t];
+            span[0] = reinterpret_cast<uint64_t>(saved + saved_indices_);
+            span[3] |= uint64_t{1} << 33U;
+            saved_indices_ += tokens;
+        }
+    }
+
+    __aicore__ uint32_t PutRowsImpl(uint32_t p, uint64_t indices, uint32_t row, uint32_t field, uint32_t count, bool ub_indices)
+    {
         p = Base::QueuePeer(p);
         if (rows_pending_ && active_state_ != peers_[p].state) {
             Base::TraceCount(Trace::StateFlushes);
@@ -146,10 +197,10 @@ public:
         const uint64_t prepared = Base::TraceNow();
         const uint32_t n = count < kBatchWqes - rows_pending_ ? count : kBatchWqes - rows_pending_;
         auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
-        span[0] = reinterpret_cast<uint64_t>(indices);
+        span[0] = indices;
         span[1] = uint64_t(row) | (uint64_t(n) << 32U);
         span[2] = uint64_t(p) | (uint64_t(field) << 32U);
-        span[3] = rows_pending_;
+        span[3] = uint64_t(rows_pending_) | (uint64_t(ub_indices) << 32U);
         ++spans_;
         rows_pending_ += n;
         last_ = p;
@@ -180,6 +231,7 @@ public:
         Base::SubmitBatch(rows_pending_, spans_, false);
         rows_pending_ = 0;
         spans_ = 0;
+        saved_indices_ = 0;
     }
 
     // One visit is at most udma_wqes_per_visit WQEs for one peer.
@@ -248,7 +300,7 @@ public:
 private:
     const DispatchTilingData& td_;
     uint64_t x_, scales_;
-    uint32_t rows_pending_ = 0, spans_ = 0;
+    uint32_t rows_pending_ = 0, spans_ = 0, saved_indices_ = 0;
     uint32_t next_qp_[Qps == 2 ? Capacity : 1]{};
 };
 using DispatchSender = DispatchSenderT<>;

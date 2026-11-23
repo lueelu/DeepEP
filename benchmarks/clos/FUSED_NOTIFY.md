@@ -828,7 +828,7 @@ SIMT metadata and direct-off paths retain staging. Payload self-copy remains.
 The existing output publication adds a top-k address before its epoch. Its
 record grows from 64 to 96 bytes inside the unchanged 512-byte per-rank slot;
 no exchange round or barrier is added. Host and device use the same record
-size in the private UB budget (8 peers/1 QP: 13088 bytes; 64 peers/2 QPs: 97312).
+size in the private UB budget (8 peers/1 QP: 13216 bytes; 64 peers/2 QPs: 97440).
 Rebuild both host and kernels: tiling and mailbox layout changed. The native
 `dispatch_metadata_output_version` is 2, while pipeline/channel versions stay 4.
 
@@ -840,3 +840,41 @@ local destinations, invalid entries and UB capacity; they do not replace CANN
 compilation or NPU precision/performance tests. In device diagnostics, retained
 top-k direct must report zero `topk_output_bytes` as well as zero source/weight
 output-copy bytes where applicable. Formal performance sampling keeps tracing off.
+
+
+### Payload WQE index reuse
+
+The windowed peer sender now passes UB token indices to the 32-thread payload
+WQE builder. It reuses a loaded sorted-plan suffix when that suffix covers the
+next input-token tile, and uses a lower-bound search instead of a scalar linear
+scan. Insufficient windows still reload from the consumed ordinal; this is not
+an assertion that every index is fetched from GM exactly once. Peer/channel
+plan bases and channel-prefix values are reused within the channel.
+
+A dedicated 128-byte, 32-byte-aligned sender region retains indices referenced
+by an unbuilt short batch before any index-window overwrite. Each span is saved
+at most once, and the batch owns those indices until its VF and UB-to-SQ copy
+have completed. A window/channel change does not force a flush. The owner still
+uses the existing physical-SQ admission, 32-WQE capacity, QP selection, visit
+boundaries, sparse CQE, terminal SO flag, quiet and receive protocol. Single-span
+batches skip span lookup; multi-span batches use binary search over ordered span
+starts. Payload/scale field addressing supports one or two fields without a
+runtime integer divide in the VF.
+
+Cached whole-channel and token scheduling retain immutable GM index spans;
+combine is unchanged. No new environment switch or EP/hidden/core-count rule is
+introduced. Host and kernel must be rebuilt together for the matching private
+UB budget. Metadata packing, Source handle construction and its completion
+boundary are not changed by this optimization. Index/WQE double buffering is
+not introduced in this revision.
+
+Compare this revision with cfb07dd using the same configuration, including
+metadata direct, skip-init, channel metadata and its double-buffer option.
+Start with EP16, communication 8 AIV, T4096/H2816/K8/E256/BF16, reduce 48, then
+cover EP8/32 and 32 AIV. Preserve zero-tolerance precision, tails, empty sends,
+repeated calls, scale fields, both QP lanes and shared-SQ cases. Verify WQE
+count, batch sizes and short-flush counts before comparing index-window,
+WQE-build, communication and complete API timings. Trace-off API mean/P95 is
+the performance acceptance criterion. CPU constexpr tests exercise production
+window decisions, WQE addressing and pending-index retention, including an
+intentionally corrupted retention path; they do not validate device ordering.

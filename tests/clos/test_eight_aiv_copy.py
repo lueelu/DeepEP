@@ -25,7 +25,7 @@ def test_eight_aiv_production_bodies(tmp_path):
     schedule = (source / "kernels/dispatch/udma_dispatch_schedule.h").read_text()
     begin = schedule.index("template <class Sender, class Trace>")
     functions += schedule[begin : schedule.index("// Each producer", begin)]
-    functions += cpp_functions(schedule, "DispatchRemoteImpl")
+    functions += cpp_functions(schedule, "ReuseDispatchIndexWindow", "DispatchIndexLowerBound", "DispatchRemoteImpl")
     functions += cpp_functions((source / "kernels/combine/udma_combine_schedule.h").read_text(), "CombineRemoteImpl")
     functions += cpp_functions(
         (source / "kernels/combine/udma_token_combine_schedule.h").read_text(),

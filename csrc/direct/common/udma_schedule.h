@@ -15,6 +15,7 @@ inline constexpr uint32_t kMaxPeers = 8;
 inline constexpr uint32_t kTileTokens = 256;
 inline constexpr uint32_t kBatchWqes = 32;
 inline constexpr uint32_t kWqeBytes = 64;
+inline constexpr uint32_t kDispatchSavedIndexBytes = kBatchWqes * sizeof(int32_t);
 inline constexpr uint32_t kSignalBytes = 512;
 static_assert(kSignalBytes % 256 == 0, "completion slots must be 256-byte aligned");
 inline constexpr uint32_t kRankOrder = 0;
@@ -31,7 +32,7 @@ __aicore__
 inline constexpr uint32_t DispatchLiveSendUbBytes(uint32_t capacity, uint32_t qps)
 {
     return kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)) +
-        capacity * qps * (2U * kWqeBytes + kOutputRecordBytes) + 32U +
+        capacity * qps * (2U * kWqeBytes + kOutputRecordBytes) + 32U + kDispatchSavedIndexBytes +
         capacity * kTileTokens * sizeof(int32_t);
 }
 

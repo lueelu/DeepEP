@@ -404,7 +404,7 @@ def test_production_qp_union_covers_all_schedules(tmp_path):
     harness = tmp_path / "coverage.cpp"
     harness.write_text(
         r"""
-#include "csrc/direct/common/udma_schedule.h"
+#include "common/udma_schedule.h"
 #include <cassert>
 #include <cstdio>
 using namespace ascend_deepep::udma;
@@ -438,10 +438,23 @@ int main() {
     )
     binary = tmp_path / "coverage"
     subprocess.run(
-        [compiler, "-std=c++17", "-O2", "-I" + str(ROOT), str(harness), "-o", str(binary)],
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-I" + str(ROOT / "csrc/direct"),
+            str(harness),
+            "-o",
+            str(binary),
+        ],
         check=True,
         capture_output=True,
         timeout=60,
     )
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60, check=True)
+    try:
+        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60, check=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
     assert "QP_UNION_OK" in result.stdout

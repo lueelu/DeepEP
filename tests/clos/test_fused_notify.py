@@ -315,7 +315,7 @@ int main() {
       std::vector<topk_idx_t> idx(tokens*k);
       std::vector<uint8_t> routes(tokens*world,99), want(tokens*world,0);
       for (unsigned i=0; i<idx.size(); ++i) {
-        idx[i] = i%11 == 0 ? -1 : (i%3 == 0 ? 0 : (i*17)%experts);
+        idx[i] = i%11 == 0 ? topk_idx_t(-1) : topk_idx_t(i%3 == 0 ? 0 : (i*17)%experts);
         if (idx[i]>=0) { ++expected[idx[i]]; want[(i/k)*world+idx[i]/(experts/world)]=1; }
       }
       for (threadIdx.x=0;threadIdx.x<128;++threadIdx.x)

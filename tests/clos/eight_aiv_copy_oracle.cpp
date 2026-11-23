@@ -175,6 +175,13 @@ struct DispatchSenderT {
         for (uint32_t i = 0; i < n; ++i) sent.emplace_back(Rank(p), plan[i], row + i);
         return n;
     }
+    // This oracle consumes rows immediately; the separate sender oracle tests
+    // deferred UB references and short-batch preservation.
+    void PreserveIndices() {}
+    uint32_t PutRowsUb(uint32_t p, const int32_t* plan, uint32_t row, uint32_t field, uint32_t n)
+    {
+        return PutRows(p, plan, row, field, n);
+    }
     void Flush() { assert(sender_phase == 0); pending_rows = false; }
     void PutPackedScales(uint32_t, uint32_t, uint32_t, uint32_t)
     {
