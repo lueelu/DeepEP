@@ -337,10 +337,14 @@ def test_pack_and_local_copy_pipeline(tmp_path):
         "static unsigned list_loads;",
         "static unsigned list_loads;\nstatic uintptr_t plan_begin, plan_end;\nstatic uint64_t plan_bytes;",
     )
+    dma_entry = (
+        "void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams copy, DataCopyPadExtParams<T>)\n{"
+    )
+    assert harness.count(dma_entry) == 1, "GM-to-UB DMA mock instrumentation anchor must be unique"
     harness = harness.replace(
-        "if constexpr (sizeof(T) == 4) ++list_loads;",
-        "if constexpr (sizeof(T) == 4) ++list_loads;\n"
-        "    if (uintptr_t(src.data)>=plan_begin && uintptr_t(src.data)<plan_end) plan_bytes+=copy.bytes;",
+        dma_entry,
+        dma_entry
+        + "\n    if (uintptr_t(src.data)>=plan_begin && uintptr_t(src.data)<plan_end) plan_bytes+=copy.bytes;",
     )
     harness = harness.replace(
         "template <HardEvent>\nvoid SetFlag(int)\n{\n}",

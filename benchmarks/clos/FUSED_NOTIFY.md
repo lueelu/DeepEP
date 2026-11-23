@@ -1,11 +1,29 @@
 # Fused layout/notify experiment
 
-Opt-in fresh V2 UDMA dispatch experiment. Default dispatch is unchanged:
+Fresh V2 UDMA layout/notify fusion remains opt-in:
 
 ```bash
 export DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY=0  # separate layout, then notify
 export DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY=1  # layout inside notify
 ```
+
+### Default metadata settings
+
+Fresh channel metadata, metadata double buffering, skip-init and direct output
+are enabled by default on supported peer-UDMA paths. Cached weighted dispatch
+defaults to pack/direct/omit; omission only applies to an unused non-expanded
+top-k output. Each existing flag can still be set to `0` independently.
+Automatic packing retains the old path for graph capture, token scheduling,
+unsupported shapes, and cached handles without a private plan/send head.
+Explicit opt-ins retain the existing validation and errors.
+
+Layout/notify fusion, HOST_PREP and DEFER_PLAN remain off by default. The default
+metadata tile remains automatic (128 tokens with UB-capacity fallback). The
+Buffer's `use_1g_huge_pages` default remains `False`; these optimizations do not
+enable huge pages. Communication and reduce core counts are unchanged: callers
+choose `reduce_num_sms`, whose zero/default value follows the resolved core
+count. Existing benchmarks may explicitly override these production defaults;
+record their effective flags rather than assuming they test unset defaults.
 
 Set the same value on every rank before a fresh dispatch. The switch is read
 per invocation; changing it does not require rebuilding Buffer or SHMEM.
@@ -347,10 +365,10 @@ It checks exact token/destination rows and per-visit budget, not network
 completion or device performance. CANN compilation and NPU validation remain
 required before treating the experiment as deployable.
 
-## Opt-in channel metadata experiment
+## Channel metadata packing
 
 `DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA=1` enables **fresh peer-scheduled UDMA
-dispatch only**. The default is 0. Cached dispatch ignores the switch and is
+dispatch only**. It defaults on for supported paths. Cached dispatch ignores the switch and is
 the negative control; graph capture is rejected when the fresh experiment is
 requested. All ranks must use the same switch. Rebuild and install both the host
 extension and kernel library because `DispatchTilingData` has new fields.
@@ -579,7 +597,7 @@ for dispatch; combine's outer alignment notify is excluded from its measured API
 
 Rebuild both host and kernel libraries. Send-before-self is mandatory; the old
 `DEEPEP_CLOS_DISPATCH_OVERLAP_SELF=0` no longer selects copy-first. Slots defaults
-to `1`; init and notify remain opt-in. Peer order, P/W/Q, visit, payload UDMA,
+to `1`; init and notify also default on for their applicable paths. Peer order, P/W/Q, visit, payload UDMA,
 combine and reduce core policies are unchanged.
 
 | Benchmark mode | Environment variable set to `1` | Effective scope |
@@ -627,9 +645,9 @@ out inapplicable options. Traces append `topk_init_cycles`, `source_cycles` and
 again as a completion-tail cost. CPU mocks check indexing, UB boundaries and
 event credit pairing, but do not establish device ordering or NPU performance.
 
-### Cached weights and direct metadata outputs (opt-in)
+### Cached weights and direct metadata outputs
 
-Three independent flags default to `0`; rebuild both host and kernels before
+Three independent flags default on for supported paths; rebuild both host and kernels before
 using them, with identical settings on every rank. The default payload schedule, core count, visit and completion
 protocol are unchanged.
 

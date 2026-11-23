@@ -1,4 +1,8 @@
-"""Public cached-dispatch opt-in forwarding, without a device runtime."""
+"""Public cached-dispatch defaults and overrides, without a device runtime."""
+
+from pathlib import Path
+import shutil
+import subprocess
 
 import pytest
 
@@ -6,7 +10,7 @@ from tests.api.test_clos_compatibility import run_host
 
 
 @pytest.mark.parametrize("expanded", [False, True])
-@pytest.mark.parametrize("option", [None, "CACHED_WEIGHT_PACK", "CACHED_OMIT_TOPK_OUTPUT"])
+@pytest.mark.parametrize("option", [None, "default", "CACHED_WEIGHT_PACK", "CACHED_OMIT_TOPK_OUTPUT"])
 def test_cached_metadata_keeps_route_ownership_and_expansion_consumers(expanded, option):
     run_host(f"""
         import os
@@ -21,7 +25,10 @@ def test_cached_metadata_keeps_route_ownership_and_expansion_consumers(expanded,
             def element_size(self): return 2
         torch.empty=lambda shape,**kw:Tensor(shape,**kw)
         for key in ('CACHED_WEIGHT_PACK','CACHED_OMIT_TOPK_OUTPUT'):
-            os.environ['DEEPEP_CLOS_'+key] = str(int(key=={option!r}))
+            if {option!r} == 'default':
+                os.environ.pop('DEEPEP_CLOS_'+key, None)
+            else:
+                os.environ['DEEPEP_CLOS_'+key] = str(int(key=={option!r}))
         for name in ('_validate_dispatch_scope','_validate_dispatch_tensors'):
             setattr(m,name,lambda *a:None)
         m._get_allocation_stream_id=lambda _:0
@@ -55,3 +62,52 @@ def test_cached_metadata_keeps_route_ownership_and_expansion_consumers(expanded,
         except Submitted: pass
         else: raise AssertionError('missing native dispatch')
     """)
+
+
+def test_native_packing_defaults_preserve_unsupported_paths(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    root = Path(__file__).resolve().parents[2]
+    source = (root / "csrc/direct/ops/dispatch.cpp").read_text()
+    begin = source.index("    const bool default_channel_metadata =")
+    selection = source[begin : source.index("    if (cached_weight_pack)", begin)]
+    program = r"""
+#include "common/dispatch_channel_metadata.h"
+struct Optional { bool present; constexpr bool has_value() const { return present; } };
+constexpr unsigned choose(bool use_udma=true, bool token=false, bool capturing=false,
+                          unsigned world_size=32, unsigned num_topk=8, bool cached_mode=true,
+                          bool weight=true, bool plan=true, bool head=true, int override_value=-1) {
+    struct Shmem { bool token; constexpr bool TokenSchedule() const { return token; } } shmem{token};
+    const Optional topk_weights{weight}, cached_dispatch_plan{plan}, cached_send_head{head};
+    const auto enabled_option = [=](const char*, bool fallback) {
+        return override_value < 0 ? fallback : override_value == 1;
+    };
+    // SELECTION
+    return unsigned(default_channel_metadata) | (unsigned(cached_weight_pack) << 1);
+}
+static_assert(choose() == 3);
+static_assert(choose(true,false,false,16) == 3);
+static_assert(choose(true,false,false,8) == 3);
+static_assert(choose(true,false,false,256,128) == 3);
+static_assert(choose(false) == 0);
+static_assert(choose(true,true) == 0);
+static_assert(choose(true,false,true) == 0);
+static_assert(choose(true,false,false,512) == 0);
+static_assert(choose(true,false,false,32,0) == 0);
+static_assert(choose(true,false,false,32,129) == 0);
+static_assert(choose(true,false,false,32,8,false) == 1);
+static_assert(choose(true,false,false,32,8,true,false) == 1);
+static_assert(choose(true,false,false,32,8,true,true,false) == 1);
+static_assert(choose(true,false,false,32,8,true,true,true,false) == 1);
+static_assert(choose(true,false,false,32,8,true,true,true,true,0) == 1);
+"""
+    path = tmp_path / "metadata_defaults.cpp"
+    path.write_text(program.replace("// SELECTION", selection))
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-I", str(root / "csrc/direct"), "-c", str(path), "-o", str(tmp_path / "defaults.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr

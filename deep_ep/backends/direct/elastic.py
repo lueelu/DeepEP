@@ -894,7 +894,7 @@ class ElasticBuffer:
             )
             if cached_mode:
                 metadata_options = topk_weights is not None and any(
-                    os.environ.get(name, "0") == "1"
+                    os.environ.get(name, "1") == "1"
                     for name in ("DEEPEP_CLOS_CACHED_WEIGHT_PACK", "DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT")
                 )
                 extra = ()

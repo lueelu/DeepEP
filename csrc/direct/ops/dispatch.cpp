@@ -337,18 +337,9 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         TORCH_CHECK(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0, name, " must be 0 or 1");
         return value ? std::strcmp(value, "1") == 0 : default_value;
     };
-    const bool cached_weight_pack = cached_mode && topk_weights.has_value() &&
-        enabled_option("DEEPEP_CLOS_CACHED_WEIGHT_PACK");
-    const bool direct_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_METADATA_DIRECT");
+    const bool direct_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_METADATA_DIRECT", true);
     const bool omit_topk_output = use_udma && cached_mode && topk_weights.has_value() &&
-        allow_omit_topk_output && enabled_option("DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT");
-    if (cached_weight_pack) {
-        TORCH_CHECK(use_udma && !shmem.TokenSchedule() && cached_dispatch_plan.has_value() && cached_send_head.has_value(),
-                    "cached weight packing requires peer UDMA and handle-owned plan/send_head");
-        TORCH_CHECK(cached_send_head->scalar_type() == torch::kInt32 && cached_send_head->dim() == 2 &&
-                        cached_send_head->size(0) == x.size(0) && cached_send_head->size(1) == world_size,
-                    "cached send_head must be int32 [num_tokens, world_size]");
-    }
+        allow_omit_topk_output && enabled_option("DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT", true);
     const bool metadata_src_256 = enabled_option("DEEPEP_CLOS_DISPATCH_SRC_IDX_256");
     const bool metadata_topk_256 = enabled_option("DEEPEP_CLOS_DISPATCH_TOPK_256");
     TORCH_CHECK(use_udma || !(metadata_src_256 || metadata_topk_256),
@@ -399,6 +390,22 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                 " UB bytes, but the dispatch staging area provides ", kDispatchStageBytes, " bytes");
     TORCH_CHECK(num_topk <= kMaxDispatchTopk, "num_topk must not exceed ", kMaxDispatchTopk,
                 " for the dispatch UB layout");
+
+    // Default packing is limited to the supported peer-UDMA path. Legacy
+    // handles, token scheduling and graph capture retain their existing path;
+    // explicit opt-ins still go through the original validation below.
+    const bool default_channel_metadata = use_udma && !shmem.TokenSchedule() && !capturing && num_topk > 0 &&
+        world_size <= ascend_deepep::kChannelMetadataMaxRanks && num_topk <= ascend_deepep::kChannelMetadataMaxTopk;
+    const bool cached_weight_pack = cached_mode && topk_weights.has_value() &&
+        enabled_option("DEEPEP_CLOS_CACHED_WEIGHT_PACK",
+            default_channel_metadata && cached_dispatch_plan.has_value() && cached_send_head.has_value());
+    if (cached_weight_pack) {
+        TORCH_CHECK(use_udma && !shmem.TokenSchedule() && cached_dispatch_plan.has_value() && cached_send_head.has_value(),
+                    "cached weight packing requires peer UDMA and handle-owned plan/send_head");
+        TORCH_CHECK(cached_send_head->scalar_type() == torch::kInt32 && cached_send_head->dim() == 2 &&
+                        cached_send_head->size(0) == x.size(0) && cached_send_head->size(1) == world_size,
+                    "cached send_head must be int32 [num_tokens, world_size]");
+    }
 
     int64_t num_scales = 0;
     int64_t scale_element_bytes = 0;
@@ -585,9 +592,9 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                           host_prep ? torch::Tensor() : allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
-    const bool metadata_double_buffer = enabled_option("DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER");
+    const bool metadata_double_buffer = enabled_option("DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER", true);
     const bool channel_metadata =
-        (enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA") && !cached_mode) || cached_weight_pack;
+        (enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA", default_channel_metadata) && !cached_mode) || cached_weight_pack;
     tiling.cached_weight_pack = cached_weight_pack;
     tiling.cached_metadata_head = cached_weight_pack ? reinterpret_cast<uint64_t>(send_head.data_ptr()) : 0;
     tiling.metadata_direct_output = channel_metadata && direct_metadata;
@@ -705,7 +712,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // Sending AIVs never copy self before submitting payload. The old overlap
     // environment variable can no longer restore that ordering.
     const bool early_slots = enabled_option("DEEPEP_CLOS_DISPATCH_EARLY_SLOTS", true);
-    const bool skip_topk_init = enabled_option("DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT");
+    const bool skip_topk_init = enabled_option("DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT", true);
     const bool peer_dispatch = use_udma && !shmem.TokenSchedule();
     tiling.dispatch_early_slots = peer_dispatch && public_handle != nullptr && early_slots;
     tiling.dispatch_skip_topk_init = peer_dispatch && channel_metadata && skip_topk_init;

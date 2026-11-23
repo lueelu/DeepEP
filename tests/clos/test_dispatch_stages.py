@@ -268,6 +268,7 @@ def test_post_submit_slots_and_private_ub(tmp_path):
 #include <cassert>
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 #define __aicore__
 #define __simt_vf__
 #define __launch_bounds__(n)
