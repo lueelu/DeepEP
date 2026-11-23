@@ -184,8 +184,8 @@ def backend(monkeypatch):
         "require_native",
         lambda _: SimpleNamespace(
             megamoe_workspace_address=lambda _: 4096,
-            megamoe_combine_reduce_version=4,
-            megamoe_combine_qps=16,
+            megamoe_combine_reduce_version=5,
+            megamoe_combine_qps=24,
             megamoe_dispatch_qps=8,
             megamoe_dispatch_workers=14,
         ),
@@ -227,8 +227,8 @@ def backend(monkeypatch):
         timer_numel=64,
         small_batch_max_tokens=256,
         hierarchical_max_tokens=256,
-        combine_reduce_version=4,
-        combine_qps=16,
+        combine_reduce_version=5,
+        combine_qps=24,
         dispatch_qps=8,
         dispatch_workers=14,
     )

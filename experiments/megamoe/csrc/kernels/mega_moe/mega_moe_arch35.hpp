@@ -1267,17 +1267,6 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     if (earlyShared) SharedFp8Projection(true, true);
 #endif
     ProcessInputPreparationStage();
-#ifdef DEEPEP_MEGAMOE_ROCE
-    if constexpr (g_coreType == AIV && ENABLE_A8W4) {
-        if (params_.tilingData->bf16Bs96 && GetSubBlockIdx() == 0U) {
-            // Each shared activation tile has the same physical owner as its GMM1 tile.
-            WaitUntilGmFlagEquals(ClosureSlot(params_, BF16_GMM1_READY_SLOT + blockIdx_),
-                                  params_.tilingData->hierarchicalSequence);
-            PipeBarrier<PIPE_ALL>();
-            ProcessSharedExpertActivation();
-        }
-    }
-#endif
     if constexpr (g_coreType == AIV) {
 #ifdef DEEPEP_MEGAMOE_ROCE
         timer_.StartUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
@@ -1289,19 +1278,27 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备后再进入 GMM。
     if constexpr (g_coreType == AIC) {
         timer_.End(AscendTimer::AIC_WAIT_INPUT_PREP);
-#ifdef DEEPEP_MEGAMOE_ROCE
-    } else {
-        timer_.EndUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
     }
-
+#ifdef DEEPEP_MEGAMOE_ROCE
     if constexpr (g_coreType == AIV) {
-        // The barrier retired both reset DMAs and the BF16 shared activation stores.
-        if (params_.tilingData->bf16Bs96 && GetSubBlockIdx() == 0U)
-            WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSharedActivationDonePtr) +
-                                    blockIdx_ * INT_CACHELINE, 1);
+        timer_.EndUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
+        const auto& workspace = params_.workspaceInfo;
         if (countWorkspace_.shared && aivJob_.jobIndex == 0U)
-            WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr),
-                                1);
+            WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(workspace.flagSendCntCalToUpdParamsPtr), 1);
+        if constexpr (ENABLE_A8W4) {
+            if (params_.tilingData->bf16Bs96 && GetSubBlockIdx() == 0U) {
+                // AIV1 can dispatch while AIV0 consumes its own GMM1 tiles for this invocation.
+                WaitUntilGmFlagEquals(ClosureSlot(params_, BF16_GMM1_READY_SLOT + blockIdx_),
+                                      params_.tilingData->hierarchicalSequence);
+                PipeBarrier<PIPE_ALL>();
+                ProcessSharedExpertActivation();
+                // Retire activation and scale stores before releasing GMM2, even for an empty tile range.
+                PipeBarrier<PIPE_ALL>();
+                SyncFuncStatic<HardEvent::MTE3_S, SYNC_EVENT_ID0>();
+                WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(workspace.flagSharedActivationDonePtr) +
+                                        blockIdx_ * INT_CACHELINE, 1);
+            }
+        }
     }
 
     if (UseHierarchicalRoce(params_.tilingData)) {
@@ -1310,8 +1307,6 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
 #else
         FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr);
 #endif
-    }
-#else
     }
 #endif
 

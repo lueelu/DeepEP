@@ -157,15 +157,13 @@ dist.destroy_process_group()
 
 每机 16 个连续 rank，HNS_1825，两端安装相同的 wheel 和 SHMEM SDK。UBX 在 EP4/8/16、
 每 rank 容量不超过 256 时选基础 MTE，更大的容量选 URMA。双机 EP32 decode 采用分层 MTE + RoCE。
-目标 BS96 的 BF16 候选调度使用协议 5，构建时设置
-`DEEPEP_MEGAMOE_BF16_BS96=ON`。性能对照使用 `DEEPEP_MEGAMOE_TIMER=OFF`。
+在 28 AIC / 56 AIV 上，BS96、H5120、I2304、K6、每 rank 13 个 routed FP4 专家和 1 个原生 FP8 shared 专家的 BF16 输入默认启用优化调度。公共输入屏障后，AIV0 执行 shared SwiGLU，AIV1 可同时推进 routed Dispatch。
 
 ```bash
-bash experiments/megamoe/scripts/build.sh --rdma-backend HNS_1825
+DEEPEP_MEGAMOE_TIMER=OFF bash experiments/megamoe/scripts/build.sh --rdma-backend HNS_1825
 ```
 
-用同一份脚本对照精简前的 `9080aeb` 和当前 wheel。两端使用相同的协议、构建选项和输入；
-每次切换 wheel 后重新启动作业。生成用例使用固定种子，在共享目录准备一次 CPU golden。已有历史固定 bank 时，设备作业可将 `--golden "$CASE/golden"` 换为 `--bank "$CASE/bank"`。
+对照基线用 `87d1ccc` 已启用 BF16 BS96 优化的 wheel。两版使用同一份验收脚本和输入，均应报告协议 5、8 个 Dispatch QP、24 个 Combine QP、wave 5。每次切换 wheel 后重新启动作业。生成用例使用固定种子，在共享目录准备一次 CPU golden。复测历史数据时，两版均使用 `--bank "$CASE/bank"` 加载同一份 map136 输入。
 以下命令中的 `NODE_RANK` 在两机分别为 0 和 1，`MASTER_ADDR` 指向第 0 节点。
 
 ```bash
@@ -173,12 +171,12 @@ script=experiments/megamoe/scripts/check_ep32_replay.py
 python "$script" golden --input bf16 --golden "$CASE/golden"
 launch=(torchrun --nnodes=2 --nproc-per-node=16 --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR")
 # 两机均安装对照 wheel
-"${launch[@]}" "$script" eager --golden "$CASE/golden" --out "$CASE/before"
+"${launch[@]}" "$script" fixed --golden "$CASE/golden" --out "$CASE/before"
 # 两机均切换到当前 wheel
-"${launch[@]}" "$script" replay --golden "$CASE/golden" --reference "$CASE/before" --out "$CASE/after"
+"${launch[@]}" "$script" fixed --golden "$CASE/golden" --reference "$CASE/before" --out "$CASE/after"
 ```
 
-`replay` 比对全 32 rank 的 160 轮输出摘要、实际物理路由计数及 8 轮交替调用。
+`fixed` 按实际物理路由独立核对专家计数，每个 rank 的 `fixed_metrics.json` 记录逐位不一致数、最大绝对误差和相对 RMSE。另测 graph replay 时，对照版用 `eager`，当前版用 `replay`，使用新的输出目录。脚本比对全 32 rank 的 160 轮输出摘要及 8 轮交替调用。
 用 `--input fp8` 重复 golden、eager 和 replay 可复查调用方提供 scale 的路径。
 性能作业在 timer-off 的两套 wheel 上按 A/B/B/A 顺序运行 `perf --out 新目录`；
 历史输入对照需在四批作业中传入同一 `--bank`。每批预热 20 次、采集 30 次，`fixed_perf.json` 保存每次的 32 个 rank 耗时和后 15 轮汇总。

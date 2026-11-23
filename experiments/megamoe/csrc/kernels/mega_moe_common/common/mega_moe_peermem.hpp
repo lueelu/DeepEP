@@ -77,8 +77,7 @@ constexpr uint32_t DISPATCH_PROBE_ROWS = 8U;  // One delivery bitmap byte per wi
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t CLOSURE_SLOT_COUNT = 64U + 2U * HIERARCHICAL_RANKS_PER_HOST + 2U;
 constexpr uint32_t BF16_GMM1_READY_SLOT = CLOSURE_SLOT_COUNT;
-constexpr uint32_t PLAN_FLAG_SLOTS = deepep::megamoe_config::PROTOCOL == 5U ? BF16_GMM1_READY_SLOT + 28U
-                                                                           : CLOSURE_SLOT_COUNT;
+constexpr uint32_t PLAN_FLAG_SLOTS = BF16_GMM1_READY_SLOT + 28U;
 // The QP backend uses the first 256B; startup consumers reuse this reservation
 // for a single strided snapshot of sixteen 32B flag heads (512B total).
 constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = HIERARCHICAL_RANKS_PER_HOST * 32U;
@@ -184,8 +183,7 @@ HOST_DEVICE bool UseAiv0CombineOwners(const MegaMoeTilingData* t)
 
 HOST_DEVICE bool UseBf16Bs96(const MegaMoeTilingData* t, bool prequantized)
 {
-    return deepep::megamoe_config::PROTOCOL == 5U && !prequantized && UseHierarchicalRoce(t) &&
-           IsDsv96CombineShape(t) && t->aicNum == 28U;
+    return !prequantized && UseHierarchicalRoce(t) && IsDsv96CombineShape(t) && t->aicNum == 28U;
 }
 
 // Each active Combine QP has one physical owner. The input barrier closes Dispatch's use of QP1..8.

@@ -81,6 +81,7 @@ def profile(torch, group, forward, dest):
 def run(args, config, group, torch):
     from deep_ep_experimental.megamoe import SymmBuffer, fp8_fp4_mega_moe, golden
     from deep_ep_experimental.megamoe.api import _extension
+    from deep_ep_experimental.megamoe.reference import error_metrics
 
     rank = group.rank()
     if group.size() != WORLD or int(os.environ["LOCAL_WORLD_SIZE"]) != 16:
@@ -134,10 +135,12 @@ def run(args, config, group, torch):
             forward(None)
         stream.synchronize()
         ext = _extension()
-        plan = dict(protocol=ext.combine_reduce_version, wave=buf._plan.effective_wave,
-                    bf16_bs96_active=buf._plan.bf16_bs96_active, extension=ext.__file__)
+        plan = dict(protocol=ext.combine_reduce_version, dispatch_qps=ext.dispatch_qps, combine_qps=ext.combine_qps,
+                    wave=buf._plan.effective_wave, bf16_bs96_active=buf._plan.bf16_bs96_active, extension=ext.__file__)
         (dest / "plan.json").write_text(json.dumps(plan))
-        if plan["wave"] != 5 or plan["bf16_bs96_active"] != (kind == "bf16" and plan["protocol"] == 5):
+        if (plan["protocol"], plan["dispatch_qps"], plan["combine_qps"], plan["wave"], plan["bf16_bs96_active"]) != (
+            5, 8, 24, 5, kind == "bf16"
+        ):
             raise ValueError(f"Unexpected schedule: {plan}")
         if args.mode == "perf":
             if buf.timer_enabled or kind != "bf16":
@@ -171,7 +174,8 @@ def run(args, config, group, torch):
                 with torch.npu.graph(graph, stream=stream):
                     forward()
             results = []
-            for i, step in enumerate([*range(STEPS), *(TAIL if replay else ())]):
+            steps = range(1 if args.mode == "fixed" else STEPS)
+            for i, step in enumerate([*steps, *(TAIL if replay else ())]):
                 checksum, local = install(buf, step)
                 hist = np.sum(group.all_gather(local.tolist(), f"physical routes {i}"), axis=0)
                 stats.zero_()
@@ -181,6 +185,16 @@ def run(args, config, group, torch):
                 else:
                     forward()
                 out, counts = y.float().cpu().numpy(), stats.cpu().numpy()
+                if args.mode == "fixed":
+                    # Every finite BF16 bit pattern has a distinct exact FP32 representation, including signed zero.
+                    np.save(dest / "fixed.npy", out)
+                    if args.reference:
+                        expected = np.load(args.reference / dest.name / "fixed.npy")
+                        metrics = error_metrics(out, expected)
+                        mismatches = int(np.count_nonzero(out.view(np.uint32) != expected.view(np.uint32)))
+                        (dest / "fixed_metrics.json").write_text(json.dumps(dict(metrics, mismatches=mismatches, values=out.size)))
+                        if mismatches:
+                            raise ValueError(f"Fixed BF16 output differs on rank {rank}: {mismatches}/{out.size}")
                 if not np.isfinite(out).all() or not np.array_equal(counts, np.split(hist, WORLD)[rank]):
                     raise ValueError(f"Invalid result at rank {rank}, step {step}")
                 outcome = digest((out, counts))
@@ -204,7 +218,7 @@ def main():
     from deep_ep_experimental.megamoe.benchmark import load_config
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("golden", "eager", "replay", "perf"))
+    parser.add_argument("mode", choices=("golden", "fixed", "eager", "replay", "perf"))
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument("--bank", type=Path, help="Existing fixed input bank, overrides generated inputs")
     for key in ("golden", "reference", "out"):

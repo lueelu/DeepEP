@@ -273,7 +273,7 @@ class SymmBuffer:
                 fields = ("combine_reduce_version", "combine_qps", "dispatch_qps", "dispatch_workers")
                 config = tuple(getattr(ext, f, None) for f in fields)
                 if (
-                    config not in ((4, 16, 8, 14), (5, 24, 8, 14))
+                    config != (5, 24, 8, 14)
                     or config != tuple(getattr(native, "megamoe_" + f, None) for f in fields)
                 ):
                     raise RuntimeError(

@@ -227,7 +227,7 @@ def count_diagnostics(raw, core_id):
     return result
 
 
-def task_metadata(raw, core_id, logical_index):
+def task_metadata(raw, core_id, logical_index, combine_qps=16):
     """坐标直接来自设备，不根据 shape 或耗时猜测任务身份。"""
     dynamic_index = logical_index - len(FIXED_NAMES)
     if dynamic_index < 0:
@@ -239,7 +239,8 @@ def task_metadata(raw, core_id, logical_index):
     if family == "AIV_COMBINE_ASYNC":
         expert, row = ((first >> 32) & mask) - 1, first & mask
         phase, slot = second & mask, ((second >> 32) & mask) - 1
-        if expert < 0 or phase not in (1, 2, 3) or slot not in (-1, 0, 1) or (slot == -1 and phase != 1):
+        slots = 4 if combine_qps == 24 else 2
+        if expert < 0 or phase not in (1, 2, 3) or not -1 <= slot < slots or (slot == -1 and phase != 1):
             raise ValueError(f"invalid async Combine metadata: core={core_id}, slot={dynamic_index}")
         result = dict(
             granularity="combine_async",
@@ -254,12 +255,12 @@ def task_metadata(raw, core_id, logical_index):
     if family == "AIV_COMBINE_READY":
         qp, token = (first >> 32) & mask, first & mask
         pending, observed = (second >> 32) & mask, second & mask
-        if not (1 <= qp <= 16 and token < 256) or observed & ~pending:
+        if not (1 <= qp <= combine_qps and token < 256) or observed & ~pending:
             raise ValueError(f"invalid Combine ready snapshot: core={core_id}, slot={dynamic_index}")
         return dict(
             granularity="combine_ready",
             qp_index=qp,
-            lane_count=16,
+            lane_count=combine_qps,
             token_index=token,
             pending_topk_mask=pending,
             observed_ready_mask=observed,
@@ -269,20 +270,20 @@ def task_metadata(raw, core_id, logical_index):
     if family == "AIV_COMBINE_SYNC":
         qp, phase = (first >> 32) & mask, first & mask
         phases = ("before_export_sync", "after_export_sync", "before_host_barrier", "after_host_barrier")
-        if not (1 <= qp <= 16 and 1 <= phase <= len(phases) and 0 <= second <= 8192):
+        if not (1 <= qp <= combine_qps and 1 <= phase <= len(phases) and 0 <= second <= 8192):
             raise ValueError(f"invalid Combine sync marker: core={core_id}, slot={dynamic_index}")
         return dict(
-            granularity="combine_sync", qp_index=qp, lane_count=16, sync_phase=phases[phase - 1], pending_rows=second
+            granularity="combine_sync", qp_index=qp, lane_count=combine_qps, sync_phase=phases[phase - 1], pending_rows=second
         )
     if family == "AIV_COMBINE_REDUCE":
         qp, token = (first >> 32) & mask, first & mask
         topk_mask, hidden = (second >> 32) & mask, second & mask
-        if not (1 <= qp <= 16 and token < 256 and topk_mask and 1024 <= hidden <= 8192 and hidden % 64 == 0):
+        if not (1 <= qp <= combine_qps and token < 256 and topk_mask and 1024 <= hidden <= 8192 and hidden % 64 == 0):
             raise ValueError(f"invalid combine reduction metadata: core={core_id}, slot={dynamic_index}")
         return dict(
             granularity="combine_reduce",
             qp_index=qp,
-            lane_count=16,
+            lane_count=combine_qps,
             token_index=token,
             topk_mask=topk_mask,
             expert_rows=topk_mask.bit_count(),
@@ -383,9 +384,8 @@ def task_metadata(raw, core_id, logical_index):
         kind = (second >> 32) & 255
         qp = (second >> 40) & 255
         row_start = (second >> 48) & 65535
-        if not (
-            0 <= peer < 32 and 0 <= phase < len(RDMA_PHASES) and kind in (0, 1) and qp <= (16 if phase == 2 else 8)
-        ):
+        lanes = combine_qps if phase == 2 else 8
+        if not (0 <= peer < 32 and 0 <= phase < len(RDMA_PHASES) and kind in (0, 1) and qp <= lanes):
             raise ValueError(f"invalid RDMA metadata: core={core_id}, slot={dynamic_index}")
         result = dict(
             granularity="rdma",
@@ -397,7 +397,7 @@ def task_metadata(raw, core_id, logical_index):
         if qp:
             result["qp"] = qp
             if phase in (1, 2):
-                result["lane_count"] = 16 if phase == 2 else 8
+                result["lane_count"] = lanes
                 result["lane"] = qp - 1
         if row_count:
             result.update(row_start=row_start, row_count=row_count, row_end=row_start + row_count)

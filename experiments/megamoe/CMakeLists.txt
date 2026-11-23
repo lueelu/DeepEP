@@ -102,9 +102,6 @@ install(FILES "${urma_kernel_library}" DESTINATION ../deep_ep_experimental/megam
 # and device targets select the RoCE transport and its symmetric window layout.
 set(ep32_include "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
 set(ep32_flags ${kernel_flags})
-if(DEEPEP_MEGAMOE_BF16_BS96)
-    list(APPEND ep32_flags -DDEEPEP_MEGAMOE_BF16_BS96=1)
-endif()
 list(REMOVE_ITEM ep32_flags -Wl,-soname,libmegamoe_kernel.so)
 list(PREPEND ep32_flags "-I${CMAKE_CURRENT_SOURCE_DIR}" "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32" "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc_ep32/kernels/mega_moe")
 list(APPEND ep32_flags -Wl,-Bsymbolic-functions -Wl,-soname,libmegamoe_ep32_kernel.so -DDEEPEP_MEGAMOE_ROCE=1
