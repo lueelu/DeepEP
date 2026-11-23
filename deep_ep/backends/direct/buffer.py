@@ -64,6 +64,9 @@ class Buffer:
     ``shmem_ip_port=None`` selects UID bootstrap within the EP group. An
     IP/port endpoint must be passed explicitly; this class does not read
     ``ASCEND_DEEPEP_SHMEM_IP_PORT`` from the environment.
+    ``shmem_init_timeout_secs`` sets all three SHMEM initialization timeout
+    attributes in seconds (default 300). The pinned SDK resets the UID
+    bootstrap control timeout; use an explicit endpoint to customize it.
     ``low_latency_mode`` is retained by the native runtime for subsequent
     kernel/resource selection. The public layout, dispatch and combine
     signatures are identical for both dispatch implementations.
@@ -99,8 +102,10 @@ class Buffer:
         udma_auto_policy: bool = True,
         use_1g_huge_pages: bool = False,
         shmem_ip_port: Optional[str] = None,
+        shmem_init_timeout_secs: int = 300,
         num_max_tokens_per_rank: Optional[int] = None,
     ) -> None:
+        _validate_shmem_init_timeout(shmem_init_timeout_secs)
         if _is_capturing():
             raise RuntimeError("construct Buffer outside NPU graph capture")
         if num_max_tokens_per_rank is not None:
@@ -188,6 +193,7 @@ class Buffer:
         self._udma_qps_per_worker = udma_qps_per_worker
         self.low_latency_mode = low_latency_mode
         self.use_1g_huge_pages = use_1g_huge_pages
+        self.shmem_init_timeout_secs = shmem_init_timeout_secs
         self.num_qps_per_rank = num_qps_per_rank
         self.allow_nvlink_for_low_latency_mode = allow_nvlink_for_low_latency_mode
         self.allow_mnnvl = allow_mnnvl
@@ -212,6 +218,7 @@ class Buffer:
                 num_max_tokens_per_rank,
                 udma_schedule,
                 peer_options,
+                shmem_init_timeout_secs=shmem_init_timeout_secs,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
                     if self._udma_auto_policy is not None
@@ -234,6 +241,7 @@ class Buffer:
                 # appending the resource flag so it cannot become a QP count.
                 *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
                 self._udma_auto_policy is not None,
+                shmem_init_timeout_secs,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -1259,6 +1267,14 @@ def _validate_udma_peer_order(
     return result + ((0, workers_per_peer) if workers_per_peer != 1 else ())
 
 
+def _validate_shmem_init_timeout(seconds):
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise TypeError("shmem_init_timeout_secs must be an integer")
+    # The SDK multiplies uint32_t seconds by 1000U before widening to milliseconds.
+    if not 1 <= seconds <= 4294967:
+        raise ValueError("shmem_init_timeout_secs must be between 1 and 4294967 seconds")
+
+
 def _prepare_shmem_bootstrap(
     group,
     comm,
@@ -1272,6 +1288,7 @@ def _prepare_shmem_bootstrap(
     udma_schedule="peer",
     udma_peer_options=(0, 0, 0),
     udma_auto_options=None,
+    shmem_init_timeout_secs=300,
 ):
     native = load_native_module()
     options = (
@@ -1283,6 +1300,7 @@ def _prepare_shmem_bootstrap(
         num_max_tokens_per_rank,
         udma_schedule,
         udma_peer_options,
+        shmem_init_timeout_secs,
     )
     if udma_auto_options is not None:
         options += (udma_auto_options,)

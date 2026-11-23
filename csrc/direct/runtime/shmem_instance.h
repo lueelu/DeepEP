@@ -20,7 +20,8 @@ public:
                   bool v1_shared_jetty = false, bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1, bool auto_resources = false);
+                  int64_t udma_qps_per_worker = 1, bool auto_resources = false,
+                  int64_t shmem_init_timeout_secs = 300);
 
     ~ShmemInstance();
 
@@ -97,6 +98,7 @@ public:
 private:
     uint64_t npu_timeout_cycles_ = 0;
     uint32_t shmem_sync_timeout_us_ = 0;
+    uint32_t shmem_init_timeout_secs_ = 300;
     uint32_t notify_host_timeout_seconds_ = 0;
 
     void InitRuntime();

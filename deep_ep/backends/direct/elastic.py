@@ -20,6 +20,7 @@ from .buffer import (
     _try_record_event,
     _use_comm_stream,
     _validate_udma_peer_order,
+    _validate_shmem_init_timeout,
 )
 from .config import Config
 from .config import (
@@ -109,6 +110,9 @@ class ElasticBuffer:
     uses the same shared-Jetty scheduler as V1; MTE retains its own transport.
     ``use_1g_huge_pages`` optionally backs the symmetric workspace with 1 GiB
     HBM pages through CANN SHMEM's user-buffer initialization path.
+    ``shmem_init_timeout_secs`` sets all three SHMEM initialization timeout
+    attributes in seconds (default 300). The pinned SDK resets the UID
+    bootstrap control timeout; use an explicit endpoint to customize it.
     """
 
     def __init__(
@@ -132,6 +136,7 @@ class ElasticBuffer:
         use_1g_huge_pages: bool = False,
         *,
         shmem_ip_port: Optional[str] = None,
+        shmem_init_timeout_secs: int = 300,
         transport: Optional[str] = None,
         udma_schedule: Optional[str] = None,
         udma_dispatch_peer_order: Optional[str] = None,
@@ -144,6 +149,7 @@ class ElasticBuffer:
         udma_wqes_per_visit: Optional[int] = None,
         udma_auto_policy: bool = True,
     ) -> None:
+        _validate_shmem_init_timeout(shmem_init_timeout_secs)
         rank, num_ranks, resolved_group = _resolve_group_or_comm(group, None)
         transport = _normalize_transport(transport or os.environ.get("ASCEND_DEEPEP_TRANSPORT", "auto"))
         self._udma_auto_policy = resolve_udma_policy(
@@ -276,6 +282,7 @@ class ElasticBuffer:
         self.sl_idx = sl_idx
         self.num_allocated_qps = num_allocated_qps
         self.num_cpu_timeout_secs = num_cpu_timeout_secs
+        self.shmem_init_timeout_secs = shmem_init_timeout_secs
         self.num_gpu_timeout_secs = num_gpu_timeout_secs
         self.explicitly_destroy = explicitly_destroy
         self.use_1g_huge_pages = use_1g_huge_pages
@@ -306,6 +313,7 @@ class ElasticBuffer:
                 num_max_tokens_per_rank or None,
                 udma_schedule,
                 peer_options,
+                shmem_init_timeout_secs=shmem_init_timeout_secs,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
                     if self._udma_auto_policy is not None
@@ -327,6 +335,7 @@ class ElasticBuffer:
                 # Keep the appended flag after all six native peer fields.
                 *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
                 self._udma_auto_policy is not None,
+                shmem_init_timeout_secs,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:

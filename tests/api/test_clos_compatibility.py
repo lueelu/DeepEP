@@ -49,6 +49,29 @@ def test_multi_buffer_bootstrap_uses_fresh_uid_and_capacity_independent_identity
     """)
 
 
+def test_bootstrap_rejects_timeout_disagreement_before_uid_creation():
+    run_host("""
+        from deep_ep.backends.direct import buffer
+        def forbidden():
+            raise AssertionError('must reject before opening a UID listener')
+        buffer.load_native_module = lambda: SimpleNamespace(
+            get_shmem_bootstrap=lambda key: (0, []), get_shmem_unique_id=forbidden)
+        def gather(group, comm, size, value):
+            options, state, uid = value
+            assert options[-1] == 300
+            return [value, (options[:-1] + (120,), state, uid)]
+        buffer._bootstrap_all_gather = gather
+        try:
+            buffer._prepare_shmem_bootstrap(
+                object(), None, 0, 2, 64 << 20, 'udma', False, None,
+                shmem_init_timeout_secs=300)
+        except ValueError as error:
+            assert 'all EP ranks' in str(error)
+        else:
+            raise AssertionError('rank timeout disagreement accepted')
+    """)
+
+
 @pytest.mark.parametrize("peer_state", [-1, 7])
 def test_multi_buffer_bootstrap_rejects_incompatible_or_divergent_ids_before_uid(peer_state):
     run_host(f"""

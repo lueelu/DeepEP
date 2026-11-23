@@ -170,7 +170,7 @@ def test_public_card_construction_checks_before_device_barrier(kind, fault, card
     monkeypatch.setattr(source_v1, "_is_capturing", lambda: False)
     for module in (source_v1, source_v2):
         monkeypatch.setattr(module, "get_native_class", lambda _: Native)
-        monkeypatch.setattr(module, "_prepare_shmem_bootstrap", lambda *args: ([], "test"))
+        monkeypatch.setattr(module, "_prepare_shmem_bootstrap", lambda *args, **kwargs: ([], "test"))
         monkeypatch.setattr(module, "get_global_comm_stream", lambda: SimpleNamespace(synchronize=lambda: None))
     monkeypatch.setattr(source_v2, "_validate_group_consensus", lambda *args: None)
     monkeypatch.setattr(source_v2.ElasticBuffer, "barrier", lambda *args, **kw: calls.append("device_barrier"))

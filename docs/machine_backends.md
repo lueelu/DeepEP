@@ -133,6 +133,30 @@ Mesh+Clos 保留其 endpoint/MPI bootstrap；Clos 保留默认 UID 与显式 `sh
 
 ## 全 Clos 超时配置
 
+Direct 后端的 `Buffer` 和 `ElasticBuffer` 支持关键字参数
+`shmem_init_timeout_secs=300`，单位为秒，各 EP rank 必须一致。它统一设置 SHMEM 的
+`shm_init_timeout`、`shm_create_timeout`、`control_operation_timeout`，在普通内存和
+1 GiB 大页初始化路径均传入。接受 1–4294967 的整数，拒绝布尔值；上限避免 SDK
+将秒乘以 1000 转为毫秒时发生 uint32 溢出。此参数不改变下面的运行期 CPU/NPU 超时，
+也不改变 HCCL 超时或独立的 `SHMEM_UDMA_CONNECT_TIMEOUT_MS`。
+
+```python
+buffer = deep_ep.ElasticBuffer(
+    group=ep_group, num_bytes=num_bytes, machine_type="global_clos",
+    shmem_ip_port="tcp://<reachable-ip>:<unused-port>",
+    shmem_init_timeout_secs=300,
+)
+```
+
+当前锁定的 SHMEM `7af7bf4` 有以下限制：显式 `shmem_ip_port` 路径使用
+`control_operation_timeout` 控制 ConfigStore 的 barrier/allgather 等操作等待；
+默认 UID 路径会将 bootstrap 控制超时重新设为 120 秒，因此仅传入此参数不能延长
+UID bootstrap barrier。SDK 的 ConfigStore 建连重试仍使用内部默认值，
+`shm_create_timeout` 在该路径也没有实际消费点。这里统一传入三个属性，不表示整个
+Buffer 构造过程具有统一的总截止时间；UID 路径的完整支持需要 SHMEM 配套修改。
+错误 `Group barrier timeout or store failure` 来自控制操作等待，也可能是 store
+故障；它不是 UDMA 建链超时。
+
 在创建 Buffer 前为各 rank 设置相同的环境变量。两个变量均接受正整数，单位为秒。
 
 | 环境变量 | 默认值 | 等待范围 |
