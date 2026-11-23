@@ -29,7 +29,7 @@ def test_cached_metadata_keeps_route_ownership_and_expansion_consumers(expanded,
         m._current_npu_stream=lambda:'caller'
         m._use_stream_after_event=lambda *a:nullcontext()
         m._use_comm_stream=lambda *a:nullcontext()
-        m.load_native_module=lambda:SimpleNamespace(dispatch_metadata_output_version=1)
+        m.load_native_module=lambda:SimpleNamespace(dispatch_metadata_output_version=2)
         x,idx,weights=Tensor((65,2816)),Tensor((65,8)),Tensor((65,8))
         head,plan=object(),object()
         def submit(*args):

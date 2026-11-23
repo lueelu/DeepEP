@@ -21,8 +21,7 @@ using GM_ADDR = uint8_t*;
 using namespace ascend_deepep;
 using namespace ascend_deepep::udma;
 constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID5 = 5, EVENT_ID6 = 6, EVENT_ID7 = 7;
-constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t)), kOutputRecordBytes = 64;
-constexpr unsigned kOutputSrcWord=6, kOutputWeightWord=7;
+constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t));
 static unsigned list_loads;
 void trap() { assert(false); }
 namespace AscendC {

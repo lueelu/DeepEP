@@ -312,8 +312,8 @@ struct Trace {
 }
 // CALLBACK
 int main() {
-    static_assert(DispatchLiveSendUbBytes(8,1)==12832);
-    static_assert(DispatchLiveSendUbBytes(64,2)==93216);
+    static_assert(DispatchLiveSendUbBytes(8,1)==13088);
+    static_assert(DispatchLiveSendUbBytes(64,2)==97312);
     constexpr unsigned T=65, K=3, W=8, C=8, capacity=128, rank=3;
     std::vector<topk_idx_t> idx(T*K);
     std::vector<int32_t> head(T*W,-1), prefix(W*C,0), output(T*K,-99), expected(T*K,-1);

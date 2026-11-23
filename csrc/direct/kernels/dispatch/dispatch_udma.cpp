@@ -143,7 +143,9 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             tiling.metadata_direct_output ? tiling.metadata_src_output : 0,
             tiling.metadata_direct_output ? tiling.metadata_weight_output : 0,
             tiling.metadata_direct_output && !tiling.cached_mode ? sizeof(int32_t) : 0U,
-            tiling.metadata_direct_output && tiling.has_topk_weights ? topk_weights_row_bytes : 0U);
+            tiling.metadata_direct_output && tiling.has_topk_weights ? topk_weights_row_bytes : 0U,
+            tiling.metadata_direct_output && !tiling.omit_topk_output ? tiling.metadata_topk_output : 0,
+            tiling.metadata_direct_output && !tiling.omit_topk_output ? topk_idx_row_bytes : 0U);
     }
     trace.Mark(Trace::InitDone);
     // Clears incoming payload markers and publishes this invocation's output
@@ -272,7 +274,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         }
     }
     if (num_topk > 0) {
-        if (!tiling.omit_topk_output) {
+        if (!tiling.omit_topk_output && !tiling.metadata_direct_output) {
             trace.Accumulate(Trace::TopkOutputBytes, uint64_t(worker_tokens) * topk_idx_row_bytes);
             ascend_deepep::CopyDispatchRecvToGm(
                 recv_topk_idx, symmetric_buffer, tiling.topk_idx_buffer_offset,
@@ -304,14 +306,16 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
 
     trace.FinishOutput();
     if (tiling.v2_rank_prefix != 0) {
-        // The existing completion boundary has made all local SHMEM metadata
-        // visible. Read it directly: no dependence on another AIV's GM copy.
+        // The existing completion boundary makes staged and direct metadata
+        // visible. Read the producer destination, not another AIV's output copy.
         const uint64_t source_started = trace.Now();
         asc_vf_call<ascend_deepep::V2HandleSourceVf>(dim3(128),
             reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),
             reinterpret_cast<__gm__ int32_t*>(tiling.metadata_direct_output
                 ? recv_src_idx : symmetric_buffer + tiling.src_idx_buffer_offset),
-            reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(symmetric_buffer + tiling.topk_idx_buffer_offset),
+            reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(
+                tiling.metadata_direct_output && !tiling.omit_topk_output
+                    ? tiling.metadata_topk_output : reinterpret_cast<uint64_t>(symmetric_buffer) + tiling.topk_idx_buffer_offset),
             reinterpret_cast<__gm__ int32_t*>(tiling.v2_src_metadata),
             tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_topk,
             tiling.num_output_tokens, uint32_t(core_idx), uint32_t(core_num));

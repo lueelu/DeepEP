@@ -403,8 +403,9 @@ markers, with the original incoming wait, quiet and all-AIV/rank collective.
 Self metadata bypasses packed GM. AIV loads its plan/input windows; SIMT writes
 exact slots at the consumer. Weight always goes to `recv_topk_weights`, even
 with remote DIRECT disabled. The final SHMEM output copy excludes the self
-rank-prefix interval so stale staging cannot overwrite it. Top-k stays in the
-internal handle-builder region; src_idx retains the existing DIRECT selection.
+rank-prefix interval so stale staging cannot overwrite it. Direct mode writes
+retained top-k to the final tensor; omitted top-k stays internal. Source indices
+retain the existing DIRECT selection.
 Invalid slots are fully written as -1/0. No padded store crosses channel owners.
 
 Sender self generation remains after payload/final-marker submission; auxiliary
@@ -635,7 +636,7 @@ protocol are unchanged.
 | Flag | Effect |
 | --- | --- |
 | `DEEPEP_CLOS_CACHED_WEIGHT_PACK=1` | Repack weights after payload submission using the handle-owned plan. Send channel top-k/weight blocks with UDMA. |
-| `DEEPEP_CLOS_DISPATCH_METADATA_DIRECT=1` | For channel UDMA metadata only, send fresh source indices and fresh/cached weights directly into owned output tensors, including self. SIMT metadata retains its SHMEM path. |
+| `DEEPEP_CLOS_DISPATCH_METADATA_DIRECT=1` | For channel UDMA metadata only, send fresh source indices, retained top-k indices and fresh/cached weights directly into owned output tensors, including self. SIMT metadata retains its SHMEM path. |
 | `DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT=1` | Skip the unused top-k output allocation/copy for cached weighted non-expanded public dispatch. Internal routing indices and expanded consumers remain intact. |
 
 Fresh channel packing still requires `DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA=1`.
@@ -643,12 +644,14 @@ Cached packing requires the current handle's private plan/head, and shares the
 existing channel-packing capacity and graph-capture restrictions. It repacks
 every call: changing weights does not change routing or mutate the handle.
 
-Direct output addresses occupy the two spare words of the existing payload
-record. Capacity checks and epoch publication remain in place; no additional
+Direct output addresses share the existing payload publication. Metadata output
+version 2 extends its record for top-k. Capacity checks and epoch publication
+remain in place; no additional
 address-exchange round or collective is added. Output tensors exist before
 publication and use the existing stream-aware allocator. Source conversion
-still runs, reading the final source-index tensor. Internal top-k remains in
-SHMEM. Invalid weight slots are initialized in the actual final destination.
+still runs, reading the final source-index and retained top-k tensors. Omitted
+top-k remains in SHMEM. Invalid metadata slots are initialized in their actual
+destinations unless complete-row packing permits skip-init.
 
 Run separately for EP8 and EP16, with one Buffer per rank throughout each run:
 
@@ -807,3 +810,33 @@ precision. Preserve zero tolerance. Report same-core version changes separately
 from new-8 versus old-32, and keep notify/communication/API mean/P95 separate.
 Windows CPU compilation/constexpr and mocked event/address checks do not establish
 CANN compilation, NPU ordering/precision or an end-to-end speedup.
+
+
+### Direct top-k output (metadata output version 2)
+
+With channel metadata and `DEEPEP_CLOS_DISPATCH_METADATA_DIRECT=1`, retained
+`recv_topk_idx` is now the UDMA destination and the local pack destination.
+The handle source builder reads that same final tensor after the existing
+completion boundary. The SHMEM-to-output top-k copy is skipped; padding and
+invalid `-1` entries remain defined. With skip-init disabled, prefill also
+uses the final top-k tensor. No sending policy or default switch changes.
+
+Cached non-expanded `omit` still allocates no top-k output and uses the
+internal SHMEM region. Expanded consumers retain their top-k tensor. Legacy
+SIMT metadata and direct-off paths retain staging. Payload self-copy remains.
+
+The existing output publication adds a top-k address before its epoch. Its
+record grows from 64 to 96 bytes inside the unchanged 512-byte per-rank slot;
+no exchange round or barrier is added. Host and device use the same record
+size in the private UB budget (8 peers/1 QP: 13088 bytes; 64 peers/2 QPs: 97312).
+Rebuild both host and kernels: tiling and mailbox layout changed. The native
+`dispatch_metadata_output_version` is 2, while pipeline/channel versions stay 4.
+
+Validate direct off/on with skip-init off/on, fresh/cached, weights on/off,
+expand 0/1, local and remote rows, empty and tail routes, and repeated changed
+weights. Check handle/source mappings and combine roundtrips. The existing
+CPU production-body tests cover address publication, index widths, queue lanes,
+local destinations, invalid entries and UB capacity; they do not replace CANN
+compilation or NPU precision/performance tests. In device diagnostics, retained
+top-k direct must report zero `topk_output_bytes` as well as zero source/weight
+output-copy bytes where applicable. Formal performance sampling keeps tracing off.

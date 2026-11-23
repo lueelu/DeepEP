@@ -883,6 +883,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
     if (tiling.channel_metadata) {
         tiling.metadata_src_output = cached_mode ? 0 : reinterpret_cast<uint64_t>(recv_src_idx.data_ptr());
+        tiling.metadata_topk_output = recv_topk_idx.has_value()
+            ? reinterpret_cast<uint64_t>(recv_topk_idx->data_ptr()) : 0;
         tiling.metadata_weight_output = recv_topk_weights.has_value()
             ? reinterpret_cast<uint64_t>(recv_topk_weights->data_ptr()) : 0;
     }

@@ -51,15 +51,28 @@ int main() {
     for(unsigned cached:{0U,1U}) for(unsigned direct:{0U,1U}) {
         control.fill(77); writes.clear(); trapped=false;
         PublishDispatchOutput(reinterpret_cast<uint8_t*>(control.data()),0,1,9,1024,0,3,3,16,0,0,
-            direct&&!cached?2048:0,direct?4096:0,direct&&!cached?4:0,direct?32:0);
+            direct&&!cached?2048:0,direct?4096:0,direct&&!cached?4:0,direct?32:0,direct?8192:0,direct?64:0);
         assert(!trapped && writes.back()==64+kOutputEpochWord);
-        assert(writes.size()==(direct?8:6));
+        assert(writes.size()==(direct?9:6));
         assert(control[64+kOutputSrcWord]==(direct?(cached?0:2048):77));
         assert(control[64+kOutputWeightWord]==(direct?4096:77));
+        assert(control[64+kOutputTopkWord]==(direct?8192:77));
     }
     writes.clear(); trapped=false;
-    PublishDispatchOutput(reinterpret_cast<uint8_t*>(control.data()),0,1,10,1024,0,3,3,16,0,0,0,4096,4,32);
+    PublishDispatchOutput(reinterpret_cast<uint8_t*>(control.data()),0,1,10,1024,0,3,3,16,0,0,0,4096,4,32,8192,64);
     assert(trapped && writes.empty());
+    // A retained output cannot publish a null or overflowing top-k tensor.
+    for (uint64_t topk : {uint64_t(0), UINT64_MAX-16}) {
+        writes.clear(); trapped=false;
+        PublishDispatchOutput(reinterpret_cast<uint8_t*>(control.data()),0,1,11,1024,0,3,3,16,0,0,
+            2048,4096,4,32,topk,64);
+        assert(trapped && writes.empty());
+    }
+    // Reusing a slot for cached omit must clear the previous top-k address.
+    writes.clear(); trapped=false;
+    PublishDispatchOutput(reinterpret_cast<uint8_t*>(control.data()),0,1,12,1024,0,3,3,16,0,0,
+        0,4096,0,32,0,0);
+    assert(!trapped && control[64+kOutputTopkWord]==0 && writes.back()==64+kOutputEpochWord);
 }
 """
     path = tmp_path / "publication.cpp"
@@ -90,77 +103,87 @@ def vf_as_constexpr(source, name):
     return (body[:end] + ", uint32_t tid" + body[end:]).replace("threadIdx.x", "tid")
 
 
-def test_channel_output_uses_remote_tensor_va_and_queue_lane(tmp_path):
+@pytest.mark.parametrize("bits", [32, 64])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_channel_output_uses_remote_tensor_va_and_queue_lane(tmp_path, bits, corrupt):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("C++17 compiler required")
     functions = cpp_functions(
         (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_sender.h").read_text(), "PutChannelOutput"
     )
+    # Keep production addressing/guards; replace only UB and GM pointer casts
+    # with a constexpr address ledger so this runs even where Windows blocks EXEs.
+    functions = functions.replace(
+        "reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kDispatchBasesOffset)", "records.data()"
+    ).replace("reinterpret_cast<__gm__ uint8_t*>(source)", "source")
+    if corrupt:
+        functions = functions.replace("output[field] + row * width", "output[field] + (row + 1) * width")
     source = r"""
-#include <cassert>
 #include <array>
 #include "common/dispatch_output.h"
-#define __aicore__
-#define __ubuf__
-#define __gm__
+#define __aicore__ constexpr
 using namespace ascend_deepep::udma;
-constexpr unsigned kDispatchBasesOffset=32;
-bool trapped=false;
-void trap() { trapped=true; }
+using topk_idx_t = INDEX_TYPE;
 struct Base {
-    static unsigned lane, peer, bytes, calls;
-    static uint64_t destination, source;
-    static unsigned QueuePeer(unsigned p) { return lane*4+p; }
-    static void PutAbsolute(unsigned p,uint64_t dst,uint8_t* src,unsigned n) {
-        ++calls; peer=p; destination=dst; source=reinterpret_cast<uint64_t>(src); bytes=n;
+    unsigned lane=0, peer=0, bytes=0, calls=0;
+    uint64_t destination=0, source=0;
+    bool trapped=false;
+    constexpr void trap() { trapped=true; }
+    constexpr unsigned QueuePeer(unsigned p) { return lane*4+p; }
+    constexpr void PutAbsolute(unsigned p,uint64_t dst,uint64_t src,unsigned n) {
+        ++calls; peer=p; destination=dst; source=src; bytes=n;
     }
 };
-unsigned Base::lane,Base::peer,Base::bytes,Base::calls;
-uint64_t Base::destination,Base::source;
-struct Sender {
+struct Sender : Base {
     struct { unsigned num_topk=8; } td_;
-    alignas(32) uint8_t scratch_[32+8*64]{};
+    std::array<uint64_t,8*kOutputRecordWords> records{};
     // FUNCTIONS
 };
-int main() {
-    Sender sender;
-    for(unsigned lane:{0U,1U}) for(unsigned field:{kOutputSrcWord,kOutputWeightWord}) {
-        Base::lane=lane; Base::calls=0; trapped=false;
-        auto* record=reinterpret_cast<uint64_t*>(sender.scratch_+32)+Base::QueuePeer(2)*8;
+constexpr bool check() {
+    for(unsigned lane:{0U,1U}) for(unsigned field:{kOutputSrcWord,kOutputWeightWord,kOutputTopkWord}) {
+        Sender sender;
+        sender.lane=lane;
+        auto* record=sender.records.data()+sender.QueuePeer(2)*kOutputRecordWords;
         record[2]=100; record[field]=0x1000000+lane*0x10000;
         sender.PutChannelOutput(2,field,7,0x800000,65);
-        assert(!trapped && Base::calls==1 && Base::peer==2);
-        const unsigned width=field==kOutputSrcWord?4:32;
-        assert(Base::destination==record[field]+7*width && Base::source==0x800000 && Base::bytes==65*width);
+        if(sender.trapped || sender.calls!=1 || sender.peer!=2) return false;
+        const unsigned width=field==kOutputSrcWord?4:(field==kOutputTopkWord?8*sizeof(topk_idx_t):32);
+        if(sender.destination!=record[field]+7*width || sender.source!=0x800000 || sender.bytes!=65*width) return false;
         sender.PutChannelOutput(2,field,99,0x800000,2);
-        assert(trapped && Base::calls==1);
-        trapped=false;
+        if(!sender.trapped || sender.calls!=1) return false;
+        sender.trapped=false;
         sender.PutChannelOutput(2,99,0,0,1);
-        assert(trapped && Base::calls==1);
-        trapped=false;
+        if(!sender.trapped || sender.calls!=1) return false;
+        sender.trapped=false;
         record[field]=0;
         sender.PutChannelOutput(2,field,0,0x800000,1);
-        assert(trapped && Base::calls==1);
+        if(!sender.trapped || sender.calls!=1) return false;
+        sender.trapped=false;
+        record[2]=0;
+        sender.PutChannelOutput(2,field,0,0,0);
+        if(sender.trapped || sender.bytes!=0) return false;
+        record[2]=UINT32_MAX; record[field]=4096; sender.trapped=false;
+        const unsigned before=sender.calls;
+        sender.PutChannelOutput(2,field,0,0x800000,UINT32_MAX);
+        if(!sender.trapped || sender.calls!=before) return false;
     }
+    return true;
 }
+static_assert(check());
 """
     path = tmp_path / "channel_address.cpp"
-    path.write_text(source.replace("// FUNCTIONS", functions))
-    binary = tmp_path / ("channel_address.exe" if os.name == "nt" else "channel_address")
+    path.write_text(source.replace("// FUNCTIONS", functions).replace("INDEX_TYPE", f"int{bits}_t"))
     result = subprocess.run(
-        [compiler, "-std=c++17", "-O2", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(binary)],
+        [compiler, "-std=c++17", "-I", str(ROOT / "csrc/direct"), "-c", str(path), "-o", str(tmp_path / "address.o")],
         capture_output=True,
         text=True,
         timeout=180,
     )
-    assert result.returncode == 0, result.stderr
-    try:
-        subprocess.run([str(binary)], check=True, timeout=30)
-    except OSError as exc:
-        if getattr(exc, "winerror", None) == 4551:
-            pytest.skip("compiled, but Windows application control blocked execution (4551)")
-        raise
+    if corrupt:
+        assert result.returncode != 0 and "static assertion" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("bits", [32, 64])
@@ -493,3 +516,62 @@ static_assert(all());
         timeout=180,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_direct_topk_handle_reads_final_rows_not_stale_shmem(tmp_path, corrupt):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    kernel = (ROOT / "csrc/direct/kernels/dispatch/dispatch_udma.cpp").read_text()
+    marker = (
+        "tiling.metadata_direct_output && !tiling.omit_topk_output\n                    ? tiling.metadata_topk_output"
+    )
+    begin = kernel.index(marker)
+    end = kernel.index("),", begin)
+    selection = kernel[begin:end].replace("reinterpret_cast<uint64_t>(symmetric_buffer)", "symmetric_buffer")
+    if corrupt:
+        selection = "symmetric_buffer + tiling.topk_idx_buffer_offset"
+    vf = vf_as_constexpr((ROOT / "csrc/direct/kernels/common/v2_handle.h").read_text(), "V2HandleSourceVf")
+    source = r"""
+#include <array>
+#include <cstdint>
+#define __simt_vf__ constexpr
+#define __launch_bounds__(n)
+#define __gm__
+using topk_idx_t = int64_t;
+constexpr void asc_threadfence() {}
+// VF
+constexpr bool check(bool direct, bool omit) {
+    struct { bool metadata_direct_output, omit_topk_output;
+             uint64_t metadata_topk_output, topk_idx_buffer_offset; } tiling{direct,omit,4096,128};
+    constexpr uint64_t symmetric_buffer=8192;
+    const uint64_t selected = SELECTION;
+    // The direct tensor has a different first valid route than poisoned staging.
+    std::array<topk_idx_t,8> final_topk{-1,-1,3,-1,-1,-1,-1,4};
+    std::array<topk_idx_t,8> staging{1,-1,-1,-1,2,-1,-1,-1};
+    const auto* indices=selected==4096?final_topk.data():staging.data();
+    std::array<int32_t,4> ranks{1,0,2,0};
+    std::array<int32_t,2> src{7,9};
+    std::array<int32_t,18> output{};
+    for(unsigned tid=0;tid<128;++tid)
+        V2HandleSourceVf(ranks.data(),src.data(),indices,output.data(),0,2,64,4,3,0,1,tid);
+    if(output[0]!=7 || output[6]!=73) return false;
+    if(output[1]!=(direct&&!omit?2:0) || output[7]!=(direct&&!omit?7:4)) return false;
+    for(unsigned i=12;i<18;++i) if(output[i]!=-1) return false;
+    return true;
+}
+static_assert(check(false,false) && check(false,true) && check(true,false) && check(true,true));
+"""
+    path = tmp_path / "topk_consumer.cpp"
+    path.write_text(source.replace("// VF", vf).replace("SELECTION", selection))
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "consumer.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if corrupt:
+        assert result.returncode != 0 and "static assertion" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr

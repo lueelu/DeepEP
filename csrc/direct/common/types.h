@@ -129,6 +129,7 @@ struct alignas(8) DispatchTilingData {
     uint64_t cached_metadata_head = 0;
     uint64_t metadata_src_output = 0;
     uint64_t metadata_weight_output = 0;
+    uint64_t metadata_topk_output = 0;
     uint64_t notify_topk_weights = 0;
     uint64_t packed_channel_indices = 0;
     uint64_t packed_channel_weights = 0;

@@ -6,12 +6,14 @@ namespace ascend_deepep::udma {
 // Independent of the reusable payload workspace. One cache-line-isolated slot
 // per publishing rank; the first slot holds this Buffer's device-side epoch.
 inline constexpr uint64_t kOutputSlotBytes = 512;
-inline constexpr uint32_t kOutputRecordBytes = 64;
+inline constexpr uint32_t kOutputRecordBytes = 96;
 inline constexpr uint32_t kOutputRecordWords = kOutputRecordBytes / sizeof(uint64_t);
 inline constexpr uint32_t kOutputEpochWord = 5;
 inline constexpr uint32_t kOutputSrcWord = 6;
 inline constexpr uint32_t kOutputWeightWord = 7;
-static_assert(kOutputWeightWord < kOutputRecordWords);
+inline constexpr uint32_t kOutputTopkWord = 8;
+static_assert(kOutputTopkWord < kOutputRecordWords);
+static_assert(kOutputRecordBytes % 32 == 0 && kOutputRecordBytes <= kOutputSlotBytes);
 #if defined(__CCE_AICORE__)
 #define ASCEND_DEEPEP_OUTPUT_FN __aicore__ inline
 #else

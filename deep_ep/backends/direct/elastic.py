@@ -899,7 +899,7 @@ class ElasticBuffer:
                 )
                 extra = ()
                 if metadata_options:
-                    if getattr(load_native_module(), "dispatch_metadata_output_version", 0) != 1:
+                    if getattr(load_native_module(), "dispatch_metadata_output_version", 0) != 2:
                         raise RuntimeError("rebuild host and kernels for cached metadata output experiments")
                     extra = (handle._dispatch_layout[5], not do_expand)
                 result = self._native.intranode_dispatch_with_plan(

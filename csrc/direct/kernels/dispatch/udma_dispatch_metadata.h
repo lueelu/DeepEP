@@ -23,11 +23,13 @@ __aicore__ inline void CopySelfChannelMetadata(Resource& resource, GM_ADDR plan,
     const uint64_t base = reinterpret_cast<uint64_t>(workspace);
     const uint64_t src = td.metadata_direct_output ? td.metadata_src_output : base + td.src_idx_buffer_offset;
     const uint64_t weights = td.metadata_weight_output;
-    // Top-k remains in the handle builder's internal consumer region. Weight
+    // Omitted top-k stays in the internal consumer region; direct top-k uses
+    // the final tensor shared with the handle builder. Weight
     // always uses its final tensor; src uses it when all-source direct mode is
     // enabled. No local packed-GM write/read round trip in either mode.
     ascend_deepep::PackPeerChannelMetadata(resource, plan, td, td.rank, channel, count, stride,
-        base + td.topk_idx_buffer_offset + uint64_t(row) * td.num_topk * sizeof(topk_idx_t),
+        (td.metadata_direct_output && !td.omit_topk_output ? td.metadata_topk_output : base + td.topk_idx_buffer_offset) +
+            uint64_t(row) * td.num_topk * sizeof(topk_idx_t),
         td.has_topk_weights ? weights + uint64_t(row) * td.num_topk * sizeof(float) : 0,
         td.cached_mode ? 0 : src + uint64_t(row) * sizeof(int32_t), scratch_offset);
 }
@@ -134,7 +136,9 @@ __aicore__ inline void InitializeDispatchTopk(
         const uint64_t row_bytes = uint64_t(td.num_topk) * element_bytes;
         const uint64_t base = field == 1 && td.metadata_direct_output ? td.metadata_weight_output :
             reinterpret_cast<uint64_t>(workspace) + (field == 0 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset);
-        local.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(base));
+        const uint64_t target = field == 0 && td.metadata_direct_output && !td.omit_topk_output
+            ? td.metadata_topk_output : base;
+        local.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(target));
         const uint64_t offset = uint64_t(begin) * row_bytes;
         AscendC::Duplicate(fill_int32, int32_t(field == 0 ? -1 : 0), fill_bytes / sizeof(int32_t));
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);

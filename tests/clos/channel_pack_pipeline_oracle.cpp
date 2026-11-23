@@ -134,7 +134,7 @@ void CheckPack(unsigned world, unsigned tokens, unsigned channels, unsigned k, b
     }
 }
 
-void CheckDirectSelf(bool cached, bool direct, unsigned count, unsigned double_buffer)
+void CheckDirectSelf(bool cached, bool direct, unsigned count, unsigned double_buffer, bool omit)
 {
     DispatchTilingData td{};
     td.rank = 1;
@@ -144,6 +144,7 @@ void CheckDirectSelf(bool cached, bool direct, unsigned count, unsigned double_b
     td.has_topk_weights = 1;
     td.cached_mode = cached;
     td.metadata_direct_output = direct;
+    td.omit_topk_output = omit;
     td.num_output_tokens = count + 3;
     td.num_experts = 64;
     td.channel_metadata_tile_tokens = 32;
@@ -166,9 +167,11 @@ void CheckDirectSelf(bool cached, bool direct, unsigned count, unsigned double_b
     td.topk_weights_buffer_offset = td.topk_idx_buffer_offset + (count + 3) * 8 * sizeof(topk_idx_t);
     std::vector<uint8_t> workspace(td.topk_weights_buffer_offset + (count + 3) * 32 + 32, 0xab);
     std::vector<int32_t> src(count + 3, -77);
+    std::vector<topk_idx_t> out_idx((count + 3) * 8, -77);
     std::vector<float> out((count + 3) * 8, -77);
     td.metadata_src_output = reinterpret_cast<uint64_t>(src.data());
     td.metadata_weight_output = reinterpret_cast<uint64_t>(out.data());
+    td.metadata_topk_output = omit ? 0 : reinterpret_cast<uint64_t>(out_idx.data());
     const auto untouched = workspace;
     Resource resource;
     CopySelfChannelMetadata(resource, reinterpret_cast<GM_ADDR>(plan.data()), workspace.data(), td, 2, 1, count,
@@ -184,12 +187,20 @@ void CheckDirectSelf(bool cached, bool direct, unsigned count, unsigned double_b
             std::memcpy(&index, workspace.data() + td.topk_idx_buffer_offset + ((1 + i) * 8 + k) * sizeof(topk_idx_t),
                         sizeof(index));
             std::memcpy(&weight, workspace.data() + td.topk_weights_buffer_offset + ((1 + i) * 8 + k) * 4, 4);
-            assert(index == (k == 3 ? topk_idx_t(-1) : topk_idx_t(k)));
+            assert((direct && !omit ? out_idx[(1 + i) * 8 + k] : index) ==
+                   (k == 3 ? topk_idx_t(-1) : topk_idx_t(k)));
             assert(out[(1 + i) * 8 + k] == (k == 3 ? 0 : weights[(100 + i) * 8 + k]));
         }
     }
     assert(src.front() == -77 && src.back() == -77 && out.front() == -77 && out.back() == -77);
     if (!count) assert(workspace == untouched);
+    assert(out_idx.front() == -77 && out_idx.back() == -77);
+    if (direct && !omit)
+        assert(std::equal(untouched.begin() + td.topk_idx_buffer_offset,
+                          untouched.begin() + td.topk_weights_buffer_offset,
+                          workspace.begin() + td.topk_idx_buffer_offset));
+    else
+        assert(std::all_of(out_idx.begin(), out_idx.end(), [](auto x) { return x == -77; }));
     assert(std::equal(untouched.begin() + td.topk_weights_buffer_offset, untouched.end(),
                       workspace.begin() + td.topk_weights_buffer_offset));
     for (auto& events : AscendC::credits)
@@ -201,7 +212,11 @@ int main()
     for (bool cached : {false, true})
         for (bool direct : {false, true})
             for (unsigned count : {0U, 1U, 65U, 1025U})
-                for (unsigned db : {0U, 1U}) CheckDirectSelf(cached, direct, count, db);
+                for (unsigned db : {0U, 1U})
+                    for (bool omit : {false, true}) {
+                        if (omit && !cached) continue;
+                        CheckDirectSelf(cached, direct, count, db, omit);
+                    }
     for (unsigned world : {8U, 16U, 32U, 64U, 128U, 256U}) {
         for (unsigned tokens : {0U, 1U, 65U, 513U, 2057U}) {
             for (unsigned channels : {1U, 8U, 32U}) {

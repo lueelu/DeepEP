@@ -48,9 +48,12 @@ struct SubmitDispatchChannelMetadata {
                     sender.PutChannelField(p, workspace, td.src_idx_buffer_offset + row * sizeof(int32_t), source,
                                            count * uint32_t(sizeof(int32_t)));
             }
-            sender.PutChannelField(p, workspace, td.topk_idx_buffer_offset + row * td.num_topk * sizeof(topk_idx_t),
-                                   td.packed_channel_indices + slot * td.num_topk * sizeof(topk_idx_t),
-                                   count * td.num_topk * uint32_t(sizeof(topk_idx_t)));
+            const uint64_t topk_source = td.packed_channel_indices + slot * td.num_topk * sizeof(topk_idx_t);
+            if (td.metadata_direct_output && !td.omit_topk_output)
+                sender.PutChannelOutput(p, kOutputTopkWord, row, topk_source, count);
+            else
+                sender.PutChannelField(p, workspace, td.topk_idx_buffer_offset + row * td.num_topk * sizeof(topk_idx_t),
+                                       topk_source, count * td.num_topk * uint32_t(sizeof(topk_idx_t)));
             if (td.has_topk_weights) {
                 const uint64_t source = td.packed_channel_weights + slot * td.num_topk * sizeof(float);
                 if (td.metadata_direct_output)

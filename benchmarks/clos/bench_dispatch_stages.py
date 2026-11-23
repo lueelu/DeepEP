@@ -550,7 +550,7 @@ def main(argv=None):
         raise RuntimeError("rebuild host and kernel libraries for overlap experiments")
     if (
         any(mode != "off" for mode in args.metadata_output_modes)
-        and getattr(native, "dispatch_metadata_output_version", 0) != 1
+        and getattr(native, "dispatch_metadata_output_version", 0) != 2
     ):
         raise RuntimeError("rebuild host and kernels for metadata output experiments")
     set_overlap_mode("off")
