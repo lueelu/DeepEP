@@ -1,935 +1,145 @@
-# Fused layout/notify experiment
+# Clos performance and diagnostics
 
-Fresh V2 UDMA layout/notify fusion remains opt-in:
+This guide describes the current implementation and retained comparison tools.
+For the independent SIMT layout, see [SIMT_LAYOUT.md](SIMT_LAYOUT.md); for SQ
+ownership, sparse CQEs and completion guarantees, see
+[SPARSE_CQE.md](../../tests/clos/SPARSE_CQE.md).
 
-```bash
-export DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY=0  # separate layout, then notify
-export DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY=1  # layout inside notify
-```
+## Current defaults
 
-### Default metadata settings
+- V2 fresh dispatch uses independent SIMT layout, following resolved `num_sms`.
+  `DEEPEP_CLOS_V2_SIMT_LAYOUT=0` selects the original layout baseline.
+- Supported peer-UDMA paths enable fresh channel metadata, double buffering,
+  skip-init, direct output and early slots. Cached weighted dispatch enables
+  pack/direct/omit; omission applies only to unused non-expanded top-k output.
+- Payload submission precedes sender-local copying, including when the legacy
+  overlap switch is `0`. Compact combine self-copy is enabled on supported paths.
+- Layout/notify fusion, host preparation, deferred plans and timing diagnostics
+  remain off. The library does not enable 1 GiB huge pages. Callers independently
+  choose `reduce_num_sms`; zero inherits the resolved communication core count.
+- Automatic metadata selection retains supported fallbacks for graph capture,
+  token scheduling, shape limits and cached handles without private routing data.
+  Explicit unsupported opt-ins fail rather than silently changing the request.
 
-Fresh channel metadata, metadata double buffering, skip-init and direct output
-are enabled by default on supported peer-UDMA paths. Cached weighted dispatch
-defaults to pack/direct/omit; omission only applies to an unused non-expanded
-top-k output. Each existing flag can still be set to `0` independently.
-Automatic packing retains the old path for graph capture, token scheduling,
-unsupported shapes, and cached handles without a private plan/send head.
-Explicit opt-ins retain the existing validation and errors.
+Set matching options on all ranks. Benchmarks can explicitly override library
+settings: record effective flags, launch policy, kernel names and core counts.
+Rebuild **both Host and device libraries** after updating this branch; tiling,
+output-publication and diagnostic layouts must match the loaded kernels.
 
-Layout/notify fusion, HOST_PREP and DEFER_PLAN remain off by default. The default
-separate V2 layout is SIMT and follows the resolved `num_sms`; set
-`DEEPEP_CLOS_V2_SIMT_LAYOUT=0` for the original layout baseline. Explicit fusion
-still works with the SIMT switch unset. The default
-metadata tile remains automatic (128 tokens with UB-capacity fallback). The
-Buffer's `use_1g_huge_pages` default remains `False`; these optimizations do not
-enable huge pages. Communication and reduce core counts are unchanged: callers
-choose `reduce_num_sms`, whose zero/default value follows the resolved core
-count. Existing benchmarks may explicitly override these production defaults;
-record their effective flags rather than assuming they test unset defaults.
+## Data ownership and completion
 
-Set the same value on every rank before a fresh dispatch. The switch is read
-per invocation; changing it does not require rebuilding Buffer or SHMEM.
-Cached dispatch reuses its handle and does not rebuild layout in either mode.
-V1 and standalone `get_dispatch_layout` retain their original implementation.
-The opt-in path rejects non-UDMA V2 calls. Rebuild **both native and device
-libraries**: the dispatch tiling ABI changes in this branch.
+Channel metadata is packed from existing plan/send-head data after payload
+submission, then sent by channel and field. Direct output writes source indices,
+retained top-k indices and weights to final tensors using the existing address
+publication round. Unused cached top-k output may be omitted, but internal routing
+indices and format conversion remain. Sparse output slots retain required
+initialization unless the selected path proves full coverage.
 
-## Implementation contract
+Payload WQE preparation reads staged UB indices. Pending short spans retain their
+indices before a refill; a refill does not force an extra flush or change visit,
+QP ownership, batch capacity or peer order. Cached whole-channel traversal uses
+exact channel row counts. Token scheduling retains its separate GM-index path.
+Source-handle construction remains the single-pass implementation.
 
-- Notify launches `num_sms` AIVs, exactly as dispatch. One AIV owns one existing
-  channel and its contiguous token interval. Empty channels participate in all
-  original local and cross-rank rendezvous.
-- AIV/MTE2 loads top-k tiles to UB. SIMT builds rank membership bytes, stable
-  per-peer plan entries and per-token send heads. Private expert histograms
-  avoid competing increments for hot experts; their sums are published per channel.
-- Each rank reduces channel counts into the original rank/expert count tensors,
-  then uses the existing notify exchange, prefix construction and MTE3 host-count
-  publication. Send policies, payload transport and combine kernels are unchanged.
-- Membership bytes are still written to GM for handle/cached compatibility.
-  The small count tensors are still materialized and read by existing publication
-  code. This experiment removes the separate layout launch and route-mask reread
-  during plan construction, not every metadata copy.
-- Per-channel expert scratch is `num_sms * align8(experts) * 4` bytes in ordinary
-  GM, owned by the dispatch call and recorded on its execution stream. It does
-  not change the SHMEM workspace layout.
+Local-copy UB is separate from WQE storage. Early slots only advance work whose
+inputs are already available; receiving source data and building the final Source
+handle still respect completion. Compact combine self-copy changes local layout,
+not the caller's independent reduce-core choice. Final SO flags, quiet, receive
+waits and SIMT completion remain in force; posting a WQE does not release its GM
+source. See the sparse-CQE document for pressure checkpoints and shared-SQ rules.
 
-UB ledger (byte offsets; reused by later notify stages):
+## Comparison entry points
 
-| Region | Begin | Capacity |
-|---|---:|---:|
-| Rank counts | 0 | 4096 |
-| Rank membership tile | 4096 | 65536 |
-| Existing eight-token chunk prefixes | 69632 | 36864 |
-| Top-k tile | 106496 | 32768 |
-| Private expert histograms | 139264 | remaining platform UB |
+Use the pinned dependency and toolchain in [build instructions](../../docs/build.md).
+All examples use a fresh result directory, disable 1 GiB pages and flush L2.
+For EP16/32, replace the torchrun launcher arguments with the site's topology;
+keep the same script arguments on every rank.
 
-Tile size is capped at 128 tokens, rounded down to eight tokens, and bounded by
-top-k bytes and world size. The final tile is bounded to actual tokens. Histogram
-shards are capped at 32 and shrink with expert count. Unsupported histogram sizes
-fail on the host before launching notify. The enable bit is separate from the
-top-k pointer so zero-token ranks still execute fused count generation.
-
-## Build and run
-
-Use the toolchain and pinned SHMEM dependency in [build instructions](../../docs/build.md).
-From this branch, with CANN and matching Torch/torch_npu active:
-
-```bash
-python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
-```
-
-Single-machine EP8, exactly eight AIVs per dispatch/notify:
+Independent old/SIMT layout, same communication core count, one Buffer per rank:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_fused_notify.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --expand 0 \
-  --warmup 10 --samples 30 --flush-l2 --output /tmp/fused_notify_ep8
+  --simt-layout-sweep --aiv 8 --no-huge-pages --flush-l2 \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 \
+  --warmup 10 --samples 30 --output /tmp/layout_abba
 ```
 
-The script defaults to 1 GiB huge pages; use `--no-huge-pages` only when necessary
-and keep it identical for both modes. L2 flushing is opt-in; when enabled it
-finishes **before** the per-sample all-rank device barrier on the Buffer's existing
-stream. The outer barrier is excluded from layout/notify/communication timing.
-Use a new output directory for each run. Multi-node runs use the normal torchrun
-`--nnodes`, `--node_rank`, `--nproc_per_node`, `--master_addr`, `--master_port`
-arguments. The separate control and SHMEM ports default to 29871 and 29872.
-The benchmark's TCPStore group also carries the automatic policy's host-identity
-collective during Buffer construction. This adapter is scoped to that group and
-restored after construction (including failures); physical topology inference
-and the default send policy remain unchanged. No Gloo/HCCL process group is added.
+For separate-layout/fused-notify comparison, omit `--simt-layout-sweep`.
+`--pipeline-sweep` additionally compares fused host preparation and deferred
+plans. The baseline in this comparison explicitly selects the original layout.
+`--host-timing` adds a separate Host diagnostic pass. `--expand 1` and
+`--precision-only` support expanded and tail-routing checks.
 
-Each process creates Buffer once, checks precision, then measures both weight
-modes with switch order **0, 1, 1, 0**. Each phase keeps the same routing and
-automatic send policy; the policy is recorded and checked for A/B consistency.
-Baseline standalone layout retains its original core count; only the fused
-layout phase is constrained to the eight notify cores.
-
-Precision checks compare against the original path and independently check
-CPU-derived rank memberships, rank prefixes, expert counts, channel counts,
-stable plan entries and send heads. They also compare payload/weights and reuse
-the resulting handle for cached dispatch and combine. Routing fixtures cover
-random, masked `-1`, hot experts, all-invalid routes, and a zero-token rank.
-To check token tails and expanded dispatch, run separately, each with one Buffer:
+Fresh/cached channel-metadata comparison, with one Buffer per rank:
 
 ```bash
-torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_fused_notify.py \
-  --tokens 4099 --expand 1 --precision-only --output /tmp/fused_notify_tail_expand
-torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_fused_notify.py \
-  --tokens 3 --precision-only --output /tmp/fused_notify_empty_channels
+torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_dispatch_stages.py \
+  --cores 8 --cached-channel-modes 0 --metadata-modes 0 1 \
+  --trace-samples 0 --flush-l2 --no-huge-pages \
+  --tokens 4096 --hidden 2816 --topk 8 --experts 256 \
+  --warmup 10 --samples 30 --output /tmp/channel_abba
 ```
 
-This script covers BF16, FP32 routing weights, and expert alignment 1. FP8/scales,
-graph capture and asynchronous fixed-capacity dispatch need separate device
-qualification before enabling this experimental path for those uses.
+This replaces the removed `bench_channel_metadata.py` forwarding wrapper with
+its exact preset arguments. Keep any additional options after those presets,
+as before. The following options remain available on the shared entry point:
 
-## Host overlap experiment
-
-These independent per-call switches default to **0** and require fused layout
-notify. Set identical values on every rank. Cached dispatch ignores them.
-
-| Switch | Effect |
+| Option | Purpose |
 |---|---|
-| `DEEPEP_CLOS_NOTIFY_HOST_PREP=1` | Allocate layout metadata through native code using one aligned count arena plus the route mask. Defer the communication-only `dst_slots` allocation until after notify submission. |
-| `DEEPEP_CLOS_NOTIFY_DEFER_PLAN=1` | Produce route/count metadata first. After the existing count publication and prefix work, build stable plan/send-head entries using the original plan builder. |
-| `DEEPEP_CLOS_DISPATCH_HOST_TIMING=1` | Collect calling-thread Host timestamps; no device synchronization or logging is added by the hooks. |
-
-The host-preparation path owns fresh metadata on every invocation; it does not
-reuse storage held by an old handle. Notify receives its tiling by value and
-never reads `dst_slots`; only the later communication launch receives that
-pointer. Stream-aware allocation and lifetime tracking remain in place.
-
-The deferred-plan path retains every existing local/cross-rank synchronization
-and the MTE3 mapped-host publication. Each AIV still owns its original channel.
-UB is reused only after existing consumers drain. Count publication is **not**
-dispatch completion: the communication kernel remains ordered after the full
-notify kernel on the same stream. Host output allocation can overlap the tail
-of notify, without changing output capacity or the public return contract.
-This option rereads the route mask and recomputes plan prefixes, so total kernel
-time may grow; a complete API improvement must be measured, not assumed.
-
-Use one Buffer initialization to test all five modes in forward/reverse order:
-
-```bash
-torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_fused_notify.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --expand 0 \
-  --warmup 10 --samples 30 --flush-l2 --no-huge-pages \
-  --pipeline-sweep --host-timing --output /tmp/fused_notify_pipeline_ep8
-```
-
-`--no-huge-pages` here matches the preceding remote comparison; keep the setting
-identical across modes. The sweep is `baseline, fused, host, plan, both`, then
-the reverse, with/without FP32 weights. Baseline uses standalone layout; the
-other four use fused notify with neither, Host preparation only, deferred plan
-only, or both optimizations. Notify/communication remain eight AIVs and the
-script checks that the automatic send policy is identical. Both libraries must
-be rebuilt; the script requires `fused_notify_pipeline_version == 1`.
-
-Precision runs first for all modes and routing fixtures. For CPU source-body
-checks before device runs, use `python -m pytest tests/clos/test_fused_notify.py -q`.
-The extracted production builders are compared to an independent stable-order
-oracle, including empty channels, tails, skew, untouched early plan storage,
-and overwritten UB before deferred construction. These tests do not establish
-device event ordering or NPU precision.
-
-Formal unprofiled API timing and profiler passes run with Host timing **off**.
-`--host-timing` adds a separately warmed diagnostic pass and writes per-rank
-`host_timing.json` with raw timestamps plus `host_summary.csv` with intervals:
-
-- `api_to_notify_submit`: API entry through notify submission; `python_front`
-  includes Python work and any native layout/allocation helpers before the
-  shared V1 dispatch body. `native_prepare` and `notify_launch` split its work.
-- `post_launch_prepare`: notify submission through starting the count wait.
-- `wait_total` / `wait_remaining_counts`: when CPU observes total receive count,
-  then all expert counts. These are observation times, not device write times.
-  The API still waits for all counts before allocating receive outputs.
-- `count_to_outputs`: count validation/list preparation and receive allocation.
-- `comm_launch`, `comm_submit_to_complete`, `api_host_return`, and
-  `api_complete_diagnostic`: launch, completion tail and API boundary intervals.
-
-All timestamps use the same native steady clock. The raw `native_return` mark
-is the end of the shared V1 dispatch body; public-handle wrapping and Python
-return work are captured before `api_return`. Diagnostic summaries use each
-iteration's slowest rank, then the mean; independently aggregated intervals
-cannot be added to reconstruct the API. Use raw same-call rows for attribution.
-Do not subtract profiler timings from diagnostic API timings.
-
-Check `mapped_counts_all_samples` in the report. If false, the `.cpu()` fallback
-waits for stream completion and cannot demonstrate early mapped-count overlap.
-No new `.cpu()` fallback or device-wide synchronization is introduced here.
-
-## Eight-AIV copy and cached-path transplant
-
-The branch also contains the compact self-copy and cached dispatch changes from
-[optimize_8aiv_kernel, commit 8d98be0](https://github.com/ZiHa0-Zeng/DeepEP/commit/8d98be0e7fb93420e55a62cb8c3a69f569a60cc9).
-Automatic peer order, P/W/Q, visit, weight transport, and self-copy scheduling
-are unchanged; the source branch's policy and weight-sender changes are not included.
-
-- Ordinary UDMA V2 combine uses compact local rows for EP8, eight communication
-  AIVs and eight handle channels, with BF16 payload and dense aligned row strides.
-  It copies payload and optional weights in 64 KiB MTE chunks, partitioning rows
-  across the existing self-copy AIVs. Remote slots remain token-indexed; reduce
-  locates local rows through the receive channel prefix and send-head ordinal.
-  Independent reduction core counts keep that same mapping. Early-single,
-  aggregate-pipeline and token scheduling retain their original path.
-- Cached UDMA dispatch with EP8/eight AIVs, two-byte elements and no scales uses
-  the handle's full per-channel counts, skipping repeated 256-token list-window
-  loads and scans. Per-peer visit budgets and completion synchronization remain
-  unchanged. Fresh dispatch and unsupported layouts retain the old loop.
-
-CPU ownership/addressing checks execute extracted production functions:
-
-```bash
-python -m pytest tests/clos/test_eight_aiv_copy.py tests/clos/test_fused_notify.py tests/api/test_clos_compatibility.py -q
-```
-
-The CPU mocks do not validate device ordering or performance. In addition to the
-fused on/off precision commands above, check independent reduction cores against
-the public CPU golden on an idle EP8 machine after rebuilding:
-
-```bash
-for reduce in 8 32; do
-    python tests/clos/source/test_v1_v2_shared_backend.py \
-        --api v2 --public-auto --auto-policy --ep-size 8 \
-        --num-tokens 129 --hidden 2816 --num-topk 8 --experts-per-rank 32 \
-        --num-aiv 8 --combine-num-sms 8 --reduce-num-sms "$reduce" --check-events
-done
-```
-
-Rebuild the native library as well as Python: the internal combine tiling ABI
-now carries the local-layout flag.
-
-## Opt-in metadata thread comparison
-
-Two independent native dispatch options accept only `0` (default/unset) or `1`:
-
-| Mode | `DEEPEP_CLOS_DISPATCH_SRC_IDX_256` | `DEEPEP_CLOS_DISPATCH_TOPK_256` |
-| --- | --- | --- |
-| Baseline | 0 | 0 |
-| Top-k only | 0 | 1 |
-| Source indices only | 1 | 0 |
-| Both | 1 | 1 |
-
-These options require UDMA. They are read at each native dispatch call, so a
-drained Buffer can be reused across modes without SHMEM reinitialization.
-Keep all ranks in the same mode. Captured graphs retain their captured tiling;
-use ordinary uncaptured calls for this comparison.
-
-The default remains 128 threads for each VF and 16 threads per peer for source
-indices. The source-index option selects 256 threads, with 32 threads per peer
-for EP <= 8 and 16 for larger EP (including EP16). The top-k option selects 256
-threads for the existing token/top-k slot loop, including optional FP32 weights.
-Neither option changes peer scheduling, P/W/Q, visit, payload WQE batches,
-self-copy placement, UB allocation or completion synchronization. Source-index
-publication remains fresh-only; top-k publication still requires top-k inputs.
-Cached calls without top-k inputs do not exercise either VF.
-
-After rebuilding, inspect native `DispatchTilingData.metadata_src_threads`,
-`metadata_src_lanes`, and `metadata_topk_threads` during precision checks to
-verify the actual configuration. Remove diagnostic probes before timing.
-The tiling ABI changed, so rebuilding only Python is insufficient.
-
-Run `python -m pytest tests/clos/test_dispatch_metadata_threads.py -q` with a
-C++17 compiler for production-body CPU checks (sparse/empty routes, both weight
-modes, per-peer ownership and host option validation). These mocks do not
-validate SIMT execution, resource usage or remote-store completion on device.
-For device comparisons use EP8/16, eight communication AIVs, reduce48,
-T4096/H2816/K8/E256/BF16/expand0, with unchanged routes and huge-page/L2 settings.
-Compare modes 0/1/2/3 then 3/2/1/0, checking precision before timing fresh dispatch
-with and without weights; use cached dispatch and combine as regression controls.
-
-## Dispatch stage diagnostic and EP16 cached-channel experiment
-
-`DEEPEP_CLOS_CACHED_CHANNEL_EP16=1` enables the existing whole-channel list
-schedule for **EP16, eight communication AIVs, cached, two-byte payload, no
-scales**. Its default is zero. EP8's existing eight-AIV fast path is unchanged;
-fresh dispatch and all other core/EP combinations retain their prior path.
-Each channel uses its exact compact per-peer count, so the scalar input-token
-window scan and GM-to-UB list refill are skipped. Destination rows, visit/WQE
-budget, sender ownership and all completion operations remain unchanged.
-The longer per-peer channel interval can change inter-peer progress, so this
-is an experiment, not a promised improvement. Keep the flag identical on all
-ranks; change it only between drained, uncaptured launches.
-
-`DEEPEP_CLOS_DISPATCH_DEVICE_TIMING=1` selects a separate diagnostic kernel.
-The default kernel specializes all trace operations away and has no trace
-array, clock reads or diagnostic DMA. Both native and kernel libraries must
-be rebuilt together because `DispatchTilingData` changed. The diagnostic
-currently supports peer-scheduled dispatch only.
-
-Each AIV owns one 512-byte GM row allocated by the stream-aware allocator.
-It accumulates scalar timestamps/counters privately and exports through
-UB `[0,512)` after the original users finish; no trace region overlaps live
-sender staging. The export uses MTE3, with MTE3-to-scalar then scalar-to-MTE3
-ordering. There are no extra cross-rank collectives. Existing V-to-scalar
-completion edges bound source-index and top-k VFs; self-copy timing follows
-its existing final drain. A diagnostic-only MTE3-to-scalar edge bounds output
-copy completion. Formal bandwidth must be measured with diagnostics disabled.
-
-The native `take_dispatch_device_timing()` returns the latest launch tensor
-on the calling host thread and clears that retained reference. Consume the
-dispatch completion event before copying it to CPU; retrieve each launch
-before submitting the next. Rows have stride 64 int64 elements; interpret only
-`dispatch_device_timing_fields`. `entry_cycles` is an absolute local-device
-clock, other timeline fields are per-AIV entry offsets. Convert cycle fields
-using `dispatch_device_timing_cycles_per_us`; never align different devices
-using their absolute clock values.
-
-`payload_queued` means the final PutRows work has been queued, not that its
-last deferred batch or network transfer has completed. `published` follows
-Publish (including its existing flush), `incoming_done` follows incoming
-markers, `quiet_done` follows sender completion, and `sync_done` follows the
-existing all-rank collective. `src_cycles`, `topk_cycles`, `self_cycles` and
-`list_cycles` accumulate substage durations over channels. They overlap the
-timeline intervals and other AIVs: **do not sum their maxima into API time**.
-`work_done` excludes trace-export overhead and is diagnostic, not bandwidth.
-
-Run the following through the site's normal torchrun launcher, once for EP8
-and once for EP16 (same shape, routes, topology and libraries as the baseline):
-
-```bash
-python benchmarks/clos/bench_dispatch_stages.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 \
-  --cores 8 32 --cached-channel-modes 0 1 \
-  --warmup 10 --samples 30 --trace-samples 3 --flush-l2 --huge-pages \
-  --output /path/to/results
-```
-
-The script initializes Buffer once per rank and runs fresh without/with
-weights and cached dispatch, forward then reverse. It checks cross-variant
-output equality, requested/native huge-page state and all-rank library hashes.
-Formal API wall and kernel profiling are separate passes with traces off;
-L2 eviction finishes before each alignment barrier. Diagnostic traces follow
-in a separate pass and validate the effective whole-channel gate per core.
-Per-rank raw reports and `summary.json` contain per-iteration slowest-rank
-mean/P50/P95; bandwidth uses decimal GB/s, deduplicated payload including self.
-`device_trace.json` retains every diagnostic core/sample rather than hiding
-slow-core differences in one average.
-
-For an older installed baseline, use this script from the new checkout with
-`--cores 32 --cached-channel-modes 0 --trace-samples 0`; it imports the installed
-wheel rather than placing the checkout package on `sys.path`. Use a separate
-process/environment for each installed version. Cross-variant equality is not
-an independent golden: also run the standard device precision suite, including
-empty/skewed routes and tail tokens. Run the existing ABC harness with reduce48
-for combine and end-to-end regression; this script measures dispatch APIs only
-and contains no expert compute.
-
-CPU checks:
-
-```bash
-python -m pytest tests/clos/test_eight_aiv_copy.py \
-  tests/clos/test_dispatch_metadata_threads.py tests/clos/test_dispatch_stages.py -q
-```
-
-The production-body C++ oracle covers EP8/16/32, on/off, cached/fresh,
-8/16 cores, visit4/8/16/32, empty channels and non-divisible token counts.
-It checks exact token/destination rows and per-visit budget, not network
-completion or device performance. CANN compilation and NPU validation remain
-required before treating the experiment as deployable.
-
-## Channel metadata packing
-
-`DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA=1` enables **fresh peer-scheduled UDMA
-dispatch only**. It defaults on for supported paths. Cached dispatch ignores the switch and is
-the negative control; graph capture is rejected when the fresh experiment is
-requested. All ranks must use the same switch. Rebuild and install both the host
-extension and kernel library because `DispatchTilingData` has new fields.
-
-Channel metadata version 3 packs **after payload submission in dispatch**,
-for both fresh and cached weighted calls. Notify only builds the existing
-plan/head and counts; cached notify retains its collective and zero-UB launch.
-No kernel, readiness flag or address-exchange round is added.
-
-Each sender batches its existing peers for one channel/input token window.
-AIV loads compact plan prefixes and one shared contiguous top-k/weight window
-to UB. Binary search selects valid plan rows; SIMT processes only those rows.
-There is no peer scan per top-k element and no separate VF launch per peer.
-Output remains `[peer, channel, aligned_channel_tokens, topk]`, with invalid
-entries -1/0 and one row per deduplicated token/peer. SIMT only reads input UB.
-
-Packing uses the suffix beyond `DispatchLiveSendUbBytes(Capacity,Qps)`.
-Each input slot reserves these 32-byte-aligned regions:
-
-| Region | Bytes |
-| --- | --- |
-| Peer/count/ordinal descriptors | align32(Capacity x 3 x 4) |
-| Compact plan prefixes | align32(B x Capacity x 4) |
-| Shared top-k input | align32(B x K x sizeof(topk_idx_t)) |
-| Optional shared FP32 weights | align32(B x K x 4) |
-
-Capacity is the existing sender table size, 8 or 64. Host and kernel check the
-same live-sender budget, including two complete slots for double buffering.
-The existing `DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS` and
-`DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER` names now control dispatch packing.
-Auto tile starts at 128 and halves to fit; explicit oversized tiles fail.
-EP/K limits stay 256/128. P/W/Q, visit and WQE batch sizes do not change.
-
-MTE2_V/S_V protect input/descriptor readers, V_MTE2 protects slot reuse, and
-V_S completes GM output before UDMA reads it. Packed tensors keep their per-call
-allocation and remain immutable until quiet. Capacity is unchanged; self slots
-are unused and never sent. Allocation remains included in API timing.
-
-Payload peer order, P/W/Q, visit and self-payload copy order stay unchanged.
-After payload submission, each sender handles only its existing peer/channel
-ownership (`channel % workers_per_peer`). AIV prepares source/destination/length
-descriptors; each SIMT lane constructs one channel/field WQE using the existing
-32-WQE builder. UDMA moves the bytes. Only valid rows are sent, never padding
-between channels. At eight channels/W1, a nonempty peer needs at most 16 WQEs
-without weights or 24 with weights, excluding payload. Actual flush counts still
-depend on SQ ownership and available credits. Payload spans are flushed before
-the descriptor UB is reused; metadata uses the same owned QPs and terminal
-markers, with the original incoming wait, quiet and all-AIV/rank collective.
-
-Self metadata bypasses packed GM. AIV loads its plan/input windows; SIMT writes
-exact slots at the consumer. Weight always goes to `recv_topk_weights`, even
-with remote DIRECT disabled. The final SHMEM output copy excludes the self
-rank-prefix interval so stale staging cannot overwrite it. Direct mode writes
-retained top-k to the final tensor; omitted top-k stays internal. Source indices
-retain the existing DIRECT selection.
-Invalid slots are fully written as -1/0. No padded store crosses channel owners.
-
-Sender self generation remains after payload/final-marker submission; auxiliary
-AIVs operate in parallel. Self payload gather is unchanged. Traces count remote
-packing in `topk_cycles`, local generation in `self_cycles`, and metadata posting
-in `payload_queued`. Work moved between kernels: shorter notify alone does not
-prove a gain. Compare complete API as well as communication; disable traces
-for formal timing.
-
-Use the site's torchrun launcher for **EP8 and EP16 in separate jobs**:
-
-```bash
-# EP8 on one node; use --nnodes=2 --node_rank=$NODE_RANK and the site's
-# rendezvous arguments for EP16 across two eight-rank nodes.
-torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_channel_metadata.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 \
-  --warmup 10 --samples 30 --huge-pages --output /path/to/channel_metadata_ep8
-
-# One Buffer: compare 32/64/128/256-token packing under unchanged auto payload
-# policy and Zeng's contiguous EP8/AIV8/H2816 rank/P2/W1/Q1/visit32 policy.
-# Pack weights after payload submission for channel-metadata variants.
-torchrun --standalone --nproc_per_node=8 benchmarks/clos/bench_channel_metadata.py \
-  --metadata-modes 1 --metadata-tile-tokens 32 64 128 256 \
-  --dispatch-plans auto zeng --warmup 10 --samples 30 --huge-pages \
-  --output /path/to/channel_tile_zeng_ep8
-```
-
-The second command visits every tile/plan combination and then reverses the
-order, reusing a single Buffer throughout. `--dispatch-plans zeng` is restricted
-to contiguous EP8/AIV8/H2816/BF16/non-expanded dispatch; it is a benchmark-only
-per-launch override and leaves the production default policy untouched. It does
-not change the prepacked weight path or enable Zeng's combine weight policy.
-For EP16 tile testing use `--dispatch-plans auto`; no EP16 Zeng policy is assumed.
-Every summary includes the requested/effective tile and actual native launch
-policy. Native `last_dispatch_channel_metadata_tile_tokens()` returns zero when
-packing is inactive (including cached). Rebuild host and kernel together; this
-benchmark requires `dispatch_channel_metadata_version=4` for enabled packing.
-
-The wrapper defaults to 8 AIV, BF16, expand=0, L2 flush then all-rank alignment,
-1 GiB pages, and **off/on/on/off**. It initializes Buffer once per rank per EP,
-including precision checks and all three operators: fresh without weights,
-fresh with weights, and cached. It fixes other experimental flags to 0 and
-checks that the payload policy is identical across off/on. Native
-`last_dispatch_channel_metadata()` is checked for each invocation, not just the
-requested environment value. Native huge-page state and all-rank library hashes
-are recorded; retain the site's physical huge-page allocation audit as well.
-
-Precision precedes performance: an independent CPU oracle reconstructs receive
-rows from source routes, covering masked/tail routes, all-invalid, skew and an
-empty source rank. The normal 4096-token case is also checked independently and
-against the other variant, with another equality check after sampling. Each rank
-keeps raw profiler exports, `samples.json`, `precision.json`, `manifest.json`,
-`summary.json`, `comparison.csv` and final `exit.json`. Require every rank's exit
-file **and** the launcher exit code to be zero.
-
-`comparison.csv` separates notify, communication and unprofiled complete API
-wall time, reports paired deltas and repeat-mean ranges, and derives decimal
-payload GB/s from communication time. It never sums independently aggregated
-stage times into API latency. Cached must stay on the old path; use its variation
-to detect drift. This script has no combine/reduce or expert compute, so it does
-not establish MoE end-to-end performance.
-
-Local checks (CANN/NPU validation is still required remotely):
-
-```bash
-python -m pytest tests/clos/test_channel_metadata.py tests/clos/test_dispatch_stages.py \
-  tests/clos/test_dispatch_metadata_threads.py tests/clos/test_eight_aiv_copy.py -q
-```
-
-## Report files
-
-Each rank writes `precision.json`, `summary.csv`, `report.json`, raw profiler
-exports and per-phase `samples.json`. `exit.json` with code 0 is written only
-after all ranks finish. Collect every rank's directory and torchrun exit code.
-Missing kernels, extra layout launches in fused mode, invalid durations and
-wrong sample counts fail the run. Two leading/trailing profile guards are
-excluded from the requested sample count.
-
-- Primary comparison: separate **layout + notify** versus **fused notify**, plus
-  the unprofiled complete API wall time. Fused notify includes layout work, so
-  notify-only comparison with baseline is misleading.
-- `layout_notify_us` adds stages on each rank/sample **before** taking that
-  sample's slowest rank, then averages samples. Other stage means likewise use
-  per-sample slowest rank; their separately aggregated values cannot simply be
-  added to reconstruct API time.
-- `payload_gbps` = all ranks' rank-deduplicated BF16 payload bytes / EP /
-  communication-kernel time / 1000 (time in microseconds). It includes self,
-  excludes indices/weights and uses decimal GB/s. Expand is reported separately.
-- API wall timing and kernel profiling use separate passes; the API wall metric
-  includes host submission and completion waits, but excludes the outer barrier
-  and L2 flush. It is not a device-only API span.
-
-No NPU performance or precision claim follows from local CPU checks alone.
-
-## Queue and local-copy diagnostics
-
-Version-2 device traces add per-rank, per-AIV accounting to fresh/cached dispatch
-and ordinary split peer-scheduled combine. Rebuild **both host and kernels**.
-Normal kernels use the disabled trace specialization; no policy, visit, batch
-capacity or payload transport is changed. The switches default off:
-
-- `DEEPEP_CLOS_DISPATCH_DEVICE_TIMING=1`
-- `DEEPEP_CLOS_COMBINE_DEVICE_TIMING=1`
-
-The benchmark controls these switches itself. Formal API timing and kernel
-profiling run with tracing off; a separate diagnostic pass enables tracing.
-`trace_overhead.json` compares instrumented and normal API samples. Diagnostic
-V_S/MTE2_S edges and counters can perturb overlap, so never publish bandwidth
-computed from diagnostic timings. Combine tracing rejects token scheduling,
-early-single/aggregate pipeline, integrated expanded inputs and graph capture.
-
-Example, once per EP8/16 with the site's usual torchrun launch arguments:
-
-```bash
-torchrun <site-launch-arguments> benchmarks/clos/bench_channel_metadata.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 \
-  --metadata-modes 1 --metadata-tile-tokens 128 --dispatch-plans auto \
-  --cached-channel-modes 1 --combine-diagnostics --reduce-cores 48 \
-  --warmup 10 --samples 30 --trace-samples 5 --flush-l2 --huge-pages \
-  --output <shared-result-directory>
-```
-
-One Buffer per rank is reused across precision checks, forward/reverse formal
-sampling and diagnostic passes, including weighted/unweighted combine. BF16,
-expand=0 and routing are fixed. Fresh metadata keeps the channel-packed UDMA
-path. Combine uses its existing automatic policy, independent of the dispatch
-plan override. For EP8 only, `--dispatch-plans auto zeng` additionally compares
-the existing Q2 plan with rank/P2/W1/Q1/visit32; no default strategy is changed.
-Use `--cores 8 32 --dispatch-plans auto` to include a same-build 32-core control
-without another Buffer initialization. Reduce remains independently fixed at 48.
-
-Per-rank output retains the original formal dispatch `summary.json`, adds
-`combine_summary.json`, and writes `device_trace.json` in each capture directory.
-Every trace row includes these measurements:
-
-| Field | Interpretation |
-| --- | --- |
-| `list_cycles` | Load/scan the dispatch index window, or load the combine index window |
-| `descriptor_cycles` | Scalar descriptor/span preparation; excludes nested submission |
-| `wqe_build_cycles` | Completed SIMT WQE construction, including synchronization |
-| `wqe_submit_cycles` | Inclusive SHMEM batch submission; SDK-internal CQ polling is included |
-| `credit_cycles` / `credit_blocked_cycles` | Explicit SQ admission checks / checks that initially lacked credit |
-| `credit_checks`, `credit_blocked`, `credit_max_cycles` | Admission count, blocked count and maximum check duration |
-| `wqes`, `flushes`, `short_flushes`, `spans` | Aggregate sender WQEs, batches, batches smaller than 32, and spans |
-| `state_flushes`, `qp_flushes`, `index_flushes` | Nonempty batches flushed for state, QP or combine index-window changes |
-| `metadata_wqes`, `metadata_flushes` | Subset submitted through the generic descriptor sender, including channel metadata |
-| `submit_no_credit` | SDK submissions observed without sufficient credit immediately before the call |
-| `sq_used_max`, `sq_used_sum`, `sq_empty_checks` | Software `sq_head-sq_tail` snapshots at admission |
-| `self_cycles`, `self_begin`, `self_end` | Local-copy duration and its interval relative to that AIV's entry |
-| `src_cycles`, `topk_cycles` | Direct SIMT metadata/weight work when that path is active |
-
-The decoder supplies microseconds, mean WQEs per batch, short-batch fraction,
-blocked-admission fraction, and separate incoming-flag, quiet and final-sync
-intervals. `incoming_wait_us` starts **after** any after-submit local copy;
-the older `incoming_done_interval_us` may contain that copy and is not a pure
-wait metric. Sender publication, including terminal flags, has its own timeline
-interval. Direct SIMT metadata/weights and terminal flags are not aggregate
-WQEs and are not included in the WQE counters.
-
-Software head/tail snapshots are not hardware queue occupancy, and an empty
-snapshot alone does not prove a starved link. Explicit admission wait also does
-not capture SDK-internal waits; inspect inclusive submission and
-`submit_no_credit` together. Same-core nested counters and stages overlap;
-different AIVs overlap as well. Do not sum stage maxima into kernel/API time,
-or compare absolute cycle timestamps across devices. Use formal slow-rank
-samples and per-AIV traces to identify preparation, credit pressure, local-copy
-or completion tails before selecting the next optimization. Notify is profiled
-for dispatch; combine's outer alignment notify is excluded from its measured API.
-
-## Dispatch overlap experiments
-
-Rebuild both host and kernel libraries. Send-before-self is mandatory; the old
-`DEEPEP_CLOS_DISPATCH_OVERLAP_SELF=0` no longer selects copy-first. Slots defaults
-to `1`; init and notify also default on for their applicable paths. Peer order, P/W/Q, visit, payload UDMA,
-combine and reduce core policies are unchanged.
-
-| Benchmark mode | Environment variable set to `1` | Effective scope |
-| --- | --- | --- |
-| `self` | Legacy overlap variable, always `1` in the runner | Mandatory send-before-self; no optional slots/init/notify changes |
-| `slots` | `DEEPEP_CLOS_DISPATCH_EARLY_SLOTS` | Fresh peer dispatch: build local V2 destination slots after submission/self work; Source still waits for received metadata |
-| `send` | Both self and slots | Send-first dispatch plus early slots; no prefill or notify-pack changes |
-| `init` | `DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT` | Fresh channel-metadata path only: omit valid-row top-k prefill because packed metadata writes every slot, including invalid `-1` entries |
-| `notify` | `DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER` | Channel-metadata pack: two independent input UB tiles and event pairs; GM output layout is unchanged |
-| `all` / `off` | All optional work / no optional work | Both retain mandatory send-before-self; `off` cannot restore copy-first |
-
-Auxiliary AIVs retain parallel self-copy. A live sender's descriptors, headers,
-completion records and index windows are reserved through final submission;
-local-copy scratch prefers the suffix and can reuse released staging for large
-rows after an MTE3 drain. No incoming wait, quiet, collective,
-output padding initialization or completion publication is removed. Double-buffer
-tile selection checks **two** tiles against UB capacity; an explicit oversized
-tile fails instead of silently changing the experiment.
-
-Run once per EP8/16 using the site's launch arguments, with one Buffer per rank
-across all variants and both core counts:
-
-```bash
-torchrun <site-launch-arguments> benchmarks/clos/bench_channel_metadata.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 32 \
-  --metadata-modes 1 --metadata-tile-tokens 128 --dispatch-plans auto \
-  --cached-channel-modes 1 --overlap-modes off self slots init notify all \
-  --warmup 10 --samples 30 --trace-warmup 5 --trace-samples 5 \
-  --flush-l2 --huge-pages --output <shared-result-directory>
-```
-
-Fresh, fresh weighted and cached dispatch run in forward/reverse order. Precision
-checks also compare public Source/Slots against original CPU routes, including
-invalid routes, duplicate peer routes, empty ranks and tails. Timing remains
-L2 flush → rank alignment → measured call. Diagnostic kernels get separate warmup.
-The former cached-channel filter no longer drops fresh/32-core control groups.
-
-`overlap_comparison.csv` reports matched notify, communication and complete API
-means and pair deltas; it never mixes core counts, metadata modes or payload
-policies. `summary.json` also records the native effective option mask:
-bit 0 = after-submit self, bit 1 = early slots, bit 2 = skipped prefill,
-bit 3 = double-buffer pack. Cached or auxiliary-worker paths legitimately mask
-out inapplicable options. Traces append `topk_init_cycles`, `source_cycles` and
-`slots_cycles`; early slots occur before incoming wait and must not be counted
-again as a completion-tail cost. CPU mocks check indexing, UB boundaries and
-event credit pairing, but do not establish device ordering or NPU performance.
-
-### Cached weights and direct metadata outputs
-
-Three independent flags default on for supported paths; rebuild both host and kernels before
-using them, with identical settings on every rank. The default payload schedule, core count, visit and completion
-protocol are unchanged.
-
-| Flag | Effect |
-| --- | --- |
-| `DEEPEP_CLOS_CACHED_WEIGHT_PACK=1` | Repack weights after payload submission using the handle-owned plan. Send channel top-k/weight blocks with UDMA. |
-| `DEEPEP_CLOS_DISPATCH_METADATA_DIRECT=1` | For channel UDMA metadata only, send fresh source indices, retained top-k indices and fresh/cached weights directly into owned output tensors, including self. SIMT metadata retains its SHMEM path. |
-| `DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT=1` | Skip the unused top-k output allocation/copy for cached weighted non-expanded public dispatch. Internal routing indices and expanded consumers remain intact. |
-
-Fresh channel packing still requires `DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA=1`.
-Cached packing requires the current handle's private plan/head, and shares the
-existing channel-packing capacity and graph-capture restrictions. It repacks
-every call: changing weights does not change routing or mutate the handle.
-
-Direct output addresses share the existing payload publication. Metadata output
-version 2 extends its record for top-k. Capacity checks and epoch publication
-remain in place; no additional
-address-exchange round or collective is added. Output tensors exist before
-publication and use the existing stream-aware allocator. Source conversion
-still runs, reading the final source-index and retained top-k tensors. Omitted
-top-k remains in SHMEM. Invalid metadata slots are initialized in their actual
-destinations unless complete-row packing permits skip-init.
-
-Run separately for EP8 and EP16, with one Buffer per rank throughout each run:
-
-```bash
-torchrun <site-launch-arguments> benchmarks/clos/bench_channel_metadata.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 32 \
-  --metadata-modes 1 --metadata-tile-tokens 128 --dispatch-plans auto \
-  --cached-channel-modes 1 --overlap-modes off \
-  --metadata-output-modes off pack direct omit pack_direct all \
-  --reduce-cores 48 --warmup 10 --samples 30 --trace-warmup 5 --trace-samples 5 \
-  --flush-l2 --huge-pages --output <shared-result-directory>
-```
-
-`cached_weighted` is measured separately. Precision checks read raw weights
-(including invalid zeros), change cached weights across two handle reuses,
-and compare expansion and subsequent combine against options-off controls.
-They cover masked/invalid/skewed routes, empty ranks and partial tiles. Formal
-timing disables diagnostic instrumentation. Traces separately report
-`src_output_bytes`, `topk_output_bytes` and `weight_output_bytes` for valid-row
-SHMEM-to-output copies. Direct mode must eliminate source/weight copies;
-cached omit mode must eliminate the top-k copy.
-
-`metadata_output_comparison.csv` groups matched options and reports notify,
-communication and complete API timing separately. The legacy cached weighted
-plan-rebuild kernel is reported separately and included in `notify_total_us`
-within each rank/sample before rank aggregation. The effective metadata mask is
-bit 0 = cached pack, bit 1 = direct output, bit 2 = omitted top-k output.
-The older overlap experiments remain off in this comparison. CPU tests validate
-addressing and control flow; CANN compilation and NPU precision/performance
-must be checked on the target environment before enabling these options.
-
-### Generic sender pipeline and local copies
-
-`clos_sender_pipeline_version=4` identifies the rebuilt native module. The
-following paths use data-layout/resource eligibility rather than exact EP,
-hidden, channel-count or core-count matches:
-
-* Send-before-self is enforced. Ordinary peer dispatch
-  without spare metadata AIVs first submits payload (including the
-  short tail), then publishes SIMT metadata, then final SO markers, then copies
-  self before incoming wait/quiet. Packed UDMA metadata is still sent before
-  SO markers. The original collective still completes SIMT stores and all local
-  copies. Scale normalization/packing remains before sends because it produces
-  their source data; the independent self copy is deferred. Spare metadata AIVs
-  retain their parallel path. `EARLY_SLOTS` also
-  defaults to `1`; source-handle construction still waits for received metadata.
-* `DEEPEP_CLOS_CACHED_CHANNEL` defaults to `1`. Cached two-byte payloads without
-  scales use exact peer/channel counts and compact plan lists, avoiding repeated
-  input-token-window scans. Payload remains row WQEs with unchanged visit and
-  batch size. The old `DEEPEP_CLOS_CACHED_CHANNEL_EP16` variable is a fallback
-  only when the new variable is unset. Explicit `0` now disables the whole-channel
-  path for every EP, including EP8. Removing windows can change peer interleaving;
-  less scanning alone is not evidence of lower communication latency.
-* `DEEPEP_CLOS_COMBINE_COMPACT_SELF` defaults to `1`. Ordinary split peer BF16
-  combine copies dense local input rows into a compact local-contributor slice.
-  The reducer translates only its own contributor through the existing channel
-  prefix/ordinal mapping; remote slices and handle format are unchanged. Core
-  counts for communication and reduction may differ. Token scheduling,
-  early-single and aggregate pipeline retain their existing row layouts. Peer
-  communication/fused/remaining phases copy only after publication; token sends
-  copy after their final peer window is published. Pipeline producers publish
-  ready chunks before independent self copies. Legacy `self_copy=0` is an alias
-  for after-submit and `DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT=0` cannot opt out.
-
-Ownership and scratch ledger: dispatch payload QP/peer owners and metadata
-channel owners are unchanged. Local writes occupy disjoint receive-row ranges;
-early slots retain their original per-core token ownership. Dispatch reserves
-`DispatchLiveSendUbBytes(capacity,qps)` for sender state and index windows:
-12,832 bytes for capacity 8/Q1, 80,928 for capacity 64/Q1, and 93,216 for capacity
-64/Q2. Deferred local scratch starts after that aligned region when at least
-32 KiB remains and a row fits. Otherwise it reuses full UB after final publication
-and an MTE3 drain; UB pressure never restores copy-first. All local DMA slots
-drain before reuse. Compact combine reuses a 64 KiB tile at UB offset
-2,048 after all final WQEs have been submitted and
-MTE3 has released staging (or on an auxiliary AIV). Quiet uses retained queue
-state, not overwritten WQE staging. GM input buffers remain live until completion.
-No completion barrier, source-lifetime requirement or sparse-CQE credit wait is
-removed.
-
-The stage benchmark accepts EP2..256 with experts divisible by EP. Reuse one
-Buffer per EP, run automatic 8/32-core plans, and hold reduce at 48 cores:
-
-```bash
-torchrun <site-launch-arguments> benchmarks/clos/bench_dispatch_stages.py \
-  --tokens 4096 --hidden 2816 --topk 8 --experts 256 --cores 8 32 \
-  --dispatch-plans auto --metadata-modes 0 --metadata-output-modes off \
-  --cached-channel-modes 0 1 --overlap-modes send \
-  --combine-diagnostics --compact-self-modes 0 1 --reduce-cores 48 \
-  --warmup 10 --samples 30 --trace-warmup 5 --trace-samples 3 \
-  --flush-l2 --huge-pages --output <shared-result-directory>
-```
-
-The independent reference retains zero tolerance. Masked/invalid/skewed routes,
-empty ranks, tails, cached reuse and expanded consumers are checked outside
-timing. Each configuration runs in both orders. Dispatch notify, communication,
-complete API and combine communication/reduce/API are separate; combine's outer
-alignment notify is not part of its measured API. Formal sampling disables
-diagnostic instrumentation. The trace decoder accepts metadata either before
-payload or between payload and final publication, and labels the observed order.
-CPU oracle coverage includes EP4..256, independent 8/32/48/64-core reduction,
-empty/tail copies, preserved remote partitions and scheduler callback order.
-These checks do not replace CANN compilation, device precision/stress or measured
-end-to-end performance on the target topology.
-
-The benchmark defaults to `--overlap-modes send`. An older command containing
-`--overlap-modes off` still sends before copying and only disables optional
-slots/init/notify work. Compare with an older commit to measure copy-first versus
-send-first; that old execution order is no longer selectable in this library.
-
-
-### Post-submit packing verification
-
-Both `dispatch_channel_metadata_version` and `clos_sender_pipeline_version` are
-4; rebuild host and kernels together. Existing channel/pack flags select the new
-algorithm. Compare packing baseline `de50285` under the same options, routing, huge pages,
-SHMEM and benchmark wrapper. Run EP8/16/32, 8/32 communication AIVs,
-T4096/H2816/K8/E256/BF16, reduce 48; one Buffer per EP/rank. Include fresh and
-cached, weighted/unweighted, DIRECT off/on, single/double buffer and expand 0/1.
-Keep zero tolerance; cover changing weights, continuous reuse, empty ranks,
-invalid routes and tails. Formal sampling disables traces and reports notify,
-communication and unprofiled complete API mean/P95 separately. Local compiler
-and mock checks cannot replace CANN/NPU precision and performance validation.
-
-
-### Channel packing pipeline (version 4)
-
-The current VF is issued before loading the next input slot. Each slot has
-separate V-to-MTE2 and V-to-scalar retirement credits: DMA cannot overwrite
-live inputs, and scalar descriptor/cache inspection cannot race the VF. Empty
-channels produce no credits. All issued credits drain before channel publication.
-The existing single/double-buffer option is retained; it is not enabled implicitly.
-
-Unused private packing UB extends each slot's per-peer sorted-plan cache. Cached
-suffixes are reused while they cover the next token window; exhausted or short
-windows refill from the current ordinal. A double-buffered invocation owns two
-independent caches, so initial loads can be duplicated, but neither slot aliases
-sender WQEs, headers or payload index windows. The common layout helper bounds
-the cache by the available per-slot budget, actual peer count and channel length;
-all per-peer plan bases remain 32-byte aligned. No EP/hidden exception is added.
-
-Each completed channel is handed to the existing sender immediately. Its
-src/top-k/weight addresses, logical row order and direct-output gates are unchanged.
-The sender flushes a channel's short WQE tail but never quiets per tile/channel.
-GM staging remains immutable until the original final quiet and collective.
-The extra short-tail flushes are a performance tradeoff to measure, not a claimed
-unconditional improvement. Sender order/P/W/Q/visit, WQE capacity, self-copy and
-combine remain unchanged. TopkCycles excludes the per-channel submission callback;
-queue/build counters continue to measure those submissions separately.
-
-For A/B use both revisions' own matching benchmark/native module, with identical
-options. Compare de50285 and version 4 at 8 and 32 communication cores, reduce 48,
-EP8/16/32, T4096/H2816/K8/E256/BF16, huge pages enabled. Run the existing double-buffer
-option off/on in both versions. Include fresh/cached, weighted/unweighted, local
-and remote consumers, tails, empty routes, repeated weight updates and expand
-precision. Preserve zero tolerance. Report same-core version changes separately
-from new-8 versus old-32, and keep notify/communication/API mean/P95 separate.
-Windows CPU compilation/constexpr and mocked event/address checks do not establish
-CANN compilation, NPU ordering/precision or an end-to-end speedup.
-
-
-### Direct top-k output (metadata output version 2)
-
-With channel metadata and `DEEPEP_CLOS_DISPATCH_METADATA_DIRECT=1`, retained
-`recv_topk_idx` is now the UDMA destination and the local pack destination.
-The handle source builder reads that same final tensor after the existing
-completion boundary. The SHMEM-to-output top-k copy is skipped; padding and
-invalid `-1` entries remain defined. With skip-init disabled, prefill also
-uses the final top-k tensor. No sending policy or default switch changes.
-
-Cached non-expanded `omit` still allocates no top-k output and uses the
-internal SHMEM region. Expanded consumers retain their top-k tensor. Legacy
-SIMT metadata and direct-off paths retain staging. Payload self-copy remains.
-
-The existing output publication adds a top-k address before its epoch. Its
-record grows from 64 to 96 bytes inside the unchanged 512-byte per-rank slot;
-no exchange round or barrier is added. Host and device use the same record
-size in the private UB budget (8 peers/1 QP: 13216 bytes; 64 peers/2 QPs: 97440).
-Rebuild both host and kernels: tiling and mailbox layout changed. The native
-`dispatch_metadata_output_version` is 2, while pipeline/channel versions stay 4.
-
-Validate direct off/on with skip-init off/on, fresh/cached, weights on/off,
-expand 0/1, local and remote rows, empty and tail routes, and repeated changed
-weights. Check handle/source mappings and combine roundtrips. The existing
-CPU production-body tests cover address publication, index widths, queue lanes,
-local destinations, invalid entries and UB capacity; they do not replace CANN
-compilation or NPU precision/performance tests. In device diagnostics, retained
-top-k direct must report zero `topk_output_bytes` as well as zero source/weight
-output-copy bytes where applicable. Formal performance sampling keeps tracing off.
-
-
-### Payload WQE index reuse
-
-The windowed peer sender now passes UB token indices to the 32-thread payload
-WQE builder. It reuses a loaded sorted-plan suffix when that suffix covers the
-next input-token tile, and uses a lower-bound search instead of a scalar linear
-scan. Insufficient windows still reload from the consumed ordinal; this is not
-an assertion that every index is fetched from GM exactly once. Peer/channel
-plan bases and channel-prefix values are reused within the channel.
-
-A dedicated 128-byte, 32-byte-aligned sender region retains indices referenced
-by an unbuilt short batch before any index-window overwrite. Each span is saved
-at most once, and the batch owns those indices until its VF and UB-to-SQ copy
-have completed. A window/channel change does not force a flush. The owner still
-uses the existing physical-SQ admission, 32-WQE capacity, QP selection, visit
-boundaries, sparse CQE, terminal SO flag, quiet and receive protocol. Single-span
-batches skip span lookup; multi-span batches use binary search over ordered span
-starts. Payload/scale field addressing supports one or two fields without a
-runtime integer divide in the VF.
-
-The initial windowed-path change left cached whole-channel and token scheduling
-on immutable GM index spans; the cached path is extended below. Combine is
-unchanged. No new environment switch or EP/hidden/core-count rule is
-introduced. Host and kernel must be rebuilt together for the matching private
-UB budget. Metadata packing, Source handle construction and its completion
-boundary are not changed by this optimization. Index/WQE double buffering is
-not introduced in this revision.
-
-Compare this revision with cfb07dd using the same configuration, including
-metadata direct, skip-init, channel metadata and its double-buffer option.
-Start with EP16, communication 8 AIV, T4096/H2816/K8/E256/BF16, reduce 48, then
-cover EP8/32 and 32 AIV. Preserve zero-tolerance precision, tails, empty sends,
-repeated calls, scale fields, both QP lanes and shared-SQ cases. Verify WQE
-count, batch sizes and short-flush counts before comparing index-window,
-WQE-build, communication and complete API timings. Trace-off API mean/P95 is
-the performance acceptance criterion. CPU constexpr tests exercise production
-window decisions, WQE addressing and pending-index retention, including an
-intentionally corrupted retention path; they do not validate device ordering.
-
-### Cached whole-channel WQE indices in UB
-
-The BF16 cached whole-channel peer sender now loads compact token indices into
-its existing per-peer UB slots before `PutRowsUb`. Each refill loads up to 256
-`int32` indices (1 KiB), bounded by that peer/channel's remaining rows. No new
-UB allocation or host/device tiling field is required. SIMT builds payload WQEs
-from these UB indices; payload bytes are still transferred from GM by UDMA.
-The token scheduler retains its separate GM-index path.
-
-Whole-channel traversal still uses the handle's exact row counts. It does not
-scan input-token windows or perform lower-bound searches. Refill happens inside
-the current visit, so crossing a 256-index boundary neither advances to another
-peer nor resets the visit/QP selection. Requests are bounded by available UB
-indices; the sender retains its 32-WQE batches, physical-SQ admission, sparse
-CQE and final completion protocol. Before any index slot is overwritten,
-`PreserveIndices` retains unbuilt short spans, including references carried
-from the preceding channel. The existing `S_MTE2` and `MTE2_S` ordering protects
-the refill; WQE construction retains its `S_V` boundary and completed UB-to-SQ
-copy. There is no refill-triggered flush or new switch. `ListWindows` and
-`ListCycles` now also account for these cached index refills.
-
-Compare against ad281b5 with `cached_channel=1`, matching all metadata/weight
-options. Start at EP8/16/32, T4096/H2816/K8/E256/BF16, communication 8 and 32 AIV,
-reduce 48. Check weighted/unweighted precision, empty peers/channels, tails,
-multiple index windows, continuous reuse and multiple QPs. Confirm WQE counts,
-batch sizes and short-flush counts, then compare trace-off communication and
-complete API mean/P95. Use diagnostics separately for index-load and WQE-build
-cost; moving index reads into DMA does not itself prove a performance gain.
-CPU constexpr checks execute the production sender loop and WQE/preservation
-bodies with mocked DMA, shared/separate SQs, odd visits, cross-channel tails
-and a deliberately removed refill-protection call. Device compilation and
-ordering still require CANN/NPU validation.
+| `--cores 8 32` | Compare communication core counts |
+| `--cached-channel-modes 0 1` | Compare cached window/whole-channel traversal |
+| `--metadata-modes 0 1` | Compare legacy/channel metadata |
+| `--metadata-tile-tokens 0 32 64 128 256` | Automatic or explicit packing tiles |
+| `--overlap-modes send all` | Compare optional slots, initialization and buffering; both send first |
+| `--metadata-output-modes off pack direct omit pack_direct all` | Independent cached-pack/direct/omit combinations |
+| `--dispatch-plans auto zeng` | Retained constrained EP8 policy experiment |
+| `--trace-samples 5 --combine-diagnostics --reduce-cores 48` | Separate dispatch/combine diagnostic passes |
+| `--compact-self-modes 0 1` | Compare scatter/compact combine local copies |
+
+These presets are ablations, not an assertion that every production default is
+active. Use `--help` for constraints and defaults. `combine_queue_diagnostics.py`
+is the shared script's combine helper, not a separate launch entry point.
+
+## Interpreting results
+
+The scripts run precision checks and forward/reverse comparisons with one Buffer
+per rank. Both weight modes use the same routing across variants. L2 eviction
+finishes before each sample's all-rank barrier on the existing Buffer stream;
+neither preparation step is part of the measured API or communication duration.
+
+- Formal API wall time is measured without profiler, through output completion.
+  Kernel durations come from a separate profiler pass. Do not subtract these
+  independently sampled measurements to infer Host or synchronization cost.
+- Aggregate each stage by the slowest rank **per iteration**, then report mean,
+  P50/P95 and both round results. For layout+notify, sum within each rank/sample
+  before aggregation. Independently aggregated stages cannot reconstruct API.
+- Logical bandwidth is rank-deduplicated BF16 payload bytes / EP / communication
+  time / 1000 for microseconds and decimal GB/s. It includes self and excludes
+  index/weight bytes. Expanded local work is reported separately.
+- Device diagnostics default off. Their counters and synchronization can perturb
+  overlap; use them to locate WQE preparation, queue waits, local copies and
+  handle work, not to claim formal bandwidth. `--host-timing` similarly isolates
+  Python/native preparation, count waits, output allocation and submission.
+- Retain raw per-rank samples and both rounds, including long tails. Missing or
+  mixed kernel sequences and invalid durations fail profiling validation.
+
+Each rank exports precision status, summaries/reports, profiler captures and raw
+samples; diagnostic modes add trace/overhead records. Collect all rank outputs
+and launcher exit codes. The stage benchmark's failed-worker handler retains
+its traceback and avoids collective teardown that could mask the original error.
+
+## Validation
+
+Regression tests under `tests/clos` cover production VF/DMA bodies, sparse
+routes, direct output addresses, pending-index retention, local-copy ownership,
+UB capacity, event credits, queue completion and profiler accounting. API tests
+cover launch policy and default routing. Use the focused tests for the changed
+path, preserving zero tolerance and intentionally corrupted-reference checks.
+
+CPU emulation and source checks do not establish CANN compilation, asynchronous
+hardware ordering or NPU performance. Device qualification should include empty
+and tail routes, changed weights, continuous reuse, both index widths, local and
+remote outputs, cached handles and expanded consumers. Diagnostics have narrower
+supported paths: combine tracing rejects token scheduling, early-single/pipeline,
+integrated expanded inputs and graph capture. Validate FP8/scales, graph capture
+and async fixed-capacity paths separately before drawing conclusions about them.
