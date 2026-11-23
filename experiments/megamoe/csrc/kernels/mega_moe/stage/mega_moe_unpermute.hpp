@@ -13,6 +13,7 @@
 #define MEGA_MOE_UNPERMUTE_H
 
 #include "../common/mega_moe_mxfp8_utils.hpp"
+#include "route_accumulate.hpp"
 #include "../common/mega_moe_utils.hpp"
 
 namespace MegaMoeImpl {
@@ -114,22 +115,12 @@ __aicore__ inline void AccumulateMoeExpertsForToken(const TokenUnpermuteConfig& 
         SetFlag<HardEvent::S_V>(event);
         WaitFlag<HardEvent::S_V>(event);
         PipeBarrier<PIPE_V>();
-        if (expertIdx == 0) {
-            if constexpr (TopkWeightsPrefetch) {
-                DataCopy(scratch.dataResFp32Tensor, dataInFp32, common.tokenHiddenDim);
-            } else {
-                float expertScale = scratch.topKWeightsTensor.GetValue(localIdx * common.topK + expertIdx);
-                Muls(scratch.dataResFp32Tensor, dataInFp32, expertScale, common.tokenHiddenDim);
-            }
-        } else {
-            if constexpr (!TopkWeightsPrefetch) {
-                float expertScale = scratch.topKWeightsTensor.GetValue(localIdx * common.topK + expertIdx);
-                Muls(dataInFp32, dataInFp32, expertScale, common.tokenHiddenDim);
-                PipeBarrier<PIPE_V>();
-            }
-            Add(scratch.dataResFp32Tensor, scratch.dataResFp32Tensor, dataInFp32, common.tokenHiddenDim);
-            PipeBarrier<PIPE_V>();
-        }
+        float weight = 1.0F;
+        if constexpr (!TopkWeightsPrefetch)
+            weight = scratch.topKWeightsTensor.GetValue(localIdx * common.topK + expertIdx);
+        AccumulateRoute<!TopkWeightsPrefetch>(scratch.dataResFp32Tensor, dataInFp32, common.tokenHiddenDim,
+                                              expertIdx == 0, weight);
+        if (expertIdx != 0) PipeBarrier<PIPE_V>();
         SetFlag<HardEvent::V_MTE2>(event);
     }
 }

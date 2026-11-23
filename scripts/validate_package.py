@@ -66,24 +66,29 @@ def inspect_wheel(path):
         if len([n for n in names if n.endswith("deepseek-deepep.LICENSE")]) != 1:
             raise RuntimeError("Wheel must include the adopted API's third-party license")
         info = json.loads(archive.read("deep_ep/_build_info.json"))
-        beta = info.get("megamoe", {}).get("enabled", False)
-        beta_names = [name for name in names if name.startswith("deep_ep_experimental/megamoe/")]
-        if beta:
-            required = {
-                "deep_ep_experimental/megamoe/api.py",
-                "deep_ep_experimental/megamoe/benchmark.py",
-                "deep_ep_experimental/megamoe/configs/smoke.json",
-                "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
-            }
-            extensions = [
-                n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_C.") and n.endswith(".so")
-            ]
-            if len(extensions) != 1 or not required.issubset(names):
-                raise RuntimeError("Incomplete MegaMoE Beta wheel")
-            if not any(name.endswith("cann.LICENSE") for name in names):
-                raise RuntimeError("Missing CANN license for MegaMoE")
-        elif beta_names:
-            raise RuntimeError("MegaMoE Beta payload in an OFF wheel; use a fresh build directory")
+        megamoe_enabled = info.get("megamoe", {}).get("enabled", False)
+        component = "deep_ep_experimental/megamoe/"
+        members = [n for n in names if n.startswith(component)]
+        if any(component in n and not n.startswith(component) for n in names):
+            raise RuntimeError("Wheel contains nested MegaMoE staging")
+        if megamoe_enabled:
+            required = (
+                "__init__.py",
+                "api.py",
+                "_bf16.py",
+                "_autograd.py",
+                "benchmark.py",
+                "configs/smoke.json",
+                "libmegamoe_kernel.so",
+            )
+            libraries = [n for n in members if n.endswith(".so")]
+            extensions = [n for n in libraries if n.startswith(component + "_C.")]
+            if len(extensions) != 1 or any(component + n not in names for n in required):
+                raise RuntimeError("Incomplete MegaMoE wheel")
+            if len(libraries) != 2:
+                raise RuntimeError("MegaMoE wheel must contain exactly one Host extension and one device library")
+        elif members:
+            raise RuntimeError("MegaMoE payload in an OFF wheel; use a fresh build directory")
         component = "deep_ep_experimental/ep_gmm_fused/"
         if any(component in n and not n.startswith(component) for n in names):
             raise RuntimeError("Wheel contains nested EP_GMM_FUSED staging artifacts")
@@ -349,13 +354,17 @@ def main():
             "assert not torch.npu.is_initialized(); print('Installed shared EP_GMM_FUSED runtime verified')"
         )
     run([python, "-I", "-c", probe], output, env, 120)
-    if info.get("megamoe", {}).get("enabled"):
-        probe_beta = (
-            "import pathlib,sys; from deep_ep_experimental.megamoe.api import _extension; "
+    megamoe = info.get("megamoe", {})
+    if megamoe.get("enabled"):
+        probe_megamoe = (
+            "import pathlib,sys,torch,torch_npu; from deep_ep_experimental.megamoe.api import _extension; "
             "m=_extension(); assert pathlib.Path(m.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()); "
-            "assert callable(m.forward) and callable(m.buffer_size); print('Installed MegaMoE extension loaded; no device call')"
+            "assert m.quantized_enabled and m.bf16_enabled; "
+            "assert callable(m.Plan.forward) and callable(m.BF16Plan.forward) and callable(m.BF16Plan.backward); "
+            f"assert m.timer_enabled is {megamoe['timer']!r}; "
+            "assert not torch.npu.is_initialized(); print('Installed MegaMoE extension verified')"
         )
-        run([python, "-I", "-c", probe_beta], output, env, 120)
+        run([python, "-I", "-c", probe_megamoe], output, env, 120)
     # Copy tests, not the Python package: sys.path cannot select checkout code.
     shutil.copytree(source / "tests", output / "tests", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(

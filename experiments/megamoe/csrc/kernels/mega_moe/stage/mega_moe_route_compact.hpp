@@ -8,6 +8,30 @@
 
 namespace MegaMoeImpl {
 
+struct RouteExpertRange {
+    int32_t begin;
+    int32_t count;
+};
+
+__aicore__ inline RouteExpertRange SplitRouteExperts(int32_t experts, int32_t job, int32_t jobs)
+{
+    const int32_t base = experts / jobs;
+    const int32_t extra = experts % jobs;
+    return {job * base + (job < extra ? job : extra), base + (job < extra ? 1 : 0)};
+}
+
+// Input indices increase in token/slot order. GatherMask preserves that order for equal expert IDs.
+__aicore__ inline uint32_t CompactExpertRoutes(AscendC::LocalTensor<int32_t> routes, AscendC::LocalTensor<int32_t> ids,
+                                               AscendC::LocalTensor<int32_t> indices,
+                                               AscendC::LocalTensor<uint8_t> mask, int32_t expert, uint32_t items)
+{
+    using namespace AscendC;
+    uint64_t count = 0;
+    CompareScalar(mask, ids, expert, CMPMODE::EQ, items);
+    GatherMask(routes, indices, mask.ReinterpretCast<uint32_t>(), true, items, {1, 1, 0, 0}, count);
+    return static_cast<uint32_t>(count);
+}
+
 // One VF builds every owned expert's stable compact route. The caller supplies
 // a separate, 32B-aligned route slice per expert and enough capacity for one
 // occurrence per source token (top-k expert IDs are distinct within a token).

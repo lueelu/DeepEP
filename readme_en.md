@@ -9,7 +9,7 @@ Modified by Joyce_An 2026
 
 [简体中文](README.md) | English
 
-**DeepEP on Ascend** (`Ascend/DeepEP`) is an expert-parallel (EP) communication library for mixture-of-experts (MoE) inference on Ascend NPUs. It provides high-throughput **prefill** and low-latency **decode** communication, together with experimental **MegaMoE** fused inference.
+**DeepEP on Ascend** (`Ascend/DeepEP`) is an expert-parallel (EP) communication library for mixture-of-experts (MoE) inference and training on Ascend NPUs. It provides high-throughput **prefill** and low-latency **decode** communication, together with experimental **MegaMoE** operators that fuse expert communication and computation.
 
 ## Machine-specific backends
 
@@ -37,10 +37,11 @@ The HT/LL/MegaMoE descriptions below apply to the Mesh+Clos backend.
 - **Low-latency decode:** small-batch dispatch and combine through the same V2 interface for EP64/128.
 - **MegaMoE prefill (experimental):** W4A8 fused communication and expert computation for EP32/64/128.
 - **MegaMoE decode (experimental):** small-batch W4A8 fused inference for EP64/128, using the same MegaMoE forward entry as prefill.
+- **MegaMoE BF16 inference and training (experimental):** inference and training on Ascend950 share one BF16 forward interface, with PyTorch autograd support for training.
 
 ### Architecture
 
-DeepEP connects inference frameworks to Ascend communication kernels through V2. MegaMoE integrates token communication, expert computation, activation, and quantization into a fused forward workflow.
+DeepEP V2 provides token dispatch and combine operations. MegaMoE fuses dispatch, expert computation, and combine in one forward call and provides a backward operator for BF16 training.
 
 <p align="center">
   <a href="figures/architecture_en.svg">
@@ -59,7 +60,7 @@ DeepEP/
 │   ├── ops/                 # Host validation and kernel launch
 │   └── kernels/             # Ascend C communication kernels
 ├── experiments/
-│   ├── megamoe/             # MegaMoE fused inference
+│   ├── megamoe/             # MegaMoE quantized inference, BF16 inference and training
 │   └── ep_gmm_fused/        # Fused communication and grouped matmul
 ├── cmake/                   # Build and installation
 ├── third-party/             # Dependencies
@@ -87,18 +88,20 @@ See the [architecture guide](docs/architecture.md) for module responsibilities.
 | Framework | PyTorch and `torch_npu` |
 | HDK and Firmware | Huawei's Q3 commercial HDK with a planned release date of October 15 2026 |
 | Communication | SHMEM pinned in [dependencies.lock.json](dependencies.lock.json); URMA runtime |
-| MegaMoE | CATLASS; dependency setup in the [MegaMoE guide](experiments/megamoe/README.md) |
+| MegaMoE | CATLASS and SHMEM. See the [MegaMoE guide](experiments/megamoe/README.md) for dependency versions. |
 
 ### Install SHMEM dependency
 
-Prepare the SHMEM SDK using the [build guide](docs/build.md), then load the CANN and SHMEM environment:
+For source builds, prepare the SHMEM SDK using the [build guide](docs/build.md), then load CANN:
 
 ```bash
 source /path/to/ascend-toolkit/set_env.sh
 export SHMEM_ROOT=/path/to/shmem-sdk
-source "$SHMEM_ROOT/set_env.sh"
-export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 ```
+
+The wheel bundles the build SDK's SHMEM runtime libraries. After installation,
+load the matching CANN environment; `SHMEM_ROOT` and an external SHMEM library
+path are not required at run time. `SHMEM_ROOT` selects the SDK only when building.
 
 ### Development
 
@@ -129,7 +132,7 @@ With matching Torch/torch_npu and CANN 9.2.0, run:
 bash experiments/megamoe/scripts/build.sh
 ```
 
-The script prepares dependencies and builds and installs a wheel with MegaMoE and timer support. Subsequent builds reuse the validated SHMEM SDK. Direct `pip wheel` builds keep MegaMoE disabled by default. See the [MegaMoE guide](experiments/megamoe/README.md) for multi-node configuration and validation. Device compilation, accuracy and performance qualification remain outstanding.
+The script prepares the dependencies and installs a MegaMoE wheel with W4A8, W8A8, BF16, and timer support. Subsequent builds reuse the validated SHMEM SDK. For manual builds, set `DEEPEP_BUILD_MEGAMOE=ON`. See the [MegaMoE guide](experiments/megamoe/README.md) for multi-node setup and validation.
 
 ## Interfaces and examples
 
@@ -139,12 +142,13 @@ The script prepares dependencies and builds and installs a wheel with MegaMoE an
 | --- | --- |
 | DeepEP prefill / decode | `deep_ep.ElasticBuffer.dispatch()` / `combine()` |
 | MegaMoE prefill / decode (experimental) | `deep_ep_experimental.megamoe.fp8_fp4_mega_moe()` |
+| MegaMoE BF16 inference and training (experimental) | `deep_ep_experimental.megamoe.bf16_mega_moe()` |
 
 ### Buffer initialization
 
 Prefill and decode share `ElasticBuffer.dispatch()` / `combine()`. For supported configurations, `num_max_tokens_per_rank ≤ 256` uses low latency; other configurations use high throughput. This parameter is the per-rank token capacity, not the current token count.
 
-The BF16 example below assumes that the NPU device, SHMEM endpoint and EP process group `ep_group` are configured. The model supplies `x [T,H]` (BF16), `topk_idx [T,K]` (INT64) and `topk_weights [T,K]` (FP32) on the current NPU. All ranks use the same T/H/K, with `T ≤ max_tokens_per_rank` and an expert count divisible by the EP size. High throughput supports `0 < H ≤ 7168`: H must be divisible by 16 for BF16 or 128 for FP8, with 1≤K≤16.
+The `ElasticBuffer` BF16 example below assumes that the NPU device, SHMEM endpoint and EP process group `ep_group` are configured. The model supplies `x [T,H]` (BF16), `topk_idx [T,K]` (INT64) and `topk_weights [T,K]` (FP32) on the current NPU. All ranks use the same T/H/K, with `T ≤ max_tokens_per_rank` and an expert count divisible by the EP size. High throughput supports `0 < H ≤ 7168`: H must be divisible by 16 for BF16 or 128 for FP8, with 1≤K≤16.
 
 Low latency uses an 8 GiB workspace; for high throughput, the buffer estimates the capacity automatically.
 
@@ -231,7 +235,7 @@ The model feeds `grad_x` and `grad_topk_weights` back into the input network and
 
 Every rank must participate in communication in the same order, including ranks with no received rows. For training, keep each handle until its backward pass finishes. After all iterations, call `buffer.destroy()` in the same order on all ranks, before releasing the EP group. See the [Elastic guide](docs/elastic.md) and [API guide](docs/api.md) for FP8, asynchronous calls and handle reuse.
 
-### MegaMoE example
+### MegaMoE quantized inference example
 
 MegaMoE fuses token dispatch, two expert matrix multiplications, SwiGLU, quantization, and combine into one forward call. Prefill and decode use the same interface.
 
@@ -290,6 +294,33 @@ See [example.py](experiments/megamoe/python/deep_ep_experimental/megamoe/example
 
 Tensor layouts, event synchronization, and buffer lifecycle are described in the [API guide](docs/api.md) and [Elastic guide](docs/elastic.md).
 
+### MegaMoE BF16 inference and training example
+
+Inference and training both call `bf16_mega_moe()` and write the result to `y`. For inference, use `need_grad=False` with gradients disabled on inputs and weights. For training, set `need_grad=True` and enable `requires_grad` on the tensors that need gradients.
+
+Set the current NPU and `DEEPEP_SHMEM_ENDPOINT` and initialize the EP process group `ep_group` before constructing the buffer.
+
+```python
+import torch
+from deep_ep_experimental.megamoe import SymmBuffer, bf16_mega_moe
+
+training = True  # Set to False for inference.
+buffer = SymmBuffer(
+    ep_group,
+    num_experts=32, num_max_tokens_per_rank=4096, num_topk=6,
+    hidden=7168, intermediate_hidden=3072, mma_type="bf16xbf16",
+    need_grad=training, max_recv_tokens=27648,
+)
+buffer.x, buffer.topk_idx, buffer.topk_weights = x, topk_idx, topk_weights
+y = torch.empty_like(x, requires_grad=False)
+bf16_mega_moe(y, w1, w2, buffer)
+if training:
+    y.backward(grad_y)
+buffer.destroy()
+```
+
+See the [MegaMoE BF16 guide](experiments/megamoe/README.md#bf16前向与训练) for input layouts, receive capacity, and training save modes.
+
 ### Environment variables
 
 | Variable | Purpose |
@@ -311,7 +342,7 @@ Each EP group uses a shared SHMEM initialization endpoint and an explicit rank-t
 
 ### MegaMoE
 
-MegaMoE combines dispatch, expert computation, activation/quantization, and combine into W4A8 fused inference for prefill and decode. See [experiments/megamoe/](experiments/megamoe/README.md) for configuration and usage.
+W4A8 supports prefill and decode. BF16 inference and training share a forward interface. See the [MegaMoE guide](experiments/megamoe/README.md) for configuration and usage.
 
 ## Acknowledgement
 

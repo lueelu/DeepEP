@@ -106,6 +106,7 @@ class A8W4MatmulPipeline {
         GM_ADDR bScaleGlobal = nullptr;
     } addr_;
     GM_ADDR output_ = nullptr;
+    uint32_t outputRowStride_ = 0;
     bool active_ = false;
 
     template <class Element, class Layout>
@@ -122,7 +123,7 @@ public:
     __aicore__ inline A8W4MatmulPipeline(const Config& config, const GMMAddrInfo& addr, GM_ADDR output)
         : A8W4MatmulPipeline()
     {
-        UpdateProblem(config, addr, output);
+        UpdateProblem(config, addr, output, config.n);
         Begin();
     }
     A8W4MatmulPipeline(const A8W4MatmulPipeline&) = delete;
@@ -135,7 +136,8 @@ public:
     // Scheduling policies (shared expert, Wave, gate/up) stay in the caller.
     // Only dimensions and GM addresses are consumed by this block adapter.
     template <class ProblemConfig>
-    __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr, GM_ADDR output)
+    __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr, GM_ADDR output,
+                                         uint32_t outputRowStride)
     {
         using Next = typename ProblemConfig::KernelConfig;
         static_assert(std::is_same_v<A, typename Next::ElementAType> &&
@@ -150,6 +152,7 @@ public:
         config_.scaleK = config.scaleK;
         addr_ = {addr.aGlobal, addr.bGlobal, addr.aScaleGlobal, addr.bScaleGlobal};
         output_ = output;
+        outputRowStride_ = outputRowStride;
         if constexpr (g_coreType == AscendC::AIV) {
             block_.params.layoutPrologueB = tla::MakeLayout<W, LayoutB>(config.k, config.n);
         }
@@ -168,8 +171,8 @@ public:
         }
     }
 
-    // Preserve the old slice boundary: GMM2/other stages may reuse the same
-    // event IDs and L1/L0/UB storage while this C++ object remains alive.
+    // Retire the active pipeline before another execution path takes ownership
+    // of its hardware events and L1/L0/UB storage.
     __aicore__ inline void End(bool outputDrained = false)
     {
         if (active_) {
@@ -187,7 +190,7 @@ protected:
             Tensor<SA>(addr_.aScaleGlobal, tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(config_.m, config_.scaleK));
         auto sb =
             Tensor<SB>(addr_.bScaleGlobal, tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(config_.scaleK, config_.n));
-        auto c = Tensor<Out>(output_, tla::MakeLayout<Out, LayoutC>(config_.m, config_.n));
+        auto c = Tensor<Out>(output_, tla::MakeLayout<Out, LayoutC>(config_.m, outputRowStride_));
         auto tileA = tla::GetTile(a, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.k));
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
@@ -223,10 +226,18 @@ public:
     template <class ProblemConfig>
     __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr)
     {
-        Pipeline::UpdateProblem(config, addr, addr.gmm1OutGlobal);
+        Pipeline::UpdateProblem(config, addr, addr.gmm1OutGlobal, addr.gmm1OutRowStride);
         fused_ = ProblemConfig::FUSED_GATE_UP;
         planarSingle_ = config.sharedPolicy.decode;
         halfN_ = config.outputN;
+    }
+
+    // Routed GMM1 and GMM2 share the same physical MMAD and prologue resources.
+    __aicore__ inline void UpdateDownProblem(const Config& config, const GMMAddrInfo& addr)
+    {
+        Pipeline::UpdateProblem(config, addr, addr.gmm2OutGlobal, config.n);
+        fused_ = false;
+        planarSingle_ = true;
     }
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
     {

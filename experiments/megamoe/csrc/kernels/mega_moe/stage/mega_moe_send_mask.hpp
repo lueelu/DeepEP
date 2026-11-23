@@ -89,16 +89,15 @@ __aicore__ inline void GatherAndSendExpertCompactRouteBatch(const MoeStageCommon
         TEventID eventId = static_cast<TEventID>(bufferIdx);
         uint32_t slotOffset = bufferIdx * bufferConfig.bufferBytes;
         LocalTensor<uint8_t> compareMaskTensor = scratch.routeRingTensor[slotOffset];
-        LocalTensor<uint32_t> compareMaskU32Tensor = compareMaskTensor.template ReinterpretCast<uint32_t>();
         LocalTensor<int32_t> tokValidIndexTensor =
             scratch.routeRingTensor[slotOffset + compareMaskBytes].template ReinterpretCast<int32_t>();
 
         WaitFlag<AscendC::HardEvent::MTE3_V>(eventId);
         uint64_t batchMatchedRouteCount = 0U;
         if (validLen > 0) {
-            CompareScalar(compareMaskTensor, scratch.topkIdsTensor, globalExpertId, AscendC::CMPMODE::EQ, validLen);
-            GatherMask(tokValidIndexTensor, scratch.topkIndexTensor, compareMaskU32Tensor, true,
-                       static_cast<uint32_t>(validLen), {1, 1, 0, 0}, batchMatchedRouteCount);
+            batchMatchedRouteCount =
+                CompactExpertRoutes(tokValidIndexTensor, scratch.topkIdsTensor, scratch.topkIndexTensor,
+                                    compareMaskTensor, globalExpertId, validLen);
         }
         SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
 
@@ -202,11 +201,9 @@ __aicore__ inline void GatherAndSendExpertCompactRoutesDirect(const AivJobContex
     int32_t totalExperts = static_cast<int32_t>(common.worldSize * common.moeExpertPerRank);
     int32_t jobIndex = static_cast<int32_t>(job.jobIndex);
     int32_t totalJobs = static_cast<int32_t>(job.totalJobs);
-    int32_t expertsPerJob = totalExperts / totalJobs;
-    int32_t jobCountWithExtraExpert = totalExperts % totalJobs;
-    int32_t ownedExpertNum = expertsPerJob + (jobIndex < jobCountWithExtraExpert ? 1 : 0);
-    int32_t ownedExpertBegin =
-        jobIndex * expertsPerJob + (jobIndex < jobCountWithExtraExpert ? jobIndex : jobCountWithExtraExpert);
+    const auto owned = SplitRouteExperts(totalExperts, jobIndex, totalJobs);
+    const int32_t ownedExpertNum = owned.count;
+    const int32_t ownedExpertBegin = owned.begin;
     if (ownedExpertNum <= 0) {
         return;
     }
@@ -374,16 +371,15 @@ __aicore__ inline void RelayExpertCompactRouteBatch(const MoeStageCommonConfig& 
         TEventID eventId = static_cast<TEventID>(bufferIdx);
         uint32_t slotOffset = bufferIdx * bufferConfig.bufferBytes;
         LocalTensor<uint8_t> compareMaskTensor = scratch.routeRingTensor[slotOffset];
-        LocalTensor<uint32_t> compareMaskU32Tensor = compareMaskTensor.template ReinterpretCast<uint32_t>();
         LocalTensor<int32_t> tokValidIndexTensor =
             scratch.routeRingTensor[slotOffset + compareMaskBytes].template ReinterpretCast<int32_t>();
 
         WaitFlag<AscendC::HardEvent::MTE3_V>(eventId);
         uint64_t batchMatchedRouteCount = 0U;
         if (validLen > 0) {
-            CompareScalar(compareMaskTensor, scratch.topkIdsTensor, globalExpertId, AscendC::CMPMODE::EQ, validLen);
-            GatherMask(tokValidIndexTensor, scratch.topkIndexTensor, compareMaskU32Tensor, true,
-                       static_cast<uint32_t>(validLen), {1, 1, 0, 0}, batchMatchedRouteCount);
+            batchMatchedRouteCount =
+                CompactExpertRoutes(tokValidIndexTensor, scratch.topkIdsTensor, scratch.topkIndexTensor,
+                                    compareMaskTensor, globalExpertId, validLen);
         }
         SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
 

@@ -13,21 +13,26 @@ from deep_ep_experimental.megamoe.api import _MegaRuntime
 
 
 @pytest.mark.parametrize("backend", ["store", "gloo"])
-@pytest.mark.parametrize("case", ["same-host", "different-host", "missing-host", "mapping", "device", "engine"])
+@pytest.mark.parametrize(
+    "case",
+    ["same-host", "different-host", "missing-host", "mapping", "device", "engine", "bf16", "bf16-debug-mismatch"],
+)
 def test_megamoe_bootstrap(monkeypatch, backend, case):
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
-    monkeypatch.setattr(_runtime, "_OWNER", None)
+    monkeypatch.setattr(_runtime, "_OWNERS", set())
     monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "test-host")
     created = []
 
-    def create(*args):
-        created.append(args)
+    def create(*args, bf16=False):
+        created.append((*args, bf16))
         return SimpleNamespace(close=lambda: None)
 
     def core_runtime(*args):
         pytest.fail("MegaMoE must use its own native runtime factory")
 
-    native = SimpleNamespace(runtime_busy=lambda: False, Runtime=core_runtime, create_megamoe_runtime=create)
+    native = SimpleNamespace(
+        runtime_busy=lambda: False, next_instance_id=lambda: 0, Runtime=core_runtime, create_megamoe_runtime=create
+    )
     monkeypatch.setattr(_runtime, "require_native", lambda operation: native)
     monkeypatch.setattr(
         _runtime,
@@ -49,6 +54,8 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
             peer[5] += 1
         elif case == "device":
             peer[6] = 0
+        elif case == "bf16-debug-mismatch":
+            peer[-1] ^= 16  # Peer enabled debug_collectives.
         elif case == "engine":
             peer[7] = 1
         return [local, peer]
@@ -75,15 +82,48 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
         "mapping": "common visible-device mapping",
         "device": "distinct local NPU",
         "engine": "runtime engines",
+        "bf16-debug-mismatch": "debug_collectives",
     }
+    bf16 = case in ("bf16", "bf16-debug-mismatch")
     if case in errors:
         with pytest.raises((ValueError, RuntimeError), match=errors[case]):
-            _MegaRuntime(group, 2 << 20)
+            _MegaRuntime(group, 2 << 20, bf16=bf16)
         assert not created
     else:
-        runtime = _MegaRuntime(group, 2 << 20)
+        runtime = _MegaRuntime(group, 2 << 20, bf16=bf16)
         try:
             assert len(created) == 1
             assert created[0][:3] == (0, 2, 2 << 20)
+            assert created[0][-1] is bf16
+            if bf16:
+                with pytest.raises(RuntimeError, match="already owns"):
+                    _MegaRuntime(group, 2 << 20, bf16=True)
+                assert len(created) == 1
         finally:
             runtime.close()
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_bf16_topk_dtype_coordination(monkeypatch, debug):
+    torch = pytest.importorskip("torch")
+    group = StoreGroup(None, 0, 2, prefix="test")
+    exchanged = []
+
+    def gather(value, stage):
+        exchanged.append(value)
+        return [value, value]
+
+    monkeypatch.setattr(group, "all_gather", gather)
+    runtime = _MegaRuntime.__new__(_MegaRuntime)
+    runtime.group = group
+    runtime.debug_collectives = debug
+    for stage, dtype in ((0, torch.bfloat16), (0, torch.float32), (1, torch.float32), (1, torch.bfloat16)):
+        runtime.validate_topk_weight_type(dtype, stage)
+    assert exchanged == ([[0, 0], [0, 1], [1, 1], [1, 0]] if debug else [])
+    with pytest.raises(ValueError, match="bfloat16 or float32"):
+        runtime.validate_topk_weight_type(torch.float16, 0)
+    if debug:
+        for peer in ([0, 1], [1, 0]):
+            monkeypatch.setattr(group, "all_gather", lambda value, stage: [value, peer])
+            with pytest.raises(ValueError, match="EP ranks"):
+                runtime.validate_topk_weight_type(torch.bfloat16, 0)

@@ -14,7 +14,7 @@
 
 #include "lib/std/tuple.h"
 #include "tensor_api/tensor.h"
-#include "../mega_moe_tiling.hpp"
+#include "mega_moe_quantized_tiling.hpp"
 #include "mega_moe_constants.hpp"
 #include "mega_moe_workspace.hpp"
 #if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
@@ -22,7 +22,10 @@
 #endif
 #include "../mc2_common/mc2_moe_context.hpp"
 
-class AscendTimerDevice;
+template <class Schema>
+class BasicAscendTimerDevice;
+struct MegaMoeTimerSchema;
+using AscendTimerDevice = BasicAscendTimerDevice<MegaMoeTimerSchema>;
 
 namespace MegaMoeImpl {
 
@@ -76,6 +79,8 @@ struct GMMAddrInfo {
     __gm__ int32_t* gmmToEpilogueFlag;
     __gm__ int32_t* gmm1TileStatus;
     __gm__ int32_t* sharedExpertGmm2TileCounter;
+    uint32_t gmm1OutRowStride = 0;
+    void* routedA8W4Pipeline = nullptr;
     // 仅 Wave 调试采集设置；其他调用保持空指针。
     AscendTimerDevice* timer = nullptr;
 };

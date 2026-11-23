@@ -283,12 +283,17 @@ def build_configuration(environment=None):
         raise RuntimeError("Native wheels require Linux with an Ascend SDK")
     if env.get("DEEPEP_NPU_ARCH") != "Ascend950":
         raise RuntimeError("DEEPEP_NPU_ARCH must be Ascend950; other targets are unqualified")
-    beta = env.get("DEEPEP_BUILD_MEGAMOE", "OFF")
+    megamoe = env.get("DEEPEP_BUILD_MEGAMOE", "OFF")
     timer = env.get("DEEPEP_MEGAMOE_TIMER", "OFF")
-    if beta not in {"ON", "OFF"} or timer not in {"ON", "OFF"}:
+    if megamoe not in {"ON", "OFF"} or timer not in {"ON", "OFF"}:
         raise RuntimeError("MegaMoE build options accept ON or OFF only")
-    if timer == "ON" and beta != "ON":
+    megamoe_enabled = megamoe == "ON"
+    if timer == "ON" and not megamoe_enabled:
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
+
+    forward_schedule = env.get("DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE", "0")
+    if forward_schedule not in ("0", "1"):
+        raise RuntimeError("DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE must be 0 or 1")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
@@ -315,7 +320,7 @@ def build_configuration(environment=None):
         sdk = json.loads(manifest.read_text(encoding="utf-8"))
         validate_shmem_sdk(manifest.parent, lock["shmem"])
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
-        if beta == "ON" or shmem_metadata_mode(manifest.parent) == "dynamic":
+        if megamoe_enabled or shmem_metadata_mode(manifest.parent) == "dynamic":
             raise
         warnings.warn(f"{exc}; continuing with SHMEM_ROOT={manifest.parent}", RuntimeWarning, stacklevel=2)
     library = manifest.parent / "lib/libshmem.so"
@@ -358,8 +363,12 @@ def build_configuration(environment=None):
     }
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
-    result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
-    if beta == "ON":
+    result["megamoe"] = {
+        "enabled": megamoe_enabled,
+        "timer": timer == "ON",
+        "bf16_forward_schedule": forward_schedule,
+    }
+    if megamoe_enabled:
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
             raise RuntimeError(
@@ -438,10 +447,10 @@ def build_configuration(environment=None):
 
 class VariantBuild(ConfiguredBuild):
     def finalize_options(self):
-        # 隔离 ON/OFF 产物，避免连续构建把旧 Beta 模块打入基础 wheel。
-        beta = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
+        # Keep the core, MegaMoE and Timer builds in separate staging directories.
+        megamoe = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
         timer = os.environ.get("DEEPEP_MEGAMOE_TIMER", "OFF") == "ON"
-        variant = "megamoe-timer" if beta and timer else ("megamoe" if beta else "core")
+        variant = "megamoe-timer" if megamoe and timer else ("megamoe" if megamoe else "core")
         self.build_base = str(Path(self.build_base) / variant)
         super().finalize_options()
 
@@ -508,8 +517,11 @@ def publish_source_native(destination):
 class CMakeBuild(build_ext):
     def run(self):
         # Check before setuptools temporarily clears inplace during run().
-        if enabled("DEEPEP_BUILD_EP_GMM_FUSED") and (self.inplace or self.editable_mode):
-            raise RuntimeError("EP_GMM_FUSED requires a wheel; editable/inplace builds are not supported")
+        ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
+        megamoe = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
+        if (ep_gmm_fused or megamoe) and (self.inplace or self.editable_mode):
+            component = "EP_GMM_FUSED" if ep_gmm_fused else "MEGAMOE"
+            raise RuntimeError(f"{component} requires a wheel; editable/inplace builds are not supported")
         self._publish_source_links = not (self.inplace or self.editable_mode)
         super().run()
 
@@ -544,6 +556,7 @@ class CMakeBuild(build_ext):
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
+            f"-DDEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE={megamoe.get('bf16_forward_schedule', '0')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
         ]
