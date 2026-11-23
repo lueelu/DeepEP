@@ -16,13 +16,18 @@ from tests.utils.cpp import cpp_functions
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_eight_aiv_production_bodies(tmp_path):
+@pytest.mark.parametrize("corrupt_cached_retention", [False, True])
+def test_eight_aiv_production_bodies(tmp_path, corrupt_cached_retention):
     source = ROOT / "csrc/direct"
     functions = cpp_functions(
         (source / "kernels/combine/udma_combine_self_copy.h").read_text(), "CopySelfField", "CopyCompactSelf"
     )
     functions += cpp_functions((source / "kernels/combine/combine_udma.cpp").read_text(), "ContributorSlot")
     schedule = (source / "kernels/dispatch/udma_dispatch_schedule.h").read_text()
+    if corrupt_cached_retention:
+        marker = schedule.index("// A short batch may still reference this slot")
+        call = schedule.index("sender.PreserveIndices();", marker)
+        schedule = schedule[:call] + schedule[call:].replace("sender.PreserveIndices();", "", 1)
     begin = schedule.index("template <class Sender, class Trace>")
     functions += schedule[begin : schedule.index("// Each producer", begin)]
     functions += cpp_functions(schedule, "ReuseDispatchIndexWindow", "DispatchIndexLowerBound", "DispatchRemoteImpl")
@@ -51,8 +56,12 @@ def test_eight_aiv_production_bodies(tmp_path):
         [compiler, "-std=c++17", "-O2", "-I", str(source), str(path), "-o", str(executable)], check=True, timeout=180
     )
     try:
-        subprocess.run([str(executable)], check=True, timeout=60)
+        result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=60)
     except OSError as exc:
         if getattr(exc, "winerror", None) == 4551:
             pytest.skip("compiled, but Windows application control blocked oracle execution (4551)")
         raise
+    if corrupt_cached_retention:
+        assert result.returncode != 0 and "sent == ordered" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr

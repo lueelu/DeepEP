@@ -861,8 +861,9 @@ batches skip span lookup; multi-span batches use binary search over ordered span
 starts. Payload/scale field addressing supports one or two fields without a
 runtime integer divide in the VF.
 
-Cached whole-channel and token scheduling retain immutable GM index spans;
-combine is unchanged. No new environment switch or EP/hidden/core-count rule is
+The initial windowed-path change left cached whole-channel and token scheduling
+on immutable GM index spans; the cached path is extended below. Combine is
+unchanged. No new environment switch or EP/hidden/core-count rule is
 introduced. Host and kernel must be rebuilt together for the matching private
 UB budget. Metadata packing, Source handle construction and its completion
 boundary are not changed by this optimization. Index/WQE double buffering is
@@ -917,3 +918,36 @@ CPU tests exercise the production builder and VF with both top-k widths,
 checked DMA bounds, one output write per element, empty ranks, padding and UB
 fallback; constexpr tests include a deliberately incorrect master encoding.
 These checks do not establish CANN compilation, device ordering or NPU gains.
+
+### Cached whole-channel WQE indices in UB
+
+The BF16 cached whole-channel peer sender now loads compact token indices into
+its existing per-peer UB slots before `PutRowsUb`. Each refill loads up to 256
+`int32` indices (1 KiB), bounded by that peer/channel's remaining rows. No new
+UB allocation or host/device tiling field is required. SIMT builds payload WQEs
+from these UB indices; payload bytes are still transferred from GM by UDMA.
+The token scheduler retains its separate GM-index path.
+
+Whole-channel traversal still uses the handle's exact row counts. It does not
+scan input-token windows or perform lower-bound searches. Refill happens inside
+the current visit, so crossing a 256-index boundary neither advances to another
+peer nor resets the visit/QP selection. Requests are bounded by available UB
+indices; the sender retains its 32-WQE batches, physical-SQ admission, sparse
+CQE and final completion protocol. Before any index slot is overwritten,
+`PreserveIndices` retains unbuilt short spans, including references carried
+from the preceding channel. The existing `S_MTE2` and `MTE2_S` ordering protects
+the refill; WQE construction retains its `S_V` boundary and completed UB-to-SQ
+copy. There is no refill-triggered flush or new switch. `ListWindows` and
+`ListCycles` now also account for these cached index refills.
+
+Compare against ad281b5 with `cached_channel=1`, matching all metadata/weight
+options. Start at EP8/16/32, T4096/H2816/K8/E256/BF16, communication 8 and 32 AIV,
+reduce 48. Check weighted/unweighted precision, empty peers/channels, tails,
+multiple index windows, continuous reuse and multiple QPs. Confirm WQE counts,
+batch sizes and short-flush counts, then compare trace-off communication and
+complete API mean/P95. Use diagnostics separately for index-load and WQE-build
+cost; moving index reads into DMA does not itself prove a performance gain.
+CPU constexpr checks execute the production sender loop and WQE/preservation
+bodies with mocked DMA, shared/separate SQs, odd visits, cross-channel tails
+and a deliberately removed refill-protection call. Device compilation and
+ordering still require CANN/NPU validation.

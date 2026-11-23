@@ -23,6 +23,7 @@ using namespace ascend_deepep::udma;
 constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID5 = 5, EVENT_ID6 = 6, EVENT_ID7 = 7;
 constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t));
 static unsigned list_loads;
+static unsigned list_elements;
 void trap() { assert(false); }
 namespace AscendC {
 enum class HardEvent { V_S, MTE2_MTE3, MTE3_MTE2, MTE3_S, S_MTE2, MTE2_S, S_MTE3, MTE2_V, S_V };
@@ -86,7 +87,7 @@ template <class T>
 void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams copy, DataCopyPadExtParams<T>)
 {
     assert(copy.blocks == 1);
-    if constexpr (sizeof(T) == 4) ++list_loads;
+    if constexpr (sizeof(T) == 4) { ++list_loads; list_elements += copy.bytes / 4; }
     std::memcpy(dst.data, src.data, copy.bytes);
 }
 template <class T>
@@ -143,8 +144,16 @@ static uint32_t max_visit, used_visit;
 template <uint32_t Capacity, uint32_t Qps, class Trace>
 struct DispatchSenderT {
     DispatchTilingData td;
-    DispatchSenderT(const DispatchTilingData& t, uint32_t, AscendC::LocalTensor<uint8_t>, GM_ADDR, GM_ADDR, GM_ADDR)
-        : td(t)
+    uintptr_t ub_begin;
+    struct PendingIndex {
+        const int32_t* index;
+        uint32_t peer, row;
+        int32_t saved = 0;
+        bool retained = false;
+    };
+    std::vector<PendingIndex> pending;
+    DispatchSenderT(const DispatchTilingData& t, uint32_t, AscendC::LocalTensor<uint8_t> ub, GM_ADDR, GM_ADDR, GM_ADDR)
+        : td(t), ub_begin(reinterpret_cast<uintptr_t>(ub.data))
     {
         sender_phase = 0;
         pending_rows = false;
@@ -163,26 +172,39 @@ struct DispatchSenderT {
     {
         used_visit = 0;
     }
-    uint32_t PutRows(uint32_t p, const int32_t* plan, uint32_t row, uint32_t field, uint32_t n)
+    // Defer index reads until a full WQE batch or explicit flush, as the real
+    // sender does. Sharing one batch across peers exercises short UB spans.
+    uint32_t PutRowsUb(uint32_t p, const int32_t* plan, uint32_t row, uint32_t field, uint32_t n)
     {
         assert(sender_phase == 0 && !metadata_packed);
         pending_rows = true;
         assert(field == 0);
         n = std::min(n, 7U);  // Exercise partial progress, not only full visits.
+        n = std::min(n, 32U - unsigned(pending.size()));
+        assert(reinterpret_cast<uintptr_t>(plan) >= ub_begin);
+        assert(reinterpret_cast<uintptr_t>(plan + n) <= ub_begin + platform::kKernelUbBytes);
         used_visit += n;
         assert(used_visit <= td.udma_wqes_per_visit);
         max_visit = std::max(max_visit, used_visit);
-        for (uint32_t i = 0; i < n; ++i) sent.emplace_back(Rank(p), plan[i], row + i);
+        for (uint32_t i = 0; i < n; ++i) pending.push_back({plan + i, Rank(p), row + i});
+        if (pending.size() == 32) DrainWqes();
         return n;
     }
-    // This oracle consumes rows immediately; the separate sender oracle tests
-    // deferred UB references and short-batch preservation.
-    void PreserveIndices() {}
-    uint32_t PutRowsUb(uint32_t p, const int32_t* plan, uint32_t row, uint32_t field, uint32_t n)
+    // The separate sender oracle tests the production preservation method.
+    // Here verify the scheduler calls it before overwriting any live index.
+    void PreserveIndices()
     {
-        return PutRows(p, plan, row, field, n);
+        for (auto& entry : pending) if (!entry.retained) {
+            entry.saved = *entry.index;
+            entry.retained = true;
+        }
     }
-    void Flush() { assert(sender_phase == 0); pending_rows = false; }
+    void DrainWqes() {
+        for (const auto& entry : pending)
+            sent.emplace_back(entry.peer, entry.retained ? entry.saved : *entry.index, entry.row);
+        pending.clear();
+    }
+    void Flush() { assert(sender_phase == 0); DrainWqes(); pending_rows = false; }
     void PutPackedScales(uint32_t, uint32_t, uint32_t, uint32_t)
     {
         assert(false);
@@ -431,8 +453,8 @@ void CheckCachedDispatch()
     for (unsigned world : {8U, 16U, 32U, 64U, 128U, 256U})
         for (bool opt_in : {false, true})
             for (unsigned cores : {8U, 16U})
-                for (unsigned tokens : {0U, 3U, 513U, 2049U})
-                    for (unsigned visit : {4U, 8U, 16U, 32U})
+                for (unsigned tokens : {0U, 3U, 513U, 2049U, 4099U})
+                    for (unsigned visit : {4U, 8U, 16U, 31U, 32U, 257U})
                         for (unsigned workers : {1U, 2U}) for (bool metadata : {false, true}) {
                             DispatchTilingData td{};
                             td.world_size = world;
@@ -465,7 +487,7 @@ void CheckCachedDispatch()
                             for (bool cached : {false, true}) {
                                 td.cached_mode = cached;
                                 sent.clear();
-                                list_loads = max_visit = 0;
+                                list_loads = list_elements = max_visit = 0;
                                 for (unsigned core = 0; core < workers; ++core) {
                                     Resource resource;
                                     DisabledDispatchDeviceTrace trace(0);
@@ -481,12 +503,35 @@ void CheckCachedDispatch()
                                             nullptr, td, core, cores, trace);
                                     }
                                 }
+                                if (cached && opt_in) {
+                                    // Independent whole-channel, per-peer visit order;
+                                    // UB refill must not truncate a visit or reorder peers.
+                                    std::vector<Row> ordered;
+                                    unsigned expected_loads = 0;
+                                    for (unsigned core = 0; core < workers; ++core)
+                                        for (unsigned ch = core; ch < 8; ch += workers) {
+                                            unsigned cursor[3]{}, counts[3]{}, starts[3]{};
+                                            const unsigned peers[3] = {1U, world / 2U, world - 1U};
+                                            for (unsigned p = 0; p < 3; ++p) {
+                                                starts[p] = ch ? cp[peers[p] * 8 + ch - 1] : 0;
+                                                counts[p] = cp[peers[p] * 8 + ch] - starts[p];
+                                                expected_loads += (counts[p] + 255) / 256;
+                                            }
+                                            while (cursor[0] < counts[0] || cursor[1] < counts[1] || cursor[2] < counts[2])
+                                                for (unsigned p = 0; p < 3; ++p) {
+                                                    const unsigned stop = std::min(counts[p], cursor[p] + visit);
+                                                    for (; cursor[p] < stop; ++cursor[p])
+                                                        ordered.emplace_back(peers[p], plan[(peers[p] * 8 + ch) * stride + cursor[p]],
+                                                                             starts[p] + cursor[p]);
+                                                }
+                                        }
+                                    assert(sent == ordered);
+                                    assert(list_elements == expected.size());
+                                    assert(list_loads == expected_loads);
+                                } else if (tokens > 3)
+                                    assert(list_loads > 0);
                                 std::sort(sent.begin(), sent.end());
                                 assert(sent == expected);
-                                if (cached && opt_in)
-                                    assert(list_loads == 0);
-                                else if (tokens > 3)
-                                    assert(list_loads > 0);
                             }
                         }
 }

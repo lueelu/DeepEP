@@ -8,6 +8,7 @@
 #define __ubuf__
 #define __gm__
 constexpr uint32_t kBatchWqes = 32, kOutputRecordWords = 12;
+constexpr uint32_t kTileTokens = 256, EVENT_ID6 = 6;
 void trap();
 namespace __asc_simt_vf {
 void __trap();
@@ -15,12 +16,40 @@ void __trap();
 namespace AscendC {
 template <class T>
 struct LocalTensor {
-    const T* data;
+    T* data;
     constexpr T GetValue(unsigned i) const
     {
         return data[i];
     }
+    constexpr LocalTensor operator[](unsigned i) const
+    {
+        return {data + i};
+    }
 };
+struct DataCopyExtParams {
+    uint32_t blocks, bytes, src_stride, dst_stride, reserved;
+};
+template <class T>
+struct DataCopyPadExtParams {
+    bool pad;
+    uint8_t left, right;
+    T value;
+};
+template <class T>
+constexpr void DataCopyPad(LocalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams p, DataCopyPadExtParams<T>)
+{
+    if (p.blocks != 1 || p.src_stride || p.dst_stride) trap();
+    for (unsigned i = 0; i < p.bytes / sizeof(T); ++i) dst.data[i] = src.data[i];
+}
+enum class HardEvent { S_MTE2, MTE2_S };
+template <HardEvent>
+constexpr void SetFlag(unsigned)
+{
+}
+template <HardEvent>
+constexpr void WaitFlag(unsigned)
+{
+}
 }  // namespace AscendC
 // WINDOW_HELPERS
 
@@ -65,8 +94,15 @@ constexpr bool Windows()
 static_assert(Windows());
 
 struct Trace {
-    enum { StateFlushes, DescriptorCycles };
+    enum { StateFlushes, DescriptorCycles, ListWindows, ListCycles, PutRowsCalls };
+    constexpr uint64_t Now() const
+    {
+        return 0;
+    }
+    constexpr void Count(unsigned) const {}
+    constexpr void Add(unsigned, uint64_t) const {}
 };
+using DispatchDeviceTrace = Trace;
 struct Base {
     static constexpr unsigned QueuePeer(unsigned p)
     {
@@ -110,6 +146,15 @@ struct Model {
         for (unsigned i = 0; i < headers.size(); ++i) headers[i] = i + 900;
     }
     // SENDER_METHODS
+    constexpr unsigned Count() const
+    {
+        return 2;
+    }
+    constexpr void BeginVisit(unsigned) {}
+    constexpr unsigned PutRowsUb(unsigned p, uint64_t address, unsigned row, unsigned field, unsigned count)
+    {
+        return PutRowsImpl(p, address, row, field, count, true);
+    }
     constexpr void Flush()
     {
         if (!rows_pending_) return;
@@ -191,6 +236,48 @@ struct Model {
             if (actual_batches[i] != expected_batches[i]) return false;
         return true;
     }
+    constexpr bool RunCached(unsigned visit_budget)
+    {
+        auto& sender = *this;
+        const struct {
+            unsigned udma_wqes_per_visit;
+        } td{visit_budget};
+        const Trace trace;
+        const bool cached_channel = true;
+        unsigned row[2]{};
+        for (unsigned channel = 0; channel < 3; ++channel) {
+            unsigned total[2]{channel == 0 ? 271U : (channel == 1 ? 17U : 0U),
+                              channel == 0 ? 39U : (channel == 1 ? 9U : 3U)};
+            unsigned consumed[2]{total[0], total[1]}, counts[2]{total[0], total[1]};
+            unsigned loaded_first[2]{}, loaded_count[2]{}, cursor[2]{}, field[2]{};
+            uint64_t plan_base[2]{0, 300};
+            std::array<int32_t, 600> plan{};
+            for (unsigned p = 0; p < 2; ++p)
+                for (unsigned i = 0; i < total[p]; ++i) plan[plan_base[p] + i] = channel * 1000 + p * 500 + i;
+            AscendC::LocalTensor<int32_t> lists{memory.data()}, plan_gm{plan.data()};
+            // Independent old whole-channel ordering and physical-SQ batch oracle.
+            unsigned expected_cursor[2]{};
+            while (expected_cursor[0] < total[0] || expected_cursor[1] < total[1])
+                for (unsigned p = 0; p < 2; ++p) {
+                    unsigned budget = visit_budget;
+                    while (budget && expected_cursor[p] < total[p]) {
+                        const unsigned i = expected_cursor[p]++;
+                        Expect(p, row[p] + i, plan[plan_base[p] + i], 0);
+                        --budget;
+                    }
+                }
+            unsigned remaining = total[0] + total[1];
+            // CACHED_SENDER_LOOP
+        }
+        Flush();
+        if (expected_pending) expected_batches[ne++] = expected_pending;
+        if (actual != expected || nb != ne) return false;
+        for (unsigned i = 0; i < actual; ++i)
+            if (actual_src[i] != expected_src[i] || actual_dst[i] != expected_dst[i]) return false;
+        for (unsigned i = 0; i < nb; ++i)
+            if (actual_batches[i] != expected_batches[i]) return false;
+        return true;
+    }
 };
 // Separate evaluations keep compiler constexpr limits bounded.
 static_assert(Model(1, true).Run(1, false));
@@ -204,3 +291,7 @@ static_assert(Model(2, true).Run(16, false));
 static_assert(Model(2, false).Run(32, false));
 static_assert(Model(1, true).Run(16, true));
 static_assert(Model(2, true).Run(16, true));
+static_assert(Model(1, true).RunCached(4));
+static_assert(Model(1, true).RunCached(31));
+static_assert(Model(1, false).RunCached(32));
+static_assert(Model(1, true).RunCached(257));

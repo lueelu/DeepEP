@@ -155,7 +155,8 @@ static_assert(matrix());
 
 
 @pytest.mark.parametrize("corrupt_retention", [False, True])
-def test_dispatch_index_windows_and_pending_batch_lifetime(tmp_path, corrupt_retention):
+@pytest.mark.parametrize("corrupt_cached_refill", [False, True])
+def test_dispatch_index_windows_and_pending_batch_lifetime(tmp_path, corrupt_retention, corrupt_cached_refill):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if not compiler:
         pytest.skip("C++17 compiler required")
@@ -177,6 +178,17 @@ def test_dispatch_index_windows_and_pending_batch_lifetime(tmp_path, corrupt_ret
     if corrupt_retention:
         methods = methods.replace("saved[saved_indices_ + t] = indices[t]", "saved[saved_indices_ + t] = 0")
     program = Path(__file__).with_name("dispatch_index_oracle.cpp").read_text()
+    begin = schedule.index("while (remaining)", schedule.index("DispatchRemoteImpl("))
+    body = schedule.index("{", begin)
+    depth = 1
+    end = body + 1
+    while depth:
+        depth += (schedule[end] == "{") - (schedule[end] == "}")
+        end += 1
+    loop = schedule[begin:end].replace("reinterpret_cast<const __ubuf__ int32_t*>(lists.GetPhyAddr())", "0U")
+    if corrupt_cached_refill:
+        loop = loop.replace("sender.PreserveIndices();", "")
+    program = program.replace("// CACHED_SENDER_LOOP", loop)
     path = tmp_path / "dispatch_indices.cpp"
     path.write_text(program.replace("// WINDOW_HELPERS", helpers).replace("// SENDER_METHODS", methods))
     result = subprocess.run(
@@ -185,7 +197,7 @@ def test_dispatch_index_windows_and_pending_batch_lifetime(tmp_path, corrupt_ret
         text=True,
         timeout=180,
     )
-    if corrupt_retention:
+    if corrupt_retention or corrupt_cached_refill:
         assert result.returncode != 0 and "static assertion" in result.stderr, result.stderr
     else:
         assert result.returncode == 0, result.stderr

@@ -188,7 +188,8 @@ __aicore__ inline void DispatchRemoteImpl(
             uint32_t counts[Capacity]{}, cursor[Capacity]{}, field[Capacity]{}, remaining = 0;
             if (cached_channel) {
                 // The handle already contains compact lists and the exact per-peer
-                // count for this channel. PutRows reads token indices from that list.
+                // count. Visit the entire channel without scanning token windows;
+                // refill bounded UB index slices on demand in the sender loop.
                 for (uint32_t p = 0; p < sender.Count(); ++p) {
                     counts[p] = consumed[p] = total[p];
                     remaining += total[p];
@@ -240,13 +241,35 @@ __aicore__ inline void DispatchRemoteImpl(
                     if (cursor[p] < counts[p]) sender.BeginVisit(p);
                     while (visit && cursor[p] < counts[p]) {
                         const uint32_t ordinal = consumed[p] - counts[p] + cursor[p];
-                        const uint32_t available = (counts[p] - cursor[p]) * fields - field[p];
+                        uint32_t available = (counts[p] - cursor[p]) * fields - field[p];
+                        if (cached_channel) {
+                            if (ordinal >= loaded_first[p] + loaded_count[p]) {
+                                const uint64_t list_started = trace.Now();
+                                trace.Count(DispatchDeviceTrace::ListWindows);
+                                // A short batch may still reference this slot, even
+                                // across channel boundaries. Retain it without a
+                                // flush before MTE2 overwrites the index window.
+                                sender.PreserveIndices();
+                                AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+                                AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+                                const uint32_t left = total[p] - ordinal;
+                                const uint32_t load = left < kTileTokens ? left : kTileTokens;
+                                AscendC::DataCopyPad(
+                                    lists[p * kTileTokens], plan_gm[plan_base[p] + ordinal],
+                                    AscendC::DataCopyExtParams{1, load * uint32_t(sizeof(int32_t)), 0, 0, 0},
+                                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+                                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                                loaded_first[p] = ordinal;
+                                loaded_count[p] = load;
+                                trace.Add(DispatchDeviceTrace::ListCycles, list_started);
+                            }
+                            available = (loaded_first[p] + loaded_count[p] - ordinal) * fields - field[p];
+                        }
                         trace.Count(DispatchDeviceTrace::PutRowsCalls);
                         const uint32_t request = available < visit ? available : visit;
-                        const uint32_t count = cached_channel ?
-                            sender.PutRows(p, reinterpret_cast<const __gm__ int32_t*>(plan) + plan_base[p] + ordinal,
-                                row[p], field[p], request) :
-                            sender.PutRowsUb(p, reinterpret_cast<const __ubuf__ int32_t*>(lists.GetPhyAddr()) +
+                        const uint32_t count = sender.PutRowsUb(p,
+                            reinterpret_cast<const __ubuf__ int32_t*>(lists.GetPhyAddr()) +
                                 p * kTileTokens + ordinal - loaded_first[p], row[p], field[p], request);
                         const uint32_t rows = (field[p] + count) / fields;
                         field[p] = (field[p] + count) % fields;

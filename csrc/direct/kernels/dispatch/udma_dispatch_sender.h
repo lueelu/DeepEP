@@ -14,7 +14,7 @@ static_assert(kDispatchSenderBytes % 32 == 0);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 // span[3]: low 32 bits are the first WQE, bit 32 selects UB indices,
 // bit 33 marks indices retained in the sender-owned short-tail buffer.
-// GM spans remain available for cached whole-channel and token scheduling.
+// GM spans remain available for token scheduling.
 __simt_vf__ __launch_bounds__(32) inline void BuildDispatchWqes(
     __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers, __ubuf__ uint64_t* remote_bases,
     uint64_t x, uint64_t scales, uint32_t x_bytes, uint32_t scale_bytes,
