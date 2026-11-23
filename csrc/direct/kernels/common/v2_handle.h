@@ -38,10 +38,11 @@ __simt_vf__ __launch_bounds__(128) inline void V2HandleSourceVf(
     uint32_t source_rank = 0;
     for (uint32_t row = begin + threadIdx.x; row < end; row += 128) {
         const uint64_t base = uint64_t(row) * (k + 2);
-        for (uint32_t col = 0; col < k + 2; ++col)
-            output[base + col] = -1;
-        if (row >= uint32_t(valid))
+        if (row >= uint32_t(valid)) {
+            for (uint32_t col = 0; col < k + 2; ++col) output[base + col] = -1;
             continue;
+        }
+        for (uint32_t col = 2; col < k + 2; ++col) output[base + col] = -1;
         while (row >= uint32_t(ranks[uint64_t(source_rank) * world + rank]))
             ++source_rank;
         uint32_t master = 0;

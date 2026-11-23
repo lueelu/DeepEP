@@ -575,3 +575,109 @@ static_assert(check(false,false) && check(false,true) && check(true,false) && ch
         assert result.returncode != 0 and "static assertion" in result.stderr
     else:
         assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+def test_source_handle_ub_builder_matches_public_format_and_bounds(tmp_path, bits):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    kernels = ROOT / "csrc/direct/kernels/common"
+    source = (kernels / "v2_handle_source.h").read_text()
+    production = cpp_functions((kernels / "v2_handle.h").read_text(), "V2HandleSourceVf")
+    production += source[source.index("struct V2SourceTile") : source.index("#endif")]
+    oracle = Path(__file__).with_name("source_handle_oracle.cpp").read_text()
+    path = tmp_path / "source_handle.cpp"
+    path.write_text(oracle.replace("// PRODUCTION", production).replace("TOPK_TYPE", f"int{bits}_t"))
+    binary = tmp_path / ("source_handle.exe" if os.name == "nt" else "source_handle")
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-I", str(ROOT / "csrc/direct"), str(path), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+    try:
+        subprocess.run([str(binary)], check=True, timeout=60)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
+
+
+@pytest.mark.parametrize("bits", [32, 64])
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_source_handle_tile_constexpr_precision_and_ub_capacity(tmp_path, bits, corrupt):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    header = (ROOT / "csrc/direct/kernels/common/v2_handle_source.h").read_text()
+    struct_begin = header.index("struct V2SourceTile")
+    structure = header[struct_begin : header.index("};", struct_begin) + 2]
+    functions = cpp_functions(header, "MakeV2SourceTile")
+    functions += vf_as_constexpr(header, "V2HandleSourceTileVf")
+    if corrupt:
+        functions = functions.replace("master_base + master", "master_base + master + 1")
+    source = r"""
+#include <array>
+#include <cstdint>
+#define __aicore__ constexpr
+#define __simt_vf__ constexpr
+#define __launch_bounds__(n)
+#define __ubuf__
+using topk_idx_t = TOPK_TYPE;
+// STRUCTURE
+// FUNCTIONS
+constexpr bool layout() {
+    for (uint32_t world : {8U,16U,32U,128U})
+        for (uint32_t k : {0U,1U,3U,8U,128U,4096U,UINT32_MAX})
+            for (uint32_t budget : {32U,1024U,192U*1024,216U*1024-64}) {
+                const auto t = MakeV2SourceTile(world,k,budget);
+                if (!t.rows) continue;
+                if (t.rows>256 || t.rows%8 || t.bytes>budget) return false;
+                if (t.source_offset%32 || t.topk_offset%32 || t.output_offset%32) return false;
+                if (t.source_offset < world*4 || t.topk_offset < t.source_offset+t.rows*4) return false;
+                if (t.output_offset < t.topk_offset+uint64_t(t.rows)*k*sizeof(topk_idx_t)) return false;
+                if (t.bytes < t.output_offset+uint64_t(t.rows)*(uint64_t(k)+2)*4) return false;
+            }
+    return !MakeV2SourceTile(0,8,1024).rows && !MakeV2SourceTile(128,8,128).rows;
+}
+constexpr bool encoding() {
+    constexpr uint32_t k=3, rows=33;
+    std::array<int32_t,rows> src{};
+    std::array<topk_idx_t,rows*k> topk{};
+    std::array<int32_t,rows*(k+2)> out{};
+    for (uint32_t r=0;r<rows;++r) {
+        src[r]=r*3+2;
+        for(uint32_t c=0;c<k;++c)topk[r*k+c]=c<r%(k+1)?-1:7;
+    }
+    for (uint32_t tid=0;tid<128;++tid)
+        V2HandleSourceTileVf(src.data(),topk.data(),out.data(),rows,k,4096*7,7*k,true,tid);
+    for(uint32_t r=0;r<rows;++r) for(uint32_t c=0;c<k+2;++c) {
+        const int32_t value=c==0?4096*7+src[r]:(c==1?int32_t(7*k+r%(k+1)):-1);
+        if(out[r*(k+2)+c]!=value)return false;
+    }
+    for (uint32_t tid=0;tid<128;++tid)
+        V2HandleSourceTileVf(nullptr,nullptr,out.data(),rows,k,0,0,false,tid);
+    for(auto value:out)if(value!=-1)return false;
+    return true;
+}
+static_assert(layout());
+static_assert(encoding());
+"""
+    path = tmp_path / "source_tile.cpp"
+    path.write_text(
+        source.replace("TOPK_TYPE", f"int{bits}_t")
+        .replace("// STRUCTURE", structure)
+        .replace("// FUNCTIONS", functions)
+    )
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "source_tile.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if corrupt:
+        assert result.returncode != 0 and "static assertion" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr

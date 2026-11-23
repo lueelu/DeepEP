@@ -6,7 +6,7 @@
 
 #include "kernels/dispatch/dispatch_scale_pack.h"
 #include "kernels/dispatch/dispatch_recv_copy.h"
-#include "kernels/common/v2_handle.h"
+#include "kernels/common/v2_handle_source.h"
 #include "common/launch.h"
 #include "common/types.h"
 #include "kernels/dispatch/udma_dispatch_schedule.h"
@@ -309,7 +309,8 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         // The existing completion boundary makes staged and direct metadata
         // visible. Read the producer destination, not another AIV's output copy.
         const uint64_t source_started = trace.Now();
-        asc_vf_call<ascend_deepep::V2HandleSourceVf>(dim3(128),
+        ascend_deepep::BuildV2HandleSource(resource,
+            reinterpret_cast<__gm__ int32_t*>(tiling.v2_rank_prefix),
             reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),
             reinterpret_cast<__gm__ int32_t*>(tiling.metadata_direct_output
                 ? recv_src_idx : symmetric_buffer + tiling.src_idx_buffer_offset),
