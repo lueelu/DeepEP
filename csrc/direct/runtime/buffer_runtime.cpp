@@ -323,6 +323,16 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
                                                  RequireShmem().FftsAddr(), allocation_stream_id);
 }
 
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
+BufferRuntime::GetDispatchLayoutV2Simt(torch::Tensor topk_idx, int64_t num_experts, int64_t num_aiv,
+                                     c10::optional<int64_t> allocation_stream_id)
+{
+    TORCH_CHECK(num_aiv > 0, "V2 SIMT layout requires resolved num_sms");
+    return ascend_deepep::ops::GetDispatchLayout(
+        topk_idx, num_experts, static_cast<int>(rank_), static_cast<int>(num_ranks_), static_cast<int>(num_device_aiv_),
+        RequireShmem().FftsAddr(), allocation_stream_id, false, num_aiv);
+}
+
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
            std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 BufferRuntime::IntranodeDispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales,

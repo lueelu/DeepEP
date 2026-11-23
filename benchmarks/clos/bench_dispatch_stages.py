@@ -425,8 +425,13 @@ def capture_stages(directory, samples, cached, cached_weighted=False, cached_pac
     with paths[0].open(encoding="utf-8-sig", newline="") as file:
         rows = sorted(csv.DictReader(file), key=lambda row: float(row["Start Time(us)"]))
     names = ["cached_notify_combine_kernel"]  # out-of-measurement alignment
+    layout = (
+        "dispatch_layout_simt_kernel"
+        if any(row["Name"] == "dispatch_layout_simt_kernel" for row in rows)
+        else "dispatch_layout_kernel"
+    )
     if not cached:
-        names.append("dispatch_layout_kernel")
+        names.append(layout)
     notify = "cached_notify_dispatch_kernel" if cached else "notify_dispatch_kernel"
     # Version 3 prepares metadata in dispatch after payload submission. Cached
     # weighted packing therefore uses the same alignment-only notify kernel.
@@ -439,7 +444,13 @@ def capture_stages(directory, samples, cached, cached_weighted=False, cached_pac
         for row in rows
         if row["Name"]
         in set(names)
-        | {"cached_dispatch_plan_kernel", "cached_notify_dispatch_packed_kernel", "cached_notify_dispatch_kernel"}
+        | {
+            "cached_dispatch_plan_kernel",
+            "cached_notify_dispatch_packed_kernel",
+            "cached_notify_dispatch_kernel",
+            "dispatch_layout_kernel",
+            "dispatch_layout_simt_kernel",
+        }
     ]
     if [row["Name"] for row in selected] != names * (samples + 4):
         raise RuntimeError("unexpected kernel sequence/sample count; retain raw capture for inspection")
@@ -450,6 +461,8 @@ def capture_stages(directory, samples, cached, cached_weighted=False, cached_pac
     }
     if any(not math.isfinite(t) or t <= 0 for values in result.values() for t in values):
         raise ValueError("invalid profiler duration")
+    if layout == "dispatch_layout_simt_kernel" and not cached:
+        result["dispatch_layout_kernel"] = result.pop(layout)
     # Aggregate within each rank/sample before slow-rank aggregation, including legacy head rebuilding.
     result["notify_total_us"] = [
         value + result.get("cached_dispatch_plan_kernel", [0] * samples)[i] for i, value in enumerate(result[notify])

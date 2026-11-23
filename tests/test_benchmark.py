@@ -51,7 +51,8 @@ METADATA = dict(
 @pytest.mark.parametrize("op", ["dispatch", "cached-dispatch", "combine_unweighted", "combine_weighted"])
 @pytest.mark.parametrize("flush", [False, True])
 @pytest.mark.parametrize("barrier", ["_Z24barrier_on_stream_kernelim", "cached_notify_combine_kernel"])
-def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush, barrier):
+@pytest.mark.parametrize("simt_layout", [False, True])
+def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush, barrier, simt_layout):
     from benchmarks.clos.stage_metrics import L2_FLUSH_RANGE, PROFILE_SAMPLE_RANGE, parse_profile
 
     events, rows = [], []
@@ -60,7 +61,7 @@ def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush
         ["cached_notify_combine_kernel", "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
         if op.startswith("combine")
         else (
-            ["dispatch_layout_kernel", "notify_dispatch_kernel"]
+            ["dispatch_layout_simt_kernel" if simt_layout else "dispatch_layout_kernel", "notify_dispatch_kernel"]
             if op == "dispatch"
             else ["cached_notify_dispatch_kernel"]
         )

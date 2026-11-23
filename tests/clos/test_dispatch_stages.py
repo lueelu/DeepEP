@@ -617,10 +617,11 @@ def test_reject_wrong_launch_or_incomplete_trace(field, value):
 
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("corrupt", [False, True])
-def test_capture_excludes_alignment_and_guards(tmp_path, cached, corrupt):
+@pytest.mark.parametrize("simt_layout", [False, True])
+def test_capture_excludes_alignment_and_guards(tmp_path, cached, corrupt, simt_layout):
     names = ["cached_notify_combine_kernel"]
     if not cached:
-        names.append("dispatch_layout_kernel")
+        names.append("dispatch_layout_simt_kernel" if simt_layout else "dispatch_layout_kernel")
     names += ["cached_notify_dispatch_kernel" if cached else "notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
     rows = []
     for sample in range(7):  # 2 guards + 3 samples + 2 guards

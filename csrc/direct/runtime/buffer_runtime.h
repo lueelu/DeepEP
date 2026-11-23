@@ -62,6 +62,9 @@ public:
         torch::Tensor topk_idx, int64_t num_experts, c10::optional<int64_t> allocation_stream_id = c10::nullopt);
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> AllocateDispatchLayout(
         torch::Tensor topk_idx, int64_t num_experts, c10::optional<int64_t> allocation_stream_id = c10::nullopt);
+    std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> GetDispatchLayoutV2Simt(
+        torch::Tensor topk_idx, int64_t num_experts, int64_t num_aiv,
+        c10::optional<int64_t> allocation_stream_id = c10::nullopt);
 
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
                std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

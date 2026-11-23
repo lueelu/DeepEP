@@ -56,6 +56,9 @@ static auto buffer_runtime_registry =
              {torch::arg("topk_idx"), torch::arg("num_experts"), torch::arg("allocation_stream_id") = c10::IValue()})
         .def("get_dispatch_layout", &BufferRuntime::GetDispatchLayout, "",
              {torch::arg("topk_idx"), torch::arg("num_experts"), torch::arg("allocation_stream_id") = c10::IValue()})
+        .def("get_dispatch_layout_v2_simt", &BufferRuntime::GetDispatchLayoutV2Simt, "",
+             {torch::arg("topk_idx"), torch::arg("num_experts"), torch::arg("num_aiv"),
+              torch::arg("allocation_stream_id") = c10::IValue()})
         .def("intranode_dispatch", &BufferRuntime::IntranodeDispatch, "",
              {torch::arg("x"),
               torch::arg("x_scales"),

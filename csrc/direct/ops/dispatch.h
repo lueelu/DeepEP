@@ -13,7 +13,8 @@ namespace ascend_deepep::ops {
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> GetDispatchLayout(
     torch::Tensor topk_idx, int64_t num_experts, int rank, int world_size, int num_device_aiv, uint64_t ffts_addr,
-    c10::optional<int64_t> allocation_stream_id = c10::nullopt, bool allocate_only = false);
+    c10::optional<int64_t> allocation_stream_id = c10::nullopt, bool allocate_only = false,
+    int64_t simt_num_aiv = 0);
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
            std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,

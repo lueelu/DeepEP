@@ -29,14 +29,14 @@ uint8_t* OptionalTensorPtr(const c10::optional<torch::Tensor>& tensor)
 void LaunchDispatchLayoutKernel(torch::Tensor topk_idx, torch::Tensor num_tokens_per_rank,
                                 torch::Tensor num_tokens_per_expert, torch::Tensor is_token_in_rank,
                                 const ascend_deepep::DispatchLayoutTilingData& tiling, torch::Tensor scratch_buffer,
-                                uint64_t ffts_addr)
+                                uint64_t ffts_addr, bool simt_layout)
 {
     aclrtStream stream = GetCurrentAclStream();
-    dispatch_layout_kernel_do(tiling.block_dim, stream, BytePtr(topk_idx.data_ptr()),
-                              BytePtr(scratch_buffer.data_ptr()), BytePtr(num_tokens_per_rank.data_ptr()),
-                              BytePtr(num_tokens_per_expert.data_ptr()), BytePtr(is_token_in_rank.data_ptr()),
-                              reinterpret_cast<uint8_t*>(const_cast<ascend_deepep::DispatchLayoutTilingData*>(&tiling)),
-                              ffts_addr);
+    auto launch = simt_layout ? &dispatch_layout_simt_kernel_do : &dispatch_layout_kernel_do;
+    launch(tiling.block_dim, stream, BytePtr(topk_idx.data_ptr()), BytePtr(scratch_buffer.data_ptr()),
+           BytePtr(num_tokens_per_rank.data_ptr()), BytePtr(num_tokens_per_expert.data_ptr()),
+           BytePtr(is_token_in_rank.data_ptr()),
+           reinterpret_cast<uint8_t*>(const_cast<ascend_deepep::DispatchLayoutTilingData*>(&tiling)), ffts_addr);
 }
 
 void LaunchNotifyDispatchKernel(torch::Tensor num_tokens_per_rank, torch::Tensor num_tokens_per_expert,

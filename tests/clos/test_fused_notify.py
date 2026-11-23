@@ -190,7 +190,7 @@ def test_host_intervals_are_same_call_and_native_flags_are_checked(mode):
 
 
 def test_sweep_is_forward_reverse_and_resets_all_options(monkeypatch):
-    for env in (bench.ENV, bench.HOST_PREP_ENV, bench.DEFER_PLAN_ENV):
+    for env in (bench.ENV, bench.HOST_PREP_ENV, bench.DEFER_PLAN_ENV, bench.SIMT_LAYOUT_ENV):
         monkeypatch.setenv(env, "stale")
     for sweep in (False, True):
         order = bench.mode_order(sweep)
@@ -202,15 +202,20 @@ def test_sweep_is_forward_reverse_and_resets_all_options(monkeypatch):
                 tuple(int(os.environ[e]) for e in (bench.ENV, bench.HOST_PREP_ENV, bench.DEFER_PLAN_ENV))
                 == bench.MODES[name]
             )
+            assert os.environ[bench.SIMT_LAYOUT_ENV] == "0"
+    assert bench.mode_order(False, True) == ["baseline", "simt", "simt", "baseline"]
+    bench.set_mode("simt")
+    assert os.environ[bench.SIMT_LAYOUT_ENV] == "1"
+    assert os.environ[bench.ENV] == "0"
 
 
-@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("fused,simt", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("expanded", [False, True])
 @pytest.mark.parametrize("guards", [0, 2])
-def test_profile_sequence_excludes_outer_barrier(tmp_path, fused, expanded, guards):
+def test_profile_sequence_excludes_outer_barrier(tmp_path, fused, simt, expanded, guards):
     names = ["cached_notify_combine_kernel"]
     if not fused:
-        names.append("dispatch_layout_kernel")
+        names.append("dispatch_layout_simt_kernel" if simt else "dispatch_layout_kernel")
     names += ["notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
     if expanded:
         names.append("expand_kernel")
@@ -227,11 +232,14 @@ def test_profile_sequence_excludes_outer_barrier(tmp_path, fused, expanded, guar
                     "Duration(us)": 900 if "combine" in name else (10 if measured else 777),
                 }
             )
-    result = bench.parse_capture(tmp_path, fused, 3, expanded, guards)
+    result = bench.parse_capture(tmp_path, fused, 3, expanded, guards, simt_layout=simt)
     assert result["notify_dispatch_kernel"] == [10] * 3
     assert ("dispatch_layout_kernel" in result) != fused
     with pytest.raises(RuntimeError, match="sequence"):
-        bench.parse_capture(tmp_path, fused, 2, expanded, guards)
+        bench.parse_capture(tmp_path, fused, 2, expanded, guards, simt_layout=simt)
+    if simt:
+        with pytest.raises(RuntimeError, match="sequence"):
+            bench.parse_capture(tmp_path, False, 3, expanded, guards)
     if fused:
         with pytest.raises(RuntimeError, match="sequence"):
             bench.parse_capture(tmp_path, False, 3, expanded, guards)

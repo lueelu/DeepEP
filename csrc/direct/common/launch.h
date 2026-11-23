@@ -31,6 +31,10 @@ ASCEND_DEEPEP_EXPORT void dispatch_layout_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
+ASCEND_DEEPEP_EXPORT void dispatch_layout_simt_kernel_do(
+    uint32_t block_dim, void* stream, uint8_t* topk_idx, uint8_t* scratch_buffer, uint8_t* num_tokens_per_rank,
+    uint8_t* num_tokens_per_expert, uint8_t* is_token_in_rank, uint8_t* tiling_host, uint64_t ffts_addr);
+
 // A distinct symbol prevents the old Notify ABI from accepting the new output argument.
 ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
     uint32_t block_dim,

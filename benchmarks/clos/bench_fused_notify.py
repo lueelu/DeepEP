@@ -1,4 +1,4 @@
-"""8-AIV fresh dispatch A/B, one Buffer per rank, precision before timing."""
+"""Fresh dispatch layout/notify A/B, one Buffer per rank, precision before timing."""
 
 import argparse
 import csv
@@ -16,23 +16,30 @@ ENV = "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY"
 HOST_PREP_ENV = "DEEPEP_CLOS_NOTIFY_HOST_PREP"
 DEFER_PLAN_ENV = "DEEPEP_CLOS_NOTIFY_DEFER_PLAN"
 HOST_TIMING_ENV = "DEEPEP_CLOS_DISPATCH_HOST_TIMING"
+SIMT_LAYOUT_ENV = "DEEPEP_CLOS_V2_SIMT_LAYOUT"
 MODES = {
     "baseline": (0, 0, 0),
     "fused": (1, 0, 0),
     "host": (1, 1, 0),
     "plan": (1, 0, 1),
     "both": (1, 1, 1),
+    "simt": (0, 0, 0),
 }
 
 
-def mode_order(sweep):
-    names = list(MODES) if sweep else ["baseline", "fused"]
+def mode_order(sweep, simt_layout=False):
+    names = (
+        ["baseline", "simt"]
+        if simt_layout
+        else ([name for name in MODES if name != "simt"] if sweep else ["baseline", "fused"])
+    )
     return names + names[::-1]
 
 
 def set_mode(name):
     for env, value in zip((ENV, HOST_PREP_ENV, DEFER_PLAN_ENV), MODES[name]):
         os.environ[env] = str(value)
+    os.environ[SIMT_LAYOUT_ENV] = str(int(name == "simt"))
 
 
 def host_durations(rows, fields, samples, mode):
@@ -92,7 +99,9 @@ def store_topology_collective(group):
         _machine.gather_records = original
 
 
-def parse_capture(directory, fused, samples, expanded=False, guards=0):
+def parse_capture(directory, fused, samples, expanded=False, guards=0, simt_layout=False):
+    if fused and simt_layout:
+        raise ValueError("SIMT layout must be separate from notify")
     paths = list(directory.rglob("kernel_details.csv"))
     if len(paths) != 1:
         raise RuntimeError(f"expected one kernel_details.csv, found {len(paths)}")
@@ -100,11 +109,11 @@ def parse_capture(directory, fused, samples, expanded=False, guards=0):
         rows = sorted(csv.DictReader(f), key=lambda r: float(r["Start Time(us)"]))
     names = ["cached_notify_combine_kernel"]
     if not fused:
-        names.append("dispatch_layout_kernel")
+        names.append("dispatch_layout_simt_kernel" if simt_layout else "dispatch_layout_kernel")
     names += ["notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
     if expanded:
         names.append("expand_kernel")
-    known = set(names) | {"dispatch_layout_kernel", "expand_kernel"}
+    known = set(names) | {"dispatch_layout_kernel", "dispatch_layout_simt_kernel", "expand_kernel"}
     selected = [r for r in rows if r["Name"] in known]
     if [r["Name"] for r in selected] != names * (samples + 2 * guards):
         raise RuntimeError("unexpected barrier/layout/notify/comm sequence or sample count")
@@ -114,6 +123,8 @@ def parse_capture(directory, fused, samples, expanded=False, guards=0):
     }
     if any(not math.isfinite(t) or t <= 0 for values in result.values() for t in values):
         raise RuntimeError("invalid kernel duration")
+    if simt_layout:
+        result["dispatch_layout_kernel"] = result.pop("dispatch_layout_simt_kernel")
     return result
 
 
@@ -132,9 +143,13 @@ def main():
     p.add_argument("--flush-l2", action="store_true")
     p.add_argument("--precision-only", action="store_true")
     p.add_argument("--pipeline-sweep", action="store_true", help="baseline/fused/host/plan/both, then reverse order")
+    p.add_argument("--simt-layout-sweep", action="store_true", help="separate old/SIMT layout ABBA; fusion stays off")
+    p.add_argument("--aiv", type=int, choices=range(2, 65, 2), default=8)
     p.add_argument("--host-timing", action="store_true", help="separate unprofiled Host diagnostic pass")
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
+    if args.pipeline_sweep and args.simt_layout_sweep:
+        p.error("choose either --pipeline-sweep or --simt-layout-sweep")
     if min(args.tokens, args.hidden, args.topk, args.experts, args.samples) <= 0 or args.warmup < 0:
         p.error("shape/sample counts must be positive; warmup must be nonnegative")
     import torch
@@ -156,6 +171,8 @@ def main():
         raise RuntimeError("install this branch's native and device libraries before initializing Buffer")
     if getattr(native, "fused_notify_pipeline_version", 0) != 1:
         raise RuntimeError("rebuild native and device libraries for pipeline sweep/Host timing")
+    if args.simt_layout_sweep and getattr(native, "v2_simt_layout_version", 0) != 1:
+        raise RuntimeError("rebuild native and device libraries for V2 SIMT layout")
     store = dist.TCPStore(
         os.environ["MASTER_ADDR"],
         args.control_port,
@@ -185,7 +202,9 @@ def main():
         encoding="utf-8",
     )
     rows = []
-    old_env = {key: os.environ.get(key) for key in (ENV, HOST_PREP_ENV, DEFER_PLAN_ENV, HOST_TIMING_ENV)}
+    old_env = {
+        key: os.environ.get(key) for key in (ENV, HOST_PREP_ENV, DEFER_PLAN_ENV, HOST_TIMING_ENV, SIMT_LAYOUT_ENV)
+    }
     os.environ[HOST_TIMING_ENV] = "0"
     with store_topology_collective(group):
         buffer = ElasticBuffer(
@@ -200,7 +219,7 @@ def main():
             shmem_ip_port=f"tcp://{os.environ['MASTER_ADDR']}:{args.shmem_port}",
         )
     if rank == 0:
-        print(f"BUFFER_READY EP={world} AIV=8 initializations=1", flush=True)
+        print(f"BUFFER_READY EP={world} AIV={args.aiv} initializations=1", flush=True)
     flush = L2CacheFlush(torch, buffer, args.flush_l2)
 
     def done(result):
@@ -226,12 +245,12 @@ def main():
         experts = sum((torch.bincount(idx[idx >= 0], minlength=args.experts) for idx in all_idx))
         e = args.experts // world
         assert_equal(h.num_unaligned_recv_tokens_per_expert.cpu(), experts[rank * e : (rank + 1) * e].to(torch.int32))
-        length = (local_idx.shape[0] + 7) // 8
+        length = (local_idx.shape[0] + args.aiv - 1) // args.aiv
         plan = h._dispatch_plan.cpu()
         stable = []
         for peer in range(world):
             total = 0
-            for ch in range(8):
+            for ch in range(args.aiv):
                 begin, end = ch * length, min((ch + 1) * length, local_idx.shape[0])
                 indices = torch.where(memberships[rank][begin:end, peer])[0] + begin
                 total += len(indices)
@@ -250,11 +269,11 @@ def main():
             )
         outputs += layout + stable
         # Exercise the handle in cached dispatch and both combine weight modes.
-        cached = done(buffer.dispatch(local_x, handle=h, num_sms=8, do_expand=bool(args.expand)))
+        cached = done(buffer.dispatch(local_x, handle=h, num_sms=args.aiv, do_expand=bool(args.expand)))
         assert_equal(cached[0], recv)
         for weighted in (False, True):
             w = recv_w if weighted else None
-            combined = done(buffer.combine(recv, h, topk_weights=w, num_sms=8))
+            combined = done(buffer.combine(recv, h, topk_weights=w, num_sms=args.aiv))
             outputs.append(combined[0].cpu().clone())
             if combined[1] is not None:
                 outputs.append(combined[1].cpu().clone())
@@ -268,7 +287,7 @@ def main():
         for routing in ("random", "masked", "hot", "empty", "empty_local"):
             if rank == 0:
                 print(
-                    f"PRECISION routing={routing} expand={args.expand} order={mode_order(args.pipeline_sweep)}",
+                    f"PRECISION routing={routing} expand={args.expand} order={mode_order(args.pipeline_sweep, args.simt_layout_sweep)}",
                     flush=True,
                 )
             cpu_idx = raw.clone()
@@ -288,7 +307,7 @@ def main():
             idx = cpu_idx.to(dtype=topk_idx_t, device="npu")
             for weighted in (False, True):
                 baseline = None
-                for mode in mode_order(args.pipeline_sweep):
+                for mode in mode_order(args.pipeline_sweep, args.simt_layout_sweep):
                     torch.npu.synchronize()
                     group.agree([routing, weighted, mode])
                     set_mode(mode)
@@ -297,7 +316,7 @@ def main():
                         topk_idx=idx,
                         topk_weights=local_weights if weighted else None,
                         num_experts=args.experts,
-                        num_sms=8,
+                        num_sms=args.aiv,
                         do_expand=bool(args.expand),
                     )
                     actual = snapshot(result, local_x, cpu_idx, all_idx)
@@ -324,12 +343,12 @@ def main():
                             topk_idx=idx,
                             topk_weights=weights if weighted else None,
                             num_experts=args.experts,
-                            num_sms=8,
+                            num_sms=args.aiv,
                             do_expand=bool(args.expand),
                         )
                     )
 
-                for turn, mode in enumerate(mode_order(args.pipeline_sweep)):
+                for turn, mode in enumerate(mode_order(args.pipeline_sweep, args.simt_layout_sweep)):
                     if rank == 0:
                         print(f"PERFORMANCE weights={weighted} round={turn} fused={mode}", flush=True)
                     torch.npu.synchronize()
@@ -364,7 +383,14 @@ def main():
                         for _ in range(args.samples + 4):
                             prepare_v2_sample(buffer, flush)
                             invoke()
-                    stages = parse_capture(capture, bool(MODES[mode][0]), args.samples, bool(args.expand), guards=2)
+                    stages = parse_capture(
+                        capture,
+                        bool(MODES[mode][0]),
+                        args.samples,
+                        bool(args.expand),
+                        guards=2,
+                        simt_layout=mode == "simt",
+                    )
                     stages["api_wall_us_unprofiled"] = api
                     stages["layout_plus_notify"] = [
                         a + b
@@ -434,7 +460,7 @@ def main():
                     args=vars(args) | {"output": str(args.output)},
                     precision_passed=True,
                     buffer_initializations=1,
-                    aiv=8,
+                    aiv=args.aiv,
                     results=rows,
                 ),
                 indent=2,

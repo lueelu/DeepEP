@@ -6,6 +6,7 @@
 
 #include "common/launch.h"
 #include "common/types.h"
+#include "kernels/dispatch/dispatch_layout_simt.h"
 
 using namespace AscendC;
 
@@ -238,5 +239,33 @@ extern "C" ASCEND_DEEPEP_EXPORT void dispatch_layout_kernel_do(
 {
     auto* td = reinterpret_cast<ascend_deepep::DispatchLayoutTilingData*>(tiling_host);
     dispatch_layout_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchLayoutUbBytes), stream>>>(
+        topk_idx, scratch_buffer, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank, *td, ffts_addr);
+}
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void dispatch_layout_simt_kernel(
+    GM_ADDR topk_idx, GM_ADDR scratch_buffer, GM_ADDR num_tokens_per_rank, GM_ADDR num_tokens_per_expert,
+    GM_ADDR is_token_in_rank, ascend_deepep::DispatchLayoutTilingData tiling, uint64_t ffts_addr)
+{
+    util_set_ffts_config(ffts_addr);
+    if ASCEND_IS_AIC {
+        return;
+    }
+    const uint32_t core = get_block_idx() * get_subblockdim() + get_subblockid();
+    const uint32_t cores = get_block_num() * get_subblockdim();
+    ascend_deepep::UbWorkspace resource;
+    ascend_deepep::BuildSimtLayoutPartials(resource, topk_idx, is_token_in_rank, scratch_buffer, tiling, core, cores);
+    // Every core participates, including empty ranges. All partial and mask
+    // DMA stores are drained before readers reuse the UB and consume scratch.
+    AscendC::SyncAll<true>();
+    ascend_deepep::ReduceSimtLayoutPartials(resource, scratch_buffer, num_tokens_per_rank, num_tokens_per_expert,
+                                          tiling, core, cores);
+}
+
+extern "C" ASCEND_DEEPEP_EXPORT void dispatch_layout_simt_kernel_do(
+    uint32_t block_dim, void* stream, uint8_t* topk_idx, uint8_t* scratch_buffer, uint8_t* num_tokens_per_rank,
+    uint8_t* num_tokens_per_expert, uint8_t* is_token_in_rank, uint8_t* tiling_host, uint64_t ffts_addr)
+{
+    auto* td = reinterpret_cast<ascend_deepep::DispatchLayoutTilingData*>(tiling_host);
+    dispatch_layout_simt_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchLayoutUbBytes), stream>>>(
         topk_idx, scratch_buffer, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank, *td, ffts_addr);
 }

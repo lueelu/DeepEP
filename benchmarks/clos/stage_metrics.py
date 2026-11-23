@@ -98,6 +98,7 @@ def prepare_v2_sample(buffer, flush_cache):
 
 STAGES = {
     "dispatch_layout_kernel": "layout",
+    "dispatch_layout_simt_kernel": "layout",
     "notify_dispatch_kernel": "notify",
     "cached_notify_dispatch_kernel": "notify",
     "cached_notify_combine_kernel": "notify",
@@ -542,6 +543,9 @@ def parse_profile(
     combine = op.startswith("combine")
     fused = api == "v1" and combine
     counts = Counter(r["Name"] for r in rows)
+    layout = "dispatch_layout_simt_kernel" if counts["dispatch_layout_simt_kernel"] else "dispatch_layout_kernel"
+    if api != "v2" and counts["dispatch_layout_simt_kernel"]:
+        raise ValueError("SIMT layout is only supported by V2")
     early = bool(counts["v1_combine_udma_early_kernel"] or counts["v1_combine_udma_remaining_kernel"])
     if early and not (combine and expanded and api == "v2"):
         raise ValueError("early single-source stages require expanded combine")
@@ -563,7 +567,7 @@ def parse_profile(
     required += (
         combine_notify + ([] if fused else ["v1_combine_udma_reduce_kernel"])
         if combine
-        else ["dispatch_layout_kernel", "notify_dispatch_kernel"]
+        else [layout, "notify_dispatch_kernel"]
         if op == "dispatch"
         else ["cached_notify_dispatch_kernel"]
     )
@@ -624,7 +628,7 @@ def parse_profile(
     )
     if notify in sequence and sequence.index(notify) >= sequence.index(main):
         raise ValueError("communication precedes notify")
-    if op == "dispatch" and sequence.index("dispatch_layout_kernel") >= sequence.index(notify):
+    if op == "dispatch" and sequence.index(layout) >= sequence.index(notify):
         raise ValueError("notify precedes layout")
     samples = []
     kernels = []
@@ -668,7 +672,7 @@ def parse_profile(
                 raise ValueError("nonfinite kernel timestamp")
             if (
                 STAGES.get(name) in ("early_submit", "comm", "expand", "aggregate", "reduce", "fused_combine")
-                or name == "cached_notify_combine_kernel"
+                or name in ("cached_notify_combine_kernel", "dispatch_layout_simt_kernel")
             ) and int(row["Block Num"]) != aiv:
                 raise ValueError("unexpected launch AIV count")
             times[STAGES.get(name, "other") + "_us"] += duration

@@ -10,6 +10,7 @@
 
 #include "common/types.h"
 #include "common/fused_layout.h"
+#include "common/simt_layout.h"
 #include "common/platform.h"
 #include "common/udma_schedule.h"
 #include "ops/launcher.h"
@@ -193,7 +194,7 @@ namespace ascend_deepep::ops {
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> GetDispatchLayout(
     torch::Tensor topk_idx, int64_t num_experts, int rank, int world_size, int num_device_aiv, uint64_t ffts_addr,
-    c10::optional<int64_t> allocation_stream_id, bool allocate_only)
+    c10::optional<int64_t> allocation_stream_id, bool allocate_only, int64_t simt_num_aiv)
 {
     StreamAllocator allocator(allocation_stream_id);
     allocator.Record({topk_idx});
@@ -222,8 +223,20 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
     const int64_t layout_parallelism =
         (num_experts + kDeepEpLayoutExpertsPerWorker - 1) / kDeepEpLayoutExpertsPerWorker +
         (world_size + kDeepEpLayoutRanksPerWorker - 1) / kDeepEpLayoutRanksPerWorker;
-    const uint32_t block_dim = static_cast<uint32_t>(std::min<int64_t>(
+    uint32_t block_dim = static_cast<uint32_t>(std::min<int64_t>(
         std::min<int64_t>(num_device_aiv, kMaxDispatchAiv), std::max<int64_t>(2, layout_parallelism)));
+    TORCH_CHECK(simt_num_aiv >= 0, "SIMT layout cores must not be negative");
+    if (simt_num_aiv) {
+        TORCH_CHECK(!allocate_only, "SIMT layout requires an independent launch");
+        TORCH_CHECK(simt_num_aiv == ResolveNumAiv(simt_num_aiv) && simt_num_aiv <= num_device_aiv,
+                    "SIMT layout cores exceed device capacity");
+        TORCH_CHECK(CheckedMulInt64(num_tokens, num_topk, "layout histogram bound") <=
+                        std::numeric_limits<int32_t>::max(), "layout histogram exceeds int32 capacity");
+        const auto ub = ascend_deepep::MakeSimtLayoutUbPlan(world_size, num_experts, num_topk,
+                                                          sizeof(ascend_deepep::topk_idx_t), kDispatchLayoutUbBytes);
+        TORCH_CHECK(ub.tile != 0, "SIMT layout shape exceeds UB capacity");
+        block_dim = static_cast<uint32_t>(simt_num_aiv);
+    }
     const int64_t rank_stride = AlignUpInt64(world_size, kDispatchLayoutAlignElems);
     const int64_t expert_stride = AlignUpInt64(num_experts, kDispatchLayoutAlignElems);
     const int64_t is_token_in_rank_ub_bytes = AlignUpInt64(world_size, 32);
@@ -262,7 +275,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
     tiling.expert_stride = static_cast<uint32_t>(expert_stride);
 
     LaunchDispatchLayoutKernel(topk_idx, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank, tiling,
-                               scratch_buffer, ffts_addr);
+                               scratch_buffer, ffts_addr, simt_num_aiv != 0);
 
     return {num_tokens_per_rank, c10::nullopt, num_tokens_per_expert, is_token_in_rank};
 }

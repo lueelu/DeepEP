@@ -9,7 +9,7 @@
 void LaunchDispatchLayoutKernel(torch::Tensor topk_idx, torch::Tensor num_tokens_per_rank,
                                 torch::Tensor num_tokens_per_expert, torch::Tensor is_token_in_rank,
                                 const ascend_deepep::DispatchLayoutTilingData& tiling, torch::Tensor scratch_buffer,
-                                uint64_t ffts_addr);
+                                uint64_t ffts_addr, bool simt_layout = false);
 
 void LaunchNotifyDispatchKernel(torch::Tensor num_tokens_per_rank, torch::Tensor num_tokens_per_expert,
                                 torch::Tensor is_token_in_rank, torch::Tensor rank_prefix_matrix,

@@ -21,6 +21,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("get_shmem_unique_id", &GetShmemUniqueId);
     m.def("get_shmem_bootstrap", &GetShmemBootstrap);
     m.attr("fused_layout_notify_version") = 1;
+    m.attr("v2_simt_layout_version") = 1;
     m.attr("fused_notify_pipeline_version") = 1;
     m.def("take_dispatch_device_timing", &ascend_deepep::ops::TakeDispatchDeviceTiming);
     m.def("take_combine_device_timing", &ascend_deepep::ops::TakeCombineDeviceTiming);

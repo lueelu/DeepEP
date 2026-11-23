@@ -800,6 +800,11 @@ class ElasticBuffer:
         fused_layout = os.environ.get("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY", "0") if not cached_mode else "0"
         if fused_layout not in ("0", "1"):
             raise ValueError("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1")
+        simt_layout = os.environ.get("DEEPEP_CLOS_V2_SIMT_LAYOUT", "0") if not cached_mode else "0"
+        if simt_layout not in ("0", "1"):
+            raise ValueError("DEEPEP_CLOS_V2_SIMT_LAYOUT must be 0 or 1")
+        if simt_layout == "1" and fused_layout == "1":
+            raise ValueError("V2 SIMT layout requires separate layout/notify")
         host_prep = os.environ.get("DEEPEP_CLOS_NOTIFY_HOST_PREP", "0") if not cached_mode else "0"
         defer_plan = os.environ.get("DEEPEP_CLOS_NOTIFY_DEFER_PLAN", "0") if not cached_mode else "0"
         if host_prep not in ("0", "1") or defer_plan not in ("0", "1"):
@@ -855,6 +860,17 @@ class ElasticBuffer:
                             is_token_in_rank = torch.empty(
                                 (x_tensor.shape[0], self.num_ranks), device=x_tensor.device, dtype=torch.bool
                             )
+                elif simt_layout == "1":
+                    if getattr(load_native_module(), "v2_simt_layout_version", 0) != 1:
+                        raise RuntimeError("rebuild host and kernels for V2 SIMT layout")
+                    (
+                        num_tokens_per_rank,
+                        _,
+                        num_tokens_per_expert,
+                        is_token_in_rank,
+                    ) = self._native.get_dispatch_layout_v2_simt(
+                        resolved_topk_idx, resolved_num_experts, resolved_num_sms, allocation_stream_id
+                    )
                 else:
                     (
                         num_tokens_per_rank,
