@@ -99,7 +99,7 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker, bool auto_resources)
+                             int64_t udma_qps_per_worker, bool auto_resources, int64_t shmem_init_timeout_secs)
     : rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -120,6 +120,11 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
       workspace_ptr_(nullptr),
       ffts_addr_(0)
 {
+    // ConfigStore converts seconds to milliseconds using uint32_t arithmetic.
+    TORCH_CHECK(shmem_init_timeout_secs > 0 &&
+                    shmem_init_timeout_secs <= std::numeric_limits<uint32_t>::max() / 1000U,
+                "shmem_init_timeout_secs must be between 1 and 4294967 seconds");
+    shmem_init_timeout_secs_ = static_cast<uint32_t>(shmem_init_timeout_secs);
     if (udma_dispatch_peer_order < 0 || udma_dispatch_peer_order > 3 || udma_combine_peer_order < 0 ||
         udma_combine_peer_order > 3) {
         throw std::invalid_argument("invalid UDMA peer order");
@@ -429,7 +434,8 @@ void ShmemInstance::InitRuntime()
     config << "direct:" << device << ':' << rank_ << ':' << world_size_ << ':' << data_op_engine_type_ << ':'
            << shared_jetty_ << ':' << token_schedule_ << ':' << dispatch_peer_order_ << ':' << combine_peer_order_
            << ':' << ranks_per_group_ << ':' << peers_per_group_per_worker_ << ':' << workers_per_peer_ << ':'
-           << qps_per_worker_ << ':' << tuning_session_ << ':' << auto_resources_ << ':' << bootstrap_key_;
+           << qps_per_worker_ << ':' << tuning_session_ << ':' << auto_resources_ << ':' << bootstrap_key_
+           << ':' << shmem_init_timeout_secs_;
     const bool first = !deepep_has_instances();
     instance_id_ = deepep_reserve_instance(config.str().c_str());
     bool runtime_started = false;
@@ -484,6 +490,12 @@ void ShmemInstance::InitRuntime()
             init_flags = ACLSHMEMX_INIT_WITH_UNIQUEID;
         }
 
+        // Apply after the UID setter, which may initialize option_attr itself.
+        // The pinned SDK's UID bootstrap still replaces its control timeout
+        // with DEFAULT_TIMEOUT; explicit IP/port bootstrap honors this field.
+        attributes.option_attr.shm_init_timeout = shmem_init_timeout_secs_;
+        attributes.option_attr.shm_create_timeout = shmem_init_timeout_secs_;
+        attributes.option_attr.control_operation_timeout = shmem_init_timeout_secs_;
         attributes.runtime_config.sync_timeout_us = shmem_sync_timeout_us_;
         attributes.instance_id = instance_id_;
         deepep::InstanceEndpoint endpoint(attributes);
