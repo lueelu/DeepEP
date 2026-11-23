@@ -1,11 +1,13 @@
-# V2 separate SIMT layout experiment
+# V2 separate SIMT layout
 
 `DEEPEP_CLOS_V2_SIMT_LAYOUT=1` selects the new independent layout kernel for
 fresh `ElasticBuffer.dispatch`. Its AIV count follows the resolved `num_sms`
-(including the existing `num_sms=0` resolution to 32). The default is `0`, using
-the original layout and its original launch sizing. V1, cached dispatch,
-notify/dispatch schedules and combine are unchanged. Enabling this switch
-together with `DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY=1` is an error.
+(including the existing `num_sms=0` resolution to 32). This is now the default
+for separate V2 layout. Set `DEEPEP_CLOS_V2_SIMT_LAYOUT=0` to use the original
+layout and its original launch sizing. V1, cached dispatch, notify/dispatch
+schedules and combine are unchanged. Explicitly enabling
+`DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY=1` uses the fused path when the SIMT switch is
+unset; explicitly setting both switches to `1` remains an error.
 
 Rebuild both native and device libraries. The new native entry is
 `get_dispatch_layout_v2_simt`, guarded by `v2_simt_layout_version=1`; the existing

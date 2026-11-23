@@ -91,6 +91,7 @@ def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode_name, c
             return Tensor(shape, **kw)
         torch.empty = empty
         os.environ['DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY'] = '{mode}'
+        os.environ.pop('DEEPEP_CLOS_V2_SIMT_LAYOUT', None)
         os.environ['DEEPEP_CLOS_NOTIFY_HOST_PREP'] = '{host}'
         os.environ['DEEPEP_CLOS_NOTIFY_DEFER_PLAN'] = '{plan}'
         os.environ['DEEPEP_CLOS_DISPATCH_HOST_TIMING'] = '0'
@@ -101,10 +102,12 @@ def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode_name, c
         m._current_npu_stream = lambda: 'caller'
         m._use_stream_after_event = lambda *a: nullcontext()
         m._use_comm_stream = lambda *a: nullcontext()
-        m.load_native_module = lambda: SimpleNamespace(fused_layout_notify_version=1, fused_notify_pipeline_version=1)
+        m.load_native_module = lambda: SimpleNamespace(
+            fused_layout_notify_version=1, fused_notify_pipeline_version=1, v2_simt_layout_version=1)
         x, topk = Tensor(({tokens},2816)), Tensor(({tokens},8))
         mask = Tensor(({tokens},8))
         def layout(*a):
+            assert a == (topk, 256, 8, 0)
             layouts.append(a)
             return Tensor((8,)), None, Tensor((256,)), mask
         def allocate(*a):
@@ -125,7 +128,7 @@ def test_public_dispatch_routes_layout_and_preserves_eight_channels(mode_name, c
             get_buffer_size_hint=lambda *a: 0, group=None, allow_hybrid_mode=True,
             num_bytes=1, num_device_aiv=64, _udma_auto_policy=policy, transport='udma',
             _communication_stream='comm', _use_single_source_combine=False,
-            _native=SimpleNamespace(get_dispatch_layout=layout, allocate_dispatch_layout=allocate,
+            _native=SimpleNamespace(get_dispatch_layout_v2_simt=layout, allocate_dispatch_layout=allocate,
                 intranode_dispatch_with_plan=submit, intranode_dispatch_with_handle=submit))
         handle = SimpleNamespace(num_sms=8, num_experts=256, num_max_tokens_per_rank=129,
             expert_alignment=1, do_expand=False, topk_idx=topk, num_recv_tokens=0,

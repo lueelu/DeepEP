@@ -800,7 +800,13 @@ class ElasticBuffer:
         fused_layout = os.environ.get("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY", "0") if not cached_mode else "0"
         if fused_layout not in ("0", "1"):
             raise ValueError("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1")
-        simt_layout = os.environ.get("DEEPEP_CLOS_V2_SIMT_LAYOUT", "0") if not cached_mode else "0"
+        # Independent V2 layout follows dispatch's resolved core count by default.
+        # Explicit fusion owns layout itself; it needs no separate layout launch.
+        simt_layout = (
+            os.environ.get("DEEPEP_CLOS_V2_SIMT_LAYOUT", "0" if fused_layout == "1" else "1")
+            if not cached_mode
+            else "0"
+        )
         if simt_layout not in ("0", "1"):
             raise ValueError("DEEPEP_CLOS_V2_SIMT_LAYOUT must be 0 or 1")
         if simt_layout == "1" and fused_layout == "1":

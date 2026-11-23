@@ -18,6 +18,9 @@ unsupported shapes, and cached handles without a private plan/send head.
 Explicit opt-ins retain the existing validation and errors.
 
 Layout/notify fusion, HOST_PREP and DEFER_PLAN remain off by default. The default
+separate V2 layout is SIMT and follows the resolved `num_sms`; set
+`DEEPEP_CLOS_V2_SIMT_LAYOUT=0` for the original layout baseline. Explicit fusion
+still works with the SIMT switch unset. The default
 metadata tile remains automatic (128 tokens with UB-capacity fallback). The
 Buffer's `use_1g_huge_pages` default remains `False`; these optimizations do not
 enable huge pages. Communication and reduce core counts are unchanged: callers

@@ -42,14 +42,17 @@ def test_production_simt_layout_dma_and_counts(tmp_path, bits):
 
 
 @pytest.mark.parametrize("num_sms", [0, 8, 16, 32, 48, 64])
-@pytest.mark.parametrize("mode", ["unset", "0", "1", "bad", "fused", "old-library", "cached"])
+@pytest.mark.parametrize(
+    "mode", ["unset", "0", "1", "bad", "fused", "old-library", "old-library-default", "cached", "cached-default"]
+)
 def test_v2_layout_inherits_dispatch_cores_and_keeps_baseline(num_sms, mode):
     from tests.api.test_clos_compatibility import run_host
 
     resolved = num_sms or 32
-    cached = mode == "cached"
-    flag = "1" if mode in ("1", "fused", "old-library", "cached") else mode
-    error = "ValueError" if mode in ("bad", "fused") else "RuntimeError" if mode == "old-library" else "Submitted"
+    cached = mode in ("cached", "cached-default")
+    flag = "1" if mode in ("1", "fused", "old-library", "cached") else "unset" if mode.endswith("-default") else mode
+    old_library = mode.startswith("old-library")
+    error = "ValueError" if mode in ("bad", "fused") else "RuntimeError" if old_library else "Submitted"
     run_host(f"""
         import os
         from contextlib import nullcontext
@@ -71,7 +74,7 @@ def test_v2_layout_inherits_dispatch_cores_and_keeps_baseline(num_sms, mode):
         m._current_npu_stream = lambda: 'caller'
         m._use_stream_after_event = lambda *a: nullcontext()
         m._use_comm_stream = lambda *a: nullcontext()
-        m.load_native_module = lambda: SimpleNamespace(v2_simt_layout_version={int(mode != "old-library")})
+        m.load_native_module = lambda: SimpleNamespace(v2_simt_layout_version={int(not old_library)})
         x, topk, mask = Tensor((129,2816)), Tensor((129,8)), Tensor((129,8))
         calls = []
         def layout(*args):
@@ -99,7 +102,7 @@ def test_v2_layout_inherits_dispatch_cores_and_keeps_baseline(num_sms, mode):
                 topk_idx=None if {cached} else topk, num_experts=256, num_sms={num_sms}, do_expand=False)
         except {error}: pass
         else: raise AssertionError('expected {error}')
-        if {mode!r} == '1': assert calls == [('simt', (topk, 256, {resolved}, 0))]
-        elif {mode!r} in ('unset', '0'): assert calls == [('old', (topk, 256, 0))]
+        if {mode!r} in ('unset', '1'): assert calls == [('simt', (topk, 256, {resolved}, 0))]
+        elif {mode!r} == '0': assert calls == [('old', (topk, 256, 0))]
         else: assert calls == []
     """)
