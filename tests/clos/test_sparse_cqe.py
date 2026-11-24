@@ -79,6 +79,74 @@ def test_sender_layout_and_coverage():
         assert schedule.index("sender.Quiet()") < schedule.index("aclshmemx_sync_vec_all()")
 
 
+def test_combine_fast_wqe_equivalence(tmp_path):
+    """Compile-time byte equality, including split weight pairs and QP header slots."""
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("C++17 compiler required")
+    text = (ROOT / "csrc/direct/kernels/combine/udma_combine_sender.h").read_text()
+    functions = []
+    for name in ("BuildCombineWqes", "BuildCombineWqesFast"):
+        body = cpp_functions(text, name)
+        end = body.rfind(")", 0, body.index("{"))
+        body = (body[:end] + ", uint32_t tid" + body[end:]).replace("threadIdx.x", "tid")
+        body = body.replace(
+            "reinterpret_cast<__ubuf__ int32_t*>(span[0])[position / fields * index_step]",
+            "index_at(span[0], position / fields * index_step)",
+        ).replace("reinterpret_cast<__ubuf__ int32_t*>(span[0])[index]", "index_at(span[0], index)")
+        functions.append(body)
+    source = r"""
+#include <cstdint>
+#define __simt_vf__ constexpr
+#define __launch_bounds__(n)
+#define __ubuf__
+#define __gm__
+namespace __asc_simt_vf { void __trap(); }
+constexpr int32_t index_at(uint64_t seed, unsigned i) { return (seed+i*7)%1024; }
+// FUNCTIONS
+template<bool Weighted> constexpr bool check(unsigned count,unsigned width,unsigned start_field) {
+    uint64_t expected[256]{}, actual[256]{}, spans[128]{}, headers[64*16]{}, bases[64]{};
+    for(unsigned i=0;i<1024;++i) headers[i]=0x100000000ULL+i;
+    for(unsigned p=0;p<64;++p) bases[p]=0x200000000ULL+p*123456;
+    unsigned n=0;
+    for(unsigned begin=0;begin<count;begin+=width,++n) {
+        unsigned len=count-begin<width?count-begin:width;
+        spans[n*4]=n*13;
+        spans[n*4+1]=(uint64_t(len)<<32)|(17+n*19);
+        spans[n*4+2]=(uint64_t(start_field)<<32)|((n*11)%64);
+        spans[n*4+3]=begin;
+    }
+    for(unsigned tid=0;tid<32;++tid) {
+        BuildCombineWqes(expected,spans,headers,bases,10000,20000,64,128,5632,32,
+                         5664,64,1024,Weighted?2:1,n,count,1,1,0,0,0,tid);
+        BuildCombineWqesFast<Weighted>(actual,spans,headers,bases,10000,20000,64,128,5632,32,
+                                      5664,64,1024,n,count,tid);
+    }
+    for(unsigned i=0;i<256;++i) if(expected[i]!=actual[i])return false;
+    return true;
+}
+template<bool Weighted> constexpr bool matrix(unsigned width) {
+    for(unsigned count=0;count<=32;++count)
+        for(unsigned field=0;field<(Weighted?2U:1U);++field)
+            if(!check<Weighted>(count,width,field))return false;
+    return true;
+}
+static_assert(matrix<false>(1) && matrix<true>(1));
+static_assert(matrix<false>(3) && matrix<true>(3));
+static_assert(matrix<false>(16) && matrix<true>(16));
+static_assert(matrix<false>(32) && matrix<true>(32));
+"""
+    path = tmp_path / "combine_fast_wqes.cpp"
+    path.write_text(source.replace("// FUNCTIONS", "\n".join(functions)))
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "combine_fast.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_payload_wqe_headers_and_addresses(tmp_path):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if not compiler:

@@ -347,12 +347,12 @@ def test_pack_and_local_copy_pipeline(tmp_path):
         + "\n    if (uintptr_t(src.data)>=plan_begin && uintptr_t(src.data)<plan_end) plan_bytes+=copy.bytes;",
     )
     harness = harness.replace(
-        "template <HardEvent>\nvoid SetFlag(int)\n{\n}",
+        cpp_functions(harness, "SetFlag").strip(),
         "static int credits[16][8]{};\nstatic unsigned event_sets;\n"
         "template <HardEvent E> void SetFlag(int e) { assert(!credits[int(E)][e]); credits[int(E)][e]=1; ++event_sets; }",
     )
     harness = harness.replace(
-        "template <HardEvent>\nvoid WaitFlag(int)\n{\n}",
+        cpp_functions(harness, "WaitFlag").strip(),
         "template <HardEvent E> void WaitFlag(int e) { assert(credits[int(E)][e]==1); credits[int(E)][e]=0; }",
     )
     harness += r"""
@@ -380,6 +380,7 @@ namespace ascend_deepep {
             compiler,
             "-std=c++17",
             "-O2",
+            "-UNDEBUG",
             "-I",
             str(ROOT / "csrc/direct"),
             str(path),

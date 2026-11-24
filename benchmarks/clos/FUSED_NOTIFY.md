@@ -105,6 +105,28 @@ These presets are ablations, not an assertion that every production default is
 active. Use `--help` for constraints and defaults. `combine_queue_diagnostics.py`
 is the shared script's combine helper, not a separate launch entry point.
 
+### Combine preparation and copy A/B
+
+Two independent switches default to `0` and are read on each combine call:
+
+| Environment variable | When set to `1` |
+| --- | --- |
+| `DEEPEP_CLOS_COMBINE_WQE_FAST` | Specialize ordinary contiguous-row WQE construction; single-span batches skip lookup, multi-span batches use binary search |
+| `DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER` | Pipeline compact local copies through two 64 KiB UB slots |
+
+Compare `(0,0)`, `(1,0)`, `(0,1)`, `(1,1)` in forward and reverse order with
+one Buffer per rank. Rebuild both Host and kernel because the tiling grows.
+Verify the effective `combine_wqe_fast` and `combine_self_double_buffer` fields;
+unsupported paths retain the baseline. WQE fast mode excludes token scheduling,
+early-single and aggregate pipeline; double buffering requires compact self rows.
+Neither switch changes sender policy, P/W/Q, visit, WQE batch size, weight
+transport, local row ownership, final flags or quiet. Do not change compact-self
+or reduce cores between groups. Run zero-tolerance precision before timing;
+report communication and full API mean/P50/P95 separately, with diagnostics off.
+Use an independent diagnostic pass for WQE build/submit, local copy, incoming
+wait and quiet. CPU equivalence/event tests do not establish NPU ordering or
+performance; both still require device validation.
+
 ## Interpreting results
 
 The scripts run precision checks and forward/reverse comparisons with one Buffer

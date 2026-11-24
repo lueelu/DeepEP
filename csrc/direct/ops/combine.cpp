@@ -383,6 +383,16 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         !expanded_x.has_value() &&
         x.scalar_type() == torch::kBFloat16 && workspace.x_row_stride == hidden_bytes &&
         (!topk_weights.has_value() || workspace.topk_weights_row_stride == topk_weights_row_bytes);
+    const char* wqe_fast = std::getenv("DEEPEP_CLOS_COMBINE_WQE_FAST");
+    TORCH_CHECK(!wqe_fast || std::strcmp(wqe_fast, "0") == 0 || std::strcmp(wqe_fast, "1") == 0,
+                "DEEPEP_CLOS_COMBINE_WQE_FAST must be 0 or 1");
+    tiling.combine_wqe_fast = wqe_fast && std::strcmp(wqe_fast, "1") == 0 &&
+        use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
+        !pipeline_chunk_tokens && !expanded_x.has_value();
+    const char* self_db = std::getenv("DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER");
+    TORCH_CHECK(!self_db || std::strcmp(self_db, "0") == 0 || std::strcmp(self_db, "1") == 0,
+                "DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER must be 0 or 1");
+    tiling.combine_self_double_buffer = self_db && std::strcmp(self_db, "1") == 0 && tiling.compact_self_rows;
     tiling.x_buffer_offset = static_cast<uint64_t>(workspace.x_buffer_offset);
     tiling.topk_weights_buffer_offset = static_cast<uint64_t>(workspace.topk_weights_buffer_offset);
     tiling.udma_completion_signal_offset = static_cast<uint64_t>(workspace.udma_completion_signal_offset);

@@ -7,6 +7,10 @@
 #include <tuple>
 #include <vector>
 
+#ifdef NDEBUG
+#error "CPU oracle assertions must remain enabled"
+#endif
+
 #define __aicore__
 #define __gm__
 #define __ubuf__
@@ -20,7 +24,9 @@
 using GM_ADDR = uint8_t*;
 using namespace ascend_deepep;
 using namespace ascend_deepep::udma;
-constexpr int EVENT_ID0 = 0, EVENT_ID2 = 2, EVENT_ID5 = 5, EVENT_ID6 = 6, EVENT_ID7 = 7;
+constexpr int EVENT_ID0 = 0, EVENT_ID1 = 1, EVENT_ID2 = 2, EVENT_ID5 = 5, EVENT_ID6 = 6, EVENT_ID7 = 7;
+static bool audit_copy_events = false;
+static bool copy_credit[2]{};
 constexpr uint32_t kHeadersOffset = kBatchWqes * (kWqeBytes + 4U * sizeof(uint64_t));
 static unsigned list_loads;
 static unsigned list_elements;
@@ -33,13 +39,19 @@ inline uint64_t GetSystemCycle()
     static uint64_t tick = 1000;
     return ++tick;
 }
-template <HardEvent>
-void SetFlag(int)
+template <HardEvent Event>
+void SetFlag(int id)
 {
+    if constexpr (Event == HardEvent::MTE3_MTE2) {
+        if (audit_copy_events) { assert(id < 2 && !copy_credit[id]); copy_credit[id] = true; }
+    }
 }
-template <HardEvent>
-void WaitFlag(int)
+template <HardEvent Event>
+void WaitFlag(int id)
 {
+    if constexpr (Event == HardEvent::MTE3_MTE2) {
+        if (audit_copy_events) { assert(id < 2 && copy_credit[id]); copy_credit[id] = false; }
+    }
 }
 template <class T>
 struct GlobalTensor {
@@ -419,10 +431,14 @@ void CheckCopyAndReduction()
                                 }
                             }
                             Resource resource;
-                            for (unsigned core = 0; core < 8; ++core)
-                                CopyCompactSelf(resource, x.data(), weights.data(), reinterpret_cast<GM_ADDR>(rp.data()),
-                                                output.data(), td, core);
-                            assert(output == expected);  // Includes untouched remote partitions and guard bytes.
+                            for (bool db : {false, true}) {
+                                td.combine_self_double_buffer = db;
+                                std::fill(output.begin(), output.end(), 0xAB);
+                                for (unsigned core = 0; core < 8; ++core)
+                                    CopyCompactSelf(resource, x.data(), weights.data(), reinterpret_cast<GM_ADDR>(rp.data()),
+                                                    output.data(), td, core);
+                                assert(output == expected);  // Includes untouched remote partitions and guard bytes.
+                            }
                             AscendC::GlobalTensor<int32_t> channels;
                             channels.SetGlobalBuffer(cp.data());
                             for (unsigned reduce_cores : {8U, 32U, 48U, 64U}) {
@@ -572,6 +588,14 @@ void CheckHostGate()
         // PRODUCTION_GATE
         assert(tiling.compact_self_rows == (exclusion == 0 || exclusion == 7 || exclusion == 8 ||
                                           exclusion == 9 || exclusion == 13));
+        for (const char* wqe_fast : {static_cast<const char*>(nullptr), "0", "1"})
+            for (const char* self_db : {static_cast<const char*>(nullptr), "0", "1"}) {
+                // PRODUCTION_OPT_GATES
+                assert(tiling.combine_wqe_fast == (wqe_fast && wqe_fast[0]=='1' &&
+                       (exclusion==0 || exclusion>=7)));
+                assert(tiling.combine_self_double_buffer ==
+                       (self_db && self_db[0]=='1' && tiling.compact_self_rows));
+            }
     }
 }
 void CheckTrace()
@@ -597,8 +621,31 @@ void CheckTrace()
     off.Save(resource, 0);
     assert(output[0] == 0xdead);
 }
+void CheckCopyTiles()
+{
+    constexpr unsigned tile = 64U * 1024U;
+    for (bool db : {false, true})
+        for (unsigned bytes : {0U, 1U, 31U, tile-1, tile, tile+1, 2*tile, 2*tile+17, 5*tile+31}) {
+            Resource resource;
+            std::fill(resource.ub.begin(), resource.ub.end(), 0x12345678);
+            std::vector<uint8_t> input(bytes+64), output(bytes+64, 0xAB);
+            for (unsigned i=0;i<input.size();++i) input[i]=(i*17)%251;
+            auto expected=output;
+            std::copy_n(input.data()+3, bytes, expected.data()+7);
+            audit_copy_events=true;
+            // Reuse the same slots and event IDs for the next field/call.
+            for (unsigned repeat=0;repeat<3;++repeat) {
+                CopySelfField(resource,input.data()+3,output.data()+7,bytes,db);
+                assert(output==expected && !copy_credit[0] && !copy_credit[1]);
+            }
+            audit_copy_events=false;
+            for (unsigned i=0;i<kBatchWqes*kWqeBytes/8;++i) assert(resource.ub[i]==0x12345678);
+        }
+}
+
 int main()
 {
+    CheckCopyTiles();
     CheckTrace();
     CheckCopyAndReduction();
     CheckCachedDispatch();

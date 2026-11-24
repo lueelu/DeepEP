@@ -69,6 +69,49 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqes(
     __asc_simt_vf::__trap();
 }
 
+// Ordinary contiguous input rows: indices have already been loaded by AIV to UB.
+// Keep descriptor order and every WQE byte identical to the general builder.
+template <bool Weighted>
+__simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesFast(
+    __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers, __ubuf__ uint64_t* remote_bases,
+    uint64_t x, uint64_t weights, uint64_t x_offset, uint64_t weights_offset, uint32_t x_bytes, uint32_t weight_bytes,
+    uint32_t x_stride, uint32_t weight_stride, uint32_t token_capacity, uint32_t span_count, uint32_t count)
+{
+    const uint32_t i = threadIdx.x;
+    if (i >= count) return;
+    if (!span_count) { __asc_simt_vf::__trap(); return; }
+    // Full single-span batches skip lookup. Short multi-span batches have
+    // strictly increasing starts, so use a bounded binary search.
+    uint32_t first = 0, last = span_count;
+    while (first + 1U < last) {
+        const uint32_t mid = first + (last - first) / 2U;
+        if (static_cast<uint32_t>(spans[mid * 4U + 3U]) <= i) first = mid;
+        else last = mid;
+    }
+    auto* span = spans + first * 4U;
+    const uint32_t begin = static_cast<uint32_t>(span[3]);
+    const uint32_t length = static_cast<uint32_t>(span[1] >> 32U);
+    if (i < begin || i - begin >= length) { __asc_simt_vf::__trap(); return; }
+    const uint32_t peer = static_cast<uint32_t>(span[2]);
+    const uint32_t position = static_cast<uint32_t>(span[2] >> 32U) + i - begin;
+    const uint32_t index = Weighted ? position >> 1U : position;
+    const uint64_t row = uint64_t(static_cast<uint32_t>(span[1])) + index;
+    const int32_t token = reinterpret_cast<__ubuf__ int32_t*>(span[0])[index];
+    if (token < 0 || static_cast<uint32_t>(token) >= token_capacity) { __asc_simt_vf::__trap(); return; }
+    const bool weight = Weighted && (position & 1U);
+    auto* header = headers + peer * 2U * 8U;
+    auto* wqe = wqes + i * 8U;
+    wqe[0] = header[0];
+    wqe[1] = header[1];
+    wqe[2] = header[2];
+    wqe[3] = header[3];
+    wqe[4] = header[4];
+    wqe[5] = remote_bases[peer] + (weight ? weights_offset : x_offset) +
+             uint64_t(token) * (weight ? weight_stride : x_stride);
+    wqe[6] = weight ? weight_bytes : x_bytes;
+    wqe[7] = (weight ? weights : x) + row * (weight ? weight_bytes : x_bytes);
+}
+
 template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, class Trace = DisabledDispatchDeviceTrace>
 class CombineSenderT : public SenderT<Capacity, Qps, Trace> {
     using Base = SenderT<Capacity, Qps, Trace>;
@@ -167,16 +210,21 @@ public:
         const uint64_t rank_slot = uint64_t(td_.rank) * td_.token_capacity;
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
-        asc_vf_call<BuildCombineWqes>(
-            dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
-            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
-            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
-            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kCombineBasesOffset), x_, weights_,
-            td_.x_buffer_offset + rank_slot * td_.x_row_stride,
-            td_.topk_weights_buffer_offset + rank_slot * td_.topk_weights_row_stride, td_.hidden * td_.x_element_bytes,
-            td_.num_topk * uint32_t(sizeof(float)), td_.x_row_stride, td_.topk_weights_row_stride, td_.token_capacity,
-            fields_, spans_, rows_pending_, row_step_, index_step_,
-            td_.expanded_x, td_.single_source_slots, td_.num_expanded_tokens);
+        if (td_.combine_wqe_fast && row_step_ == 1U && index_step_ == 1U && !td_.single_source_slots) {
+            if (fields_ == 2U) BuildFast<true>(rank_slot);
+            else BuildFast<false>(rank_slot);
+        } else {
+            asc_vf_call<BuildCombineWqes>(
+                dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kCombineBasesOffset), x_, weights_,
+                td_.x_buffer_offset + rank_slot * td_.x_row_stride,
+                td_.topk_weights_buffer_offset + rank_slot * td_.topk_weights_row_stride, td_.hidden * td_.x_element_bytes,
+                td_.num_topk * uint32_t(sizeof(float)), td_.x_row_stride, td_.topk_weights_row_stride, td_.token_capacity,
+                fields_, spans_, rows_pending_, row_step_, index_step_,
+                td_.expanded_x, td_.single_source_slots, td_.num_expanded_tokens);
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         Base::FinishWqeBuild(built);
@@ -209,6 +257,20 @@ public:
     }
 
 private:
+    template <bool Weighted>
+    __aicore__ void BuildFast(uint64_t rank_slot)
+    {
+        asc_vf_call<BuildCombineWqesFast<Weighted>>(
+            dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
+            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
+            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
+            reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kCombineBasesOffset), x_, weights_,
+            td_.x_buffer_offset + rank_slot * td_.x_row_stride,
+            td_.topk_weights_buffer_offset + rank_slot * td_.topk_weights_row_stride,
+            td_.hidden * td_.x_element_bytes, td_.num_topk * uint32_t(sizeof(float)),
+            td_.x_row_stride, td_.topk_weights_row_stride, td_.token_capacity, spans_, rows_pending_);
+    }
+
     const CombineTilingData& td_;
     uint64_t x_, weights_;
     uint32_t row_step_, index_step_, fields_;

@@ -12,15 +12,43 @@ namespace ascend_deepep::udma {
 // have element alignment; the UB tile is 32-byte aligned. Drain both MTEs
 // before giving the shared scratch back to the sender.
 template <class Resource>
-__aicore__ inline void CopySelfField(Resource& resource, GM_ADDR source, GM_ADDR destination, uint64_t bytes)
+__aicore__ inline void CopySelfField(Resource& resource, GM_ADDR source, GM_ADDR destination, uint64_t bytes,
+                                    bool double_buffer = false)
 {
     constexpr uint32_t tile = 64U * 1024U;
     constexpr uint32_t offset = kBatchWqes * kWqeBytes;
-    static_assert(offset + tile <= platform::kKernelUbBytes);
+    // Sender has published all WQEs before entering this function. Keep its
+    // 2 KiB WQE/final-signal scratch intact; the old span/index area is dead.
+    // Two aligned 64 KiB slots end at byte 133120, below the kernel UB budget.
+    static_assert(offset + 2U * tile <= platform::kKernelUbBytes);
     auto scratch = resource.template GetBufferByByte<uint8_t>(offset);
     AscendC::GlobalTensor<uint8_t> input, output;
     input.SetGlobalBuffer(source);
     output.SetGlobalBuffer(destination);
+    if (double_buffer) {
+        bool pending[2] = {false, false};
+        uint32_t slot = 0;
+        for (uint64_t i = 0; i < bytes; i += tile) {
+            const auto event = slot == 0 ? EVENT_ID0 : EVENT_ID1;
+            // Only wait for a real previous store, including zero/one-tile tails.
+            if (pending[slot]) AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+            const uint32_t n = bytes - i < tile ? uint32_t(bytes - i) : tile;
+            AscendC::DataCopyExtParams copy{1, n, 0, 0, 0};
+            auto buffer = scratch[slot * tile];
+            AscendC::DataCopyPad(buffer, input[i], copy, AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+            AscendC::DataCopyPad(output[i], buffer, copy);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+            pending[slot] = true;
+            slot ^= 1U;
+        }
+        if (pending[0]) AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        if (pending[1]) AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+        return;
+    }
     for (uint64_t i = 0; i < bytes; i += tile) {
         const uint32_t n = bytes - i < tile ? uint32_t(bytes - i) : tile;
         AscendC::DataCopyExtParams copy{1, n, 0, 0, 0};
@@ -50,11 +78,11 @@ __aicore__ inline void CopyCompactSelf(Resource& resource, GM_ADDR x, GM_ADDR we
     const uint32_t end = uint64_t(rows) * (core - first + 1) / workers;
     const uint64_t src = base + begin, dst = uint64_t(td.rank) * td.token_capacity + begin;
     CopySelfField(resource, x + src * td.x_row_stride, workspace + td.x_buffer_offset + dst * td.x_row_stride,
-                  uint64_t(end - begin) * td.x_row_stride);
+                  uint64_t(end - begin) * td.x_row_stride, td.combine_self_double_buffer != 0);
     if (td.has_topk_weights)
         CopySelfField(resource, weights + src * td.topk_weights_row_stride,
                       workspace + td.topk_weights_buffer_offset + dst * td.topk_weights_row_stride,
-                      uint64_t(end - begin) * td.topk_weights_row_stride);
+                      uint64_t(end - begin) * td.topk_weights_row_stride, td.combine_self_double_buffer != 0);
 }
 
 template <class Resource>
