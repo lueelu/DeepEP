@@ -125,15 +125,6 @@ private:
         } while (true);
     }
 
-    __aicore__ inline void GmSignalWaitBarrier(__gm__ int32_t* sig_addr, int32_t cmp_val)
-    {
-        do {
-            if (ReadGmByPassDCache(sig_addr) == cmp_val) {
-                return;
-            }
-        } while (true);
-    }
-
     TBuf<> CrossRankSyncBuf_;
     TBuf<> PrevSumBuf_;
     TBuf<> CopyTempBuf_;
@@ -732,18 +723,8 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CrossRankSyncInWorldSize
 {
     MegaMoeTrainTimerWaitScope timerWait(g_coreType == AscendC::AIV ? timer_ : nullptr,
                                          MegaMoeTrainTimer::AIV_SYNC_WAIT);
-    __gm__ int32_t* syncRank = (__gm__ int32_t*)(params_.peermemInfo.ptrBase);
-    __gm__ int32_t* syncCount = (__gm__ int32_t*)(params_.peermemInfo.ptrBase + MegaMoeBF16Impl::kPeerSyncCountOffset);
-    int count = *(syncCount + aivCoreIdx_ * 16) + 1;
-    for (int i = aivCoreIdx_; i < worldSize_; i += blockAivNum_) {
-        __gm__ int32_t* syncRemoteAddr = (__gm__ int32_t*)(bf16WinRankAddr[i]) + rankId_ * 16;
-        WriteGmByPassDCache(syncRemoteAddr, count);
-        auto syncCheck = syncRank + i * 16;
-        GmSignalWaitBarrier(syncCheck, count);
-    }
-    PipeBarrier<PIPE_ALL>();
-    SyncAll<true>();
-    *(syncCount + aivCoreIdx_ * 16) = count;
+    Bf16CrossRankSyncInWorldSize(bf16WinRankAddr, params_.peermemInfo.ptrBase, MegaMoeBF16Impl::kPeerSyncCountOffset,
+                                 rankId_, worldSize_, {aivCoreIdx_, blockAivNum_});
 }
 
 template <typename TopkWeightT>

@@ -185,15 +185,6 @@ private:
         return dim0 * perRankStridesInTokenPerExpert_ + dim1 * expertPerRank_ + dim2;
     }
 
-    __aicore__ inline void GmSignalWaitBarrier(__gm__ int32_t* sig_addr, int32_t cmp_val)
-    {
-        do {
-            if (ReadGmByPassDCache(sig_addr) == cmp_val) {
-                return;
-            }
-        } while (true);
-    }
-
     // P1/P2 own three work tiles at UB offset zero. P0 reuses the disjoint
     // staging region above them, sequentially on each AIV.
     static constexpr uint32_t BW_TILE_BYTES =
@@ -747,21 +738,8 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::CrossRankSyncInWorldSiz
 {
     MegaMoeTrainTimerWaitScope timerWait(g_coreType == AscendC::AIV ? timer_ : nullptr,
                                          MegaMoeTrainTimer::AIV_SYNC_WAIT);
-    if constexpr (g_coreType == AscendC::AIC) {
-        return;
-    }
-    __gm__ int32_t* syncRank = (__gm__ int32_t*)(params_.peermemInfo.ptrBase);
-    __gm__ int32_t* syncCount = (__gm__ int32_t*)(params_.peermemInfo.ptrBase + MegaMoeBF16Impl::kPeerSyncCountOffset);
-    int count = *(syncCount + aivCoreIdx_ * 16) + 1;
-    for (int i = aivCoreIdx_; i < static_cast<int>(worldSize_); i += static_cast<int>(blockAivNum_)) {
-        __gm__ int32_t* syncRemoteAddr = (__gm__ int32_t*)(bf16WinRankAddr[i]) + rankId_ * 16;
-        WriteGmByPassDCache(syncRemoteAddr, count);
-        auto syncCheck = syncRank + i * 16;
-        GmSignalWaitBarrier(syncCheck, count);
-    }
-    PipeBarrier<PIPE_ALL>();
-    SyncAll<true>();
-    *(syncCount + aivCoreIdx_ * 16) = count;
+    Bf16CrossRankSyncInWorldSize(bf16WinRankAddr, params_.peermemInfo.ptrBase, MegaMoeBF16Impl::kPeerSyncCountOffset,
+                                 rankId_, worldSize_, {aivCoreIdx_, blockAivNum_});
 }
 
 template <typename TopkWeightT>

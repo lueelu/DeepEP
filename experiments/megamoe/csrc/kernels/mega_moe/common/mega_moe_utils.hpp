@@ -647,6 +647,27 @@ __aicore__ inline void AdvanceInputEpochLocally(GM_ADDR rankSyncInWorldPtr, cons
     WriteGmByPassDCache(counter, ReadGmByPassDCache(counter) + 1);
 }
 
+// BF16 publishes the next local epoch after every AIV has completed the peer handshake.
+__aicore__ inline void Bf16CrossRankSyncInWorldSize(GM_ADDR const* rankWindows, GM_ADDR localWindow,
+                                                    uint64_t counterOffset, uint32_t rankId, uint32_t worldSize,
+                                                    const AivJobContext& job)
+{
+    if constexpr (g_coreType == AIC) {
+        return;
+    }
+    auto* arrivals = reinterpret_cast<__gm__ int32_t*>(localWindow);
+    auto* counter = reinterpret_cast<__gm__ int32_t*>(localWindow + counterOffset) + job.jobIndex * INT_CACHELINE;
+    const int32_t next = *counter + 1;
+    for (uint32_t peer = job.jobIndex; peer < worldSize; peer += job.totalJobs) {
+        auto* remote = reinterpret_cast<__gm__ int32_t*>(rankWindows[peer]) + rankId * INT_CACHELINE;
+        WriteGmByPassDCache(remote, next);
+        GmSignalWaitBarrier(arrivals + peer * INT_CACHELINE, next);
+    }
+    PipeBarrier<PIPE_ALL>();
+    SyncAll<true>();
+    *counter = next;
+}
+
 // 两种同步模式共用跨卡握手；逻辑分工和物理计数槽由调用方明确指定。
 __aicore__ inline int32_t CrossRankHandshakeInWorldSize(GM_ADDR rankSyncInWorldPtr, uint32_t rankId, uint32_t worldSize,
                                                         const AivJobContext& syncJob, __gm__ int32_t* syncCount)
