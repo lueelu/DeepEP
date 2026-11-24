@@ -493,7 +493,7 @@ def publish_source_native(destination):
     print(f"Prepared source native links in {package}")
 
 
-def bundle_kernel_sources(destination, shmem_root):
+def bundle_kernel_sources(destination, configuration):
     """Ship the device headers the installed wheel compiles through DeepJIT."""
     kernel_src = destination / "_kernel_src"
     csrc_out = kernel_src / "csrc"
@@ -507,11 +507,28 @@ def bundle_kernel_sources(destination, shmem_root):
         target = include_out / path.relative_to(ROOT / "deep_ep" / "include")
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
-    shmem_source = Path(shmem_root)
+    shmem_source = Path(configuration["SHMEM_ROOT"])
     for sub in ("include", "src"):
         source = shmem_source / sub
         if source.is_dir():
             shutil.copytree(source, kernel_src / "shmem" / sub, dirs_exist_ok=True)
+    if not configuration.get("megamoe", {}).get("enabled", False):
+        return
+    # MegaMoE device code is compiled on demand; its headers and the pinned
+    # CATLASS closure travel with the wheel instead of a prebuilt library.
+    mega_source = ROOT / "experiments/megamoe/csrc"
+    mega_out = kernel_src / "megamoe" / "csrc"
+    for path in mega_source.rglob("*"):
+        if path.is_file() and path.suffix in {".h", ".hpp"}:
+            target = mega_out / path.relative_to(mega_source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+    catlass = Path(configuration["CATLASS_ROOT"])
+    for sub in ("include", "examples/common"):
+        source = catlass / sub
+        if not source.is_dir():
+            raise RuntimeError(f"MegaMoE runtime compilation requires CATLASS at {source}")
+        shutil.copytree(source, kernel_src / "megamoe" / "catlass" / sub, dirs_exist_ok=True)
 
 
 class CMakeBuild(build_ext):
@@ -593,7 +610,7 @@ class CMakeBuild(build_ext):
         info["compiler"] = json.loads((directory / "compiler-info.json").read_text())
         info.update(json.loads((directory / "capabilities.json").read_text(encoding="utf-8")))
         info["shmem_runtime"] = bundle_shmem_runtime(configuration["SHMEM_ROOT"], destination)
-        bundle_kernel_sources(destination, configuration["SHMEM_ROOT"])
+        bundle_kernel_sources(destination, configuration)
         (destination / "_build_info.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

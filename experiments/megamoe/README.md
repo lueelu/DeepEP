@@ -176,6 +176,12 @@ python -m pip show ascend-deepep
 wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBRARY_PATH`。
 基础包的 `pip wheel` 默认关闭 MegaMoE，详见[构建文档](../../docs/build.md)。
 
+MegaMoE 的设备代码不再预编译进 wheel：首次调用时由 DeepJIT 使用 wheel 内的
+`deep_ep/_kernel_src/megamoe`（含 CATLASS 头文件闭包）和当前 CANN 的 `bisheng`
+在运行期编译，并按变体缓存到 DeepJIT 的磁盘缓存目录。因此运行环境必须与构建环境
+使用同一 CANN 版本，并保留 `tools/bisheng_compiler/bin/bisheng`；首次调用会包含一次
+编译耗时，之后复用缓存。启动流程与预编译版本相同，不需要额外开关。
+
 ## 3. 多机测试
 
 ### 配置与启动

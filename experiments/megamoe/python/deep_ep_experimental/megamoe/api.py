@@ -33,8 +33,18 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 10:
+    if getattr(extension, "api_protocol", None) != 11:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
+    # Device code is compiled on demand from the sources bundled in the core
+    # wheel, so bind the runtime compiler to that installation exactly once.
+    import os
+    from pathlib import Path
+
+    import deep_ep
+
+    extension.init_megamoe_jit(
+        str(Path(deep_ep.__file__).resolve().parent), os.environ.get("ASCEND_HOME_PATH", "")
+    )
     return extension
 
 

@@ -327,7 +327,8 @@ def test_elastic_wheel_requires_device_library(tmp_path, capability, shmem_wheel
 
 
 @pytest.mark.parametrize(
-    "missing", [None, "deep_ep/libdeepep_kernels.so", "deep_ep_experimental/megamoe/libmegamoe_kernel.so"]
+    "missing", [None, "deep_ep/libdeepep_kernels.so",
+                "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_entry.hpp"]
 )
 def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
@@ -344,8 +345,9 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
         "deep_ep_experimental/megamoe/benchmark.py",
         "deep_ep_experimental/megamoe/configs/smoke.json",
         "deep_ep_experimental/megamoe/_C.fake.so",
-        "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
-        "deep_ep_experimental/megamoe/libmegamoe_urma_kernel.so",
+        "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_entry.hpp",
+        "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
+        "deep_ep/_kernel_src/megamoe/catlass/include/catlass/catlass.hpp",
         "deep_ep_experimental/megamoe/cann.LICENSE",
     }
     wheel = tmp_path / "combined.whl"
@@ -561,9 +563,14 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     pybind11.get_cmake_dir = lambda: pybind11_cmake_dir
     monkeypatch.setitem(sys.modules, "pybind11", pybind11)
 
+    # The runtime-compiled MegaMoE payload needs a real CATLASS closure to ship.
+    catlass = tmp_path / "catlass"
+    for sub in ("include/catlass", "examples/common"):
+        (catlass / sub).mkdir(parents=True)
+    (catlass / "include/catlass/catlass.hpp").write_text("// catlass\n")
     configuration = {
         "megamoe": {"enabled": beta, "timer": timer},
-        "CATLASS_ROOT": "/private/catlass" if beta else "",
+        "CATLASS_ROOT": str(catlass) if beta else "",
         "source_sha256": "current",
         "source_version": "1",
         "cmake_path": "/tools/cmake",

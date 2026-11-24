@@ -1,10 +1,11 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-# MegaMoE is an optional Torch-bound extension. The core _C keeps its original ABI.
+# MegaMoE is an optional Torch-bound extension. Its device code is compiled at
+# runtime through DeepJIT from the kernel sources shipped in the wheel, so this
+# target only builds the Host module; no Bisheng device library is produced.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Headers.cmake")
 ascend_deepep_find_mega_moe_headers()
-find_program(BISHENG bisheng PATHS "${ASCEND_HOME_PATH}/tools/bisheng_compiler/bin" NO_DEFAULT_PATH REQUIRED)
 execute_process(COMMAND "${Python_EXECUTABLE}" -c
     "import torch,torch_npu; from pathlib import Path; print(torch.utils.cmake_prefix_path); print(Path(torch_npu.__file__).parent)"
     OUTPUT_VARIABLE framework_paths OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
@@ -31,69 +32,46 @@ set(beta_include
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}"
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api"
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api/include")
-set(kernel_flags
-    -O2 -std=c++17 -xasc --npu-arch=dav-3510 --cce-auto-infer-kernel-type=false
-    --cce-auto-sync=off --cce-fatobj-link -shared -fPIC -Wl,-soname,libmegamoe_kernel.so
-    -DCATLASS_ARCH=3510 -DASCEND_DEEPEP_DIRECT_TENSOR_INPUT=1
-    -DASCEND_DEEPEP_DISABLE_MEGA_MOE_EXCEPTION_DUMP=1 -DENABLE_TENSOR_API
-    -DNOT_DYNAMIC_COMPILE -DHIGH_PERFORMANCE=1 -DDETERMINISTIC_MODE=0 -DL2_CACHE_HINT)
-if(DEEPEP_MEGAMOE_TIMER)
-    list(APPEND kernel_flags -DDEEPEP_MEGAMOE_TIMER=1)
-endif()
-foreach(path IN LISTS beta_include)
-    list(APPEND kernel_flags "-I${path}")
+
+# Content identity of everything the runtime compiler will read. It feeds the
+# DeepJIT cache key so a wheel with different kernel sources never reuses a
+# binary compiled from the previous tree. Paths are stripped to stay
+# machine-independent; the flags themselves are hashed by DeepJIT separately.
+set(_mega_jit_identity "")
+file(GLOB_RECURSE _mega_jit_own CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/csrc/*")
+file(GLOB_RECURSE _mega_jit_catlass CONFIGURE_DEPENDS
+    "${CATLASS_ROOT}/include/*.h" "${CATLASS_ROOT}/include/*.hpp"
+    "${CATLASS_ROOT}/examples/common/*.h" "${CATLASS_ROOT}/examples/common/*.hpp")
+file(GLOB_RECURSE _mega_jit_shmem CONFIGURE_DEPENDS
+    "${SHMEM_ROOT}/include/*.h" "${SHMEM_ROOT}/include/*.hpp"
+    "${SHMEM_ROOT}/src/*.h" "${SHMEM_ROOT}/src/*.hpp")
+foreach(_file IN LISTS _mega_jit_own _mega_jit_catlass _mega_jit_shmem)
+    file(SHA256 "${_file}" _digest)
+    string(APPEND _mega_jit_identity "${_digest}\n")
 endforeach()
-find_file(api_header ascendc_api_version.h
-    PATHS "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/lib"
-          "${ASCEND_HOME_PATH}/aarch64-linux/tikcpp/tikcfw/lib" NO_DEFAULT_PATH)
-if(api_header)
-    file(STRINGS "${api_header}" api_version REGEX "^#define ASCENDC_API_VERSION [0-9]+")
-    string(REGEX REPLACE ".*ASCENDC_API_VERSION ([0-9]+).*" "\\1" api_version "${api_version}")
-    list(APPEND kernel_flags "-DASCENDC_API_VERSION=${api_version}")
+string(APPEND _mega_jit_identity "pi=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP}\n")
+if(DEEPEP_MEGAMOE_TIMER)
+    string(APPEND _mega_jit_identity "timer=1\n")
 endif()
-set(kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_kernel.so")
-file(GLOB_RECURSE kernel_headers CONFIGURE_DEPENDS "csrc/kernels/*.hpp")
-add_custom_command(OUTPUT "${kernel_library}"
-    COMMAND "${BISHENG}" ${kernel_flags} csrc/kernels/mega_moe/mega_moe.cpp
-        "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
-        -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
-        -o "${kernel_library}"
-    DEPENDS csrc/kernels/mega_moe/mega_moe.cpp csrc/kernel_launch.hpp ${kernel_headers}
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
-set(urma_kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_urma_kernel.so")
-set(urma_kernel_flags ${kernel_flags})
-list(PREPEND urma_kernel_flags "-I${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe_urma")
-list(APPEND urma_kernel_flags -fvisibility=hidden -DDEEPEP_MEGAMOE_URMA=1)
-list(REMOVE_ITEM urma_kernel_flags -Wl,-soname,libmegamoe_kernel.so)
-list(APPEND urma_kernel_flags -Wl,-soname,libmegamoe_urma_kernel.so)
-add_custom_command(OUTPUT "${urma_kernel_library}"
-    COMMAND "${BISHENG}" ${urma_kernel_flags} csrc/kernels/mega_moe_urma/mega_moe_urma.cpp
-        "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
-        -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
-        -o "${urma_kernel_library}"
-    DEPENDS csrc/kernels/mega_moe_urma/mega_moe_urma.cpp ${kernel_headers}
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
-add_custom_target(megamoe_device DEPENDS "${kernel_library}" "${urma_kernel_library}")
-pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/kernel_launch.cpp)
-set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
+string(SHA256 DEEPEP_MEGAMOE_JIT_SIGNATURE "${_mega_jit_identity}")
+message(STATUS "MegaMoE runtime kernel source identity: ${DEEPEP_MEGAMOE_JIT_SIGNATURE}")
+
+pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/kernel_launch.cpp csrc/jit/mega_moe_jit.cpp)
+set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON
     INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include")
 separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 target_compile_options(megamoe_ext PRIVATE ${torch_flags} -O2 -fstack-protector-strong)
-target_compile_definitions(megamoe_ext PRIVATE CATLASS_ARCH=3510)
+target_compile_definitions(megamoe_ext PRIVATE CATLASS_ARCH=3510
+    "DEEPEP_MEGAMOE_PI_ON_CHIP=${DEEPEP_SHMEM_HNS_1825_PI_ON_CHIP}"
+    "DEEPEP_MEGAMOE_JIT_SIGNATURE=\"${DEEPEP_MEGAMOE_JIT_SIGNATURE}\"")
 if(DEEPEP_MEGAMOE_TIMER)
     target_compile_definitions(megamoe_ext PRIVATE DEEPEP_MEGAMOE_TIMER=1)
 endif()
-add_library(megamoe_kernel SHARED IMPORTED)
-add_library(megamoe_urma_kernel SHARED IMPORTED)
-set_target_properties(megamoe_urma_kernel PROPERTIES IMPORTED_LOCATION "${urma_kernel_library}")
-set_target_properties(megamoe_kernel PROPERTIES IMPORTED_LOCATION "${kernel_library}")
-add_dependencies(megamoe_ext megamoe_device)
+deepep_apply_deepjit(megamoe_ext)
 target_link_libraries(megamoe_ext PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIBRARY}"
-    "${TORCH_NPU_LIBRARY}" megamoe_kernel megamoe_urma_kernel shmem ascendcl)
+    "${TORCH_NPU_LIBRARY}" shmem ascendcl)
 target_link_directories(megamoe_ext PRIVATE "${ASCEND_HOME_PATH}/lib64")
-target_link_libraries(megamoe_ext PRIVATE platform tiling_api)
+target_link_libraries(megamoe_ext PRIVATE platform tiling_api ${CMAKE_DL_LIBS})
 target_link_options(megamoe_ext PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 install(TARGETS megamoe_ext LIBRARY DESTINATION ../deep_ep_experimental/megamoe)
-install(FILES "${kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
-install(FILES "${urma_kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
