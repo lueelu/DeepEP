@@ -24,6 +24,7 @@
 #include "deep_ep/comm/comm_args.hpp"
 #include "../kernels/combine/low_latency/launch.hpp"
 #include "../kernels/runtime/clock_alignment.h"
+#include "../kernels/runtime/clock_wait.hpp"
 
 namespace py = pybind11;
 namespace deepep {
@@ -63,6 +64,12 @@ uint8_t* tensor(py::handle value, const Shape& shape, const char* dtype)
         throw std::invalid_argument("LL tensor shape, dtype or contiguity mismatch");
     }
     return reinterpret_cast<uint8_t*>(obj.attr("data_ptr")().cast<uintptr_t>());
+}
+void require_npu(py::handle value, const char* what)
+{
+    auto obj = py::reinterpret_borrow<py::object>(value);
+    if (obj.attr("device").attr("type").cast<std::string>() != "npu")
+        throw std::invalid_argument(std::string("LL clock wait requires ") + what + " on the NPU");
 }
 uint8_t* reference_profile(py::dict tensors, uint32_t cores)
 {
@@ -189,6 +196,10 @@ void bind_low_latency(py::module_& module)
             throw std::runtime_error("LL Host/device tiling-key policy mismatch; rebuild the complete wheel");
     module.def("low_latency_ranks_per_group", [](uint32_t world) { return deep_ep::LlGroupForWorld(world); });
     module.attr("low_latency_clock_alignment_version") = clock_alignment::kVersion;
+    module.attr("low_latency_clock_cycles_per_second") = clock_alignment::kCyclesPerSecond;
+    module.attr("low_latency_clock_wait_record_words") = deep_ep::kClockWaitRecordWords;
+    module.attr("low_latency_clock_wait_record_fields") = std::vector<std::string>{
+        "enter", "release", "batch", "core"};
     module.def("low_latency_clock_sync",
                [](Session& session, py::object comm_args, py::object samples, uint32_t sample_count,
                   uint32_t warmup_sample_count, uint64_t magic, uint64_t timeout_cycles,
@@ -223,6 +234,36 @@ void bind_low_latency(py::module_& module)
                    deepep_clock_sleep_at_kernel_do(
                        reinterpret_cast<void*>(stream_address), local_deadline, output);
                });
+    // In-graph wait shared by every captured call: the deadline lives in a GM
+    // table and the call index is a runtime argument, so a replay only needs to
+    // refresh the table contents. Cores must match the Dispatch launch exactly
+    // because the record stride is a function of the participating core count.
+    module.def("low_latency_clock_wait_table",
+               [](Session& session, py::object deadlines, int64_t num_iters, int64_t index,
+                  py::object records, int64_t batch, bool diagnostic, uintptr_t stream_address) {
+                   if (!session.ll_rdma() || !stream_address || num_iters <= 0 || num_iters > INT32_MAX ||
+                       index < 0 || index >= num_iters) {
+                       throw std::invalid_argument("Invalid LL clock wait-table configuration");
+                   }
+                   const uint32_t cores = pin_session_cores(session);
+                   if (cores == 0U) throw std::invalid_argument("LL clock wait-table has no active cores");
+                   auto* table = tensor(deadlines, {num_iters}, "int64");
+                   require_npu(deadlines, "deadlines");
+                   uint8_t* output = nullptr;
+                   if (diagnostic) {
+                       output = tensor(records, {num_iters, int64_t(cores),
+                                                 int64_t(deep_ep::kClockWaitRecordWords)}, "int64");
+                       require_npu(records, "records");
+                       if (reinterpret_cast<uintptr_t>(output) % 32U != 0U) {
+                           throw std::invalid_argument("LL clock wait records require 32-byte alignment");
+                       }
+                   }
+                   py::gil_scoped_release release;
+                   deep_ep::launch_clock_wait_table(cores, reinterpret_cast<void*>(stream_address),
+                                                    table, index, output, batch, diagnostic);
+               },
+               "Wait until deadlines[index] (device cycles) on every active AIV core; "
+               "records, when requested, are int64[num_iters][cores][4].");
     module.def("low_latency_layout", [](int p, int b, int h, int k, int e, const std::string& dtype) {
         // A rejected shape is a Host-only capability result, not a launch failure.
         check_dispatch_dtype(dtype);
