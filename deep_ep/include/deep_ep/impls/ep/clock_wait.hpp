@@ -27,7 +27,7 @@ struct ClockWaitArgs {
     int32_t cores;
     int32_t diagnostic;
 };
-static_assert(sizeof(ClockWaitArgs) == 40U, "clock wait argument ABI changed");
+static_assert(sizeof(ClockWaitArgs) == kClockWaitArgBytes, "clock wait argument ABI changed");
 static_assert(offsetof(ClockWaitArgs, index) == 8U, "clock wait argument ABI changed");
 static_assert(offsetof(ClockWaitArgs, records) == 16U, "clock wait argument ABI changed");
 static_assert(offsetof(ClockWaitArgs, batch) == 24U, "clock wait argument ABI changed");

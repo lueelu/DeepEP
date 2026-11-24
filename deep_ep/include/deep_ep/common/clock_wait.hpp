@@ -26,6 +26,10 @@ constexpr uint32_t kClockWaitRecordRelease = 1U;
 constexpr uint32_t kClockWaitRecordBatch = 2U;
 constexpr uint32_t kClockWaitRecordCore = 3U;
 
+// Serialized argument block of the wait kernel. The device struct must match;
+// the Host never builds it, but callers can verify the ABI they launched with.
+constexpr uint32_t kClockWaitArgBytes = 40U;
+
 static_assert(kClockWaitRecordStrideWords >= kClockWaitRecordWords,
               "the physical record slot cannot be narrower than its fields");
 static_assert(kClockWaitRecordStrideBytes == 128U, "the admitted record slot is 128 bytes");

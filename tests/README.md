@@ -236,9 +236,15 @@ master 地址、master 端口和 SHMEM endpoint 必须通过 CLI、JSON 或环�
 
 周期对齐有两条路径。`--clock-align` 默认走 `--clock-align-mode stream`，每个迭代前由 Host 入队一次 `sleep_at`。`--clock-align-mode graph` 需要同时给出 `--dispatch-only` 和 `--do-cpu-sync 0`：先准备资源、完成首次编译和核绑定、在 capture stream 上捕获 `num_iters` 对 wait+Dispatch，之后才做校准，最后按 `--clock-align-replays` 逐次重放。
 
-时钟模型是以 rank 0 为参考的仿射模型 `R(L) = R0 + alpha * (L - L0)`。校准按 `--clock-align-calibration-windows` 采集多个相隔 `--clock-align-calibration-gap-secs` 的四时间戳窗口，用整数有理数拟合 alpha；三个及以上窗口会把最后一个留作 holdout 残差检查，窗口不足时明确标记 rate 不可解析，而不是假定零漂移。死线由同一模型反算并向上取整，释放统计也走正算，避免只修一个方向留下固定偏移。`--clock-align-model-max-age-secs` 决定重放前是重新锚定还是重拟合。
+capture 只登记操作、不执行，因此 records 在 capture 后必须仍是初始哨兵；记录通路由一次显式的 `probe_replay` 验证（全零过期死线表、同步后读回全部核），probe 与后续失败都会把当次完整记录写成 `failure` 文件后退出，而不是删除检查。
 
-每次重放都在图外重新取锚点、选择未来的共同起点、在原地址刷新死线表、把 records 清成哨兵，重放后单独校验该次的全部记录：每个活动 AIV 核的 `enter/release/batch/core` 必须齐全，`enter` 早于死线、`release` 不早于死线。记录槽为 128 B（schema 2，`low_latency_clock_wait_record_stride_bytes`），与旧的四 word 存储不兼容，遇到旧 wheel 会直接报版本不匹配。最后一次重放由 profiler 采样，从 `kernel_details.csv` 提取 Dispatch Duration 并校验 100 个 wait 与 100 个 Dispatch 交替出现；`--skip-perf-test` 关闭这次采样。验收范围只到模型域：逐次偏差、传播后的两两误差界与 holdout 残差都会写入 `clock_graph/.../clock_alignment.json`，不包含 SuperKernel 融合解析，也不据此声称物理首指令对齐。
+时钟模型是以 rank 0 为参考的仿射模型 `R(L) = R0 + alpha * (L - L0)`。校准按 `--clock-align-calibration-windows` 采集多个相隔 `--clock-align-calibration-gap-secs` 的四时间戳窗口；三个及以上窗口会把最后一个留作独立 holdout，锚点、斜率、截距和斜率误差界都只来自训练窗口，holdout 只用于未来时刻残差验收。斜率误差界按 RTT 上界 `B_alpha = Σ|d_i|(e_i+e_a) / Σd_i²` 以整数有理数计算（`uncertainty_method=rtt_bound_v1`），不再用残差为零推断零频率误差；窗口不足或斜率被截断时模型不可用于正式路径，`error_budget()` 会直接报错而不是给出有限预算。死线由同一模型反算并向上取整，释放统计也走正算；预算在提交图之前按实际 local deadline 计算。
+
+每次重放都在图外重新取锚点（超过 `--clock-align-model-max-age-secs` 或新锚点偏离旧预测超出预算时重拟合，且每次 replay 最多一次）、选择未来的共同起点、在原地址刷新死线表、把 records 与计数输出清成哨兵，重放后单独校验该次的全部记录与全部节点输出：每个活动 AIV 核的 `enter/release/batch/core` 必须齐全，`enter` 早于死线、`release` 不早于死线；每个节点的计数按 `(local expert, source rank)` 累计 ABI 与路由期望逐一比对，payload/scales 复用 `verify_dispatch`。记录槽为 128 B（schema 2，`low_latency_clock_wait_record_stride_bytes`，参数块 40 B），与旧的四 word 存储不兼容，遇到旧 wheel 会直接报版本不匹配。全局预算按每个 iteration 的最差两个 rank 预算求和，跨 rank 汇总一致；`--clock-align-max-pair-error-ns` 配置时在提交前失败，未配置时状态为 `reported_only`。
+
+最后一次重放由 profiler 采样（replay 在 active step 内、`step()` 之前），从 `kernel_details.csv` 提取 Dispatch Duration 并校验 100 个 wait 与 100 个 Dispatch 交替出现，AOT 的 `dispatch_server_dedup_kernel` 与 JIT 的 `dispatch_jit` 都映射到同一逻辑 Dispatch；`--skip-perf-test` 关闭这次采样。`--clock-align-graph-exp-prefix 100` 在校准之后、fresh anchor 之前补上正式 Exp 前缀，原生验收保持 0。验收范围只到模型域：逐次偏差、传播后的两两误差界、holdout 残差与校准年龄都会写入 `clock_graph/.../clock_alignment.json`，不包含 SuperKernel 融合解析，也不据此声称物理首指令对齐。
+
+AOT/JIT 匹配比较使用 [ll_clock_benchmark.py](elastic/ll_clock_benchmark.py)：每版各跑一次（`--label aot|jit --report <json>`，内部固定 graph 模式、`--do-cpu-sync 0`、Exp 100），报告中记录 wheel 身份、公共模型模块 SHA256、等待 ABI 与全部采样条件；`--compare a.json b.json` 在任何一项不一致时拒绝给出差值，只比较同一协议下的最慢 rank tail50 均值与 P99。
 
 ## 日志与结果
 

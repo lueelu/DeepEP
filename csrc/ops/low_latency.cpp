@@ -207,6 +207,7 @@ void bind_low_latency(py::module_& module)
         deep_ep::kClockWaitRecordStrideBytes;
     module.attr("low_latency_clock_wait_record_alignment_bytes") =
         deep_ep::kClockWaitRecordAlignmentBytes;
+    module.attr("low_latency_clock_wait_arg_bytes") = deep_ep::kClockWaitArgBytes;
     module.def("low_latency_clock_sync",
                [](Session& session, py::object comm_args, py::object samples, uint32_t sample_count,
                   uint32_t warmup_sample_count, uint64_t magic, uint64_t timeout_cycles,
