@@ -746,6 +746,9 @@ class ElasticBuffer:
                 )
                 ll_options = (
                     within_bound
+                    # Empty input has no LL layout even though the capacity query
+                    # succeeds; leave it to the outer routing path.
+                    and hidden.shape[0] > 0
                     and type(do_handle_copy) is bool
                     and (do_cpu_sync is None or type(do_cpu_sync) is bool)
                     and (do_expand is None or do_expand is True)

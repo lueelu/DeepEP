@@ -28,7 +28,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_serv
     const bool enableDedup = deep_ep::EpServerDedupEnabled(td->numMaxTokensPerRank);
     CombineDedup::CombineMemoryServerDedupKernel kernel;
     kernel.Init(commArgs, expertOut, destinationIndex, sendCounts, expertScales, tokenType, relayReadIndex, sourceMask,
-                yOut, td->bs, td->h, td->topK, td->moeExpertNum, td->dtype, 0, magic, enableDedup);
+                yOut, td->bs, td->numMaxTokensPerRank, td->h, td->topK, td->moeExpertNum, td->dtype, 0, magic,
+                enableDedup);
     kernel.Process();
 }
 extern "C" DEEPEP_EXPORT void combine_server_dedup_kernel_do(void* stream,

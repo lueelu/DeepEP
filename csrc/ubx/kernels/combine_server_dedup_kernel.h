@@ -24,8 +24,8 @@ class CombineMemoryServerDedupKernel {
 public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
-                                GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK, uint32_t experts, uint8_t dtype,
-                                int64_t magic, bool enableDedup = true)
+                                GM_ADDR yOut, uint32_t bs, uint32_t maxTokens, uint32_t h, uint32_t topK,
+                                uint32_t experts, uint8_t dtype, int64_t magic, bool enableDedup = true)
     {
         coreNum_ = GetBlockNum();
         recvCores_ = EpCombineRecvCoreCount(coreNum_);
@@ -40,9 +40,16 @@ public:
         notifyBegin_ = coreNum_ - UbxDispatch::kLlNotifyCoreNum;
         args_ = reinterpret_cast<const __gm__ UbxDispatch::CommArgs*>(commArgs);
         enableDedup_ = enableDedup;
+        if (maxTokens == 0U || maxTokens < bs) {
+            // Terminal metadata is encoded against the admit capacity; without a
+            // valid capacity the stage slots cannot be compacted to this launch.
+            Trap();
+            return;
+        }
         h_ = h;
         topK_ = topK;
         bs_ = bs;
+        maxTokens_ = maxTokens;
         experts_ = experts;
         dtype_ = dtype;
         expertAddr_ = expertOut;
@@ -243,7 +250,9 @@ private:
 
             CacheTableRows(row, start, task, count, cacheBegin, cacheEnd);
 
-            const uint32_t slot = uint32_t(tableUb_.GetValue((row - cacheBegin) * 3U));
+            // Dispatch encodes TERMINAL slots in capacity-M partitions while the
+            // stage and its partial readers use this launch's actual B rows.
+            const uint32_t slot = StageSlot(uint32_t(tableUb_.GetValue((row - cacheBegin) * 3U)));
             const uint32_t lane = task % activeLanes;
 
             WaitFlag<HardEvent::MTE3_MTE2>(lane);
@@ -267,6 +276,13 @@ private:
         Sync<HardEvent::S_MTE3>();
         auto done = Control(args_->rank, COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_PREPARE_DONE_OFFSET);
         DataCopyPad(done[core_ * 8U], preparePublish_, {8U, 32U, 0U, kCombinePrepareRowBytes - 32U, 0U});
+    }
+    // Restore the dispatch partition and its in-partition ordinal, then rebuild
+    // the slot with the actual token stride. B == M keeps the encoded value.
+    __aicore__ inline uint32_t StageSlot(uint32_t encoded) const
+    {
+        const uint32_t partition = encoded / maxTokens_;
+        return partition * bs_ + (encoded - partition * maxTokens_);
     }
     __aicore__ inline void CacheTableRows(uint32_t row, uint32_t start, uint32_t task, uint32_t count,
                                           uint32_t& cacheBegin, uint32_t& cacheEnd)
@@ -589,7 +605,7 @@ private:
     GM_ADDR masksAddr_ = nullptr;
     GM_ADDR outputAddr_ = nullptr;
     bool enableDedup_ = false;
-    uint32_t bs_ = 0, experts_ = 0;
+    uint32_t bs_ = 0, maxTokens_ = 0, experts_ = 0;
     uint8_t dtype_ = 0;
     bool directRoutesCached_ = false;
     uint32_t core_ = 0, h_ = 0, topK_ = 0, blocks_ = 0, resultStride_ = 0, tokens_ = 0, lanes_ = 0, laneBytes_ = 0,

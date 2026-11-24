@@ -303,8 +303,9 @@ void bind_low_latency(py::module_& module)
             uint32_t(session.world()), uint32_t(capacity), uint32_t(h), uint32_t(k), uint32_t(e), mode, cores);
         const uint32_t group = deep_ep::LlGroupForWorld(uint32_t(session.world()));
         const int64_t c = plan.capacityRows;
-        if (!stream_address || rows < c || session.capacity() != deep_ep::kEpServerDedupPeerBytes) {
-            throw std::invalid_argument("Invalid LL output capacity, workspace or stream");
+        if (!stream_address || rows < c || b <= 0 || b > int(capacity) ||
+            session.capacity() != deep_ep::kEpServerDedupPeerBytes) {
+            throw std::invalid_argument("Invalid LL token count, output capacity, workspace or stream");
         }
         auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
         const bool dedup = deep_ep::EpServerDedupEnabled(uint32_t(capacity), uint32_t(session.world()));

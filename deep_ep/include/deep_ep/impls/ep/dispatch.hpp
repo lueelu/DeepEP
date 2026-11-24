@@ -2296,7 +2296,9 @@ __aicore__ inline void dispatch_body(
 
     EP_DEVICE_ASSERT(view.num_ranks == kNumRanks && view.rank < kNumRanks);
     EP_DEVICE_ASSERT(core.count == kNumVecCores && core.index < kNumVecCores);
-    EP_DEVICE_ASSERT(num_tokens >= 0 && uint32_t(num_tokens) <= kNumMaxTokensPerRank);
+    // Empty input must be routed outside LL: its capacity-sized layout is valid
+    // but no row exists to price or move.
+    EP_DEVICE_ASSERT(num_tokens > 0 && uint32_t(num_tokens) <= kNumMaxTokensPerRank);
     EP_DEVICE_ASSERT(view.is_rdma() == kRdma);
 
     util_set_ffts_config(uint64_t(ffts_val));
