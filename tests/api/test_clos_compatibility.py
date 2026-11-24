@@ -541,7 +541,8 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 args = (cores, 2048 if bucket == 'small' else 5632, op)
                 plan = base.for_launch(*args, bf16=True)
                 assert plan is base.for_launch(*args, bf16=True)
-                assert plan.native_plan()[:7] == [1, order, group, p, w, q, visit]
+                expected_order = 0 if cores == 8 and ep in (8,16,32) else order
+                assert plan.native_plan()[:7] == [1, expected_order, group, p, w, q, visit]
                 assert plan.self_copy == (copy or 2)
                 assert plan.send_workers <= cores and plan.send_workers * q <= 32
                 assert plan.valid_group_capacity()
@@ -573,11 +574,11 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
                 assert plan.send_workers < cores, (ep, cores, plan)
                 expected = 0 if ep == 128 else 2 if ep == 64 or (ep in (16,32) and row_bytes <= 8192) else mode
                 assert plan.weight_mode == expected, (ep, cores, row_bytes, plan)
-        # At EP8/G8/AIV8 the fitted plan uses every AIV for payload.
+        # Rank ordering frees the RR self-owner slot without changing UDMA.
         base = resolve_udma_policy(True,8,'udma',None,None,None,None,None)
         policy = replace(base, ranks_per_group=8, topology_known=True)
         plan = policy.for_launch(8,7168,'weighted',bf16=True)
-        assert plan.send_workers == 8 and plan.weight_mode == 1
+        assert plan.send_workers == 7 and plan.weight_mode == 1
 
         base = resolve_udma_policy(True,64,'udma',None,None,None,None,None)
         for group, known, cores in ((16,True,32), (8,True,32), (16,False,32), (16,True,48)):
@@ -686,7 +687,11 @@ def test_weight_preference_does_not_return_to_simt_as_rows_grow():
                             # under the normal SIMT-enabled peer kernel build.
                             preferred = _simt_weight_row_fits(ep,size)
                             simt = plan.weight_mode != 1 and plan.send_workers < cores
-                            assert simt == (preferred and plan.send_workers < cores)
+                            # The low-core rank override preserves the weight
+                            # mode selected before removing the RR self owner.
+                            rank_keeps_udma = (ep == 8 and cores == 8 and group == 8
+                                              and known and 2048 <= size <= 12288)
+                            assert simt == (preferred and plan.send_workers < cores and not rank_keeps_udma)
                             # Capacity fallback is separate from the row rule:
                             # no helper must remain legal even in the SIMT band.
                             assert not (udma_seen and preferred), (ep,size)
@@ -705,12 +710,14 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                                ranks_per_group=group, topology_known=True)
                 for cores in (range(8,16,2) if tier == 8 else range(32,64,2)):
                     plan = base.for_launch(cores,2048 if bucket == 'small' else 5632,op,bf16=True)
-                    assert plan.native_plan()[:7] == [1,order,group,p,w,q,visit]
+                    expected_order = 0 if tier == 8 and ep in (8,16,32) else order
+                    assert plan.native_plan()[:7] == [1,expected_order,group,p,w,q,visit]
                     assert base.config(cores).num_aiv == cores
                     if op == 'combine':
                         assert plan.self_copy == (1 if cores >= 2*plan.send_workers else 2)
                     if op == 'weighted':
-                        assert plan.weight_mode == (2 if cores > plan.send_workers else 1)
+                        selected_senders = ((group+p-1)//p if order == 3 else (ep-2)//p+1)*w
+                        assert plan.weight_mode == (2 if cores > selected_senders else 1)
         # Scan legal budgets and both sides of row-width boundaries, including
         # unknown topology and widths outside the measured profiles.
         for ep in (4,8,16,32,64,128,256):
@@ -732,6 +739,39 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                                 assert plan.send_workers <= cores
                                 assert plan.send_workers*plan.qps_per_worker <= 32
                                 assert plan.valid_group_capacity()
+    """)
+
+
+def test_low_core_rank_defaults_match_measured_plans():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+
+        # Frozen rank arm of the T8192/H2816,H6144 device comparison.
+        # P/W/Q, visit, copy and UDMA weight mode are preserved, including
+        # EP8 weighted combine's newly available helper slot.
+        expected = {
+            (8,'dispatch'): (2,1,2,32,4,0),
+            (8,'combine'): (1,1,2,32,7,0),
+            (8,'weighted'): (1,1,1,32,7,1),
+            (16,'dispatch'): (2,1,1,16,8,0),
+            (16,'combine'): (2,1,1,16,8,0),
+            (16,'weighted'): (2,1,1,32,8,1),
+            (32,'dispatch'): (4,1,1,32,8,0),
+            (32,'combine'): (4,1,1,32,8,0),
+            (32,'weighted'): (4,1,1,32,8,1),
+        }
+        for (ep,op),(p,w,q,visit,senders,mode) in expected.items():
+            group = min(ep,16)
+            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=group,topology_known=True)
+            original = base.native_plan()
+            for hidden in (2816,4096,6144):
+                plan = base.for_launch(8,hidden*2,op,bf16=True)
+                assert plan.native_plan() == [1,0,group,p,w,q,visit,2,mode]
+                assert plan.send_workers == senders
+                assert plan.valid_group_capacity()
+            assert base.native_plan() == original
     """)
 
 

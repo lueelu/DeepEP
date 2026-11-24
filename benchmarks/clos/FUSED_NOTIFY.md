@@ -9,6 +9,11 @@ ownership, sparse CQEs and completion guarantees, see
 
 - V2 fresh dispatch uses independent SIMT layout, following resolved `num_sms`.
   `DEEPEP_CLOS_V2_SIMT_LAYOUT=0` selects the original layout baseline.
+- Automatic V2 non-expanded BF16 plans for EP8/16/32 use rank ordering in
+  the existing low-core tier (`8 <= num_sms < 16`). P/W/Q, visit and selected
+  copy/weight modes remain unchanged; EP8 weighted combine retains UDMA at
+  8 cores even though rank ordering frees one worker slot. Other core tiers,
+  EP sizes and explicit benchmark/manual policies retain their own selection.
 - Supported peer-UDMA paths enable fresh channel metadata, double buffering,
   skip-init, direct output and early slots. Cached weighted dispatch enables
   pack/direct/omit; omission applies only to unused non-expanded top-k output.
