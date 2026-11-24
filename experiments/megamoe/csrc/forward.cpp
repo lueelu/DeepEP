@@ -160,7 +160,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
 namespace deepep::megamoe::bf16 {
 namespace {
 
-torch::Tensor AllocateTrainingSavedState(const MegaMoeBF16Training::TrainingSavedStateLayout& savedStateLayout,
+torch::Tensor AllocateTrainingSavedState(const MegaMoeBF16Impl::TrainingSavedStateLayout& savedStateLayout,
                                          const torch::Tensor& like)
 {
     // The compact ordinary-BF16 layout begins at cumsumOffset=0. Embedded
@@ -200,7 +200,7 @@ ForwardResult BF16Plan::forward(torch::Tensor out, torch::Tensor x, torch::Tenso
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
     TORCH_CHECK(topkIds.scalar_type() == torch::kInt32, "topk_ids must be int32");
     const auto topkWeightType = TopkWeightType(topkWeights.scalar_type());
-    const auto topkWeightBytes = MegaMoeBF16Training::TopkWeightBytes(topkWeightType);
+    const auto topkWeightBytes = MegaMoeBF16Impl::TopkWeightBytes(topkWeightType);
     TORCH_CHECK(weight1.scalar_type() == torch::kBFloat16, "weight1 must be bfloat16");
     TORCH_CHECK(weight2.scalar_type() == torch::kBFloat16, "weight2 must be bfloat16");
     TORCH_CHECK(topkWeights.sizes() == topkIds.sizes(), "topk_weights shape must match topk_ids");
@@ -225,7 +225,7 @@ ForwardResult BF16Plan::forward(torch::Tensor out, torch::Tensor x, torch::Tenso
                       weight_before_gmm2_ ? save_gmm1_output : "none", topkWeightType, weightLayout.transW);
 
     const auto savedStateLayout = MakeSavedStateLayout(tiling, k, n, maxRecvTokens);
-    const MegaMoeBF16Training::DispatchOutputLayout dispatchOutputLayout(k, maxRecvTokens, topkWeightBytes);
+    const MegaMoeBF16Impl::DispatchOutputLayout dispatchOutputLayout(k, maxRecvTokens, topkWeightBytes);
     // Both unpermute implementations overwrite every output token row once.
     // ExpertTokenNumCopyOut likewise writes all local-expert entries, so these
     // returned tensors do not need a device-wide pre-clear.

@@ -19,7 +19,8 @@
 
 #include <cstdint>
 
-#include "common/mega_moe_kernel_utils.hpp"
+#include "kernel_operator.h"
+#include "lib/std/tuple.h"
 #include "op_common/op_kernel/math_util.h"
 #include "mega_moe_constants.hpp"
 #include "mega_moe_types.hpp"
@@ -28,6 +29,130 @@
 namespace MegaMoeImpl {
 
 using namespace AscendC;
+
+constexpr uint8_t SYNC_AIC_AIV_MODE = 4;
+constexpr uint16_t AIC_SYNC_AIV_FLAG = 4;
+constexpr uint16_t AIV_SYNC_AIC_FLAG = 6;
+
+__aicore__ inline void NotifyCube(uint16_t value = 0)
+{
+    AscendC::CrossCoreSetFlag<SYNC_AIC_AIV_MODE, PIPE_V>(AIV_SYNC_AIC_FLAG + value);
+}
+
+__aicore__ inline void WaitForVector(uint16_t value = 0)
+{
+    AscendC::CrossCoreWaitFlag<SYNC_AIC_AIV_MODE, PIPE_FIX>(AIV_SYNC_AIC_FLAG + value);
+}
+
+__aicore__ inline void NotifyVector(uint16_t value = 0)
+{
+    AscendC::CrossCoreSetFlag<SYNC_AIC_AIV_MODE, PIPE_FIX>(AIC_SYNC_AIV_FLAG + value);
+}
+
+__aicore__ inline void WaitForCube(uint16_t value = 0)
+{
+    AscendC::CrossCoreWaitFlag<SYNC_AIC_AIV_MODE, PIPE_V>(AIC_SYNC_AIV_FLAG + value);
+}
+
+__aicore__ inline void TilingByCore(int32_t totalLen, int32_t& coreLen, int32_t& coreOffset, int32_t align)
+{
+    int32_t coreIdx = AscendC::GetBlockIdx();
+    int32_t coreNum = AscendC::GetBlockNum() * 2;
+    int32_t lenPerCore = Ops::Base::CeilDiv(static_cast<uint32_t>(totalLen), static_cast<uint32_t>(coreNum));
+    int32_t lenPerCoreAlign = Ops::Base::CeilAlign(static_cast<uint32_t>(lenPerCore), static_cast<uint32_t>(align));
+    coreLen = lenPerCoreAlign;
+    coreOffset = coreIdx * lenPerCoreAlign;
+    if (coreOffset + coreLen >= totalLen) {
+        coreLen = totalLen - coreOffset;
+    }
+    if (coreOffset >= totalLen) {
+        coreLen = 0;
+    }
+}
+
+template <size_t I, typename T>
+__aicore__ constexpr inline decltype(auto) Get(T&& value)
+{
+    return AscendC::Std::get<I>(AscendC::Std::forward<T>(value));
+}
+
+template <size_t First, size_t Second, size_t... Rest, typename T>
+__aicore__ constexpr inline decltype(auto) Get(T&& value)
+{
+    return Get<Second, Rest...>(AscendC::Std::get<First>(AscendC::Std::forward<T>(value)));
+}
+
+constexpr uint32_t kCopyBufferBytes = 16 * 1024;
+
+// Backward P0 uses static UB without a TPipe. Reserve event 3 for the synchronous
+// copy fences; the Dispatch ping-pong slots independently use events 0 and 1.
+template <AscendC::HardEvent event>
+__aicore__ inline void SyncCopyStage()
+{
+    AscendC::SetFlag<event>(EVENT_ID3);
+    AscendC::WaitFlag<event>(EVENT_ID3);
+}
+
+__aicore__ inline void CopyContiguous(GM_ADDR dstAddr, GM_ADDR srcAddr, uint64_t byteCount, uint32_t coreIdx,
+                                      uint32_t coreCount, AscendC::LocalTensor<uint8_t> copyBuffer)
+{
+    const uint64_t unalignedBytesPerCore = (byteCount + coreCount - 1) / coreCount;
+    const uint64_t bytesPerCore = (unalignedBytesPerCore + MegaMoeBF16Impl::kMetaAlignment - 1) /
+                                  MegaMoeBF16Impl::kMetaAlignment * MegaMoeBF16Impl::kMetaAlignment;
+    const uint64_t coreOffset = coreIdx * bytesPerCore;
+    if (coreOffset >= byteCount) {
+        return;
+    }
+    uint64_t remaining = byteCount - coreOffset;
+    if (remaining > bytesPerCore) {
+        remaining = bytesPerCore;
+    }
+
+    AscendC::GlobalTensor<uint8_t> src;
+    AscendC::GlobalTensor<uint8_t> dst;
+    src.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(srcAddr));
+    dst.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(dstAddr));
+
+    uint64_t copied = 0;
+    while (copied < remaining) {
+        const uint32_t current =
+            static_cast<uint32_t>(remaining - copied > kCopyBufferBytes ? kCopyBufferBytes : remaining - copied);
+        if (current % 32U == 0) {
+            AscendC::DataCopy(copyBuffer, src[coreOffset + copied], current);
+            SyncCopyStage<AscendC::HardEvent::MTE2_MTE3>();
+            AscendC::DataCopy(dst[coreOffset + copied], copyBuffer, current);
+        } else {
+            const AscendC::DataCopyExtParams span{1U, current, 0U, 0U, 0U};
+            AscendC::DataCopyPad(copyBuffer, src[coreOffset + copied], span,
+                                 AscendC::DataCopyPadExtParams<uint8_t>{false, 0U, 0U, 0U});
+            SyncCopyStage<AscendC::HardEvent::MTE2_MTE3>();
+            AscendC::DataCopyPad(dst[coreOffset + copied], copyBuffer, span);
+        }
+        SyncCopyStage<AscendC::HardEvent::MTE3_MTE2>();
+        copied += current;
+    }
+}
+
+// Input is one FP32 route. Preserve first-route initialization and slot order.
+// SourceIsSum avoids a redundant first-route copy in BF16 preweighted Unpermute.
+template <bool ApplyWeight, bool SourceIsSum = false>
+__aicore__ inline void AccumulateRoute(AscendC::LocalTensor<float> sum, AscendC::LocalTensor<float> value,
+                                       uint32_t length, bool first, float weight = 1.0F)
+{
+    using namespace AscendC;
+    if (first) {
+        if constexpr (ApplyWeight)
+            Muls(sum, value, weight, length);
+        else if constexpr (!SourceIsSum)
+            DataCopy(sum, value, length);
+    } else {
+        if constexpr (ApplyWeight) {
+            Muls(value, value, weight, length);
+            PipeBarrier<PIPE_V>();
+        }
+        Add(sum, sum, value, length);
+    }
+}
 
 constexpr uint32_t UINT64_BYTE_OFFSET_SHIFT = 3U;
 
@@ -329,10 +454,11 @@ __aicore__ inline uint64_t GetUrmaCommHandle(__gm__ Mc2MoeContext* mc2Context, u
 }
 
 inline GM_ADDR g_winRankAddr_[HCCL_MAX_RANK_SIZE];
+inline GM_ADDR bf16WinRankAddr[Mc2Aclnn::HCCL_MAX_RANK_SIZE];
 
-__aicore__ inline GM_ADDR GetRankWinAddrWithOffset(uint32_t rankId, uint64_t offset)
+__aicore__ inline GM_ADDR GetRankWinAddrWithOffset(GM_ADDR const* rankWindows, uint32_t rankId, uint64_t offset)
 {
-    return (GM_ADDR)(g_winRankAddr_[rankId] + offset);
+    return rankWindows[rankId] + offset;
 }
 
 __aicore__ inline GM_ADDR GetTensorAddr(uint16_t index, GM_ADDR tensorPtr)

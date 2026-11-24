@@ -20,6 +20,14 @@
 namespace Mc2Aclnn {
 constexpr uint32_t HCCL_MAX_RANK_SIZE = 1024;
 
+struct Bf16MoeContext {
+    uint32_t epRankId;
+    uint32_t rankSizePerServer = 0;
+    uint64_t kfcContextAddr = 0;
+    uint64_t epHcclBuffer[HCCL_MAX_RANK_SIZE];
+};
+static_assert(sizeof(Bf16MoeContext) == 8208, "BF16 communication context ABI changed");
+
 struct Mc2MoeContext {
     uint32_t epRankId;
     uint32_t rankSizePerServer;

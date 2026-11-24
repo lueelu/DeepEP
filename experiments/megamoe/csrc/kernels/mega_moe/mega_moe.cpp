@@ -85,20 +85,12 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     }
 }
 
-/*
- * BF16 training forward and backward entries.  The implementation uses
- * DeepEP's routing/dispatch/combine pipeline and only references CATLASS
- * primitives for BF16 MMAD; it does not call the CATCCOS DispatchFFNCombine
- * operator.
- */
-#include "kernel_operator.h"
+// The Host pass needs only the launch signatures and shared tiling layout.
 #include "mega_moe_bf16_tiling.hpp"
+#if defined(__NPU_DEVICE__)
 #include "mega_moe_wave_bf16.hpp"
 #include "mega_moe_bf16_backward.hpp"
-#include "kernel_launch.hpp"
-
-using namespace AscendC;
-using namespace MegaMoeImpl;
+#endif
 
 template <typename TopkWeightT>
 __mix__(1, 2) __global__ __aicore__
@@ -107,11 +99,12 @@ __mix__(1, 2) __global__ __aicore__
                                GM_ADDR dispatchOutputGM, GM_ADDR forwardTransientWorkspaceGM, GM_ADDR timerAddr,
                                MegaMoeBf16TilingData tilingData)
 {
+#if defined(__NPU_DEVICE__)
     InitSocState();
     MegaMoeTrainTimerDevice timer;
     timer.Init(timerAddr);
     timer.Start(MegaMoeTrainTimer::KERNEL_TIMING);
-    MegaMoeBF16Forward<TopkWeightT> op;
+    MegaMoeImpl::MegaMoeBF16Forward<TopkWeightT> op;
     op.Init(context, x, topkIds, topkWeights, weight1, weight2, nullptr, nullptr, nullptr, nullptr, yOut,
             expertTokenNumsOut, nullptr, nullptr, nullptr, trainingSavedStateGM, &tilingData,
             forwardTransientWorkspaceGM, dispatchOutputGM);
@@ -121,6 +114,7 @@ __mix__(1, 2) __global__ __aicore__
     if (timer.Enabled()) AscendC::PipeBarrier<PIPE_ALL>();
     timer.End(MegaMoeTrainTimer::KERNEL_TIMING);
     timer.FlushDynamicCounts();
+#endif
 }
 
 extern "C" __attribute__((visibility("default"))) void mega_moe_bf16_forward_kernel_do(
@@ -160,20 +154,6 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_bf16_forward_tim
     }
 }
 
-// Retain the exported capability queries: both schedules stage raw Gate/Up in GM.
-extern "C" __attribute__((visibility("default"))) int mega_moe_bf16_swiglu_decoupled(uint64_t hidden)
-{
-    (void)hidden;
-    return 1;
-}
-extern "C" __attribute__((visibility("default"))) int mega_moe_bf16_swiglu_decoupled_for_saved_mode(uint64_t hidden,
-                                                                                                    uint32_t savedMode)
-{
-    (void)hidden;
-    (void)savedMode;
-    return 1;
-}
-
 template <typename TopkWeightT>
 __mix__(1, 2) __global__ __aicore__
     void mega_moe_bf16_backward(GM_ADDR context, GM_ADDR gradY, GM_ADDR topkWeights, GM_ADDR weight1, GM_ADDR weight2,
@@ -181,11 +161,12 @@ __mix__(1, 2) __global__ __aicore__
                                 GM_ADDR trainingSavedState, GM_ADDR dispatchOutput, GM_ADDR backwardWorkspace,
                                 GM_ADDR timerAddr, MegaMoeBf16TilingData tilingData)
 {
+#if defined(__NPU_DEVICE__)
     InitSocState();
     MegaMoeTrainTimerDevice timer;
     timer.Init(timerAddr);
     timer.Start(MegaMoeTrainTimer::KERNEL_TIMING);
-    MegaMoeBF16Backward<TopkWeightT> op;
+    MegaMoeImpl::MegaMoeBF16Backward<TopkWeightT> op;
     op.Init(context, gradY, topkWeights, weight1, weight2, gradX, gradTopkWeights, gradWeight1, gradWeight2,
             trainingSavedState, dispatchOutput, backwardWorkspace, &tilingData);
     op.SetTimer(timer.Enabled() ? &timer : nullptr);
@@ -193,6 +174,7 @@ __mix__(1, 2) __global__ __aicore__
     if (timer.Enabled()) AscendC::PipeBarrier<PIPE_ALL>();
     timer.End(MegaMoeTrainTimer::KERNEL_TIMING);
     timer.FlushDynamicCounts();
+#endif
 }
 
 extern "C" __attribute__((visibility("default"))) void mega_moe_bf16_backward_kernel_do(

@@ -36,23 +36,23 @@ constexpr uint16_t FLAG_ID_MAX = 16;
 // 用一个独立的flag槽位(避开combine使用的pingpong 0/1)，值2 => AIV1本地槽8，
 // cube侧WaitForVector(2+FLAG_ID_MAX)路由到AIV1。
 constexpr uint16_t GMM2_UB_READY_FLAG = 2;
-constexpr uint32_t SWIGLU_N_HALF = MegaMoeBF16Training::kSwigluNHalf;
+constexpr uint32_t SWIGLU_N_HALF = MegaMoeBF16Impl::kSwigluNHalf;
 constexpr int32_t MXFP_DIVISOR_SIZE = 64;
 constexpr int32_t MXFP_SCALE_GROUP_NUM = 32;
 constexpr int32_t MXFP_MULTI_BASE_SIZE = 2;
 constexpr int64_t SIMT_THREAD_NUM = 2048;
-constexpr int64_t ALIGN_32 = static_cast<int64_t>(MegaMoeBF16Training::kAlignment32);
-constexpr int64_t ALIGN_128 = static_cast<int64_t>(MegaMoeBF16Training::kAlignment128);
-constexpr int64_t ALIGN_256 = static_cast<int64_t>(MegaMoeBF16Training::kAlignment256);
-constexpr int64_t ALIGN_512 = static_cast<int64_t>(MegaMoeBF16Training::kAlignment512);
-constexpr int32_t INT_CACHELINE = static_cast<int32_t>(MegaMoeBF16Training::kIntCacheline);
+constexpr int64_t ALIGN_32 = static_cast<int64_t>(MegaMoeBF16Impl::kAlignment32);
+constexpr int64_t ALIGN_128 = static_cast<int64_t>(MegaMoeBF16Impl::kAlignment128);
+constexpr int64_t ALIGN_256 = static_cast<int64_t>(MegaMoeBF16Impl::kAlignment256);
+constexpr int64_t ALIGN_512 = static_cast<int64_t>(MegaMoeBF16Impl::kAlignment512);
+constexpr int32_t INT_CACHELINE = static_cast<int32_t>(MegaMoeBF16Impl::kIntCacheline);
 constexpr int32_t MAX_AICORE_NUM = 36;
 constexpr uint32_t BUFFER_ALIGN = 96U * 1024U * 2U;
 constexpr uint32_t HCCL_MAX_RANK_SIZE = 1024U;
 constexpr uint32_t UNPERMUTE_LIST_NUM = 3U;
 constexpr int64_t SIZE_INT_8 = 1U;
-constexpr int64_t SIZE_BF_16 = static_cast<int64_t>(MegaMoeBF16Training::kBf16Bytes);
-constexpr int64_t SIZE_INT_32 = static_cast<int64_t>(MegaMoeBF16Training::kInt32Bytes);
+constexpr int64_t SIZE_BF_16 = static_cast<int64_t>(MegaMoeBF16Impl::kBf16Bytes);
+constexpr int64_t SIZE_INT_32 = static_cast<int64_t>(MegaMoeBF16Impl::kInt32Bytes);
 }  // namespace
 
 struct ForwardWorkspaceInfo {
@@ -105,10 +105,10 @@ struct ForwardWorkspaceInfo {
         ptrFlagSwiGluToGmm2 = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(SIZE_INT_32 * tilingData->expertPerRank * INT_CACHELINE, ALIGN_128);
         ptrDispatchedTopkWeights = base + workspaceSize;
-        workspaceSize += Ops::Base::CeilAlign(
-            static_cast<int64_t>(MegaMoeBF16Training::TopkWeightBytes(tilingData->topkWeightType)) *
-                tilingData->maxOutputSize,
-            ALIGN_512);
+        workspaceSize +=
+            Ops::Base::CeilAlign(static_cast<int64_t>(MegaMoeBF16Impl::TopkWeightBytes(tilingData->topkWeightType)) *
+                                     tilingData->maxOutputSize,
+                                 ALIGN_512);
         ptrSavedTokenPerExpert = nullptr;
         savedStateSize = 0;
         transientWorkspaceSize = workspaceSize;
@@ -119,12 +119,12 @@ struct ForwardWorkspaceInfo {
     __aicore__ inline void InitSavedState(GM_ADDR savedStateBase, const MegaMoeBf16TilingData* tilingData,
                                           bool embeddedDispatchOutput = true)
     {
-        const MegaMoeBF16Training::TrainingSavedStateLayout savedLayout(
+        const MegaMoeBF16Impl::TrainingSavedStateLayout savedLayout(
             tilingData->m, tilingData->k, tilingData->topK, tilingData->epWorldSize, tilingData->expertPerRank,
-            tilingData->maxOutputSize, tilingData->n, tilingData->savedGateUpMode == MegaMoeBF16Training::kSaveMxFp8,
-            tilingData->savedGateUpMode != MegaMoeBF16Training::kSaveNone,
-            MegaMoeBF16Training::SaveGateUpClipMasks(tilingData->swigluLimit, tilingData->savedGateUpMode),
-            embeddedDispatchOutput, MegaMoeBF16Training::TopkWeightBytes(tilingData->topkWeightType));
+            tilingData->maxOutputSize, tilingData->n, tilingData->savedGateUpMode == MegaMoeBF16Impl::kSaveMxFp8,
+            tilingData->savedGateUpMode != MegaMoeBF16Impl::kSaveNone,
+            MegaMoeBF16Impl::SaveGateUpClipMasks(tilingData->swigluLimit, tilingData->savedGateUpMode),
+            embeddedDispatchOutput, MegaMoeBF16Impl::TopkWeightBytes(tilingData->topkWeightType));
         ptrA = embeddedDispatchOutput ? savedStateBase + savedLayout.ptrAOffset : nullptr;
         ptrcumsumMM = savedStateBase + savedLayout.cumsumOffset;
         expandedRowIdx = savedStateBase + savedLayout.expandedRowIdxOffset;
@@ -157,8 +157,8 @@ struct ForwardWorkspaceInfo {
                                            const MegaMoeBf16TilingData* tilingData)
     {
         InitSavedState(savedStateBase, tilingData);
-        const MegaMoeBF16Training::ForwardTransientWorkspaceLayout transientLayout(
-            tilingData->n, tilingData->expertPerRank, tilingData->maxOutputSize);
+        const MegaMoeBF16Impl::ForwardTransientWorkspaceLayout transientLayout(tilingData->n, tilingData->expertPerRank,
+                                                                               tilingData->maxOutputSize);
         ptrA2 = transientWorkspaceBase + transientLayout.ptrA2Offset;
         ptrFlagSwiGluToGmm2 = transientWorkspaceBase + transientLayout.swigluToGmm2FlagOffset;
         ptrAScale = ptrA2;
@@ -173,14 +173,14 @@ struct ForwardWorkspaceInfo {
                                            GM_ADDR transientWorkspaceBase, const MegaMoeBf16TilingData* tilingData)
     {
         InitSavedState(savedStateBase, tilingData, false);
-        const MegaMoeBF16Training::DispatchOutputLayout dispatchLayout(
-            tilingData->k, tilingData->maxOutputSize, MegaMoeBF16Training::TopkWeightBytes(tilingData->topkWeightType));
+        const MegaMoeBF16Impl::DispatchOutputLayout dispatchLayout(
+            tilingData->k, tilingData->maxOutputSize, MegaMoeBF16Impl::TopkWeightBytes(tilingData->topkWeightType));
         ptrA = dispatchOutputBase;
         ptrDispatchedTopkWeights = dispatchOutputBase ? dispatchOutputBase + dispatchLayout.topkWeightsOffset : nullptr;
-        const MegaMoeBF16Training::Wave::ForwardScratch scratch(tilingData->maxOutputSize, tilingData->mGroupsPerWave,
-                                                                tilingData->forwardSchedule);
-        const MegaMoeBF16Training::ForwardTransientWorkspaceLayout transientLayout(
-            tilingData->n, tilingData->expertPerRank, scratch.hpRows);
+        const MegaMoeBF16Impl::Wave::ForwardScratch scratch(tilingData->maxOutputSize, tilingData->mGroupsPerWave,
+                                                            tilingData->forwardSchedule);
+        const MegaMoeBF16Impl::ForwardTransientWorkspaceLayout transientLayout(tilingData->n, tilingData->expertPerRank,
+                                                                               scratch.hpRows);
         ptrA2 = transientWorkspaceBase + transientLayout.ptrA2Offset;
         ptrFlagSwiGluToGmm2 = transientWorkspaceBase + transientLayout.swigluToGmm2FlagOffset;
         ptrAScale = ptrA2;
@@ -198,8 +198,8 @@ struct BackwardSavedStateInfo : ForwardWorkspaceInfo {
                                              const MegaMoeBf16TilingData* tilingData)
     {
         InitSavedState(savedStateBase, tilingData, false);
-        const MegaMoeBF16Training::DispatchOutputLayout dispatchLayout(
-            tilingData->k, tilingData->maxOutputSize, MegaMoeBF16Training::TopkWeightBytes(tilingData->topkWeightType));
+        const MegaMoeBF16Impl::DispatchOutputLayout dispatchLayout(
+            tilingData->k, tilingData->maxOutputSize, MegaMoeBF16Impl::TopkWeightBytes(tilingData->topkWeightType));
         ptrA = dispatchOutputBase + dispatchLayout.tokensOffset;
         ptrDispatchedTopkWeights = dispatchOutputBase + dispatchLayout.topkWeightsOffset;
         // Match the persistent-only backward view: no forward scratch aliases.
@@ -232,8 +232,7 @@ struct BackwardWorkspaceInfo {
     __aicore__ inline BackwardWorkspaceInfo(GM_ADDR base, const MegaMoeBf16TilingData* tilingData,
                                             uint32_t splitExperts)
     {
-        const MegaMoeBF16Training::BackwardWorkspaceLayout layout(*tilingData, splitExperts,
-                                                                  2U * AscendC::GetBlockNum());
+        const MegaMoeBF16Impl::BackwardWorkspaceLayout layout(*tilingData, splitExperts, 2U * AscendC::GetBlockNum());
         ptrDO = base + layout.doOffset;
         ptrGradZ = base + layout.dzOffset;
         ptrHp = base + layout.hpOffset;
@@ -273,16 +272,15 @@ struct Bf16PeermemInfo {
     {
         ptrBase = base;
         const bool compactEnabled = allowCompactTokenCountExchange && tilingData->compactTokenCountExchange != 0;
-        const MegaMoeBF16Training::CompactTokenCountExchangeLayout countLayout(
-            tilingData->epWorldSize, tilingData->expertPerRank, compactEnabled);
+        const MegaMoeBF16Impl::CompactTokenCountExchangeLayout countLayout(tilingData->epWorldSize,
+                                                                           tilingData->expertPerRank, compactEnabled);
         compactTokenCountExchange = countLayout.enabled;
         ptrCompactTokenCount = countLayout.enabled ? base + countLayout.packetOffset : nullptr;
         ptrCompactTokenCountBlockSums = countLayout.enabled ? base + countLayout.blockSumsOffset : nullptr;
         tokenCountsOffset = countLayout.tokenCountsOffset;
         payloadOffset = countLayout.payloadOffset;
-        const MegaMoeBF16Training::PeerPayloadLayout layout(
-            payloadOffset, tilingData->m, tilingData->k, tilingData->topK,
-            MegaMoeBF16Training::TopkWeightBytes(tilingData->topkWeightType));
+        const MegaMoeBF16Impl::PeerPayloadLayout layout(payloadOffset, tilingData->m, tilingData->k, tilingData->topK,
+                                                        MegaMoeBF16Impl::TopkWeightBytes(tilingData->topkWeightType));
         ptrTokenPerExpert = base + tokenCountsOffset;
         sourceTokens = base + payloadOffset;
         routeIndices = base + layout.routeIndexOffset;

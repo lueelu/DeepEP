@@ -10,9 +10,6 @@
 #define MEGA_MOE_BF16_TILING_HPP
 
 #include <cstdint>
-#include "kernel_tiling/kernel_tiling.h"
-
-using namespace AscendC;
 
 // P1 GMM2-grad writes one FP32 dP partial per packed row and F tile.
 // P6 reduces the partials for each row.
@@ -42,8 +39,8 @@ struct MegaMoeBf16TilingData {
     float swigluLimit;
     // Effective BF16 save policy: 1=none, 2=BF16, 3=MXFP8.
     uint32_t savedGateUpMode{2};
-    // Ordinary BF16 only: Host resolves auto/diagnostic overrides and writes
-    // the effective per-launch token-count exchange protocol here.
+    // The Host selects the token-count exchange from EP size and the number of local experts.
+    // Dense exchanges the full count table. Compact sends peer-specific counts and prefixes.
     // 0=dense, 1=compact. Experimental variants always keep this at zero.
     uint32_t compactTokenCountExchange{0};
     // TopK weights and their gradients: 0=BF16, 1=FP32. GMM operands stay BF16.

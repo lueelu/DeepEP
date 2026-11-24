@@ -1,6 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 // Modified by SimpleBright_Man 2026
 
+#include "kernels/mega_moe/mc2_common/mc2_moe_context.hpp"
 #include "plan.hpp"
 
 #include <algorithm>
@@ -47,7 +48,7 @@ size_t CalcWorkspaceSize(const MegaMoeBf16TilingData& td)
 
 inline size_t CalcBf16EarlyTopkWeightWorkspaceSize(const MegaMoeBf16TilingData& td)
 {
-    return AlignUp(static_cast<int64_t>(td.maxOutputSize) * MegaMoeBF16Training::TopkWeightBytes(td.topkWeightType),
+    return AlignUp(static_cast<int64_t>(td.maxOutputSize) * MegaMoeBF16Impl::TopkWeightBytes(td.topkWeightType),
                    ALIGN_512);
 }
 
@@ -60,7 +61,7 @@ struct BufferSizes {
 
 uint32_t SaveMode(const std::string& mode)
 {
-    using namespace MegaMoeBF16Training;
+    using namespace MegaMoeBF16Impl;
     if (mode == "none") return kSaveNone;
     if (mode == "mxfp8") return kSaveMxFp8;
     TORCH_CHECK(mode == "bf16", "gmm1_save_type must be none, bf16 or mxfp8");
@@ -77,7 +78,7 @@ BufferSizes MakeBf16Tiling(MegaMoeBf16TilingData& tiling, int64_t m, int64_t k, 
                            double swiglu_limit, const std::string& save_gmm1_output, uint32_t topk_weight_type,
                            const deepep::megamoe::PlatformInfo& platform)
 {
-    using namespace MegaMoeBF16Training;
+    using namespace MegaMoeBF16Impl;
     constexpr int64_t maxDim = std::numeric_limits<int32_t>::max();
     TORCH_CHECK(m > 0 && m <= 16384 && max_recv_tokens > 0 && max_recv_tokens <= maxDim, "invalid BF16 token capacity");
     TORCH_CHECK(k > 0 && k <= maxDim && k % 256 == 0 && f > 0 && f <= maxDim / 2 && f % 256 == 0,
@@ -91,10 +92,10 @@ BufferSizes MakeBf16Tiling(MegaMoeBf16TilingData& tiling, int64_t m, int64_t k, 
     const auto aic_num = platform.aic;
     const auto ub_size = platform.ub;
     {
-        const MegaMoeBF16Training::ForwardDispatchUbLayout dispatchUb(world_size, expert_per_rank, k, 2);
+        const MegaMoeBF16Impl::ForwardDispatchUbLayout dispatchUb(world_size, expert_per_rank, k, 2);
         TORCH_CHECK(dispatchUb.totalBytes <= ub_size, "MegaMoe BF16 Dispatch requires ", dispatchUb.totalBytes,
                     " UB bytes, but the device has ", ub_size);
-        TORCH_CHECK(MegaMoeBF16Training::ForwardDispatchUbLayout::kCountResetChunkBytes <= ub_size,
+        TORCH_CHECK(MegaMoeBF16Impl::ForwardDispatchUbLayout::kCountResetChunkBytes <= ub_size,
                     "MegaMoe BF16 count reset chunk exceeds device UB capacity");
     }
 
@@ -142,24 +143,16 @@ BufferSizes MakeBf16Tiling(MegaMoeBf16TilingData& tiling, int64_t m, int64_t k, 
 
 constexpr std::size_t kDeviceLargePageBytes = 2 * 1024 * 1024;
 
-struct MegaMoeContext {
-    uint32_t ep_rank_id;
-    uint32_t rank_size_per_server;
-    uint64_t kfc_context_addr;
-    uint64_t ep_buffer[1024];
-};
-static_assert(sizeof(MegaMoeContext) == 8208, "MegaMoe context ABI changed");
-
 void InitializeMegaMoeBF16Context(torch::Tensor context, void* symmetric_buffer, int rank, int world_size)
 {
     TORCH_CHECK(symmetric_buffer != nullptr, "symmetric_buffer must not be null");
     const std::size_t context_bytes = static_cast<std::size_t>(context.numel()) * context.element_size();
-    TORCH_CHECK(context_bytes >= sizeof(MegaMoeContext), "MegaMoe BF16 context tensor is too small");
+    TORCH_CHECK(context_bytes >= sizeof(Mc2Aclnn::Bf16MoeContext), "MegaMoe BF16 context tensor is too small");
     TORCH_CHECK(world_size <= 1024, "MegaMoe BF16 supports at most 1024 EP ranks");
-    MegaMoeContext host_context{};
-    host_context.ep_rank_id = static_cast<uint32_t>(rank);
-    host_context.rank_size_per_server = static_cast<uint32_t>(world_size);
-    deepep::megamoe::FillPeerAddresses(host_context.ep_buffer, symmetric_buffer, world_size);
+    Mc2Aclnn::Bf16MoeContext host_context{};
+    host_context.epRankId = static_cast<uint32_t>(rank);
+    host_context.rankSizePerServer = static_cast<uint32_t>(world_size);
+    deepep::megamoe::FillPeerAddresses(host_context.epHcclBuffer, symmetric_buffer, world_size);
     const auto copy_status =
         aclrtMemcpy(context.data_ptr(), context_bytes, &host_context, sizeof(host_context), ACL_MEMCPY_HOST_TO_DEVICE);
     TORCH_CHECK(copy_status == ACL_SUCCESS, "failed to initialize MegaMoe BF16 communication context, acl error ",
@@ -168,7 +161,7 @@ void InitializeMegaMoeBF16Context(torch::Tensor context, void* symmetric_buffer,
 
 uint64_t ForwardTransientWorkspaceBytes(const MegaMoeBf16TilingData& tiling)
 {
-    using namespace MegaMoeBF16Training;
+    using namespace MegaMoeBF16Impl;
     const Wave::ForwardScratch scratch(tiling.maxOutputSize, tiling.mGroupsPerWave, tiling.forwardSchedule);
     const ForwardTransientWorkspaceLayout transient(tiling.n, tiling.expertPerRank, scratch.hpRows);
     const auto expertWeightBytes = tiling.routeWeightBeforeGmm2 ? TopkWeightBytes(tiling.topkWeightType) : 0U;
@@ -190,10 +183,10 @@ std::size_t MegaMoeWindowControlRegionBytes(int64_t worldSize, int64_t expertPer
 {
     // Clear the optional compact inbox and the unchanged dense token table.
     // Forward/backward payload starts at payloadOffset and is never cleared.
-    const MegaMoeBF16Training::CompactTokenCountExchangeLayout countLayout(
+    const MegaMoeBF16Impl::CompactTokenCountExchangeLayout countLayout(
         static_cast<uint64_t>(worldSize), static_cast<uint64_t>(expertPerRank), compactTokenCountExchange);
     return static_cast<std::size_t>(
-        MegaMoeBF16Training::AlignUp(countLayout.payloadOffset, MegaMoeBF16Training::kAlignment512));
+        MegaMoeBF16Impl::AlignUp(countLayout.payloadOffset, MegaMoeBF16Impl::kAlignment512));
 }
 
 }  // namespace
@@ -203,14 +196,13 @@ namespace deepep::megamoe::bf16 {
 uint32_t BF16Plan::TopkWeightType(torch::ScalarType dtype)
 {
     TORCH_CHECK(dtype == torch::kBFloat16 || dtype == torch::kFloat32, "topk_weights must be bfloat16 or float32");
-    return dtype == torch::kFloat32 ? MegaMoeBF16Training::kTopkWeightFp32 : MegaMoeBF16Training::kTopkWeightBf16;
+    return dtype == torch::kFloat32 ? MegaMoeBF16Impl::kTopkWeightFp32 : MegaMoeBF16Impl::kTopkWeightBf16;
 }
 
-MegaMoeBF16Training::TrainingSavedStateLayout BF16Plan::MakeSavedStateLayout(const MegaMoeBf16TilingData& tiling,
-                                                                             int64_t k, int64_t n,
-                                                                             int64_t max_recv_tokens)
+MegaMoeBF16Impl::TrainingSavedStateLayout BF16Plan::MakeSavedStateLayout(const MegaMoeBf16TilingData& tiling, int64_t k,
+                                                                         int64_t n, int64_t max_recv_tokens)
 {
-    using namespace MegaMoeBF16Training;
+    using namespace MegaMoeBF16Impl;
     const auto mode = tiling.savedGateUpMode;
     return TrainingSavedStateLayout(tiling.m, k, tiling.topK, tiling.epWorldSize, tiling.expertPerRank, max_recv_tokens,
                                     n, mode == kSaveMxFp8, mode != kSaveNone,
@@ -245,7 +237,7 @@ void BF16Plan::ClearWindowControl() const
     const auto symmetricBufferBytes = SymmetricBufferBytes();
     const std::size_t controlBytes =
         MegaMoeWindowControlRegionBytes(worldSize, expertPerRank, compactTokenCountExchange);
-    const std::size_t clearOffset = static_cast<std::size_t>(MegaMoeBF16Training::PeerDataOffset(worldSize));
+    const std::size_t clearOffset = static_cast<std::size_t>(MegaMoeBF16Impl::kPeerDataOffset);
     TORCH_CHECK(controlBytes <= symmetricBufferBytes,
                 "MegaMoe BF16 SHMEM control region exceeds the symmetric buffer: need ", controlBytes, " bytes, got ",
                 symmetricBufferBytes);
@@ -280,14 +272,14 @@ torch::Tensor BF16Plan::AllocateTimer(const torch::Tensor& like, const torch::Te
     const int capacity = static_cast<int>(CeilDiv(std::max(bound, int64_t(128)), int64_t{64}) * 64);
     TORCH_CHECK(capacity <= kMaxCapacity, "training Timer task capacity exceeds supported bound");
     const Layout layout{static_cast<int>(groups * 3), capacity};
-    const bool backwardWaves = phase == 1 && MegaMoeBF16Training::UseBackwardStagedWave(SaveMode(mode), f);
+    const bool backwardWaves = phase == 1 && MegaMoeBF16Impl::UseBackwardStagedWave(SaveMode(mode), f);
     const bool withWaves = phase == 0 || backwardWaves;
     const int64_t elements = layout.Elements(withWaves);
     TORCH_CHECK(elements * 8 <= 256LL * 1024 * 1024, "training Timer exceeds 256 MiB per phase");
     auto timer = torch::zeros({elements}, like.options().dtype(torch::kInt64));
     const int64_t saved = mode == "none" ? 0 : (mode == "bf16" ? 1 : 2);
-    const int64_t flags =
-        saved | (mega_moe_bf16_swiglu_decoupled_for_saved_mode(h, saved) ? 256 : 0) | (w.transW ? 1024 : 0);
+    constexpr int64_t kDecoupledSwiglu = 1LL << 8;
+    const int64_t flags = saved | kDecoupledSwiglu | (w.transW ? 1024 : 0);
     std::vector<int64_t> values{kMagic,
                                 phase == 0 ? kForwardWaveVersion : (backwardWaves ? kBackwardWaveVersion : kVersion),
                                 groups * 3,
@@ -328,7 +320,7 @@ int64_t buffer_size(int64_t max_tokens, int64_t hidden, int64_t intermediate, in
     MegaMoeBf16TilingData tiling{};
     tiling.routeWeightBeforeGmm2 = need_grad ? 1U : 0U;
     const auto host = MakeBf16Tiling(tiling, max_tokens, hidden, intermediate, topk, world, local_experts, max_recv, 0,
-                                     0.0, "bf16", MegaMoeBF16Training::kTopkWeightFp32, GetPlatformInfo());
+                                     0.0, "bf16", MegaMoeBF16Impl::kTopkWeightFp32, GetPlatformInfo());
     const uint64_t total = host.peer_bytes;
     TORCH_CHECK(total <= uint64_t(std::numeric_limits<int64_t>::max()) - kDeviceLargePageBytes,
                 "BF16 symmetric capacity overflow");
@@ -347,17 +339,16 @@ void BF16Plan::prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t lo
     const auto host =
         MakeBf16Tiling(tiling, m, h, f, topk, world_size_, local_experts, max_recv, rank_, limit,
                        weight_before_gmm2_ ? save_type : "none",
-                       fp32_p ? MegaMoeBF16Training::kTopkWeightFp32 : MegaMoeBF16Training::kTopkWeightBf16, platform_);
+                       fp32_p ? MegaMoeBF16Impl::kTopkWeightFp32 : MegaMoeBF16Impl::kTopkWeightBf16, platform_);
     TORCH_CHECK(host.peer_bytes <= SymmetricBufferBytes(), "BF16 symmetric window is too small");
     const auto savedStateLayout = MakeSavedStateLayout(tiling, h, tiling.n, max_recv);
-    const MegaMoeBF16Training::DispatchOutputLayout dispatchOutputLayout(
-        h, max_recv, MegaMoeBF16Training::TopkWeightBytes(tiling.topkWeightType));
-    const MegaMoeBF16Training::ForwardTransientWorkspaceLayout transientWorkspaceLayout(tiling.n, local_experts,
-                                                                                        max_recv);
+    const MegaMoeBF16Impl::DispatchOutputLayout dispatchOutputLayout(
+        h, max_recv, MegaMoeBF16Impl::TopkWeightBytes(tiling.topkWeightType));
+    const MegaMoeBF16Impl::ForwardTransientWorkspaceLayout transientWorkspaceLayout(tiling.n, local_experts, max_recv);
     const uint64_t perRankTokenCountStride =
-        MegaMoeBF16Training::AlignUp(world_size_ * local_experts, MegaMoeBF16Training::kAlignment128);
-    const uint64_t legacyTrainingTailBytes = MegaMoeBF16Training::AlignUp(
-        world_size_ * perRankTokenCountStride * MegaMoeBF16Training::kInt32Bytes, MegaMoeBF16Training::kAlignment512);
+        MegaMoeBF16Impl::AlignUp(world_size_ * local_experts, MegaMoeBF16Impl::kAlignment128);
+    const uint64_t legacyTrainingTailBytes = MegaMoeBF16Impl::AlignUp(
+        world_size_ * perRankTokenCountStride * MegaMoeBF16Impl::kInt32Bytes, MegaMoeBF16Impl::kAlignment512);
     TORCH_CHECK(savedStateLayout.legacyBytes + dispatchOutputLayout.totalBytes + transientWorkspaceLayout.totalBytes ==
                     host.workspace_bytes + legacyTrainingTailBytes,
                 "MegaMoe BF16 split workspace layout does not match the legacy "
@@ -376,7 +367,7 @@ MegaMoeBf16TilingData BF16Plan::TilingForCall(int64_t m, int64_t k, int64_t n, i
         tiling_.expertPerRank != experts || tiling_.maxOutputSize != max_recv ||
         tiling_.topkWeightType != weight_type || tiling_.savedGateUpMode != SaveMode(mode) ||
         tiling_.swigluLimit != ClampLimit(limit)) {
-        prepare(m, k, n / 2, topk, experts, max_recv, limit, mode, weight_type == MegaMoeBF16Training::kTopkWeightFp32);
+        prepare(m, k, n / 2, topk, experts, max_recv, limit, mode, weight_type == MegaMoeBF16Impl::kTopkWeightFp32);
     }
     auto tiling = tiling_;
     tiling.transW = tiling.transW2 = trans_w;
@@ -401,7 +392,7 @@ torch::Tensor BF16Plan::Context(const torch::Tensor& like)
     const int world_size = world_size_;
     if (!context_.defined()) {
         auto new_context =
-            torch::empty({static_cast<int64_t>(sizeof(MegaMoeContext))}, like.options().dtype(torch::kUInt8));
+            torch::empty({static_cast<int64_t>(sizeof(Mc2Aclnn::Bf16MoeContext))}, like.options().dtype(torch::kUInt8));
         InitializeMegaMoeBF16Context(new_context, SymmetricBuffer(), rank, world_size);
         // Publish the persistent state only after initialization succeeds.
         // A failed first call must remain retryable instead of leaving a

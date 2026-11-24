@@ -75,8 +75,8 @@ __aicore__ inline void CombineTokens(uint32_t nLoc, uint32_t n, LocalTensor<int3
     ub2GmParams.blockLen = Get<N_VALUE>(actualBlockShape) * sizeof(ElementMMadOut2);
     for (int32_t tileIdx = 0; tileIdx < lenTile; ++tileIdx) {
         CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, static_cast<uint32_t>(tileIdx));
-        gmRemoteD.SetGlobalBuffer(
-            reinterpret_cast<__gm__ ElementMMadOut2*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
+        gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMMadOut2*>(
+            GetRankWinAddrWithOffset(g_winRankAddr_, route.dstRankId, gmRemoteBaseOffset)));
         uint64_t gmDstOffset = GetCombineDstRowIndex(route, params) * n + nLoc;
         AscendC::DataCopyPad(gmRemoteD[gmDstOffset], l0cOutUbGMM2[tileIdx * ubTileN], ub2GmParams);
     }
@@ -91,8 +91,8 @@ __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemo
     CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, 0U);
 
     GlobalTensor<Element> gmRemoteD;
-    gmRemoteD.SetGlobalBuffer(
-        reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
+    gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(
+        GetRankWinAddrWithOffset(g_winRankAddr_, route.dstRankId, gmRemoteBaseOffset)));
     uint64_t gmDstRowOffset = GetCombineDstRowIndex(route, params) * rowElements;
 
     DataCopyExtParams ub2GmParams{1U, static_cast<uint32_t>(rowElements * sizeof(Element)), 0U, 0U, 0U};
@@ -118,7 +118,7 @@ __aicore__ inline void CombineSendTokenToRemote(uint32_t batchStart, uint32_t cu
     GM_ADDR srcAddr = localSrcPtr;
 
     if (toRankId == rankId) {
-        srcAddr = GetRankWinAddrWithOffset(toRankId, gmRemoteOffset);
+        srcAddr = GetRankWinAddrWithOffset(g_winRankAddr_, toRankId, gmRemoteOffset);
     }
 
     gmLocalD.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(srcAddr));
@@ -144,7 +144,8 @@ __aicore__ inline void CombineSendTokenToRemote(uint32_t batchStart, uint32_t cu
 
     if (toRankId != rankId) {
         uint64_t channelHandle = GetUrmaCommHandle(params.combineCommParams.mc2Context, toRankId, rankId);
-        GM_ADDR remoteAddr = GetRankWinAddrWithOffset(toRankId, gmRemoteOffset) + dstBaseOffset * sizeof(DataType);
+        GM_ADDR remoteAddr =
+            GetRankWinAddrWithOffset(g_winRankAddr_, toRankId, gmRemoteOffset) + dstBaseOffset * sizeof(DataType);
         params.combineCommParams.hcomm->WriteNbi(channelHandle, remoteAddr, srcAddr, quantTokenSize * sizeof(DataType));
     }
 #endif
@@ -162,7 +163,7 @@ __aicore__ inline void CombineQuantizedTokens(uint32_t batchStart, uint32_t curR
     AscendC::GlobalTensor<QuantOutType> gmRemoteD;
     uint64_t gmRemoteOffset =
         static_cast<uint64_t>(params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr);
-    __gm__ void* dstPeermemPtr = GetRankWinAddrWithOffset(route.dstRankId, gmRemoteOffset);
+    __gm__ void* dstPeermemPtr = GetRankWinAddrWithOffset(g_winRankAddr_, route.dstRankId, gmRemoteOffset);
     gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ QuantOutType*>(dstPeermemPtr));
 
     uint64_t dstBaseOffset = GetCombineDstRowIndex(route, params) * quantTokenSizeBytes;

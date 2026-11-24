@@ -44,10 +44,10 @@
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "mc2_common/mc2_kernel_utils.hpp"
-#include "common/mega_moe_bf16_context.hpp"
+#include "common/mega_moe_utils.hpp"
 #include "stage/mega_moe_combine_send.hpp"
-#include "stage/mega_moe_pack_bf16.hpp"
-#include "stage/peer_row_view.hpp"
+#include "stage/mega_moe_route_bf16.hpp"
+#include "common/mega_moe_bf16_peer_row_view.hpp"
 #include "stage/mega_moe_unpermute_bf16.hpp"
 #include "epilogue/block_epilogue_swiglu_bf16_backward.hpp"
 #include "catlass_gmm/mega_moe_bf16_catlass_impl_backward.hpp"
@@ -97,21 +97,20 @@ private:
     __aicore__ inline AscendC::LocalTensor<QuantOutType> StageUb(uint32_t bytes);
     __aicore__ inline void UnpermuteBuffInit(TPipe* tPipe);
     __aicore__ inline void TopkGradBuffInit(TPipe* tPipe);
-    __aicore__ inline void GatherRoutes();
     __aicore__ inline void RestoreTokenPerExpert();
     __aicore__ inline void ResetTokenPerExpert();
     __aicore__ inline void ClearEmptyExpertGradWeights();
     __aicore__ inline void ClearGradWeightPlane(GM_ADDR base, uint64_t planeElements, uint32_t expertIdx);
     __aicore__ inline void DispatchTokensBackward(GM_ADDR dstBase, uint32_t expertIdx);
-    using WavePlan = MegaMoeBF16Training::BackwardWavePlan;
+    using WavePlan = MegaMoeBF16Impl::BackwardWavePlan;
     __aicore__ inline bool UseStagedWave(uint32_t ordinal) const
     {
-        return MegaMoeBF16Training::UseBackwardStagedWave(savedGateUpMode_, n_ / 2) && params_.peerRowsGroups == 0U &&
+        return MegaMoeBF16Impl::UseBackwardStagedWave(savedGateUpMode_, n_ / 2) && params_.peerRowsGroups == 0U &&
                ordinal < splitExperts_;
     }
     __aicore__ inline bool UseRecomputeDhpRows(uint32_t ordinal) const
     {
-        return ordinal < splitExperts_ && MegaMoeBF16Training::UseRecomputeDhpRowReady(savedGateUpMode_, n_ / 2);
+        return ordinal < splitExperts_ && MegaMoeBF16Impl::UseRecomputeDhpRowReady(savedGateUpMode_, n_ / 2);
     }
     // For row-ready recompute, the expert counter covers Gate/Up; dHp uses per-row slots.
     __aicore__ inline __gm__ int32_t* RecomputeReady(uint32_t expert) const
@@ -127,9 +126,9 @@ private:
     __aicore__ inline void PrepareWaveChunks()
     {
         if (!UseStagedWave(0) || aivCoreIdx_ >= expertPerRank_) return;
-        const MegaMoeBF16Training::Wave::GmPeerPrefix prefix{
+        const MegaMoeBF16Impl::Wave::GmPeerPrefix prefix{
             reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM)};
-        MegaMoeBF16Training::PreparedExpertCursor cursor;
+        MegaMoeBF16Impl::PreparedExpertCursor cursor;
         for (uint32_t expert = 0; expert < expertPerRank_; ++expert) {
             uint32_t rows = 0, ordinal = 0;
             if (cursor.Next(groupList_.GetValue(expert), groupListType_, maxOutputSize_, rows, ordinal) &&
@@ -142,7 +141,7 @@ private:
     }
     __aicore__ inline WavePlan MakeWavePlan(uint32_t expert, uint32_t rows, uint32_t precedingTiles) const
     {
-        const MegaMoeBF16Training::Wave::GmPeerPrefix prefix{
+        const MegaMoeBF16Impl::Wave::GmPeerPrefix prefix{
             reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM)};
         const uint32_t selfBegin = rankId_ ? prefix.Get((rankId_ - 1) * expertPerRank_ + expert) : 0;
         int32_t chunk;
@@ -201,7 +200,7 @@ private:
         MegaMoeBF16BackwardCatlassImpl::L1_TILE_M * MegaMoeBF16BackwardCatlassImpl::L1_TILE_N * sizeof(bfloat16_t);
     static constexpr uint32_t BW_STAGE_BASE_BYTES = 3 * BW_TILE_BYTES;
     static constexpr uint32_t BW_GRAD_WEIGHT_ZERO_CHUNK_BYTES =
-        MegaMoeBF16Training::ForwardDispatchUbLayout::kCountResetChunkBytes;
+        MegaMoeBF16Impl::ForwardDispatchUbLayout::kCountResetChunkBytes;
     static_assert(BW_STAGE_BASE_BYTES + BW_GRAD_WEIGHT_ZERO_CHUNK_BYTES <=
                       MegaMoeBF16BackwardCatlassImpl::ArchTag::UB_SIZE,
                   "the static staging window must hold the gradient-zero tile");
@@ -212,7 +211,7 @@ private:
     TBuf<> TopkGradPartialBuf_;
     TBuf<> TopkGradPeerPrefixBuf_;
 
-    __gm__ ::Mc2MoeContext* mc2Context_{nullptr};
+    __gm__ Mc2Aclnn::Bf16MoeContext* mc2Context_{nullptr};
     Bf16Params params_{};
     MegaMoeTrainTimerDevice* timer_ = nullptr;
     BackwardSavedStateInfo savedState_{};
@@ -240,7 +239,7 @@ private:
     uint32_t worldSize_ = 0;
     uint32_t expertPerRank_ = 0;
     uint32_t groupListType_ = 0;
-    uint32_t savedGateUpMode_ = MegaMoeBF16Training::kSaveNone;
+    uint32_t savedGateUpMode_ = MegaMoeBF16Impl::kSaveNone;
     uint64_t maxOutputSize_ = 0;
     uint32_t dispatchBlockNumPerEP_ = 0;
     int32_t perRankStridesInTokenPerExpert_ = 0;
@@ -281,9 +280,9 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Init(GM_ADDR context, G
     rankId_ = tilingData->rankId;
     savedGateUpMode_ = tilingData->savedGateUpMode;
 
-    mc2Context_ = reinterpret_cast<__gm__ ::Mc2MoeContext*>(context);
+    mc2Context_ = reinterpret_cast<__gm__ Mc2Aclnn::Bf16MoeContext*>(context);
     for (int i = 0; i < worldSize_; i++) {
-        winRankAddr_[i] = (GM_ADDR)mc2Context_->epHcclBuffer[i];
+        bf16WinRankAddr[i] = (GM_ADDR)mc2Context_->epHcclBuffer[i];
     }
 
     params_.aGmAddr = gradY;
@@ -293,7 +292,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Init(GM_ADDR context, G
     params_.y2GmAddr = gradX;
     savedState_ = BackwardSavedStateInfo(trainingSavedState, dispatchOutput, tilingData);
     params_.workspaceInfo = savedState_;
-    params_.peermemInfo = Bf16PeermemInfo(winRankAddr_[rankId_], tilingData, true);
+    params_.peermemInfo = Bf16PeermemInfo(bf16WinRankAddr[rankId_], tilingData, true);
     params_.tilingData = tilingData;
     params_.peerRowsGroups = 0;
     gradWeight1GmAddr_ = gradWeight1;
@@ -313,9 +312,8 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Init(GM_ADDR context, G
     savedTokenPerExpert_.SetGlobalBuffer((__gm__ int32_t*)savedState_.ptrSavedTokenPerExpert);
 
     GM_ADDR gatePlane =
-        (savedGateUpMode_ == MegaMoeBF16Training::kSaveNone) ? bwWs_.ptrRecomputeGate : savedState_.ptrSavedGate;
-    GM_ADDR upPlane =
-        (savedGateUpMode_ == MegaMoeBF16Training::kSaveNone) ? bwWs_.ptrRecomputeUp : savedState_.ptrSavedUp;
+        (savedGateUpMode_ == MegaMoeBF16Impl::kSaveNone) ? bwWs_.ptrRecomputeGate : savedState_.ptrSavedGate;
+    GM_ADDR upPlane = (savedGateUpMode_ == MegaMoeBF16Impl::kSaveNone) ? bwWs_.ptrRecomputeUp : savedState_.ptrSavedUp;
     epilogueOp_.Init({gatePlane, upPlane, savedState_.ptrSavedGateScale, savedState_.ptrSavedUpScale,
                       savedState_.ptrSavedGateHigh, savedState_.ptrSavedUpLow, savedState_.ptrSavedUpHigh,
                       bwWs_.ptrGradZ, bwWs_.ptrHp, bwWs_.ptrDpProducts, params_.workspaceInfo.ptrDispatchedTopkWeights,
@@ -345,7 +343,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::InitStageLayout()
     constexpr uint32_t available = MegaMoeBF16BackwardCatlassImpl::ArchTag::UB_SIZE - BW_STAGE_BASE_BYTES;
     constexpr uint32_t indexBytes = Bf16Route::kIndexBatch * sizeof(int32_t);
     constexpr uint32_t cols = (available - indexBytes) / (2U * sizeof(QuantOutType)) / 32U * 32U;
-    static_assert(cols > 0 && available >= MegaMoeForwardSave::kCopyBufferBytes);
+    static_assert(cols > 0 && available >= MegaMoeImpl::kCopyBufferBytes);
     dispatchCopyElementsPerPing_ = k_ < cols ? k_ : cols;
 }
 
@@ -369,19 +367,6 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::TopkGradBuffInit(TPipe*
         const uint32_t prefixBytes = worldSize_ * expertPerRank_ * sizeof(int32_t);
         tPipe->InitBuffer(TopkGradPeerPrefixBuf_, Ops::Base::CeilAlign(prefixBytes, static_cast<uint32_t>(ALIGN_32)));
     }
-}
-
-template <typename TopkWeightT>
-__aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::GatherRoutes()
-{
-    MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_GATHER);
-    if constexpr (g_coreType == AscendC::AIC) {
-        return;
-    }
-    auto scratch = StageUb(MegaMoeForwardSave::kCopyBufferBytes).template ReinterpretCast<uint8_t>();
-    Bf16Route::PublishDispatchInput(params_.aGmAddr, params_.peermemInfo.sourceTokens,
-                                    params_.workspaceInfo.expandedRowIdx, params_.peermemInfo.routeIndices, m_, k_,
-                                    topK_, aivCoreIdx_, blockAivNum_, scratch);
 }
 
 template <typename TopkWeightT>
@@ -413,7 +398,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ResetTokenPerExpert()
     const uint64_t countElements =
         static_cast<uint64_t>(worldSize_) * static_cast<uint32_t>(perRankStridesInTokenPerExpert_);
     constexpr uint32_t chunkElements =
-        MegaMoeBF16Training::ForwardDispatchUbLayout::kCountResetChunkBytes / sizeof(int32_t);
+        MegaMoeBF16Impl::ForwardDispatchUbLayout::kCountResetChunkBytes / sizeof(int32_t);
     const uint32_t zeroElements = countElements < chunkElements ? static_cast<uint32_t>(countElements) : chunkElements;
     // The P6 pipe is destroyed; pair events without fetching a TPipe event.
     SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
@@ -438,12 +423,12 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::CopyDispatchedGradRows(
 {
     const auto& peer = params_.peermemInfo;
     GlobalTensor<int32_t> routeIds;
-    routeIds.SetGlobalBuffer(
-        reinterpret_cast<__gm__ int32_t*>(::GetRankWinAddrWithOffset(source, peer.routeIndices - peer.ptrBase)) +
-        sourceRow);
+    routeIds.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
+                                 GetRankWinAddrWithOffset(bf16WinRankAddr, source, peer.routeIndices - peer.ptrBase)) +
+                             sourceRow);
     GlobalTensor<QuantOutType> input;
     input.SetGlobalBuffer(
-        reinterpret_cast<__gm__ QuantOutType*>(::GetRankWinAddrWithOffset(source, peer.payloadOffset)));
+        reinterpret_cast<__gm__ QuantOutType*>(GetRankWinAddrWithOffset(bf16WinRankAddr, source, peer.payloadOffset)));
     const uint32_t cols = dispatchCopyElementsPerPing_;
     const uint32_t ringBytes = 2U * cols * sizeof(QuantOutType);
     auto slots = StageUb(ringBytes);
@@ -469,7 +454,7 @@ template <class Prefix>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchWaveTokensBackward(GM_ADDR dstBase, uint32_t expertIdx,
                                                                                     const Prefix& prefix)
 {
-    using namespace MegaMoeBF16Training::Wave;
+    using namespace MegaMoeBF16Impl::Wave;
     const auto info =
         DescribePeerExpert(prefix, worldSize_, expertPerRank_, expertIdx, maxOutputSize_, params_.peerRowsGroups);
     const PeerCounts<Prefix> counts{prefix, expertPerRank_, expertIdx, info.rows};
@@ -512,7 +497,7 @@ template <typename TopkWeightT>
 __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchStagedBackward(GM_ADDR dstBase, uint32_t expert,
                                                                                 const WavePlan& plan)
 {
-    const MegaMoeBF16Training::Wave::GmPeerPrefix prefix{
+    const MegaMoeBF16Impl::Wave::GmPeerPrefix prefix{
         reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.ptrcumsumMM)};
     const RowSliceReady ready(bwWs_.ptrStagedReady, cumMRows_, expert, WavePlan::tileM);
     GlobalTensor<QuantOutType> output;
@@ -528,7 +513,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchStagedBackward(
             timer_->SetSlice(expert, row + band.start, band.count);
         }
         MegaMoeTrainTimerSpanScope span(timer_, MegaMoeTrainTimer::AIV_BW_DISPATCH);
-        MegaMoeBF16Training::VisitCanonicalPeerRows(
+        MegaMoeBF16Impl::VisitCanonicalPeerRows(
             prefix, worldSize_, expertPerRank_, expert, row + band.start, row + band.start + band.count,
             [&](uint32_t peer, uint32_t ordinal, uint32_t target, uint32_t take) __aicore__ {
                 const uint32_t source = preSumBeforeRankWorkSpace_(peer * expertPerRank_ + expert);
@@ -552,11 +537,11 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::DispatchTokensBackward(
     }
     MegaMoeTrainTimerSpanScope timerDispatch(timer_, MegaMoeTrainTimer::AIV_BW_DISPATCH);
     if (params_.peerRowsGroups != 0U) {
-        using namespace MegaMoeBF16Training::Wave;
-        if (savedGateUpMode_ == MegaMoeBF16Training::kSaveMxFp8) {
+        using namespace MegaMoeBF16Impl::Wave;
+        if (savedGateUpMode_ == MegaMoeBF16Impl::kSaveMxFp8) {
             // Saved MXFP8 writes dHp to GM. AIV0 can use its first tile for the
             // read-only prefix until Dispatch ends and its SwiGLU epilogue starts.
-            static_assert(MegaMoeBF16Training::kMaxTotalExperts * sizeof(int32_t) <= BW_TILE_BYTES);
+            static_assert(MegaMoeBF16Impl::kMaxTotalExperts * sizeof(int32_t) <= BW_TILE_BYTES);
             const uint32_t countElements = worldSize_ * expertPerRank_;
             LocalTensor<int32_t> prefixUb{TPosition::VECIN, 0, (countElements + 7U) / 8U * 8U};
             DataCopyPad(prefixUb, cumsumInWorkSpace_,
@@ -766,11 +751,10 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::CrossRankSyncInWorldSiz
         return;
     }
     __gm__ int32_t* syncRank = (__gm__ int32_t*)(params_.peermemInfo.ptrBase);
-    __gm__ int32_t* syncCount =
-        (__gm__ int32_t*)(params_.peermemInfo.ptrBase + MegaMoeBF16Training::PeerSyncCountOffset(worldSize_));
+    __gm__ int32_t* syncCount = (__gm__ int32_t*)(params_.peermemInfo.ptrBase + MegaMoeBF16Impl::kPeerSyncCountOffset);
     int count = *(syncCount + aivCoreIdx_ * 16) + 1;
     for (int i = aivCoreIdx_; i < static_cast<int>(worldSize_); i += static_cast<int>(blockAivNum_)) {
-        __gm__ int32_t* syncRemoteAddr = (__gm__ int32_t*)(winRankAddr_[i]) + rankId_ * 16;
+        __gm__ int32_t* syncRemoteAddr = (__gm__ int32_t*)(bf16WinRankAddr[i]) + rankId_ * 16;
         WriteGmByPassDCache(syncRemoteAddr, count);
         auto syncCheck = syncRank + i * 16;
         GmSignalWaitBarrier(syncCheck, count);
@@ -1264,8 +1248,8 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::CopyTopkGradBatch(uint6
     SyncFunc<HardEvent::V_MTE2>();
     SyncFunc<HardEvent::V_MTE3>();
     GlobalTensor<TopkWeightT> output;
-    output.SetGlobalBuffer(reinterpret_cast<__gm__ TopkWeightT*>(
-        ::GetRankWinAddrWithOffset(rank, params_.peermemInfo.ptrTopkGrad - params_.peermemInfo.ptrBase)));
+    output.SetGlobalBuffer(reinterpret_cast<__gm__ TopkWeightT*>(GetRankWinAddrWithOffset(
+        bf16WinRankAddr, rank, params_.peermemInfo.ptrTopkGrad - params_.peermemInfo.ptrBase)));
     MegaMoeTrainTimerPassiveScope send(timer_, MegaMoeTrainTimer::AIV_BW_DP_SEND, expert, expertRow, rows, uint32_t(-1),
                                        rows, 1U, partialTiles, 1U, 0U, rank);
     const DataCopyExtParams batchCopy{1U, static_cast<uint32_t>(rows * sizeof(TopkWeightT)), 0U, 0U, 0U};
@@ -1304,8 +1288,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad(
         return;
     }
     const int32_t f = static_cast<int32_t>(n_ / SWIGLU_N_HALF);
-    const int32_t partialTiles =
-        static_cast<int32_t>(MegaMoeBF16Training::BackwardTopkPartialCount(savedGateUpMode_, f));
+    const int32_t partialTiles = static_cast<int32_t>(MegaMoeBF16Impl::BackwardTopkPartialCount(savedGateUpMode_, f));
     const int32_t partialCapacity = static_cast<int32_t>(BW_TOPK_PARTIAL_UB_BYTES / sizeof(float));
     // Masked arithmetic does not mask Reg::DataCopy's full-register load.
     // Reserve one register minus one element as a UB tail guard.
@@ -1320,7 +1303,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad(
                                       ? rowsByPartialUb
                                       : static_cast<int32_t>(BW_TOPK_ROUTE_BATCH_ROWS);
     if (params_.peerRowsGroups != 0U) {
-        using namespace MegaMoeBF16Training::Wave;
+        using namespace MegaMoeBF16Impl::Wave;
         auto prefixUb = TopkGradPeerPrefixBuf_.Get<int32_t>();
         const uint32_t prefixBytes = worldSize_ * expertPerRank_ * sizeof(int32_t);
         DataCopyPad(prefixUb, cumsumInWorkSpace_, DataCopyExtParams{1U, prefixBytes, 0U, 0U, 0U},
@@ -1454,7 +1437,13 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
     // ---- P0-A: publish source-token dY and this microbatch's route table (all AIV) ----
     if constexpr (g_coreType == AscendC::AIV) {
         PrepareWaveChunks();
-        GatherRoutes();
+        {
+            MegaMoeTrainTimerFixedScope timerStage(timer_, MegaMoeTrainTimer::AIV_BW_GATHER);
+            auto scratch = StageUb(MegaMoeImpl::kCopyBufferBytes).template ReinterpretCast<uint8_t>();
+            Bf16Route::PublishDispatchInput(params_.aGmAddr, params_.peermemInfo.sourceTokens,
+                                            params_.workspaceInfo.expandedRowIdx, params_.peermemInfo.routeIndices, m_,
+                                            k_, topK_, aivCoreIdx_, blockAivNum_, scratch);
+        }
 
         SyncAll<true>();
         CrossRankSyncInWorldSize();
@@ -1495,7 +1484,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
     // BF16/MXFP8 modes consume the matching forward-persistent gate/up in P1.
     // Only save=none recomputes GMM1 into backward GM scratch. The AIC does
     // not hand these results through AIV UB, so it can overlap P0-A/P0-B.
-    if (savedGateUpMode_ == MegaMoeBF16Training::kSaveNone) {
+    if (savedGateUpMode_ == MegaMoeBF16Impl::kSaveNone) {
         if (params_.tilingData->transW) {
             GMM1RecomputePhase<true>();
         } else {
@@ -1512,10 +1501,10 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::Process()
     // UB output: AIC alternates dHp tiles between paired AIV slots, with a
     // completion handshake before reuse. Gate/Up comes from P0-C scratch.
     // P0 staging is disjoint from both work paths.
-    const bool useGmDataGrad = MegaMoeBF16Training::UseGmForBackwardDataGrad(savedGateUpMode_);
+    const bool useGmDataGrad = MegaMoeBF16Impl::UseGmForBackwardDataGrad(savedGateUpMode_);
     // For recompute, only P1 needs GM dHp so one AIV can reduce a full row.
     // The later dX/Combine and dW phases keep their existing ownership.
-    if (useGmDataGrad || MegaMoeBF16Training::UseWholeRowTopkGrad(savedGateUpMode_, n_ / 2)) {
+    if (useGmDataGrad || MegaMoeBF16Impl::UseWholeRowTopkGrad(savedGateUpMode_, n_ / 2)) {
         if (params_.tilingData->transW) {
             GMM2GradPhase<true, true>();
         } else {

@@ -14,7 +14,7 @@
 #include "experiments/megamoe/csrc/kernels/mega_moe/common/mega_moe_workspace_backward.hpp"
 #include "experiments/megamoe/csrc/kernels/mega_moe/stage/mega_moe_staged_wave_backward.hpp"
 
-using namespace MegaMoeBF16Training::Wave;
+using namespace MegaMoeBF16Impl::Wave;
 using Row = std::pair<uint32_t, uint32_t>;
 struct Prefix {
     const std::vector<uint32_t>& values;
@@ -32,9 +32,9 @@ static void CheckBackwardWaveRows()
     // Each peer falls three rows short of a wave. The first wave still
     // draws one complete canonical tile from each of six different peers.
     const std::vector<uint32_t> peerEnds{765, 1530, 2295, 3060, 3825, 4590, 5355, 6120};
-    const MegaMoeBF16Training::BackwardWavePlan geometry(peerEnds.back(), 3072, cores, 0, 0);
+    const MegaMoeBF16Impl::BackwardWavePlan geometry(peerEnds.back(), 3072, cores, 0, 0);
     const auto chunk = geometry.SelectChunkTiles(Prefix{peerEnds}, 8, 1, 0);
-    const MegaMoeBF16Training::BackwardWavePlan firstWave(peerEnds.back(), 3072, cores, 0, 0, chunk);
+    const MegaMoeBF16Impl::BackwardWavePlan firstWave(peerEnds.back(), 3072, cores, 0, 0, chunk);
     for (uint32_t i = 0; i < firstWave.groups; ++i) {
         const auto row = firstWave.TileOffset(i) * firstWave.tileM;
         assert(row >= i * 765 && row + firstWave.tileM <= peerEnds[i]);
@@ -67,7 +67,7 @@ static void CheckBackwardWaveRows()
                     if (scenario == 9) m = 1399;
                     uint32_t n = ep == 16 ? 2304 : 3072, cols = (n + 255) / 256;
                     const uint32_t sourceBegin = rank ? prefix[(rank - 1) * experts + e] : 0;
-                    const MegaMoeBF16Training::BackwardWavePlan geometry(m, n, cores, sourceBegin, previous);
+                    const MegaMoeBF16Impl::BackwardWavePlan geometry(m, n, cores, sourceBegin, previous);
                     const uint32_t chunk = geometry.SelectChunkTiles(Prefix{prefix}, ep, experts, e);
                     if (m < expected[e].size()) {
                         auto admitted = prefix;
@@ -77,7 +77,7 @@ static void CheckBackwardWaveRows()
                         }
                         assert(chunk == geometry.SelectChunkTiles(Prefix{admitted}, ep, experts, e));
                     }
-                    const MegaMoeBF16Training::BackwardWavePlan plan(m, n, cores, sourceBegin, previous, chunk);
+                    const MegaMoeBF16Impl::BackwardWavePlan plan(m, n, cores, sourceBegin, previous, chunk);
                     std::vector<unsigned> tileVisits(plan.tiles);
                     for (uint32_t visit = 0; visit < plan.tiles; ++visit) {
                         const auto tile = (plan.pivot + plan.TileOffset(visit)) % plan.tiles;
@@ -92,14 +92,14 @@ static void CheckBackwardWaveRows()
                             assert(row % 128 == 0 && rows == std::min(128U, m - row));
                             const auto band = MegaMoeImpl::GetBalancedTokenRange(rows, member, owners);
                             if (band.count) {
-                                MegaMoeBF16Training::VisitCanonicalPeerRows(
-                                    Prefix{prefix}, ep, experts, e, row + band.start, row + band.start + band.count,
-                                    [&](auto peer, auto j, auto dst, auto len) {
-                                        for (uint32_t i = 0; i < len; ++i) {
-                                            actual[dst + i] = {peer, j + i};
-                                            ++visited[dst + i];
-                                        }
-                                    });
+                                MegaMoeBF16Impl::VisitCanonicalPeerRows(Prefix{prefix}, ep, experts, e,
+                                                                        row + band.start, row + band.start + band.count,
+                                                                        [&](auto peer, auto j, auto dst, auto len) {
+                                                                            for (uint32_t i = 0; i < len; ++i) {
+                                                                                actual[dst + i] = {peer, j + i};
+                                                                                ++visited[dst + i];
+                                                                            }
+                                                                        });
                                 ++arrivals[row / 128];
                             }
                         });
@@ -130,7 +130,7 @@ static void CheckDhpWaveOwnership()
             unsigned previous = 0;
             std::vector<unsigned> work(cores);
             for (uint32_t m : {0U, 33U, 511U, 16384U, 65U, 1025U}) {
-                const MegaMoeBF16Training::BackwardWavePlan plan(m, cols * 256, cores, m / 2, previous);
+                const MegaMoeBF16Impl::BackwardWavePlan plan(m, cols * 256, cores, m / 2, previous);
                 std::vector<unsigned> visits(plan.tiles * cols);
                 for (unsigned lane = 0; lane < cores; ++lane) {
                     plan.ForEachDhpRow(lane, cols, previous * cols % cores,
@@ -155,7 +155,7 @@ static void CheckDhpWaveOwnership()
     // EP16: three experts with 16384 rows and F2304 share 3456 tiles across 32 AICs.
     std::vector<unsigned> work(32);
     for (unsigned expert = 0; expert < 3; ++expert) {
-        const MegaMoeBF16Training::BackwardWavePlan plan(16384, 2304, 32, 0, expert * 128);
+        const MegaMoeBF16Impl::BackwardWavePlan plan(16384, 2304, 32, 0, expert * 128);
         for (unsigned lane = 0; lane < 32; ++lane)
             plan.ForEachDhpRow(lane, 9, expert * 128 * 9 % 32, [&](unsigned, unsigned, unsigned firstCol, unsigned) {
                 assert(firstCol < 9);
@@ -167,7 +167,7 @@ static void CheckDhpWaveOwnership()
 
 static void CheckTokenCountExchange()
 {
-    using namespace MegaMoeBF16Training;
+    using namespace MegaMoeBF16Impl;
     static_assert(!UseCompactTokenCountExchange(8, 4));
     static_assert(UseCompactTokenCountExchange(512, 4));
     static_assert(!UseCompactTokenCountExchange(512, 9));
@@ -197,8 +197,8 @@ int main()
     static_assert(MegaMoeImpl::GetGmmNextStartBlock(3, 3, 4) == 2);
     // Source tokens are shared by all TopK slots; indices, weights and returns are per route.
     constexpr uint64_t payloadBase = 8192, sourceRows = 129, hidden = 256, topK = 3;
-    constexpr MegaMoeBF16Training::PeerPayloadLayout bf16Payload(payloadBase, sourceRows, hidden, topK, 2);
-    constexpr MegaMoeBF16Training::PeerPayloadLayout fp32Payload(payloadBase, sourceRows, hidden, topK, 4);
+    constexpr MegaMoeBF16Impl::PeerPayloadLayout bf16Payload(payloadBase, sourceRows, hidden, topK, 2);
+    constexpr MegaMoeBF16Impl::PeerPayloadLayout fp32Payload(payloadBase, sourceRows, hidden, topK, 4);
     static_assert(bf16Payload.routeIndexOffset == payloadBase + sourceRows * hidden * 2);
     static_assert(bf16Payload.weightOffset == bf16Payload.routeIndexOffset + 2048);
     static_assert(fp32Payload.weightOffset == bf16Payload.weightOffset);
@@ -208,12 +208,12 @@ int main()
     static_assert(bf16Payload.topkGradOffset == bf16Payload.returnOffset + sourceRows * topK * hidden * 2);
     static_assert(fp32Payload.totalBytes == fp32Payload.topkGradOffset + 2048);
     static_assert(bf16Payload.totalBytes == bf16Payload.topkGradOffset + 1024);
-    using MegaMoeBF16Training::BackwardWorkspaceLayout;
-    const BackwardWorkspaceLayout saved(4, 24576, 7168, 6144, 4, MegaMoeBF16Training::kSaveBf16, 64);
+    using MegaMoeBF16Impl::BackwardWorkspaceLayout;
+    const BackwardWorkspaceLayout saved(4, 24576, 7168, 6144, 4, MegaMoeBF16Impl::kSaveBf16, 64);
     assert(saved.dzOffset == 24576ULL * 7168U * sizeof(uint16_t));
     assert(saved.stagedReadyOffset != 0);
     assert(saved.totalBytes - saved.stagedReadyOffset == (24576 / 128 + 4) * 64);
-    using namespace MegaMoeBF16Training;
+    using namespace MegaMoeBF16Impl;
     static_assert(UseBackwardStagedWave(kSaveBf16, 2048) && UseBackwardStagedWave(kSaveMxFp8, 2080));
     static_assert(UseBackwardStagedWave(kSaveBf16, 16384) && UseBackwardStagedWave(kSaveMxFp8, 16384));
     static_assert(!UseBackwardStagedWave(kSaveMxFp8, 16416));
@@ -239,29 +239,29 @@ int main()
         const BackwardWorkspaceLayout wide(4, 128, 256, 2 * 16640, 0, mode, 64);
         assert(wide.stagedReadyOffset == 0);
         assert(wide.wideDpOffset && wide.controlOffset - wide.wideDpOffset == 64U * 16640U * sizeof(float));
-        assert(MegaMoeBF16Training::BackwardTopkPartialCount(mode, 16640) == 1);
+        assert(MegaMoeBF16Impl::BackwardTopkPartialCount(mode, 16640) == 1);
     }
-    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveBf16, 3072) == 1);
-    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveNone, 3072) == 1);
-    static_assert(MegaMoeBF16Training::BackwardTopkPartialCount(MegaMoeBF16Training::kSaveMxFp8, 3072) == 1);
+    static_assert(MegaMoeBF16Impl::BackwardTopkPartialCount(MegaMoeBF16Impl::kSaveBf16, 3072) == 1);
+    static_assert(MegaMoeBF16Impl::BackwardTopkPartialCount(MegaMoeBF16Impl::kSaveNone, 3072) == 1);
+    static_assert(MegaMoeBF16Impl::BackwardTopkPartialCount(MegaMoeBF16Impl::kSaveMxFp8, 3072) == 1);
     // These reduction widths reproduce the reference sum order for dP.
-    static_assert(MegaMoeBF16Training::MakeTopkGradReductionPlan(24467, 3072, 64).width == 3072);
-    static_assert(MegaMoeBF16Training::MakeTopkGradReductionPlan(24258, 3072, 64).width == 1536);
-    static_assert(MegaMoeBF16Training::MakeTopkGradReductionPlan(24693, 3072, 64).width == 1536);
-    constexpr auto grouped = MegaMoeBF16Training::MakeTopkGradReductionPlan(1539, 16640, 64);
+    static_assert(MegaMoeBF16Impl::MakeTopkGradReductionPlan(24467, 3072, 64).width == 3072);
+    static_assert(MegaMoeBF16Impl::MakeTopkGradReductionPlan(24258, 3072, 64).width == 1536);
+    static_assert(MegaMoeBF16Impl::MakeTopkGradReductionPlan(24693, 3072, 64).width == 1536);
+    constexpr auto grouped = MegaMoeBF16Impl::MakeTopkGradReductionPlan(1539, 16640, 64);
     static_assert(grouped.width == 256 && grouped.stripesPerGroup == 33);
-    constexpr auto shortTail = MegaMoeBF16Training::MakeTopkGradReductionPlan(498, 2560, 64);
+    constexpr auto shortTail = MegaMoeBF16Impl::MakeTopkGradReductionPlan(498, 2560, 64);
     static_assert(shortTail.width == 504 && shortTail.stripesPerGroup == 6);
-    constexpr auto fourGroups = MegaMoeBF16Training::MakeTopkGradReductionPlan(486, 1024, 64);
+    constexpr auto fourGroups = MegaMoeBF16Impl::MakeTopkGradReductionPlan(486, 1024, 64);
     static_assert(fourGroups.width == 256 && fourGroups.stripesPerGroup == 1);
     for (uint32_t f = 64; f <= 16384; f += 64) {
-        const auto batch = MegaMoeBF16Training::TopkGradBatchRows(f);
+        const auto batch = MegaMoeBF16Impl::TopkGradBatchRows(f);
         assert(batch >= 1);
-        assert(batch * 10U * f + MegaMoeBF16Training::kWholeRowTopkResultBytes <= 248U * 1024U);
+        assert(batch * 10U * f + MegaMoeBF16Impl::kWholeRowTopkResultBytes <= 248U * 1024U);
     }
     // Row ownership is independent of the 2*AIC lanes used to choose the sum tree.
     for (uint32_t f : {64U, 3072U, 16384U}) {
-        const auto batch = MegaMoeBF16Training::TopkGradBatchRows(f);
+        const auto batch = MegaMoeBF16Impl::TopkGradBatchRows(f);
         for (uint32_t readers : {1U, 32U, 36U}) {
             for (uint32_t rows : {0U, 1U, 31U, 32U, 33U, 255U, 256U, 257U, 24991U}) {
                 std::vector<uint32_t> visited(rows);
@@ -273,11 +273,11 @@ int main()
             }
         }
     }
-    using Quant = MegaMoeBF16Training::SavedGateUpQuantUbLayoutFor<256, 64, 128>;
+    using Quant = MegaMoeBF16Impl::SavedGateUpQuantUbLayoutFor<256, 64, 128>;
     static_assert(Quant::gateData == 2U * 256U * 128U * 2U);
     static_assert(Quant::totalBytesWithClipMasks + 256U * sizeof(float) <= 248U * 1024U);
     for (uint64_t capacity : {0ULL, 1ULL, 255ULL, 256ULL, 257ULL, 24576ULL}) {
-        const MegaMoeBF16Training::ForwardTransientWorkspaceLayout transient(6144, 4, capacity);
+        const MegaMoeBF16Impl::ForwardTransientWorkspaceLayout transient(6144, 4, capacity);
         const ForwardWorkspaceLayout bf16(transient.totalBytes, capacity, 4, 7168, 2, 4096, 3, capacity);
         const ForwardWorkspaceLayout other(transient.totalBytes, capacity, 4, 7168, 4, 4096, 3, capacity);
         const ForwardWorkspaceLayout dedicated(transient.totalBytes, capacity, 4, 7168, 2, 4096, 0, capacity);
@@ -318,7 +318,7 @@ int main()
     }
     for (uint32_t mode : {1U, 2U, 3U}) {
         for (uint64_t capacity : {1ULL, 127ULL, 128ULL, 129ULL, 24576ULL}) {
-            const MegaMoeBF16Training::BackwardWorkspaceLayout layout(4, capacity, 7168, 6144, 4, mode, 64);
+            const MegaMoeBF16Impl::BackwardWorkspaceLayout layout(4, capacity, 7168, 6144, 4, mode, 64);
             assert(layout.doOffset == 0 && layout.controlOffset < layout.totalBytes);
             assert(layout.dzOffset % 512 == 0 && layout.hpOffset % 512 == 0 && layout.dpOffset % 512 == 0);
             assert(layout.dhpReadyOffset < layout.dzReadyOffset && layout.dzReadyOffset < layout.dxReadyOffset);

@@ -6,10 +6,37 @@
 
 #include "kernel_operator.h"
 #include <type_traits>
-#include "route_accumulate.hpp"
-#include "common/mega_moe_bf16_unpermute_layout.hpp"
+#include "common/mega_moe_utils.hpp"
 
 namespace MegaMoeBF16Routing {
+
+struct UnpermutePlan {
+    static constexpr uint32_t kIndexElements = 1024;
+    static constexpr uint32_t kIndexBytes = kIndexElements * sizeof(int32_t);
+    static constexpr uint32_t kBf16Rows = 4;
+    static constexpr uint32_t kFp32Rows = 2;
+    bool enabled = false;
+    uint32_t rowBytes = 0;
+    uint32_t batchTokens = 0;
+
+    __host_aicore__ constexpr UnpermutePlan(uint32_t hidden, uint32_t topK, uint32_t ubBytes)
+    {
+        const uint64_t bytes = uint64_t{hidden} * sizeof(uint16_t);
+        const uint64_t scratchBytes = kBf16Rows * bytes + uint64_t{kFp32Rows} * hidden * sizeof(float);
+        if (hidden == 0 || bytes % 32 != 0 || topK == 0 || topK > kIndexElements ||
+            scratchBytes + kIndexBytes > ubBytes) {
+            return;
+        }
+        enabled = true;
+        rowBytes = static_cast<uint32_t>(bytes);
+        batchTokens = kIndexElements / topK;
+    }
+
+    __host_aicore__ constexpr uint32_t BatchCount(uint32_t remaining) const
+    {
+        return remaining < batchTokens ? remaining : batchTokens;
+    }
+};
 
 __aicore__ inline void LoadUnpermuteInput(AscendC::LocalTensor<bfloat16_t> input,
                                           AscendC::GlobalTensor<bfloat16_t> expandedX, int32_t row, uint32_t hidden,

@@ -27,12 +27,11 @@
 #include <type_traits>
 
 #include "kernel_operator.h"
-#include "stage/mega_moe_slice_ready.hpp"
 #include <adv_api/reduce/reduce.h>
 #include "kernel_tiling/kernel_tiling.h"
 #include "catlass/arch/arch.hpp"
 #include "tla/layout.hpp"
-#include "common/mega_moe_bf16_context.hpp"
+#include "common/mega_moe_utils.hpp"
 #include "common/mega_moe_bf16_layout.hpp"
 
 namespace MegaMoeBF16Impl {
@@ -83,7 +82,7 @@ public:
         uint32_t baseN{0};
         // dsv4 swiglu_limit clamp; kMegaMoeSwigluLimitDisabled disables it.
         float swigluLimit{kMegaMoeSwigluLimitDisabled};
-        uint32_t savedGateUpMode{MegaMoeBF16Training::kSaveNone};
+        uint32_t savedGateUpMode{MegaMoeBF16Impl::kSaveNone};
         GM_ADDR wideDpGmAddr{nullptr};
     };
 
@@ -126,7 +125,7 @@ public:
     {
         outputN_ = Get<1>(problemShape);
         outputF_ = outputN_ / SWIGLU_N_HALF;
-        dpPartialTiles_ = MegaMoeBF16Training::BackwardTopkPartialCount(params_.savedGateUpMode, outputF_);
+        dpPartialTiles_ = MegaMoeBF16Impl::BackwardTopkPartialCount(params_.savedGateUpMode, outputF_);
     }
 
     // One AIV owns a complete row: read dHp/Gate/Up once, form dP, Hp and dZ,
@@ -134,16 +133,16 @@ public:
     // The AR primitive retains the tensor reduction's FP32 addition tree.
     __aicore__ inline void SwiGLUGradRows(GM_ADDR dHpBase, uint32_t rows, uint32_t readerIndex, uint32_t readers)
     {
-        if (MegaMoeBF16Training::UseStreamedTopkGrad(params_.savedGateUpMode, outputF_)) {
+        if (MegaMoeBF16Impl::UseStreamedTopkGrad(params_.savedGateUpMode, outputF_)) {
             SwiGLUGradWideRows(dHpBase, rows, readerIndex, readers);
             return;
         }
         const uint16_t f = static_cast<uint16_t>(outputF_);
         const uint32_t rowBytes = static_cast<uint32_t>(f) * sizeof(bfloat16_t);
         // Stage adjacent routes together; each row keeps its own reduction tree.
-        constexpr uint32_t kResultBytes = MegaMoeBF16Training::kWholeRowTopkResultBytes;
+        constexpr uint32_t kResultBytes = MegaMoeBF16Impl::kWholeRowTopkResultBytes;
         const uint32_t bytesPerRow = rowBytes * 3U + static_cast<uint32_t>(f) * sizeof(float);
-        const uint32_t batchRows = MegaMoeBF16Training::TopkGradBatchRows(f);
+        const uint32_t batchRows = MegaMoeBF16Impl::TopkGradBatchRows(f);
         const uint32_t inputBytes = rowBytes * batchRows;
         AscendC::LocalTensor<bfloat16_t> d{AscendC::TPosition::VECIN, 0, f * batchRows};
         AscendC::LocalTensor<bfloat16_t> g{AscendC::TPosition::VECIN, inputBytes, f * batchRows};
@@ -154,8 +153,7 @@ public:
         AscendC::GlobalTensor<bfloat16_t> dhp;
         dhp.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(dHpBase));
         // Keep the tensor reduction plan tied to all AIV lanes; work ownership is independent.
-        const auto plan =
-            MegaMoeBF16Training::MakeTopkGradReductionPlan(reductionRows_, f, 2U * AscendC::GetBlockNum());
+        const auto plan = MegaMoeBF16Impl::MakeTopkGradReductionPlan(reductionRows_, f, 2U * AscendC::GetBlockNum());
         const uint32_t width = plan.width;
         const uint16_t parts = f / width;
         uint16_t mainParts = 1, folds = 0;
@@ -320,7 +318,7 @@ public:
         // tile1 holds FP32 partials and tile2 holds Hp until MTE3 consumes both.
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-        if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+        if (!MegaMoeBF16Impl::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
             const uint32_t dpTileIdx = nLoc / BACKWARD_DP_PARTIAL_TILE_N;
             AscendC::DataCopyExtParams partialCopyParams{
                 static_cast<uint16_t>(singleM), static_cast<uint32_t>(sizeof(float)),
@@ -367,7 +365,7 @@ public:
 
 private:
     MegaMoeTrainTimerDevice* timer_ = nullptr;
-    using UbLayout = MegaMoeBF16Training::BackwardSwigluUbLayout;
+    using UbLayout = MegaMoeBF16Impl::BackwardSwigluUbLayout;
     static_assert(tla::get<0>(L0TileShape_{}) == UbLayout::kTileRows &&
                       tla::get<1>(L0TileShape_{}) == UbLayout::kTileColumns,
                   "Backward SwiGLU tile must match its UB layout");
@@ -399,7 +397,7 @@ private:
         const AscendC::DataCopyExtParams copy{1U, count * static_cast<uint32_t>(sizeof(bfloat16_t)), 0U, 0U, 0U};
         AscendC::DataCopyPad(d, dhp[dhpIndex], copy, {});
 
-        if (params_.savedGateUpMode == MegaMoeBF16Training::kSaveMxFp8) {
+        if (params_.savedGateUpMode == MegaMoeBF16Impl::kSaveMxFp8) {
             MegaMoeTrainTimerSpanScope decode(timer_, MegaMoeTrainTimer::AIV_BW_DECODE_GATE_UP);
             LoadMxWholeRows(first, count, g, true);
             LoadMxWholeRows(first, count, u, false);
@@ -414,7 +412,7 @@ private:
                                              uint16_t f)
     {
         const bool clip = params_.swigluLimit != kMegaMoeSwigluLimitDisabled;
-        const bool mxClip = params_.savedGateUpMode == MegaMoeBF16Training::kSaveMxFp8;
+        const bool mxClip = params_.savedGateUpMode == MegaMoeBF16Impl::kSaveMxFp8;
         const float limit = params_.swigluLimit;
         auto* dp = reinterpret_cast<__ubuf__ bfloat16_t*>(d.GetPhyAddr());
         auto* gp = reinterpret_cast<__ubuf__ bfloat16_t*>(g.GetPhyAddr());
@@ -527,8 +525,7 @@ private:
     {
         constexpr uint32_t stripe = 4096;
         const uint32_t f = outputF_;
-        const auto plan =
-            MegaMoeBF16Training::MakeTopkGradReductionPlan(reductionRows_, f, 2U * AscendC::GetBlockNum());
+        const auto plan = MegaMoeBF16Impl::MakeTopkGradReductionPlan(reductionRows_, f, 2U * AscendC::GetBlockNum());
         AscendC::GlobalTensor<float> products;
         products.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params_.wideDpGmAddr) +
                                  static_cast<uint64_t>(AscendC::GetBlockIdx()) * f);
@@ -584,8 +581,8 @@ private:
     // Match the contiguous AR kernel: each logical core reduces consecutive
     // stripes, then the RA pass sums those group results for the same route.
     template <class Tensor>
-    __aicore__ inline void ReduceGroupedRow(Tensor products, uint32_t f,
-                                            MegaMoeBF16Training::TopkGradReductionPlan plan, uint64_t row)
+    __aicore__ inline void ReduceGroupedRow(Tensor products, uint32_t f, MegaMoeBF16Impl::TopkGradReductionPlan plan,
+                                            uint64_t row)
     {
         const uint32_t width = plan.width, stripes = (f + width - 1U) / width;
         const uint32_t aligned = (width + 7U) / 8U * 8U;
@@ -650,7 +647,7 @@ private:
                                            AscendC::LocalTensor<bfloat16_t>& gateDst,
                                            AscendC::LocalTensor<bfloat16_t>& upDst)
     {
-        if (params_.savedGateUpMode == MegaMoeBF16Training::kSaveMxFp8) {
+        if (params_.savedGateUpMode == MegaMoeBF16Impl::kSaveMxFp8) {
             MegaMoeTrainTimerSpanScope timerDecode(timer_, MegaMoeTrainTimer::AIV_BW_DECODE_GATE_UP);
             DecodeMxFp8Plane(gateMxFp8Gm_, gateScaleGm_, gateHighGm_, gateHighGm_, rowStart, nLoc, singleM, singleN,
                              gateDst, true);
@@ -924,7 +921,7 @@ private:
                     AscendC::Reg::Adds(denom, exp, 1.0F, mask);
                     AscendC::Reg::Div<float, &kBackwardDivMode>(silu, gateFp, denom, mask);
                     AscendC::Reg::Mul(hFp, silu, upFp, mask);
-                    if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+                    if (!MegaMoeBF16Impl::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
                         AscendC::Reg::Mul(productFp, dHpFp, hFp, mask);
                         AscendC::Reg::ReduceSum(rowSum, productFp, mask);
                         AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
@@ -947,7 +944,7 @@ private:
     // Forward clipping decisions zero the corresponding gradient lanes.
     __aicore__ inline void ComputeSwigluGrad(uint16_t mSize, uint16_t nSize, uint32_t rowStride)
     {
-        if (params_.savedGateUpMode == MegaMoeBF16Training::kSaveMxFp8 && params_.gateHighGmAddr != nullptr) {
+        if (params_.savedGateUpMode == MegaMoeBF16Impl::kSaveMxFp8 && params_.gateHighGmAddr != nullptr) {
             // Use saved forward bit planes for derivatives; decoded values may cross the clipping limit.
             ComputeSwigluGradImpl<true>(mSize, nSize, rowStride);
         } else {
@@ -1165,7 +1162,7 @@ private:
                     AscendC::Reg::Div<float, &kBackwardDivMode>(auxSilu, gateC, denom, mask);
                     // Match forward's FP32 H for dp and Hp reconstruction.
                     AscendC::Reg::Mul(hFp, auxSilu, upC, mask);
-                    if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+                    if (!MegaMoeBF16Impl::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
                         AscendC::Reg::Mul(productFp, dHpFp, hFp, mask);
                         AscendC::Reg::ReduceSum(rowSum, productFp, mask);
                         AscendC::Reg::Add(accumulated, accumulated, rowSum, oneLane);
@@ -1214,14 +1211,14 @@ private:
     {
         static_assert(UbLayout::kMxScratchEnd + UbLayout::kTileRows * 32U <= kWeightOffset,
                       "Fused partials overlap neither masks nor weights");
-        if (params_.savedGateUpMode == MegaMoeBF16Training::kSaveMxFp8 && params_.gateHighGmAddr != nullptr) {
+        if (params_.savedGateUpMode == MegaMoeBF16Impl::kSaveMxFp8 && params_.gateHighGmAddr != nullptr) {
             ComputeFusedFullTile<true>();
         } else {
             ComputeFusedFullTile<false>();
         }
         AscendC::SyncFunc<AscendC::HardEvent::V_MTE2>();
         AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
-        if (!MegaMoeBF16Training::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
+        if (!MegaMoeBF16Impl::UseWholeRowTopkGrad(params_.savedGateUpMode, outputF_)) {
             AscendC::DataCopyExtParams partialCopy{static_cast<uint16_t>(rows), sizeof(float), 0U,
                                                    static_cast<uint32_t>((dpPartialTiles_ - 1) * sizeof(float)), 0U};
             AscendC::DataCopyPad(dpPartialsGm_[(rowBase_ + mLoc) * dpPartialTiles_ + nLoc / BACKWARD_DP_PARTIAL_TILE_N],

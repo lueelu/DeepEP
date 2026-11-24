@@ -13,7 +13,7 @@
 #define MEGA_MOE_WAVE_HOST_DEVICE
 #endif
 
-namespace MegaMoeBF16Training::Wave {
+namespace MegaMoeBF16Impl::Wave {
 
 constexpr uint32_t kGmm1Rows = 256;
 constexpr uint32_t kGmm2Rows = 256;
@@ -268,6 +268,6 @@ MEGA_MOE_WAVE_HOST_DEVICE inline bool NextScheduledSlice(Cursor& cursor, uint32_
     return Next(cursor, groups, experts, capacity, counts, slice);
 }
 
-}  // namespace MegaMoeBF16Training::Wave
+}  // namespace MegaMoeBF16Impl::Wave
 
 #undef MEGA_MOE_WAVE_HOST_DEVICE

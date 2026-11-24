@@ -10,7 +10,7 @@
 #define MEGAMOE_BWD_WAVE_HD
 #endif
 
-namespace MegaMoeBF16Training {
+namespace MegaMoeBF16Impl {
 // Track capacity-clipped rows and the ordinal of each nonempty expert in group-list order.
 struct PreparedExpertCursor {
     int64_t previousGroupEnd = 0;
@@ -175,5 +175,5 @@ struct BackwardWavePlan {
         }
     }
 };
-}  // namespace MegaMoeBF16Training
+}  // namespace MegaMoeBF16Impl
 #undef MEGAMOE_BWD_WAVE_HD

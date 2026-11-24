@@ -13,12 +13,16 @@
 #define MEGA_MOE_BF16_HOST_DEVICE
 #endif
 
-namespace MegaMoeBF16Training {
+namespace MegaMoeBF16Impl {
 
 constexpr uint64_t kAlignment32 = 32;
 constexpr uint64_t kAlignment128 = 128;
 constexpr uint64_t kAlignment256 = 256;
 constexpr uint64_t kAlignment512 = 512;
+// Alignment of saved metadata, expert-count strides and routed rows, respectively.
+constexpr uint64_t kMetaAlignment = kAlignment512;
+constexpr uint64_t kTokenCountStrideAlignment = kAlignment128;
+constexpr uint64_t kRoutingRowAlignment = kAlignment256;
 constexpr uint64_t kBf16Bytes = 2;
 constexpr uint32_t kTopkWeightBf16 = 0;
 constexpr uint32_t kTopkWeightFp32 = 1;
@@ -51,18 +55,6 @@ static_assert(kCompactTokenCountMaxLocalExperts * kInt32Bytes <= kCompactTokenCo
 static_assert(kCompactTokenCountPrefixOffset + kCompactTokenCountMaxLocalExperts * kInt32Bytes <=
               kCompactTokenCountPacketBytes);
 
-MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t PeerSyncCountOffset(uint64_t worldSize)
-{
-    (void)worldSize;
-    return kPeerSyncCountOffset;
-}
-
-MEGA_MOE_BF16_HOST_DEVICE constexpr uint64_t PeerDataOffset(uint64_t worldSize)
-{
-    (void)worldSize;
-    return kPeerDataOffset;
-}
-
 static_assert(kMaxEpRanks * kPeerRankSyncSlotBytes <= kPeerSyncCountOffset);
 // A5 exposes at most 72 AIVs (36 AICs in MIX 1:2); 8 KiB is ample for their
 // 64-byte generation-counter slots.
@@ -79,6 +71,8 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr bool CanUseCompactTokenCountExchange(uint64_
            expertPerRank <= kCompactTokenCountMaxLocalExperts;
 }
 
+// Large EP groups exchange one packet of counts and prefixes per peer when the local experts fit.
+// Smaller groups use the dense count table.
 MEGA_MOE_BF16_HOST_DEVICE constexpr bool UseCompactTokenCountExchange(uint64_t worldSize, uint64_t expertPerRank)
 {
     return worldSize >= kCompactTokenCountAutoMinEp && CanUseCompactTokenCountExchange(worldSize, expertPerRank);
@@ -129,7 +123,7 @@ struct PeerPayloadLayout {
     }
 };
 
-// Host normalizes the public swiglu_limit=0 to FLT_MAX in tiling.
+// Backward recomputes Gate/Up for none, reads BF16 values for bf16, and decodes packed values for mxfp8.
 enum SavedGateUpMode : uint32_t { kSaveNone = 1, kSaveBf16 = 2, kSaveMxFp8 = 3 };
 
 // A complete row uses 6F bytes of BF16 inputs, 4F bytes of FP32 products
@@ -431,6 +425,6 @@ MEGA_MOE_BF16_HOST_DEVICE constexpr uint32_t BackwardDispatchSplitExperts(uint32
     return UseBackwardStagedWave(mode, f) || UseRecomputeDhpRowReady(mode, f) ? localExperts : 0U;
 }
 
-}  // namespace MegaMoeBF16Training
+}  // namespace MegaMoeBF16Impl
 
 #undef MEGA_MOE_BF16_HOST_DEVICE

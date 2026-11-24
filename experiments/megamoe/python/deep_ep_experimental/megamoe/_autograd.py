@@ -50,7 +50,6 @@ class BF16Function(torch.autograd.Function):
         runtime = b._runtime
         with b._lock:
             runtime.ensure_alive()
-            runtime.validate_topk_weight_type(p.dtype, 1)
             caller = npu_api().current_stream(runtime.device)
             if dispatched is None:
                 dispatched = ctx.rebuild_dispatch()

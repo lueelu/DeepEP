@@ -14,8 +14,6 @@ extern "C" void mega_moe_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* 
                                    uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums,
                                    uint8_t* workspace, uint8_t* timer, const uint8_t* tiling_host, uint64_t ffts_addr);
 
-extern "C" int mega_moe_bf16_swiglu_decoupled_for_saved_mode(uint64_t hidden, uint32_t saved_mode);
-
 extern "C" void mega_moe_bf16_forward_kernel_do(uint32_t block_dim, void* stream, uint8_t* context, uint8_t* x,
                                                 uint8_t* topk_ids, uint8_t* topk_weights, uint8_t* weight1,
                                                 uint8_t* weight2, uint8_t* y, uint8_t* expert_token_nums,

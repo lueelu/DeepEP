@@ -136,7 +136,6 @@ def run(y, w1, w2, b, shared_w1, shared_w2, stats, activation, clamp, fast_math)
     with b._lock:
         runtime = b._runtime
         runtime.ensure_alive()
-        runtime.validate_topk_weight_type(p.dtype, 0)
         caller = npu_api().current_stream(runtime.device)
         runtime.stream.wait_stream(caller)
         with npu_api().stream(runtime.stream):

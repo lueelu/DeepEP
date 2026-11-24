@@ -29,7 +29,7 @@
 
 #include "epilogue/block_epilogue_swiglu_bf16.hpp"
 #include "catlass/gemm/tile/copy_l0c_to_gm.hpp"
-#include "common/mega_moe_bf16_context.hpp"
+#include "common/mega_moe_utils.hpp"
 #include "stage/mega_moe_combine_send.hpp"
 #include "common/mega_moe_bf16_wave_plan.hpp"
 #include "csrc/kernels/common/mega_moe_wave_math.hpp"
@@ -52,9 +52,9 @@ struct ForwardGmTileCopy
 };
 
 using WaveBlockScheduler = Catlass::Gemm::Block::GemmIdentityBlockSwizzle<3, 0>;
-using WaveL1TileShape = tla::Shape<tla::Int<MegaMoeBF16Training::Wave::kGmm1Rows>, tla::Int<256>, tla::Int<256>>;
-using WaveL0TileShape = tla::Shape<tla::Int<MegaMoeBF16Training::Wave::kGmm1Rows>, tla::Int<256>, tla::Int<64>>;
-using WaveEpilogueTileShape = tla::Shape<tla::Int<MegaMoeBF16Training::Wave::kGmm1Rows>, tla::Int<128>, tla::Int<256>>;
+using WaveL1TileShape = tla::Shape<tla::Int<MegaMoeBF16Impl::Wave::kGmm1Rows>, tla::Int<256>, tla::Int<256>>;
+using WaveL0TileShape = tla::Shape<tla::Int<MegaMoeBF16Impl::Wave::kGmm1Rows>, tla::Int<256>, tla::Int<64>>;
+using WaveEpilogueTileShape = tla::Shape<tla::Int<MegaMoeBF16Impl::Wave::kGmm1Rows>, tla::Int<128>, tla::Int<256>>;
 
 template <class Tensor>
 struct WaveGateUpWeight : Tensor {
@@ -74,7 +74,7 @@ struct WaveWeightCopy {
         using Copy = typename ForwardGmTileCopy<WeightLayout>::template CopyGmToL1B<TensorSrc>;
         Copy copy;
         if constexpr (IsWaveGateUpWeight<TensorB>::value) {
-            using namespace MegaMoeBF16Training::Wave;
+            using namespace MegaMoeBF16Impl::Wave;
             const uint32_t k = tla::get<0>(src.coord());
             const uint32_t n = tla::get<1>(src.coord()) / 2U;
             const uint32_t f = [&]() __aicore__ {
@@ -120,7 +120,7 @@ struct WaveOutputCopy {
             using BaseTensor = typename TensorDst::BaseTensor;
             const auto halfShape = tla::MakeShape(tla::get<0>(dst.originShape()), tla::get<1>(dst.originShape()));
             auto gate = tla::GetTile(src, tla::MakeCoord(0U, 0U), halfShape);
-            auto up = tla::GetTile(src, tla::MakeCoord(0U, MegaMoeBF16Training::Wave::kPairedColumns), halfShape);
+            auto up = tla::GetTile(src, tla::MakeCoord(0U, MegaMoeBF16Impl::Wave::kPairedColumns), halfShape);
             Catlass::Gemm::Tile::CopyL0CToGmTla<ArchTag, decltype(gate), BaseTensor,
                                                 Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT, false>
                 copy;
@@ -149,8 +149,8 @@ struct WaveGmTileCopy : ForwardGmTileCopy<WeightLayout> {
 template <bool TransW>
 class WaveMatmul {
 public:
-    static constexpr uint32_t kRows = MegaMoeBF16Training::Wave::kGmm1Rows;
-    static constexpr uint32_t kDownRows = MegaMoeBF16Training::Wave::kGmm2Rows;
+    static constexpr uint32_t kRows = MegaMoeBF16Impl::Wave::kGmm1Rows;
+    static constexpr uint32_t kDownRows = MegaMoeBF16Impl::Wave::kGmm2Rows;
     using WeightLayout = std::conditional_t<TransW, Catlass::layout::ColumnMajor, Catlass::layout::RowMajor>;
     using BlockMmad = Catlass::Gemm::Block::BlockMmadTla<DispatchPolicy, WaveL1TileShape, WaveL0TileShape, bfloat16_t,
                                                          bfloat16_t, bfloat16_t, void, WaveGmTileCopy<WeightLayout>>;
@@ -159,10 +159,10 @@ public:
 
     __aicore__ inline WaveMatmul() : blockMmad(resource) {}
 
-    __aicore__ inline void GateUp(const Bf16Params& params, const MegaMoeBF16Training::Wave::Slice& slice, GM_ADDR x,
-                                  __gm__ int32_t* dispatchReady, uint32_t& startBlock, uint32_t& sequence)
+    __aicore__ inline void GateUp(const MegaMoeImpl::Bf16Params& params, const MegaMoeBF16Impl::Wave::Slice& slice,
+                                  GM_ADDR x, __gm__ int32_t* dispatchReady, uint32_t& startBlock, uint32_t& sequence)
     {
-        using namespace MegaMoeBF16Training::Wave;
+        using namespace MegaMoeBF16Impl::Wave;
         const uint32_t h = params.tilingData->k, f = params.tilingData->n / 2U;
         const uint32_t cores = AscendC::GetBlockNum();
         const uint32_t core = AscendC::GetBlockIdx() / AscendC::GetTaskRation();
@@ -208,8 +208,8 @@ public:
             });
     }
 
-    __aicore__ inline bool Down(const Bf16Params& params, const MegaMoeBF16Training::Wave::Slice& slice, GM_ADDR output,
-                                uint64_t scratchRow, __gm__ int32_t* hpFlags, uint32_t& startBlock)
+    __aicore__ inline bool Down(const MegaMoeImpl::Bf16Params& params, const MegaMoeBF16Impl::Wave::Slice& slice,
+                                GM_ADDR output, uint64_t scratchRow, __gm__ int32_t* hpFlags, uint32_t& startBlock)
     {
         const uint32_t h = params.tilingData->k, f = params.tilingData->n / 2U;
         const uint32_t cores = AscendC::GetBlockNum();
@@ -226,7 +226,7 @@ public:
         auto tc = tla::MakeTensor(c, tla::MakeLayout<bfloat16_t, Catlass::layout::RowMajor>(slice.rows, h),
                                   Catlass::Arch::PositionGM{});
         WaveBlockScheduler scheduler({slice.rows, h, f},
-                                     Catlass::MakeCoord(kDownRows, MegaMoeBF16Training::Wave::kTileColumns));
+                                     Catlass::MakeCoord(kDownRows, MegaMoeBF16Impl::Wave::kTileColumns));
         const uint32_t tasks = scheduler.GetCoreLoops();
         const uint32_t first = MegaMoeImpl::GetGmmFirstOwnedTile(core, cores, startBlock);
         const bool owns = first < tasks;
@@ -234,20 +234,20 @@ public:
         for (uint32_t task = first; task < tasks; task += cores) {
             const auto coord = scheduler.GetBlockCoord(task);
             const auto shape = scheduler.GetActualBlockShape(coord);
-            const uint32_t m = coord.m() * kDownRows, n = coord.n() * MegaMoeBF16Training::Wave::kTileColumns;
+            const uint32_t m = coord.m() * kDownRows, n = coord.n() * MegaMoeBF16Impl::Wave::kTileColumns;
             const uint32_t rows = shape.m(), columns = shape.n();
             if (m != readyM) {
                 MegaMoeTrainTimerPassiveScope wait(params.timer, MegaMoeTrainTimer::AIC_GMM2_WAIT, slice.expert,
                                                    slice.row + m, rows, n, kDownRows,
-                                                   MegaMoeBF16Training::Wave::kTileColumns, f, h);
-                const uint32_t activationColumns = MegaMoeBF16Training::Wave::kPairedColumns;
+                                                   MegaMoeBF16Impl::Wave::kTileColumns, f, h);
+                const uint32_t activationColumns = MegaMoeBF16Impl::Wave::kPairedColumns;
                 while (AscendC::ReadGmByPassDCache(hpFlags + m / kRows) < Ops::Base::CeilDiv(f, activationColumns)) {
                 }
                 AscendC::SyncFunc<AscendC::HardEvent::S_MTE2>();
                 readyM = m;
             }
             MegaMoeTrainTimerPassiveScope tile(params.timer, MegaMoeTrainTimer::AIC_GMM2, slice.expert, slice.row + m,
-                                               rows, n, kDownRows, MegaMoeBF16Training::Wave::kTileColumns, f, h);
+                                               rows, n, kDownRows, MegaMoeBF16Impl::Wave::kTileColumns, f, h);
             auto tileA = tla::GetTile(ta, tla::MakeCoord(m, 0U), tla::MakeShape(rows, f));
             auto tileB = tla::GetTile(tb, tla::MakeCoord(0U, n), tla::MakeShape(f, columns));
             auto tileC = tla::GetTile(tc, tla::MakeCoord(m, n), tla::MakeShape(rows, columns));

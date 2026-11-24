@@ -6,7 +6,7 @@
 #include "kernel_operator.h"
 #include <c_api/asc_simd.h>
 
-namespace MegaMoeBF16Training::Wave {
+namespace MegaMoeBF16Impl::Wave {
 
 // Two credits overlap the next Gate/Up write with the preceding epilogue.
 // AIV0 returns each credit after the epilogue retires; GM addresses are distinct.
@@ -38,4 +38,4 @@ struct GateUpCompletion {
         AscendC::SyncFunc<AscendC::HardEvent::FIX_S>();
     }
 };
-}  // namespace MegaMoeBF16Training::Wave
+}  // namespace MegaMoeBF16Impl::Wave

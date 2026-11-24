@@ -79,7 +79,6 @@ def buffer(monkeypatch):
     b._runtime = SimpleNamespace(
         closed=True,
         ensure_alive=lambda: None,
-        validate_topk_weight_type=lambda *a: None,
         native=SimpleNamespace(capacity=2 << 20),
         rank=0,
         world_size=2,

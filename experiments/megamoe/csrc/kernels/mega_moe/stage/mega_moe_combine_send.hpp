@@ -10,8 +10,8 @@
 #define MEGA_MOE_COMBINE_SEND_HPP
 #include "catlass/gemm_coord.hpp"
 #include "kernel_operator.h"
-#include "common/mega_moe_bf16_context.hpp"
-#include "stage/peer_row_view.hpp"
+#include "common/mega_moe_utils.hpp"
+#include "common/mega_moe_bf16_peer_row_view.hpp"
 using namespace AscendC;
 
 namespace MegaMoeCombineImpl {
@@ -19,7 +19,8 @@ template <typename ElementMMadOut2, typename GemmCoord>
 __aicore__ inline void CombineTokens(uint32_t mLoc, uint32_t nLoc, uint32_t n, uint32_t groupIdx,
                                      uint32_t expertRowOffset, uint32_t rankId,
                                      LocalTensor<ElementMMadOut2>& l0cOutUbGMM2, GemmCoord& actualBlockShape,
-                                     const Bf16Params& params, LocalTensor<int32_t>* cachedCumsum = nullptr,
+                                     const MegaMoeImpl::Bf16Params& params,
+                                     LocalTensor<int32_t>* cachedCumsum = nullptr,
                                      LocalTensor<int32_t>* cachedSourcePrefix = nullptr)
 {
     int32_t lenTile = actualBlockShape.m();
@@ -28,7 +29,7 @@ __aicore__ inline void CombineTokens(uint32_t mLoc, uint32_t nLoc, uint32_t n, u
     int32_t stTile = expertRowOffset + mLoc;
     int32_t edTile = stTile + lenTile;
     if (params.peerRowsGroups != 0U) {
-        using namespace MegaMoeBF16Training::Wave;
+        using namespace MegaMoeBF16Impl::Wave;
         const auto expert = GetPeerExpert(params, groupIdx);
         const PeerCounts<GmPeerPrefix> counts{
             GmPeerPrefix{reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.ptrcumsumMM)},
@@ -44,7 +45,8 @@ __aicore__ inline void CombineTokens(uint32_t mLoc, uint32_t nLoc, uint32_t n, u
                                        transfer.sourceOrdinalBegin;
             AscendC::GlobalTensor<ElementMMadOut2> target;
             target.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMMadOut2*>(
-                GetRankWinAddrWithOffset(transfer.sourceRank, params.peermemInfo.ptrD - params.peermemInfo.ptrBase)));
+                MegaMoeImpl::GetRankWinAddrWithOffset(MegaMoeImpl::bf16WinRankAddr, transfer.sourceRank,
+                                                      params.peermemInfo.ptrD - params.peermemInfo.ptrBase)));
             const AscendC::DataCopyExtParams copy{
                 static_cast<uint16_t>(transfer.rowCount),
                 static_cast<uint32_t>(actualBlockShape.n() * sizeof(ElementMMadOut2)), 0U,
@@ -99,7 +101,8 @@ __aicore__ inline void CombineTokens(uint32_t mLoc, uint32_t nLoc, uint32_t n, u
 
         AscendC::GlobalTensor<ElementMMadOut2> gmRemoteD;
         uint64_t gmRemoteOffset = params.peermemInfo.ptrD - params.peermemInfo.ptrBase;
-        __gm__ void* dstPeermemPtr = GetRankWinAddrWithOffset(dstEpIdx, gmRemoteOffset);
+        __gm__ void* dstPeermemPtr =
+            MegaMoeImpl::GetRankWinAddrWithOffset(MegaMoeImpl::bf16WinRankAddr, dstEpIdx, gmRemoteOffset);
         gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMMadOut2*>(dstPeermemPtr));
 
         // 远端偏移地址

@@ -101,29 +101,3 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
                 assert len(created) == 1
         finally:
             runtime.close()
-
-
-@pytest.mark.parametrize("debug", [False, True])
-def test_bf16_topk_dtype_coordination(monkeypatch, debug):
-    torch = pytest.importorskip("torch")
-    group = StoreGroup(None, 0, 2, prefix="test")
-    exchanged = []
-
-    def gather(value, stage):
-        exchanged.append(value)
-        return [value, value]
-
-    monkeypatch.setattr(group, "all_gather", gather)
-    runtime = _MegaRuntime.__new__(_MegaRuntime)
-    runtime.group = group
-    runtime.debug_collectives = debug
-    for stage, dtype in ((0, torch.bfloat16), (0, torch.float32), (1, torch.float32), (1, torch.bfloat16)):
-        runtime.validate_topk_weight_type(dtype, stage)
-    assert exchanged == ([[0, 0], [0, 1], [1, 1], [1, 0]] if debug else [])
-    with pytest.raises(ValueError, match="bfloat16 or float32"):
-        runtime.validate_topk_weight_type(torch.float16, 0)
-    if debug:
-        for peer in ([0, 1], [1, 0]):
-            monkeypatch.setattr(group, "all_gather", lambda value, stage: [value, peer])
-            with pytest.raises(ValueError, match="EP ranks"):
-                runtime.validate_topk_weight_type(torch.bfloat16, 0)

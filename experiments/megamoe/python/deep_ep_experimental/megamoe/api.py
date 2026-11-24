@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 6:
+    if getattr(extension, "api_protocol", None) != 5:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -43,34 +43,6 @@ class _MegaRuntime(Runtime):
         self._megamoe = not bf16
         self._megamoe_train = bf16
         super().__init__(group, capacity, timeout, debug_collectives=debug_collectives, **kwargs)
-
-    def validate_topk_weight_type(self, dtype, stage):
-        """Check dtype locally, with optional cross-rank dtype and phase checks."""
-        import torch
-
-        code = {torch.bfloat16: 0, torch.float32: 1}.get(dtype, -1)
-        if not self.debug_collectives:
-            if code < 0:
-                raise ValueError("topk_weights must be bfloat16 or float32")
-            return
-        local_values = [stage, code]
-        if isinstance(self.group, StoreGroup):
-            values = self.group.all_gather(local_values, "training TopK weight configuration")
-        else:
-            import torch.distributed as dist
-
-            backend = str(dist.get_backend(self.group))
-            with torch.inference_mode(False), torch.no_grad():
-                local = torch.tensor(
-                    local_values, dtype=torch.int64, device=f"npu:{self.device}" if backend == "hccl" else "cpu"
-                )
-                peers = [torch.empty_like(local) for _ in range(self.world_size)]
-            dist.all_gather(peers, local, group=self.group)
-            values = [value.cpu().tolist() for value in peers]
-        if any(value != values[0] for value in values):
-            raise ValueError("EP ranks must use the same forward/backward order and topk_weights dtype")
-        if code < 0:
-            raise ValueError("topk_weights must be bfloat16 or float32")
 
 
 def _pair(value, name):

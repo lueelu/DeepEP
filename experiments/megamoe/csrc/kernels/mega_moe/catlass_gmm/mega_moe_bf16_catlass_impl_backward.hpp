@@ -31,7 +31,6 @@
 #include <new>
 
 #include "kernel_operator.h"
-#include "stage/mega_moe_slice_ready.hpp"
 #include "mc2_common/mc2_kernel_utils.hpp"
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/resource.hpp"
@@ -56,9 +55,29 @@
 
 #include "epilogue/block_epilogue_swiglu_bf16_backward.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
-#include "common/mega_moe_bf16_context.hpp"
+#include "common/mega_moe_utils.hpp"
 #include "stage/mega_moe_staged_wave_backward.hpp"
 #include "stage/mega_moe_combine_send.hpp"
+
+namespace MegaMoeImpl {
+// One cacheline per expert-local M tile. Word 0 counts completed dO transfers;
+// word 1 counts the dHp producers that SwiGLUGrad waits for.
+// Packed expert bases are not necessarily tile-aligned, so reserve one gap
+// per expert instead of rounding the complete receive buffer down.
+struct RowSliceReady {
+    __gm__ int32_t* slots{nullptr};
+    uint64_t first{0};
+    uint32_t tileRows{128};
+    __aicore__ inline RowSliceReady(GM_ADDR base, uint64_t expertBase, uint32_t expert, uint32_t m)
+        : slots(reinterpret_cast<__gm__ int32_t*>(base)), first(expertBase / m + expert), tileRows(m)
+    {
+    }
+    __aicore__ inline __gm__ int32_t* Slot(uint32_t row) const
+    {
+        return slots + (first + row / tileRows) * 16U;
+    }
+};
+}  // namespace MegaMoeImpl
 
 namespace MegaMoeBF16BackwardCatlassImpl {
 
@@ -79,7 +98,7 @@ using BlockScheduler = Catlass::Gemm::Block::GemmIdentityBlockSwizzle<3, 1>;
 constexpr uint32_t L1_TILE_M = 128;
 constexpr uint32_t L1_TILE_N = 256;
 constexpr uint32_t L1_TILE_K = 256;
-constexpr uint32_t SWIGLU_N_HALF = MegaMoeBF16Training::kSwigluNHalf;
+constexpr uint32_t SWIGLU_N_HALF = MegaMoeBF16Impl::kSwigluNHalf;
 constexpr uint32_t MAX_SINGLE_MN = L1_TILE_M * L1_TILE_N;
 constexpr uint32_t DUAL_AIV_TARGET = 2;
 static_assert(2U * MAX_SINGLE_MN * sizeof(bfloat16_t) <= ArchTag::UB_SIZE, "The two BF16 GMM tiles must fit in A5 UB");
@@ -170,8 +189,8 @@ public:
 template <class WeightLayout>
 __aicore__ inline void GroupMatmulRecompute(BackwardGroupMatmulParam<RowMajor, WeightLayout, 0, true>& gmm1Params,
                                             const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
-                                            const Bf16GMMAddrInfo& gmmAddrInfo, GM_ADDR gatePlane, GM_ADDR upPlane,
-                                            uint32_t& startBlockIdx, uint32_t expertIdx)
+                                            const MegaMoeImpl::Bf16GMMAddrInfo& gmmAddrInfo, GM_ADDR gatePlane,
+                                            GM_ADDR upPlane, uint32_t& startBlockIdx, uint32_t expertIdx)
 {
     if (gmmAddrInfo.timer != nullptr) {
         gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
@@ -239,11 +258,11 @@ template <class WeightLayout, typename TopkWeightT, class Borrow>
 __aicore__ inline void GMM2GradStagedWave(
     BackwardGroupMatmulParam<RowMajor, WeightLayout, 0, true>& params,
     MegaMoeBF16Impl::BlockEpilogueSwigluBackwardBF16<L1TileShape, TopkWeightT>& epilogue,
-    const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problem, const Bf16GMMAddrInfo& addr, GM_ADDR dHp,
-    uint32_t expert, uint64_t base, const MegaMoeBF16Training::BackwardWavePlan& plan,
+    const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problem, const MegaMoeImpl::Bf16GMMAddrInfo& addr,
+    GM_ADDR dHp, uint32_t expert, uint64_t base, const MegaMoeBF16Impl::BackwardWavePlan& plan,
     const MegaMoeImpl::RowSliceReady& ready, uint32_t startBlock, bool recompute, Borrow borrow)
 {
-    static_assert(L1_TILE_M == MegaMoeBF16Training::BackwardWavePlan::tileM);
+    static_assert(L1_TILE_M == MegaMoeBF16Impl::BackwardWavePlan::tileM);
     if constexpr (g_coreType == AscendC::AIV) {
         if (!recompute && params.subBlockIdx == 0) return;
     }
@@ -305,7 +324,7 @@ __aicore__ inline void GMM2GradStagedWave(
                 }
             }
         };
-        if (!MegaMoeBF16Training::UseWholeRowTopkGrad(epilogue.SavedMode(), n)) {
+        if (!MegaMoeBF16Impl::UseWholeRowTopkGrad(epilogue.SavedMode(), n)) {
             // The partial path decodes a column tile at a time. Each tile
             // has one AIV1 owner and reads dHp before overwriting that tile with Hp.
             epilogue.UpdateGlobalAddr(base);
@@ -356,9 +375,10 @@ template <class WeightLayout, typename TopkWeightT>
 __aicore__ inline void GMM2GradSwiGLUGradGM(
     BackwardGroupMatmulParam<RowMajor, WeightLayout, 0, true>& gmm2Params,
     MegaMoeBF16Impl::BlockEpilogueSwigluBackwardBF16<L1TileShape, TopkWeightT>& epilogueOp,
-    const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape, const Bf16GMMAddrInfo& gmmAddrInfo,
-    GM_ADDR dHpBase, uint32_t& startBlockIdx, uint32_t& nextTargetAiv, uint32_t expertIdx, int64_t expertRowBase,
-    __gm__ int32_t* dispatchReadyFlag, int32_t dispatchTarget, __gm__ int32_t* dHpReadyFlag)
+    const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
+    const MegaMoeImpl::Bf16GMMAddrInfo& gmmAddrInfo, GM_ADDR dHpBase, uint32_t& startBlockIdx, uint32_t& nextTargetAiv,
+    uint32_t expertIdx, int64_t expertRowBase, __gm__ int32_t* dispatchReadyFlag, int32_t dispatchTarget,
+    __gm__ int32_t* dHpReadyFlag)
 {
     epilogueOp.SetTimer(gmmAddrInfo.timer);
     if (gmmAddrInfo.timer != nullptr) {
@@ -395,10 +415,10 @@ __aicore__ inline void GMM2GradSwiGLUGradGM(
             while (AscendC::ReadGmByPassDCache(dHpReadyFlag) < static_cast<int32_t>(gmm2Params.blockNum)) {
             }
         }
-        if (MegaMoeBF16Training::UseWholeRowTopkGrad(epilogueOp.SavedMode(), n)) {
+        if (MegaMoeBF16Impl::UseWholeRowTopkGrad(epilogueOp.SavedMode(), n)) {
             // Recompute overlaps the dO dispatch. Both lanes can then take disjoint rows.
             // With saved activations, AIV0 continues dispatching later experts.
-            const bool both = epilogueOp.SavedMode() == MegaMoeBF16Training::kSaveNone;
+            const bool both = epilogueOp.SavedMode() == MegaMoeBF16Impl::kSaveNone;
             if (both || gmm2Params.subBlockIdx == 1U) {
                 MegaMoeTrainTimerSpanScope timerRows(gmmAddrInfo.timer, MegaMoeTrainTimer::AIV_BW_SWIGLU_GRAD);
                 const uint32_t lane = both ? 2U * gmm2Params.blockIdx + gmm2Params.subBlockIdx : gmm2Params.blockIdx;
@@ -451,10 +471,11 @@ __aicore__ inline void GMM2GradSwiGLUGradGM(
 template <class WeightLayout, typename TopkWeightT>
 __aicore__ inline void GMM2GradSwiGLUGradDualAiv(
     BackwardGroupMatmulParam<RowMajor, WeightLayout, DUAL_AIV_TARGET>& gmm2Params,
-    MegaMoeBF16Impl::BlockEpilogueSwigluBackwardBF16<L1TileShape, TopkWeightT>& epilogueOp, const Bf16Params& params,
-    const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape, const Bf16GMMAddrInfo& gmmAddrInfo,
-    uint32_t& startBlockIdx, int32_t& outstandingMask, uint32_t& nextTargetAiv, uint32_t expertIdx,
-    int64_t expertRowBase, __gm__ int32_t* dispatchReadyFlag, int32_t dispatchTarget, uint32_t p1Event)
+    MegaMoeBF16Impl::BlockEpilogueSwigluBackwardBF16<L1TileShape, TopkWeightT>& epilogueOp,
+    const MegaMoeImpl::Bf16Params& params, const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
+    const MegaMoeImpl::Bf16GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, int32_t& outstandingMask,
+    uint32_t& nextTargetAiv, uint32_t expertIdx, int64_t expertRowBase, __gm__ int32_t* dispatchReadyFlag,
+    int32_t dispatchTarget, uint32_t p1Event)
 {
     epilogueOp.SetTimer(gmmAddrInfo.timer);
     if (gmmAddrInfo.timer != nullptr) {
@@ -556,10 +577,10 @@ __aicore__ inline void GMM2GradSwiGLUGradDualAiv(
 // The caller must retire dZ/Hp producers and dW2 readers before dX overwrites dO.
 template <class WeightLayout>
 __aicore__ inline void GMM1GradCombineGM(BackwardGroupMatmulParam<RowMajor, WeightLayout, 0, true>& mm,
-                                         const Bf16Params& params,
+                                         const MegaMoeImpl::Bf16Params& params,
                                          const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
-                                         const Bf16GMMAddrInfo& addr, GM_ADDR dxBase, uint32_t& startBlockIdx,
-                                         uint32_t expertIdx, __gm__ int32_t* dxReady)
+                                         const MegaMoeImpl::Bf16GMMAddrInfo& addr, GM_ADDR dxBase,
+                                         uint32_t& startBlockIdx, uint32_t expertIdx, __gm__ int32_t* dxReady)
 {
     if (addr.timer != nullptr) {
         addr.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
@@ -633,9 +654,9 @@ __aicore__ inline void GMM1GradCombineGM(BackwardGroupMatmulParam<RowMajor, Weig
 // Ping-pong ownership uses the forward GMM2's cross-core protocol.
 template <uint32_t TargetUBIdx, class WeightLayout>
 __aicore__ inline void GMM1GradCombine(BackwardGroupMatmulParam<RowMajor, WeightLayout, TargetUBIdx>& gmm1Params,
-                                       const Bf16Params& params,
+                                       const MegaMoeImpl::Bf16Params& params,
                                        const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
-                                       const Bf16GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
+                                       const MegaMoeImpl::Bf16GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
                                        int32_t& vecSetSyncCom, uint32_t expertIdx, int64_t expertRowBase,
                                        uint16_t& pingpongIdx)
 {
@@ -723,7 +744,8 @@ __aicore__ inline void GMM1GradCombine(BackwardGroupMatmulParam<RowMajor, Weight
 // View row-major expert bands as ColumnMajor transposes without moving GM data.
 __aicore__ inline void GMM1DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 0, true>& gmm1Params,
                               const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
-                              const Bf16GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t expertIdx)
+                              const MegaMoeImpl::Bf16GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
+                              uint32_t expertIdx)
 {
     if (gmmAddrInfo.timer != nullptr) {
         gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));
@@ -779,9 +801,9 @@ __aicore__ inline void GMM1DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 0,
 // Saved modes run this before per-expert P2 dO reuse; none runs it in P4.
 __aicore__ inline void GMM2DW(BackwardGroupMatmulParam<ColumnMajor, RowMajor, 1, true>& gmm2Params,
                               const AscendC::Shape<int64_t, int64_t, int64_t, int64_t>& problemShape,
-                              const Bf16GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t expertIdx,
-                              uint32_t firstLocal = 0, uint32_t count = ~0U, __gm__ int32_t* priority = nullptr,
-                              int32_t arrivals = 0, uint32_t* completed = nullptr)
+                              const MegaMoeImpl::Bf16GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
+                              uint32_t expertIdx, uint32_t firstLocal = 0, uint32_t count = ~0U,
+                              __gm__ int32_t* priority = nullptr, int32_t arrivals = 0, uint32_t* completed = nullptr)
 {
     if (gmmAddrInfo.timer != nullptr) {
         gmmAddrInfo.timer->SetSlice(expertIdx, 0, Get<M_VALUE>(problemShape));

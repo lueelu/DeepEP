@@ -14,7 +14,7 @@
 #include "mega_moe_quantized_tiling.hpp"
 #include "mega_moe_bf16_tiling.hpp"
 
-namespace MegaMoeBF16Training {
+namespace MegaMoeBF16Impl {
 struct TrainingSavedStateLayout;
 }
 
@@ -100,9 +100,9 @@ private:
         bool transW;
     };
     static uint32_t TopkWeightType(torch::ScalarType dtype);
-    static MegaMoeBF16Training::TrainingSavedStateLayout MakeSavedStateLayout(const MegaMoeBf16TilingData& tiling,
-                                                                              int64_t k, int64_t n,
-                                                                              int64_t max_recv_tokens);
+    static MegaMoeBF16Impl::TrainingSavedStateLayout MakeSavedStateLayout(const MegaMoeBf16TilingData& tiling,
+                                                                          int64_t k, int64_t n,
+                                                                          int64_t max_recv_tokens);
     static WeightLayout ResolveWeightLayout(const torch::Tensor& w1, const torch::Tensor& w2, int64_t k);
     void ClearWindowControl() const;
     torch::Tensor AllocateTimer(const torch::Tensor& like, const torch::Tensor& weights, const torch::Tensor& w1,

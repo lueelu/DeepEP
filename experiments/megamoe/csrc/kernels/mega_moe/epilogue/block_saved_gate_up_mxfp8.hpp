@@ -11,7 +11,7 @@ template <uint32_t RawRows = 128, uint32_t Columns = 256>
 class SavedGateUpMxFp8 {
 public:
     static constexpr uint32_t kChunkRows = RawRows > 128 ? 64 : RawRows;
-    using Layout = MegaMoeBF16Training::SavedGateUpQuantUbLayoutFor<RawRows, kChunkRows, Columns>;
+    using Layout = MegaMoeBF16Impl::SavedGateUpQuantUbLayoutFor<RawRows, kChunkRows, Columns>;
 
 private:
     using DataTypeOut = fp8_e4m3fn_t;

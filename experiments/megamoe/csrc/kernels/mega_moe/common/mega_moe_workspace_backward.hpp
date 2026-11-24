@@ -11,7 +11,7 @@
 #define MEGA_MOE_WORKSPACE_HD
 #endif
 
-namespace MegaMoeBF16Training {
+namespace MegaMoeBF16Impl {
 // Byte offsets shared by Host allocation and Device addressing.
 struct BackwardWorkspaceLayout {
     uint64_t doOffset, recomputeGateOffset, recomputeUpOffset;
@@ -86,5 +86,5 @@ struct BackwardWorkspaceLayout {
     {
     }
 };
-}  // namespace MegaMoeBF16Training
+}  // namespace MegaMoeBF16Impl
 #undef MEGA_MOE_WORKSPACE_HD

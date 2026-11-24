@@ -175,7 +175,7 @@ BF16 支持 EP=2～1024，E 须能被 EP 整除，每卡 1～32 个路由专家�
 
 框架自行重建时设置 `save_dispatched_x=False`，并在每次前向前设置 `sym_buffer.dispatch_rebuilder` 为该 microbatch 的无参函数。反向调用该函数取得连续的设备端 UInt8 缓冲。缓冲依次存放 `[max_recv_tokens, H]` BF16 X 和 `[max_recv_tokens]` 原 dtype 的 p，两段分别按 512 字节对齐。异步重建时，回调须让调用流等待生产端事件。每个前向独立记录回调，支持多前向后逆序反向。直接调用原生 Plan 的框架可以在 `plan.forward(..., capture_timer=False, save_dispatched_x=False)` 后将重建张量传入 `backward`。
 
-同一 EP 组的调用顺序、配置和 p 的 dtype 须一致。跨 rank 的 dtype 和阶段诊断默认关闭，设置 `debug_collectives=True` 可开启。
+同一 EP 组的调用顺序、配置和 p 的 dtype 须一致。
 
 #### BF16 前向缓冲
 

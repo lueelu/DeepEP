@@ -18,7 +18,7 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "catlass/arch/arch.hpp"
 #include "tla/layout.hpp"
-#include "common/mega_moe_bf16_context.hpp"
+#include "common/mega_moe_utils.hpp"
 #include "epilogue/block_saved_gate_up_mxfp8.hpp"
 #include <type_traits>
 
@@ -75,7 +75,7 @@ public:
     // Counts are read by Scalar while Gate/Up, encoded activations and p occupy UB.
     __aicore__ inline AscendC::LocalTensor<int32_t> SavedRowPrefix(uint32_t elements) const
     {
-        constexpr auto maxElements = MegaMoeBF16Training::kMaxTotalExperts;
+        constexpr auto maxElements = MegaMoeBF16Impl::kMaxTotalExperts;
         constexpr uint32_t offset = kWeightOffset - maxElements * sizeof(int32_t);
         static_assert(kWeightOffset >= maxElements * sizeof(int32_t) + 2U * kTileElements * sizeof(bfloat16_t));
         static_assert(kWeightOffset >= maxElements * sizeof(int32_t) + QuantSave::Layout::totalBytesWithClipMasks);
@@ -161,7 +161,7 @@ public:
         const uint32_t stride = Ops::Base::CeilAlign(uint32_t(cols), uint32_t(16));
         auto gate = l0cOutUbFirst_[row * stride];
         auto up = l0cOutUbSecond_[row * stride];
-        if constexpr (Mode == MegaMoeBF16Training::kSaveMxFp8) {
+        if constexpr (Mode == MegaMoeBF16Impl::kSaveMxFp8) {
             quantSave_.Save(gate, up, params_.savedGateGmAddr, params_.savedUpGmAddr, params_.savedGateScaleGmAddr,
                             params_.savedUpScaleGmAddr, params_.savedGateHighGmAddr, params_.savedUpLowGmAddr,
                             params_.savedUpHighGmAddr, params_.swigluLimit, rows, cols, outputN_, dst);

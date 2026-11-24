@@ -4,7 +4,7 @@
 #pragma once
 #include "common/mega_moe_bf16_wave_plan.hpp"
 
-namespace MegaMoeBF16Training::Wave {
+namespace MegaMoeBF16Impl::Wave {
 template <class Prefix>
 struct PeerCounts {
     Prefix prefix;
@@ -130,4 +130,4 @@ private:
     MegaMoeImpl::PeerRowLimits limits_;
     uint32_t peers_, rank_, groups_, rows_, firstSliceRows_, next_, end_;
 };
-}  // namespace MegaMoeBF16Training::Wave
+}  // namespace MegaMoeBF16Impl::Wave

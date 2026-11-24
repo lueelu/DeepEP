@@ -60,14 +60,12 @@ def main():
         p = torch.rand(m, topk, generator=generator).softmax(dim=-1).to(device=device, dtype=dtype)
         batches.append((x, ids.roll(index, dims=1), p, dy))
 
-    def forward(op, index=0, *, legacy_layout=False, weight_dtype=None):
+    def forward(op, index=0, *, legacy_layout=False):
         x, routes, weights, _ = batches[index]
         mode, limit, _ = modes[index]
         w1_in, w2_in = w1, w2
         if legacy_layout:
             w1_in, w2_in = (w.transpose(1, 2).contiguous() for w in (w1, w2))
-        if weight_dtype is not None:
-            weights = weights.to(weight_dtype)
         values = [v.detach().clone().requires_grad_() for v in (x, weights, w1_in, w2_in)]
         x, weights, w1_in, w2_in = values
         op.x, op.topk_idx, op.topk_weights = x, routes, weights
@@ -93,7 +91,6 @@ def main():
             assert tensor.dtype == reference.dtype and tensor.shape == reference.shape, label
             assert torch.equal(tensor.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8)), label
 
-    # Peer dtype mismatches are rejected by the opt-in collective diagnostics.
     def make():
         return SymmBuffer(
             group,
@@ -105,15 +102,10 @@ def main():
             mma_type="bf16xbf16",
             need_grad=True,
             max_recv_tokens=m * size * e,
-            debug_collectives=True,
         )
 
     op = make()
     expect_error(make, "already owns")
-    expect_error(
-        lambda: forward(op, weight_dtype=torch.float32 if rank % 2 else torch.bfloat16),
-        "EP ranks",
-    )
     expected = [backward(i, forward(op, i)) for i in range(len(batches))]
     assert not torch.equal(expected[0]["dw1"], expected[1]["dw1"]), "same-plan microbatches must be distinguishable"
     pending = [forward(op, i) for i in range(len(batches))]
