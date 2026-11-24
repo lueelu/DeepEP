@@ -81,8 +81,8 @@ def inspect_wheel(path):
             # its kernel sources and the pinned CATLASS closure instead of
             # prebuilt device libraries.
             kernel_required = {
-                "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_entry.hpp",
-                "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
+                "deep_ep/_kernel_src/megamoe/mte/kernels/mega_moe/mega_moe_entry.hpp",
+                "deep_ep/_kernel_src/megamoe/urma/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
                 "deep_ep/_kernel_src/megamoe/catlass/include/catlass/catlass.hpp",
             }
             if len(extensions) != 1 or not required.issubset(names) or not kernel_required.issubset(names):

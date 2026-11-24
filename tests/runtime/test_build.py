@@ -328,7 +328,7 @@ def test_elastic_wheel_requires_device_library(tmp_path, capability, shmem_wheel
 
 @pytest.mark.parametrize(
     "missing", [None, "deep_ep/libdeepep_kernels.so",
-                "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_entry.hpp"]
+                "deep_ep/_kernel_src/megamoe/mte/kernels/mega_moe/mega_moe_entry.hpp"]
 )
 def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing, shmem_wheel_payload):
     validator = load(ROOT / "scripts/validate_package.py")
@@ -345,8 +345,8 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
         "deep_ep_experimental/megamoe/benchmark.py",
         "deep_ep_experimental/megamoe/configs/smoke.json",
         "deep_ep_experimental/megamoe/_C.fake.so",
-        "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_entry.hpp",
-        "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
+        "deep_ep/_kernel_src/megamoe/mte/kernels/mega_moe/mega_moe_entry.hpp",
+        "deep_ep/_kernel_src/megamoe/urma/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
         "deep_ep/_kernel_src/megamoe/catlass/include/catlass/catlass.hpp",
         "deep_ep_experimental/megamoe/cann.LICENSE",
     }

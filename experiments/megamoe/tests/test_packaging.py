@@ -61,8 +61,8 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         ):
             entries["deep_ep_experimental/megamoe/" + name] = b"fixture"
         for name in (
-            "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe/mega_moe_entry.hpp",
-            "deep_ep/_kernel_src/megamoe/csrc/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
+            "deep_ep/_kernel_src/megamoe/mte/kernels/mega_moe/mega_moe_entry.hpp",
+            "deep_ep/_kernel_src/megamoe/urma/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
             "deep_ep/_kernel_src/megamoe/catlass/include/catlass/catlass.hpp",
         ):
             entries[name] = b"fixture"

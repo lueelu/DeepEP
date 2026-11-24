@@ -23,27 +23,29 @@ static_assert(CooperativeUb::selfCounts + kMaxPeerChunks * 4U <= kRequiredUbByte
 
 // A contiguous row prefix is safe only after every N tile of each intersecting
 // M-group has reached its final layout. Counters are published after MTE3 drain.
+template <class S>
 __aicore__ inline uint32_t PairedReorderedPrefix(const Arguments& a, const Chunk& c)
 {
-    RuntimePeerSpans cursor(a, c);
+    RuntimePeerSpans<S> cursor(a, c);
     PeerReorderSpan span{};
     uint32_t bit, rows = 0U;
-    const auto required = static_cast<int32_t>(a.config.hidden / kComputeTileN);
+    const auto required = static_cast<int32_t>(S::kHidden / kComputeTileN);
     while (cursor.Next(span, bit)) {
         if (ReadGmByPassDCache(ComputeFlag(a.gmm2Done, span.fragmentIndex)) < required) break;
         rows += span.rows;
     }
     return rows;
 }
+template <class S>
 struct DirectReorderWork {
     const Arguments& a;
-    PackBatch& pack;
+    PackBatch<S>& pack;
     uint32_t core;
     UbRoutedActivation& activation;
     template <class TimerT>
     __aicore__ inline void Activate(const RoutedCompletionItem& item, TimerT& timer)
     {
-        activation.Run(a, item.fragment, item.group, item.tile, timer);
+        activation.Run<S>(a, item.fragment, item.group, item.tile, timer);
     }
     __aicore__ inline void Before()
     {
@@ -52,7 +54,7 @@ struct DirectReorderWork {
     template <class TimerT>
     __aicore__ inline void Reorder(const RoutedCompletionItem& item, TimerT& timer)
     {
-        ReorderGmm2Tile(a, item.fragment, item.group, item.tile, timer);
+        ReorderGmm2Tile<S>(a, item.fragment, item.group, item.tile, timer);
     }
 };
 struct CooperativeNoWait {
@@ -71,6 +73,7 @@ __aicore__ inline TraceMeta CooperativeChunkMeta(const Chunk& c, uint32_t offset
 
 // One QP owner advances at most one Dispatch CV or one remote/self reorder CV
 // per turn. No blocking PeerStart/PackReady wait and no per-CV quiet.
+template <class S>
 class CooperativePeer {
 public:
     __aicore__ CooperativePeer(Arguments& a, uint32_t core, Timer& timer, DispatchReceiveObserver& observer)
@@ -78,12 +81,12 @@ public:
           core_(core),
           timer_(timer),
           dispatchObserver_(observer),
-          active_(core < CommunicationWorkers(a.config.world)),
+          active_(core < CommunicationWorkers<S>()),
           peer_(active_ ? PeerForOwner(a.config.rank, core) : 0U),
           submitted_(TPosition::VECCALC, CooperativeUb::submitted, kMaxPeerChunks),
           selfCounts_(TPosition::VECCALC, CooperativeUb::selfCounts, kMaxPeerChunks)
     {
-        dispatchCount_ = active_ ? RuntimeSendCvCount(a, peer_) : 0U;
+        dispatchCount_ = active_ ? RuntimeSendCvCount<S>(a, peer_) : 0U;
     }
     __aicore__ inline bool Active() const
     {
@@ -98,17 +101,17 @@ public:
         return !active_ || (initialized_ && finished_ && selfFinished_);
     }
 
-    __aicore__ inline bool TryDispatch(PackBatch& pack, bool packDone)
+    __aicore__ inline bool TryDispatch(PackBatch<S>& pack, bool packDone)
     {
         if (!active_ || !TryStart() || DispatchDone()) return false;
         auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(a_.symmetric);
         if (a_.sharedExperts && a_.config.bs < 4096U && !sharedHeadReady_) {
             sharedHeadReady_ =
-                ReadGmByPassDCache(LocalCompletionFlag(a_, kLocalFlagSharedGmm1Done)) == static_cast<int32_t>(kAic);
+                ReadGmByPassDCache(LocalCompletionFlag(a_, kLocalFlagSharedGmm1Done)) == static_cast<int32_t>(S::kCubeCores);
             const uint32_t startup = RouteMax(1U, a_.config.bs / 1024U);
             if (!sharedHeadReady_ && dispatchSteps_ >= startup) return false;
         }
-        const Chunk c = RuntimeSendChunk(a_, peer_, nextDispatch_);
+        const Chunk c = RuntimeSendChunk<S>(a_, peer_, nextDispatch_);
         pack.FlushReady();
         if (ReadGmByPassDCache(PackReadyFlag(a_, peer_, c.cv)) < static_cast<int32_t>(c.rows)) return false;
         // Retain S1's 1/1/2/4/8 ramp and merged-batch startup limit. Bound a
@@ -120,8 +123,8 @@ public:
                 : 1U;
         uint32_t count = 1U, rows = c.rows;
         while (count < target) {
-            const auto next = RuntimeSendChunk(a_, peer_, nextDispatch_ + count);
-            if (!AdjacentChunks(c, rows, count, next) || uint64_t(rows + next.rows) * a_.config.hidden > kMaxPutBytes ||
+            const auto next = RuntimeSendChunk<S>(a_, peer_, nextDispatch_ + count);
+            if (!AdjacentChunks(c, rows, count, next) || uint64_t(rows + next.rows) * S::kHidden > kMaxPutBytes ||
                 ReadGmByPassDCache(PackReadyFlag(a_, peer_, next.cv)) < static_cast<int32_t>(next.rows))
                 break;
             rows += next.rows;
@@ -130,13 +133,13 @@ public:
         timer_.CoarseBegin(CoarsePhase::Dispatch);
         timer_.Begin(Phase::Dispatch);
         auto m = CooperativeChunkMeta(c, 0U, rows);
-        m.bytes = uint64_t(rows) * a_.config.hidden;
+        m.bytes = uint64_t(rows) * S::kHidden;
         auto start = timer_.TraceBegin();
-        Put(symmetric, a_.config.receiveXOffset + c.remoteRow * a_.config.hidden,
-            reinterpret_cast<__gm__ uint8_t*>(a_.expandedX + c.localRow * a_.config.hidden),
+        Put(symmetric, a_.config.receiveXOffset + c.remoteRow * S::kHidden,
+            reinterpret_cast<__gm__ uint8_t*>(a_.expandedX + c.localRow * S::kHidden),
             static_cast<uint32_t>(m.bytes), peer_);
         timer_.TraceEnd(TraceEvent::DispatchPutX, start, m);
-        const uint32_t scales = a_.config.dispatchScaleStride;
+        const uint32_t scales = S::kDispatchScaleStride;
         m.bytes = uint64_t(rows) * scales;
         start = timer_.TraceBegin();
         Put(symmetric, a_.config.receiveScaleOffset + c.remoteRow * scales,
@@ -151,7 +154,7 @@ public:
                 a_.config.dispatchReadyOffset + (uint64_t(a_.config.rank) * a_.config.maxPeerChunks + cv) * kFlagBytes,
                 peer_, a_.config.epoch);
         timer_.TraceEnd(TraceEvent::DispatchPublish, start, m);
-        timer_.End(Phase::Dispatch, uint64_t(rows) * (a_.config.hidden + scales), true);
+        timer_.End(Phase::Dispatch, uint64_t(rows) * (S::kHidden + scales), true);
         nextDispatch_ += count;
         ++dispatchSteps_;
         if (DispatchDone()) timer_.CoarseEnd(CoarsePhase::Dispatch);
@@ -168,7 +171,7 @@ public:
         progress = TrySelf() || progress;
         if (remaining_ == 0U && !finished_) {
             const uint64_t start = timer_.TraceBegin();
-            PublishOrdered(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric), PeerPhaseSlot(a_, 1U, a_.config.rank),
+            PublishOrdered(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric), PeerPhaseSlot<S>(a_, 1U, a_.config.rank),
                            peer_, a_.config.epoch);
             TraceMeta m;
             m.peer = peer_;
@@ -185,7 +188,7 @@ public:
         return progress;
     }
 
-    __aicore__ inline void FinishRouted(SharedIncoming& incoming)
+    __aicore__ inline void FinishRouted(SharedIncoming<S>& incoming)
     {
         if (!active_) return;
         const uint64_t start = timer_.TraceBegin();
@@ -196,14 +199,14 @@ public:
         timer_.TraceEnd(TraceEvent::CombineSendComplete, start, m);
         timer_.CoarseEnd(CoarsePhase::Combine);
         if (receives_) timer_.MarkSendComplete(Phase::Combine);
-        FinishCombinePeer(a_, core_, incoming.peer, incoming.self);
+        FinishCombinePeer<S>(a_, core_, incoming.peer, incoming.self);
     }
 
 private:
     __aicore__ inline bool TryStart()
     {
         if (started_) return true;
-        auto* flag = reinterpret_cast<__gm__ uint64_t*>(a_.symmetric + PeerPhaseSlot(a_, 0U, peer_));
+        auto* flag = reinterpret_cast<__gm__ uint64_t*>(a_.symmetric + PeerPhaseSlot<S>(a_, 0U, peer_));
         started_ = ReadGmByPassDCache(flag) >= a_.config.epoch;
         return started_;
     }
@@ -212,7 +215,7 @@ private:
         const auto* r = RouteInfo(a_);
         begin_ = r->recvCvBase[peer_];
         receives_ = r->recvCvBase[peer_ + 1U] - begin_;
-        dispatchObserver_.Arm(a_, peer_, r->incoming[peer_][a_.config.localExperts]);
+        dispatchObserver_.template Arm<S>(a_, peer_, r->incoming[peer_][S::kLocalExperts]);
         selfBegin_ = r->recvCvBase[a_.config.rank];
         selfCount_ = r->recvCvBase[a_.config.rank + 1U] - selfBegin_;
         remaining_ = receives_;
@@ -220,7 +223,7 @@ private:
         nextSelf_ = core_;
         for (uint32_t i = 0; i < receives_; ++i) submitted_.SetValue(i, 0U);
         for (uint32_t i = 0; i < selfCount_; ++i) selfCounts_.SetValue(i, 0U);
-        for (uint32_t i = core_; i < selfCount_; i += CommunicationWorkers(a_.config.world)) ++selfRemaining_;
+        for (uint32_t i = core_; i < selfCount_; i += CommunicationWorkers<S>()) ++selfRemaining_;
         initialized_ = true;
     }
     __aicore__ inline bool TryRemote()
@@ -231,18 +234,18 @@ private:
             nextRemote_ = (nextRemote_ + 1U) % receives_;
             uint32_t sent = submitted_.GetValue(j);
             if (sent == kReorderCvSubmitted) continue;
-            const Chunk c = RuntimeReceiveChunkByIndex(a_, begin_ + j);
-            const uint32_t ready = PairedReorderedPrefix(a_, c);
+            const Chunk c = RuntimeReceiveChunkByIndex<S>(a_, begin_ + j);
+            const uint32_t ready = PairedReorderedPrefix<S>(a_, c);
             const uint32_t n = RouteMin(kCombinePutRows, c.rows - sent);
             if (sent + n > ready) return false;
             timer_.CoarseBegin(CoarsePhase::Combine);
             timer_.Begin(Phase::Combine);
             auto m = CooperativeChunkMeta(c, sent, n);
-            m.bytes = uint64_t(n) * a_.config.hidden * 2U;
+            m.bytes = uint64_t(n) * S::kHidden * 2U;
             auto start = timer_.TraceBegin();
             Put(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric),
-                a_.config.returnYOffset + (c.remoteRow + sent) * a_.config.hidden * 2U,
-                reinterpret_cast<__gm__ uint8_t*>(a_.gmm2Output + (c.localRow + sent) * a_.config.hidden * 2U),
+                a_.config.returnYOffset + (c.remoteRow + sent) * S::kHidden * 2U,
+                reinterpret_cast<__gm__ uint8_t*>(a_.gmm2Output + (c.localRow + sent) * S::kHidden * 2U),
                 static_cast<uint32_t>(m.bytes), peer_);
             timer_.TraceEnd(TraceEvent::CombinePut, start, m);
             timer_.End(Phase::Combine, m.bytes, true);
@@ -266,7 +269,7 @@ private:
     __aicore__ inline bool TrySelf()
     {
         if (!selfRemaining_) return false;
-        const uint32_t workers = CommunicationWorkers(a_.config.world);
+        const uint32_t workers = CommunicationWorkers<S>();
         const uint32_t owned = (selfCount_ - 1U - core_) / workers + 1U;
         for (uint32_t skipped = 0; skipped < owned; ++skipped) {
             const uint32_t j = nextSelf_;
@@ -274,8 +277,8 @@ private:
             if (nextSelf_ >= selfCount_) nextSelf_ = core_;
             const uint32_t before = selfCounts_.GetValue(j);
             if (before == kReorderCvSubmitted) continue;
-            const Chunk c = RuntimeReceiveChunkByIndex(a_, selfBegin_ + j);
-            if (PairedReorderedPrefix(a_, c) != c.rows) return false;
+            const Chunk c = RuntimeReceiveChunkByIndex<S>(a_, selfBegin_ + j);
+            if (PairedReorderedPrefix<S>(a_, c) != c.rows) return false;
             WriteGmByPassDCache(reinterpret_cast<__gm__ uint64_t*>(
                                     a_.symmetric + a_.config.combineReadyOffset +
                                     (uint64_t(a_.config.rank) * a_.config.maxPeerChunks + c.cv) * kFlagBytes),
@@ -299,27 +302,28 @@ private:
     LocalTensor<uint32_t> submitted_, selfCounts_;
 };
 
-__aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& timer, SharedIncoming& incoming)
+template <class S>
+__aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& timer, SharedIncoming<S>& incoming)
 {
     incoming.dispatch.Init(timer);
-    RoutedCompletionConsumer completion(a, core);
+    RoutedCompletionConsumer<S> completion(a, core);
     completion.Init();  // even zero-task AICs need the single credit
-    PackBatch pack(a, timer);
-    CooperativePeer peer(a, core, timer, incoming.dispatch);
-    SharedActivationState shared(a, core, timer);
+    PackBatch<S> pack(a, timer);
+    CooperativePeer<S> peer(a, core, timer, incoming.dispatch);
+    SharedActivationState<S> shared(a, core, timer);
     if (!peer.Active()) timer.CoarseBegin(CoarsePhase::Activation);
     UbRoutedActivation activation;
-    activation.Init(a);
-    const uint32_t comm = CommunicationWorkers(a.config.world), helpers = kAic - comm;
+    activation.template Init<S>(a);
+    const uint32_t comm = CommunicationWorkers<S>(), helpers = S::kCubeCores - comm;
     uint32_t nextPack = kPackStartupRounds;
     uint32_t nextGather = peer.Active() ? UINT32_MAX : core - comm;
     bool ready = false, packDone = false;
-    DirectReorderWork directReorder{a, pack, core, activation};
+    DirectReorderWork<S> directReorder{a, pack, core, activation};
     while (true) {
         bool progress = false;
         // A bounded Pack quantum each turn, never a Pack-until-empty loop.
         if (!packDone && nextPack < a.config.packRoundCount) {
-            PackOneRound(a, nextPack++, core, kAic, pack);
+            PackOneRound<S>(a, nextPack++, core, S::kCubeCores, pack);
             progress = true;
         }
         if (!packDone && nextPack >= a.config.packRoundCount) {
@@ -336,10 +340,10 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& ti
         if (peer.Active())
             progress = peer.TryDispatch(pack, packDone) || progress;
         else if (ready && nextGather < a.config.fragmentCount) {
-            const auto f = LoadFragment(a, nextGather);
-            if (AreGroupInputsReady(a, f)) {
+            const auto f = LoadFragment<S>(a, nextGather);
+            if (AreGroupInputsReady<S>(a, f)) {
                 pack.Close();
-                GatherInputScale(a, f, nextGather, timer);
+                GatherInputScale<S>(a, f, nextGather, timer);
                 nextGather += helpers;
                 progress = true;
             }

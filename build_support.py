@@ -516,19 +516,28 @@ def bundle_kernel_sources(destination, configuration):
         return
     # MegaMoE device code is compiled on demand; its headers and the pinned
     # CATLASS closure travel with the wheel instead of a prebuilt library.
-    mega_source = ROOT / "experiments/megamoe/csrc"
-    mega_out = kernel_src / "megamoe" / "csrc"
-    for path in mega_source.rglob("*"):
-        if path.is_file() and path.suffix in {".h", ".hpp"}:
-            target = mega_out / path.relative_to(mega_source)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
+    # DeepJIT only follows angle-bracket includes with the kernels/ prefix, so
+    # the bundled headers are normalized into one view per backend include order.
     catlass = Path(configuration["CATLASS_ROOT"])
     for sub in ("include", "examples/common"):
         source = catlass / sub
         if not source.is_dir():
             raise RuntimeError(f"MegaMoE runtime compilation requires CATLASS at {source}")
         shutil.copytree(source, kernel_src / "megamoe" / "catlass" / sub, dirs_exist_ok=True)
+    checked_run(
+        [
+            sys.executable,
+            ROOT / "experiments/megamoe/scripts/prepare_jit_headers.py",
+            "--csrc",
+            ROOT / "experiments/megamoe/csrc",
+            "--catlass",
+            catlass,
+            "--shmem",
+            Path(configuration["SHMEM_ROOT"]),
+            "--output",
+            kernel_src / "megamoe",
+        ]
+    )
 
 
 class CMakeBuild(build_ext):

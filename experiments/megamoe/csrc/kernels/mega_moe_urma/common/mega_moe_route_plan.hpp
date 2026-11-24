@@ -70,26 +70,26 @@ URMA_ROUTE_INLINE uint64_t RouteInfoAllocationBytes(uint64_t groups, uint64_t ch
     return (RouteLinkPrefixOffset(groups) + (chunks + 1U) * sizeof(uint32_t) + 511U) / 512U * 512U;
 }
 
-template <class Output>
+template <class S, class Output>
 URMA_ROUTE_INLINE void CompileDeviceRoutes(Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, Output& out, bool wave12,
                                            bool reorder)
 {
-    const uint32_t le = c.localExperts;
+    const uint32_t le = S::kLocalExperts;
     r.groupBase[0] = r.compactBase[0] = 0U;
     c.fragmentCount = c.sendChunkCount = c.recvChunkCount = c.packRoundCount = 0U;
     c.gmm1Tiles = c.gmm2Tiles = c.receiveRows = c.computeTaskCount = 0U;
     uint32_t segmentCount = 0U;
     for (uint32_t e = 0; e < le; ++e) {
         r.sources[e][0] = 0U;
-        for (uint32_t s = 0; s < c.world; ++s)
+        for (uint32_t s = 0; s < S::kEp; ++s)
             r.sources[e][s + 1U] = r.sources[e][s] + r.incoming[s][e + 1U] - r.incoming[s][e];
-        const uint32_t rows = r.sources[e][c.world];
+        const uint32_t rows = r.sources[e][S::kEp];
         r.groupBase[e + 1U] = r.groupBase[e] + (rows + 255U) / 256U;
         r.compactBase[e + 1U] = r.compactBase[e] + rows;
         for (uint32_t first = 0U; first < rows; first += 256U) {
             const uint32_t last = RouteMin(first + 256U, rows);
             Fragment f{e, segmentCount, uint64_t(r.compactBase[e]) + first, last - first, 0U, c.gmm1Tiles, c.gmm2Tiles};
-            for (uint32_t s = 0; s < c.world; ++s) {
+            for (uint32_t s = 0; s < S::kEp; ++s) {
                 uint32_t lo = RouteMax(first, r.sources[e][s]);
                 const uint32_t hi = RouteMin(last, r.sources[e][s + 1U]);
                 while (lo < hi) {
@@ -97,36 +97,36 @@ URMA_ROUTE_INLINE void CompileDeviceRoutes(Config& c, URMA_ROUTE_UB DeviceRouteI
                     const uint32_t cv = peerRow / c.cvRows;
                     const uint32_t n = RouteMin(hi - lo, c.cvRows - peerRow % c.cvRows);
                     out.Segment(segmentCount++,
-                                RowSegment{s, cv, uint64_t(s) * c.sourceRowCapacity + peerRow,
+                                RowSegment{s, cv, uint64_t(s) * S::kSourceRowCapacity + peerRow,
                                            r.returnBase[s] + peerRow, lo - first, n, s * c.maxPeerChunks + cv, 0U});
                     lo += n;
                 }
             }
             f.segmentCount = segmentCount - f.segmentBegin;
             out.FragmentAt(c.fragmentCount++, f);
-            c.gmm1Tiles += out.Gmm1Tiles(f.rows, c);
-            c.gmm2Tiles += c.hidden / 256U;
+            c.gmm1Tiles += out.Gmm1Tiles(f.rows);
+            c.gmm2Tiles += S::kHidden / 256U;
         }
     }
     c.receiveRows = r.compactBase[le];
     c.selfSendRow = r.outgoing[c.rank * le];
-    c.selfRecvRow = uint64_t(c.rank) * c.sourceRowCapacity;
+    c.selfRecvRow = uint64_t(c.rank) * S::kSourceRowCapacity;
     c.selfRows = r.incoming[c.rank][le];
     uint32_t links = 0U;
-    for (uint32_t peer = 0; peer < c.world; ++peer) {
+    for (uint32_t peer = 0; peer < S::kEp; ++peer) {
         const uint32_t sendBase = r.outgoing[peer * le];
         const uint32_t sendRows = r.outgoing[(peer + 1U) * le] - sendBase;
         c.packRoundCount = RouteMax(c.packRoundCount, (sendRows + c.cvRows - 1U) / c.cvRows);
         for (uint32_t first = 0U, cv = 0U; first < sendRows; first += c.cvRows, ++cv)
             out.Send(c.sendChunkCount++,
-                     Chunk{peer, cv, uint64_t(sendBase) + first, uint64_t(c.rank) * c.sourceRowCapacity + first,
+                     Chunk{peer, cv, uint64_t(sendBase) + first, uint64_t(c.rank) * S::kSourceRowCapacity + first,
                            RouteMin(c.cvRows, sendRows - first), 0U, 0U, 0U});
         const uint32_t recvRows = r.incoming[peer][le];
         uint32_t e = 0U;
         for (uint32_t first = 0U, cv = 0U; first < recvRows; first += c.cvRows, ++cv) {
             const uint32_t end = RouteMin(first + c.cvRows, recvRows);
             Chunk chunk{
-                peer, cv, uint64_t(peer) * c.sourceRowCapacity + first, r.returnBase[peer] + first, end - first, links,
+                peer, cv, uint64_t(peer) * S::kSourceRowCapacity + first, r.returnBase[peer] + first, end - first, links,
                 0U,   0U};
             uint32_t row = first;
             while (row < end) {
@@ -138,10 +138,10 @@ URMA_ROUTE_INLINE void CompileDeviceRoutes(Config& c, URMA_ROUTE_UB DeviceRouteI
                 out.Link(links, group);
                 // Sorted by destination row, including a partial first/last M-group.
                 if (reorder)
-                    out.ReorderSpan(
-                        links, uint64_t(r.compactBase[e]) + expertRow,
-                        peer == c.rank ? r.returnBase[peer] + row : uint64_t(peer) * c.sourceRowCapacity + row, group,
-                        n);
+                    out.ReorderSpan(links, uint64_t(r.compactBase[e]) + expertRow,
+                                    peer == c.rank ? r.returnBase[peer] + row
+                                                   : uint64_t(peer) * S::kSourceRowCapacity + row,
+                                    group, n);
                 ++links;
                 row += n;
             }
@@ -156,7 +156,7 @@ URMA_ROUTE_INLINE void CompileDeviceRoutes(Config& c, URMA_ROUTE_UB DeviceRouteI
         uint64_t rows = 0U;
         for (uint32_t peer = 0; peer < kWorld; ++peer) {
             Chunk chunk{};
-            if (peer < c.world) {
+            if (peer < S::kEp) {
                 const uint32_t base = r.outgoing[peer * le];
                 const uint32_t count = r.outgoing[(peer + 1U) * le] - base;
                 const uint32_t first = cv * c.cvRows;
@@ -164,7 +164,7 @@ URMA_ROUTE_INLINE void CompileDeviceRoutes(Config& c, URMA_ROUTE_UB DeviceRouteI
                     chunk = Chunk{peer,
                                   cv,
                                   uint64_t(base) + first,
-                                  uint64_t(c.rank) * c.sourceRowCapacity + first,
+                                  uint64_t(c.rank) * S::kSourceRowCapacity + first,
                                   RouteMin(c.cvRows, count - first),
                                   0U,
                                   0U,
@@ -210,13 +210,15 @@ URMA_ROUTE_INLINE RouteWorkRange RouteWork(uint32_t count, uint32_t worker, uint
 {
     return {uint32_t(uint64_t(count) * worker / workers), uint32_t(uint64_t(count) * (worker + 1U) / workers)};
 }
-URMA_ROUTE_INLINE uint32_t PlanGmm1Tiles(uint32_t rows, const Config& c)
+template <class S>
+URMA_ROUTE_INLINE uint32_t PlanGmm1Tiles(uint32_t rows)
 {
-    return Gmm1ComputeTileCount(rows, c);
+    return Gmm1ComputeTileCount<S>(rows);
 }
+template <class S>
 URMA_ROUTE_INLINE uint32_t PlanExpertForGroup(uint32_t group, const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r)
 {
-    uint32_t lo = 0U, hi = c.localExperts;
+    uint32_t lo = 0U, hi = S::kLocalExperts;
     while (lo < hi) {
         const uint32_t mid = (lo + hi) / 2U;
         if (r.groupBase[mid + 1U] <= group)
@@ -226,16 +228,18 @@ URMA_ROUTE_INLINE uint32_t PlanExpertForGroup(uint32_t group, const Config& c, U
     }
     return lo;
 }
+template <class S>
 URMA_ROUTE_INLINE uint32_t PlanPeerForCv(uint32_t cv, const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, bool send)
 {
     uint32_t peer = 0U;
-    while (peer + 1U < c.world && (send ? r.sendCvBase[peer + 1U] : r.recvCvBase[peer + 1U]) <= cv) ++peer;
+    while (peer + 1U < S::kEp && (send ? r.sendCvBase[peer + 1U] : r.recvCvBase[peer + 1U]) <= cv) ++peer;
     return peer;
 }
+template <class S>
 URMA_ROUTE_INLINE uint32_t PlanExpertForPeerRow(uint32_t peer, uint32_t row, const Config& c,
                                                 URMA_ROUTE_UB DeviceRouteInfo& r)
 {
-    uint32_t lo = 0U, hi = c.localExperts;
+    uint32_t lo = 0U, hi = S::kLocalExperts;
     while (lo < hi) {
         const uint32_t mid = (lo + hi) / 2U;
         if (r.incoming[peer][mid + 1U] <= row)
@@ -246,31 +250,32 @@ URMA_ROUTE_INLINE uint32_t PlanExpertForPeerRow(uint32_t peer, uint32_t row, con
     return lo;
 }
 
+template <class S>
 URMA_ROUTE_INLINE void BuildRouteSummary(Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, bool wave12)
 {
-    const uint32_t le = c.localExperts;
+    const uint32_t le = S::kLocalExperts;
     r.groupBase[0] = r.compactBase[0] = 0U;
     r.gmm1Base[0] = 0U;
     for (uint32_t e = 0; e < le; ++e) {
         r.sources[e][0] = 0U;
-        for (uint32_t s = 0; s < c.world; ++s)
+        for (uint32_t s = 0; s < S::kEp; ++s)
             r.sources[e][s + 1U] = r.sources[e][s] + r.incoming[s][e + 1U] - r.incoming[s][e];
-        const uint32_t rows = r.sources[e][c.world];
+        const uint32_t rows = r.sources[e][S::kEp];
         r.groupBase[e + 1U] = r.groupBase[e] + (rows + 255U) / 256U;
         r.compactBase[e + 1U] = r.compactBase[e] + rows;
-        r.gmm1Base[e + 1U] = r.gmm1Base[e] + uint64_t(rows / 256U) * PlanGmm1Tiles(256U, c) +
-                             (rows % 256U ? PlanGmm1Tiles(rows % 256U, c) : 0U);
+        r.gmm1Base[e + 1U] = r.gmm1Base[e] + uint64_t(rows / 256U) * PlanGmm1Tiles<S>(256U) +
+                             (rows % 256U ? PlanGmm1Tiles<S>(rows % 256U) : 0U);
     }
     c.fragmentCount = r.groupBase[le];
     c.receiveRows = r.compactBase[le];
     c.gmm1Tiles = r.gmm1Base[le];
-    c.gmm2Tiles = uint64_t(c.fragmentCount) * (c.hidden / 256U);
+    c.gmm2Tiles = uint64_t(c.fragmentCount) * (S::kHidden / 256U);
     c.selfSendRow = r.outgoing[c.rank * le];
-    c.selfRecvRow = uint64_t(c.rank) * c.sourceRowCapacity;
+    c.selfRecvRow = uint64_t(c.rank) * S::kSourceRowCapacity;
     c.selfRows = r.incoming[c.rank][le];
     c.packRoundCount = 0U;
     r.sendCvBase[0] = r.recvCvBase[0] = 0U;
-    for (uint32_t p = 0; p < c.world; ++p) {
+    for (uint32_t p = 0; p < S::kEp; ++p) {
         const uint32_t outgoing = r.outgoing[(p + 1U) * le] - r.outgoing[p * le];
         const uint32_t sends = (outgoing + c.cvRows - 1U) / c.cvRows;
         const uint32_t receives = (r.incoming[p][le] + c.cvRows - 1U) / c.cvRows;
@@ -278,18 +283,19 @@ URMA_ROUTE_INLINE void BuildRouteSummary(Config& c, URMA_ROUTE_UB DeviceRouteInf
         r.recvCvBase[p + 1U] = r.recvCvBase[p] + receives;
         c.packRoundCount = RouteMax(c.packRoundCount, sends);
     }
-    c.sendChunkCount = r.sendCvBase[c.world];
-    c.recvChunkCount = r.recvCvBase[c.world];
+    c.sendChunkCount = r.sendCvBase[S::kEp];
+    c.recvChunkCount = r.recvCvBase[S::kEp];
     c.computeTaskCount = 2U * (wave12 ? (c.fragmentCount + 11U) / 12U : le);
     c.routeSegmentCount = c.routeLinkCount = 0U;
 }
 
+template <class S>
 URMA_ROUTE_INLINE uint32_t CountGroupSegments(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, uint32_t group)
 {
-    const uint32_t e = PlanExpertForGroup(group, c, r), first = (group - r.groupBase[e]) * 256U;
-    const uint32_t last = RouteMin(first + 256U, r.sources[e][c.world]);
+    const uint32_t e = PlanExpertForGroup<S>(group, c, r), first = (group - r.groupBase[e]) * 256U;
+    const uint32_t last = RouteMin(first + 256U, r.sources[e][S::kEp]);
     uint32_t count = 0U;
-    for (uint32_t s = 0; s < c.world; ++s) {
+    for (uint32_t s = 0; s < S::kEp; ++s) {
         const uint32_t lo = RouteMax(first, r.sources[e][s]), hi = RouteMin(last, r.sources[e][s + 1U]);
         if (lo < hi) {
             const uint32_t row = r.incoming[s][e] + lo - r.sources[e][s];
@@ -298,11 +304,12 @@ URMA_ROUTE_INLINE uint32_t CountGroupSegments(const Config& c, URMA_ROUTE_UB Dev
     }
     return count;
 }
+template <class S>
 URMA_ROUTE_INLINE uint32_t CountCvLinks(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, uint32_t index)
 {
-    const uint32_t peer = PlanPeerForCv(index, c, r, false), cv = index - r.recvCvBase[peer];
-    uint32_t row = cv * c.cvRows, count = 0U, e = PlanExpertForPeerRow(peer, row, c, r);
-    const uint32_t last = RouteMin(row + c.cvRows, r.incoming[peer][c.localExperts]);
+    const uint32_t peer = PlanPeerForCv<S>(index, c, r, false), cv = index - r.recvCvBase[peer];
+    uint32_t row = cv * c.cvRows, count = 0U, e = PlanExpertForPeerRow<S>(peer, row, c, r);
+    const uint32_t last = RouteMin(row + c.cvRows, r.incoming[peer][S::kLocalExperts]);
     while (row < last) {
         while (r.incoming[peer][e + 1U] <= row) ++e;
         const uint32_t expertRow = r.sources[e][peer] + row - r.incoming[peer][e];
@@ -312,29 +319,29 @@ URMA_ROUTE_INLINE uint32_t CountCvLinks(const Config& c, URMA_ROUTE_UB DeviceRou
     return count;
 }
 
-template <class Prefix, class Output>
+template <class S, class Prefix, class Output>
 URMA_ROUTE_INLINE void EmitRouteGroups(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, Prefix& prefix, Output& out,
                                        RouteWorkRange range)
 {
     for (uint32_t g = range.first; g < range.last; ++g) {
-        const uint32_t e = PlanExpertForGroup(g, c, r), first = (g - r.groupBase[e]) * 256U;
-        const uint32_t last = RouteMin(first + 256U, r.sources[e][c.world]);
+        const uint32_t e = PlanExpertForGroup<S>(g, c, r), first = (g - r.groupBase[e]) * 256U;
+        const uint32_t last = RouteMin(first + 256U, r.sources[e][S::kEp]);
         uint32_t segment = prefix.Group(g);
         Fragment f{e,
                    segment,
                    uint64_t(r.compactBase[e]) + first,
                    last - first,
                    prefix.Group(g + 1U) - segment,
-                   r.gmm1Base[e] + uint64_t(g - r.groupBase[e]) * PlanGmm1Tiles(256U, c),
-                   uint64_t(g) * (c.hidden / 256U)};
-        for (uint32_t s = 0; s < c.world; ++s) {
+                   r.gmm1Base[e] + uint64_t(g - r.groupBase[e]) * PlanGmm1Tiles<S>(256U),
+                   uint64_t(g) * (S::kHidden / 256U)};
+        for (uint32_t s = 0; s < S::kEp; ++s) {
             uint32_t lo = RouteMax(first, r.sources[e][s]);
             const uint32_t hi = RouteMin(last, r.sources[e][s + 1U]);
             while (lo < hi) {
                 const uint32_t peerRow = r.incoming[s][e] + lo - r.sources[e][s], cv = peerRow / c.cvRows;
                 const uint32_t n = RouteMin(hi - lo, c.cvRows - peerRow % c.cvRows);
                 out.Segment(segment++,
-                            RowSegment{s, cv, uint64_t(s) * c.sourceRowCapacity + peerRow, r.returnBase[s] + peerRow,
+                            RowSegment{s, cv, uint64_t(s) * S::kSourceRowCapacity + peerRow, r.returnBase[s] + peerRow,
                                        lo - first, n, s * c.maxPeerChunks + cv, 0U});
                 lo += n;
             }
@@ -342,17 +349,17 @@ URMA_ROUTE_INLINE void EmitRouteGroups(const Config& c, URMA_ROUTE_UB DeviceRout
         out.FragmentAt(g, f);
     }
 }
-template <class Prefix, class Output>
+template <class S, class Prefix, class Output>
 URMA_ROUTE_INLINE void EmitRouteReceives(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, Prefix& prefix, Output& out,
                                          RouteWorkRange range, bool reorder)
 {
     for (uint32_t index = range.first; index < range.last; ++index) {
-        const uint32_t peer = PlanPeerForCv(index, c, r, false), cv = index - r.recvCvBase[peer];
-        const uint32_t first = cv * c.cvRows, last = RouteMin(first + c.cvRows, r.incoming[peer][c.localExperts]);
-        uint32_t row = first, e = PlanExpertForPeerRow(peer, row, c, r), link = prefix.Link(index);
+        const uint32_t peer = PlanPeerForCv<S>(index, c, r, false), cv = index - r.recvCvBase[peer];
+        const uint32_t first = cv * c.cvRows, last = RouteMin(first + c.cvRows, r.incoming[peer][S::kLocalExperts]);
+        uint32_t row = first, e = PlanExpertForPeerRow<S>(peer, row, c, r), link = prefix.Link(index);
         Chunk chunk{peer,
                     cv,
-                    uint64_t(peer) * c.sourceRowCapacity + first,
+                    uint64_t(peer) * S::kSourceRowCapacity + first,
                     r.returnBase[peer] + first,
                     last - first,
                     link,
@@ -366,7 +373,8 @@ URMA_ROUTE_INLINE void EmitRouteReceives(const Config& c, URMA_ROUTE_UB DeviceRo
             out.Link(link, g);
             if (reorder)
                 out.ReorderSpan(link, uint64_t(r.compactBase[e]) + er,
-                                peer == c.rank ? r.returnBase[peer] + row : uint64_t(peer) * c.sourceRowCapacity + row,
+                                peer == c.rank ? r.returnBase[peer] + row
+                                               : uint64_t(peer) * S::kSourceRowCapacity + row,
                                 g, n);
             ++link;
             row += n;
@@ -375,19 +383,19 @@ URMA_ROUTE_INLINE void EmitRouteReceives(const Config& c, URMA_ROUTE_UB DeviceRo
         out.Receive(index, chunk);
     }
 }
-template <class Output>
+template <class S, class Output>
 URMA_ROUTE_INLINE void EmitRouteSends(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, Output& out,
                                       RouteWorkRange range)
 {
     for (uint32_t index = range.first; index < range.last; ++index) {
-        const uint32_t peer = PlanPeerForCv(index, c, r, true), cv = index - r.sendCvBase[peer];
-        const uint32_t base = r.outgoing[peer * c.localExperts], first = cv * c.cvRows;
-        const uint32_t rows = r.outgoing[(peer + 1U) * c.localExperts] - base;
-        out.Send(index, Chunk{peer, cv, uint64_t(base) + first, uint64_t(c.rank) * c.sourceRowCapacity + first,
+        const uint32_t peer = PlanPeerForCv<S>(index, c, r, true), cv = index - r.sendCvBase[peer];
+        const uint32_t base = r.outgoing[peer * S::kLocalExperts], first = cv * c.cvRows;
+        const uint32_t rows = r.outgoing[(peer + 1U) * S::kLocalExperts] - base;
+        out.Send(index, Chunk{peer, cv, uint64_t(base) + first, uint64_t(c.rank) * S::kSourceRowCapacity + first,
                               RouteMin(c.cvRows, rows - first), 0U, 0U, 0U});
     }
 }
-template <class Output>
+template <class S, class Output>
 URMA_ROUTE_INLINE void EmitRoutePack(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, Output& out,
                                      RouteWorkRange range)
 {
@@ -395,15 +403,15 @@ URMA_ROUTE_INLINE void EmitRoutePack(const Config& c, URMA_ROUTE_UB DeviceRouteI
         uint64_t total = 0U;
         for (uint32_t peer = 0; peer < kWorld; ++peer) {
             Chunk chunk{};
-            if (peer < c.world) {
-                const uint32_t base = r.outgoing[peer * c.localExperts],
-                               rows = r.outgoing[(peer + 1U) * c.localExperts] - base;
+            if (peer < S::kEp) {
+                const uint32_t base = r.outgoing[peer * S::kLocalExperts],
+                               rows = r.outgoing[(peer + 1U) * S::kLocalExperts] - base;
                 const uint32_t first = cv * c.cvRows;
                 if (first < rows)
                     chunk = Chunk{peer,
                                   cv,
                                   uint64_t(base) + first,
-                                  uint64_t(c.rank) * c.sourceRowCapacity + first,
+                                  uint64_t(c.rank) * S::kSourceRowCapacity + first,
                                   RouteMin(c.cvRows, rows - first),
                                   0U,
                                   0U,
@@ -415,7 +423,7 @@ URMA_ROUTE_INLINE void EmitRoutePack(const Config& c, URMA_ROUTE_UB DeviceRouteI
         out.PackRows(cv, total);
     }
 }
-template <class Output>
+template <class S, class Output>
 URMA_ROUTE_INLINE void EmitRouteTasks(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, Output& out, bool wave12)
 {
     uint32_t task = 0U;
@@ -426,11 +434,12 @@ URMA_ROUTE_INLINE void EmitRouteTasks(const Config& c, URMA_ROUTE_UB DeviceRoute
             out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm2, wave});
         }
     } else {
-        for (uint32_t e = 0; e < c.localExperts; ++e)
+        for (uint32_t e = 0; e < S::kLocalExperts; ++e)
             out.Batch(e, ComputeBatch{r.groupBase[e], r.groupBase[e + 1U] - r.groupBase[e]});
         uint32_t g1 = 0U, pending = 0U;
-        for (uint32_t g2 = 0U; g2 < c.localExperts; ++g2) {
-            while (g1 < c.localExperts && (g1 < RouteMin(c.localExperts, g2 + 2U) || pending < c.gmm1AheadMGroups)) {
+        for (uint32_t g2 = 0U; g2 < S::kLocalExperts; ++g2) {
+            while (g1 < S::kLocalExperts &&
+                   (g1 < RouteMin(S::kLocalExperts, g2 + 2U) || pending < c.gmm1AheadMGroups)) {
                 out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm1, g1});
                 pending += r.groupBase[g1 + 1U] - r.groupBase[g1];
                 ++g1;
@@ -445,24 +454,26 @@ URMA_ROUTE_INLINE void EmitRouteTasks(const Config& c, URMA_ROUTE_UB DeviceRoute
 namespace MegaMoeUrma {
 // Temporary per-expert totals occupy the same arrays that the leader later
 // converts to prefixes. No consumer sees these arrays until final publication.
+template <class S>
 URMA_ROUTE_INLINE void SummarizeRouteExperts(const Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, uint32_t begin,
                                              uint32_t end)
 {
     for (uint32_t e = begin; e < end; ++e) {
         for (uint32_t s = 0; s <= kWorld; ++s) r.sources[e][s] = 0U;
-        for (uint32_t s = 0; s < c.world; ++s)
+        for (uint32_t s = 0; s < S::kEp; ++s)
             r.sources[e][s + 1U] = r.sources[e][s] + r.incoming[s][e + 1U] - r.incoming[s][e];
-        const uint32_t rows = r.sources[e][c.world];
+        const uint32_t rows = r.sources[e][S::kEp];
         r.groupBase[e + 1U] = (rows + 255U) / 256U;
         r.compactBase[e + 1U] = rows;
         r.gmm1Base[e + 1U] =
-            uint64_t(rows / 256U) * PlanGmm1Tiles(256U, c) + (rows % 256U ? PlanGmm1Tiles(rows % 256U, c) : 0U);
+            uint64_t(rows / 256U) * PlanGmm1Tiles<S>(256U) + (rows % 256U ? PlanGmm1Tiles<S>(rows % 256U) : 0U);
     }
 }
 
+template <class S>
 URMA_ROUTE_INLINE void FinishRouteSummaryPrefix(Config& c, URMA_ROUTE_UB DeviceRouteInfo& r, bool wave12)
 {
-    const uint32_t le = c.localExperts;
+    const uint32_t le = S::kLocalExperts;
     r.groupBase[0] = r.compactBase[0] = 0U;
     r.gmm1Base[0] = 0U;
     for (uint32_t e = 0; e < le; ++e) {
@@ -473,21 +484,21 @@ URMA_ROUTE_INLINE void FinishRouteSummaryPrefix(Config& c, URMA_ROUTE_UB DeviceR
     c.fragmentCount = r.groupBase[le];
     c.receiveRows = r.compactBase[le];
     c.gmm1Tiles = r.gmm1Base[le];
-    c.gmm2Tiles = uint64_t(c.fragmentCount) * (c.hidden / 256U);
+    c.gmm2Tiles = uint64_t(c.fragmentCount) * (S::kHidden / 256U);
     c.selfSendRow = r.outgoing[c.rank * le];
-    c.selfRecvRow = uint64_t(c.rank) * c.sourceRowCapacity;
+    c.selfRecvRow = uint64_t(c.rank) * S::kSourceRowCapacity;
     c.selfRows = r.incoming[c.rank][le];
     c.packRoundCount = 0U;
     r.sendCvBase[0] = r.recvCvBase[0] = 0U;
-    for (uint32_t p = 0; p < c.world; ++p) {
+    for (uint32_t p = 0; p < S::kEp; ++p) {
         const uint32_t rows = r.outgoing[(p + 1U) * le] - r.outgoing[p * le];
         const uint32_t sends = (rows + c.cvRows - 1U) / c.cvRows;
         r.sendCvBase[p + 1U] = r.sendCvBase[p] + sends;
         r.recvCvBase[p + 1U] = r.recvCvBase[p] + (r.incoming[p][le] + c.cvRows - 1U) / c.cvRows;
         c.packRoundCount = RouteMax(c.packRoundCount, sends);
     }
-    c.sendChunkCount = r.sendCvBase[c.world];
-    c.recvChunkCount = r.recvCvBase[c.world];
+    c.sendChunkCount = r.sendCvBase[S::kEp];
+    c.recvChunkCount = r.recvCvBase[S::kEp];
     c.computeTaskCount = 2U * (wave12 ? (c.fragmentCount + 11U) / 12U : le);
     c.routeSegmentCount = c.routeLinkCount = 0U;
 }

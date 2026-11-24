@@ -67,7 +67,7 @@ struct RoutedCompletionItem {
 
 // Production ownership iterator, independent of storage access. Tests compare
 // this cursor against a naive complete-task enumeration, including idle cores.
-template <class Plan>
+template <class Plan, uint32_t CubeCores = kAic>
 class OwnedTileSequence {
 public:
     URMA_CURSOR_INLINE OwnedTileSequence(const Plan& p, uint32_t core) : plan_(p), core_(core) {}
@@ -87,7 +87,7 @@ public:
                 }
                 const auto first = plan_.Group(begin_);
                 const uint64_t base = gmm1_ ? first.gmm1TileBegin : first.gmm2TileBegin;
-                next_ = FirstOwnedComputeTile(base, RoutedOwnerResidue(gmm1_, core_), kAic);
+                next_ = FirstOwnedComputeTile(base, RoutedOwnerResidue(gmm1_, core_), CubeCores);
                 active_ = true;
             }
             if (next_ < limit_) {
@@ -96,7 +96,7 @@ public:
                 item.tile = static_cast<uint32_t>(next_ % tiles_);
                 item.fragment = plan_.Group(item.group);
                 item.logicalTile = (gmm1_ ? item.fragment.gmm1TileBegin : item.fragment.gmm2TileBegin) + item.tile;
-                next_ += kAic;
+                next_ += CubeCores;
                 return true;
             }
             active_ = false;
@@ -210,6 +210,7 @@ private:
 }  // namespace MegaMoeUrma
 
 namespace MegaMoeUrma {
+template <class S>
 struct DeviceRoutePlanView {
     const Arguments& a;
     __aicore__ inline uint32_t TaskCount() const
@@ -228,13 +229,14 @@ struct DeviceRoutePlanView {
     }
     __aicore__ inline uint32_t Tiles(bool g1) const
     {
-        return g1 ? Gmm1ComputeTileCount(kComputeTileM, a.config) : ComputeTileCount(kComputeTileM, a.config.hidden);
+        return g1 ? Gmm1ComputeTileCount<S>(kComputeTileM) : ComputeTileCount(kComputeTileM, S::kHidden);
     }
     __aicore__ inline Fragment Group(uint32_t group) const
     {
-        return RuntimeFragment(a, group);
+        return RuntimeFragment<S>(a, group);
     }
 };
+template <class S>
 class OwnedRouteTileCursor {
 public:
     __aicore__ OwnedRouteTileCursor(const Arguments& a, uint32_t core) : plan_{a}, sequence_(plan_, core) {}
@@ -244,8 +246,8 @@ public:
     }
 
 private:
-    DeviceRoutePlanView plan_;
-    OwnedTileSequence<DeviceRoutePlanView> sequence_;
+    DeviceRoutePlanView<S> plan_;
+    OwnedTileSequence<DeviceRoutePlanView<S>, S::kCubeCores> sequence_;
 };
 __aicore__ inline __gm__ int32_t* RoutedIssued(const Arguments& a, uint32_t core)
 {
@@ -280,6 +282,7 @@ private:
     uint32_t core_, sequence_ = 0U;
 };
 
+template <class S>
 class RoutedCompletionConsumer {
 public:
     __aicore__ RoutedCompletionConsumer(const Arguments& a, uint32_t core) : a_(a), core_(core), cursor_(a, core) {}
@@ -343,7 +346,7 @@ private:
     }
     const Arguments& a_;
     uint32_t core_, consumed_ = 0U, issued_ = 0U;
-    OwnedRouteTileCursor cursor_;
+    OwnedRouteTileCursor<S> cursor_;
     RoutedCompletionItem next_{};
     bool prepared_ = false, exhausted_ = false;
 };

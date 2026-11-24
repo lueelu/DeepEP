@@ -8,7 +8,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <acl/acl.h>
@@ -42,7 +41,6 @@ using LaunchOptions = deep_jit::ascend::LaunchOptions;
 // exactly like the former per-backend device translation units.
 deep_jit::LazyInit<deep_jit::Runtime<deep_jit::Ascend>> mte_jit(nullptr);
 deep_jit::LazyInit<deep_jit::Runtime<deep_jit::Ascend>> urma_jit(nullptr);
-std::unordered_map<std::string, std::shared_ptr<Kernel>> compiled_mega_kernels;
 bool mega_jit_ready = false;
 
 void AppendInclude(const fs::path& path, std::vector<fs::path>& directories)
@@ -122,8 +120,8 @@ std::vector<fs::path> MegaMoEIncludeDirs(const std::string& package_root, const 
     const fs::path root = fs::absolute(package_root).lexically_normal();
     const fs::path kernel_src = root / "_kernel_src";
     const fs::path mega_src = kernel_src / "megamoe";
-    for (const char* required : {"csrc/kernels/mega_moe/mega_moe_entry.hpp",
-                                 "csrc/kernels/mega_moe_urma/mega_moe_urma_entry.hpp", "catlass/include",
+    for (const char* required : {"mte/kernels/mega_moe/mega_moe_entry.hpp",
+                                 "urma/kernels/mega_moe_urma/mega_moe_urma_entry.hpp", "catlass/include",
                                  "catlass/examples/common"})
         if (!fs::exists(mega_src / required))
             throw std::runtime_error("MegaMoE JIT is missing bundled kernel sources: " +
@@ -133,14 +131,9 @@ std::vector<fs::path> MegaMoEIncludeDirs(const std::string& package_root, const 
     const fs::path arch = AscendArchDir(home);
     const fs::path common = TensorApiCommon(home);
     std::vector<fs::path> directories;
-    AppendInclude(mega_src / "csrc", directories);
-    // The backend directory must win for the shared headers that include
-    // "epilogue/..." and "catlass_gmm/..." without a backend prefix.
-    if (urma)
-        AppendInclude(mega_src / "csrc/kernels/mega_moe_urma", directories);
-    AppendInclude(mega_src / "csrc/kernels/mega_moe", directories);
-    if (!urma)
-        AppendInclude(mega_src / "csrc/kernels/mega_moe_urma", directories);
+    // The bundled view already resolved every shared header against this
+    // backend's original include order, so it is the only project include root.
+    AppendInclude(mega_src / (urma ? "urma" : "mte"), directories);
     AppendInclude(mega_src / "catlass/include", directories);
     AppendInclude(mega_src / "catlass/examples/common", directories);
     AppendInclude(kernel_src / "shmem/include", directories);
@@ -173,13 +166,13 @@ void EnsureMegaJit()
 
 std::shared_ptr<Kernel> CompiledKernel(const std::string& key, const std::string& source, bool urma)
 {
-    const auto cached = compiled_mega_kernels.find(key);
-    if (cached != compiled_mega_kernels.end()) return cached->second;
+    // The generated source and the compiler options are part of DeepJIT's
+    // content identity, so its own memory/disk caches distinguish every
+    // specialization. An outer routed/shared map would silently reuse a
+    // binary compiled for different capacities or weight modes.
     deep_jit::ascend::CompilerOptions options;
     options.extra_bisheng_flags = MegaMoEJitFlags(urma);
-    auto kernel = (urma ? urma_jit : mte_jit)->compile(key, source, options);
-    compiled_mega_kernels.emplace(key, kernel);
-    return kernel;
+    return (urma ? urma_jit : mte_jit)->compile(key, source, options);
 }
 
 LaunchOptions MegaLaunchOptions(uint32_t block_dim, uint32_t ub_bytes, void* stream)
@@ -231,19 +224,30 @@ std::string MteSource(bool is_a8w4, bool fuse_gate_up, bool early_weights)
     return source;
 }
 
-std::string UrmaSource(bool shared)
+// Fixed plan capacity and model geometry become template arguments, so the
+// device compiler folds every stride and bound derived from them. Per-invocation
+// values stay in the Arguments block.
+std::string UrmaSpec(const MegaMoeUrma::Config& config)
+{
+    return std::to_string(config.sourceRowCapacity) + ", " + std::to_string(config.hidden) + ", " +
+           std::to_string(config.intermediate) + ", " + std::to_string(config.topk) + ", " +
+           std::to_string(config.localExperts) + ", " + std::to_string(config.world) + ", " +
+           std::to_string(config.topkWeightsType);
+}
+
+std::string UrmaSource(bool shared, const std::string& spec)
 {
     const char* flag = shared ? "true" : "false";
     std::string source =
         "#include <kernels/mega_moe_urma/mega_moe_urma_entry.hpp>\n\n"
         "extern \"C\" __schedmode__(1) __global__ __mix__(1, 2) void mega_moe_urma_jit("
         "MegaMoeUrma::Arguments args)\n{\n"
-        "    MegaMoeUrmaEntry::" + std::string(shared ? "SharedBody" : "RoutedBody") + "(args);\n}\n";
+        "    MegaMoeUrmaEntry::" + std::string(shared ? "SharedBody" : "RoutedBody") + "<" + spec + ">(args);\n}\n";
     for (uint32_t slot = 0; slot < 4U; ++slot) {
         source += "extern \"C\" __sk__ __mix__(1, 2) void mega_moe_urma_jit_sk" + std::to_string(slot) +
                   "(const MegaMoeUrma::Arguments* args, sk::SkSystemArgs* system_args)\n{\n"
-                  "    MegaMoeUrmaEntry::MegaMoeUrmaSk<" + std::string(flag) + ", " + std::to_string(slot) +
-                  ">(args, system_args);\n}\n";
+                  "    MegaMoeUrmaEntry::MegaMoeUrmaSk<" + std::string(flag) + ", " + std::to_string(slot) + ", " +
+                  spec + ">(args, system_args);\n}\n";
     }
     source +=
         "SK_BIND(mega_moe_urma_jit, 0, mega_moe_urma_jit_sk0, mega_moe_urma_jit_sk1, mega_moe_urma_jit_sk2, "
@@ -313,7 +317,7 @@ void launch_mega_moe_urma_jit(uint32_t block_dim, uint32_t ub_bytes, void* strea
     if (args == nullptr) throw std::invalid_argument("Missing URMA device arguments");
     const bool shared = args->sharedExperts != 0U;
     const std::string variant = shared ? "mega_moe_urma_shared" : "mega_moe_urma_routed";
-    auto kernel = CompiledKernel(variant, UrmaSource(shared), true);
+    auto kernel = CompiledKernel(variant, UrmaSource(shared, UrmaSpec(args->config)), true);
     urma_jit->launch(kernel, MegaLaunchOptions(block_dim, ub_bytes, stream), *args);
 }
 

@@ -11,6 +11,7 @@
 
 #include "basic_api/kernel_basic_intf.h"
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_specialization.hpp"
 
 #if defined(__NPU_DEVICE__)
 #include "kernels/mega_moe_urma/mega_moe_urma.hpp"
@@ -28,19 +29,34 @@ __aicore__ inline void MegaMoeUrmaPrologue(MegaMoeUrma::Arguments& args)
     SetSysWorkspaceForce(reinterpret_cast<GM_ADDR>(args.systemWorkspace));
 }
 
+// Capacity and model geometry are compile-time arguments of the generated JIT
+// source. AIC/AIV counts and the UB budget keep their platform defaults, so the
+// seven-argument form below is the complete public specialization.
+template <uint32_t kCapacity, uint32_t kHidden, uint32_t kIntermediate, uint32_t kTopK, uint32_t kLocalExperts,
+          uint32_t kEp, uint32_t kWeightsType, uint32_t kCubeCores = MegaMoeUrma::kAic,
+          uint32_t kVectorCores = 2U * MegaMoeUrma::kAic>
 __aicore__ inline void RoutedBody(MegaMoeUrma::Arguments& args)
 {
+    using Spec = MegaMoeUrma::MegaMoeSpec<kCapacity, kHidden, kIntermediate, kTopK, kLocalExperts, kEp, kWeightsType,
+                                          kCubeCores, kVectorCores>;
     MegaMoeUrmaPrologue(args);
-    MegaMoeUrma::ProcessRouted(args);
+    MegaMoeUrma::ProcessRouted<Spec>(args);
 }
 
+template <uint32_t kCapacity, uint32_t kHidden, uint32_t kIntermediate, uint32_t kTopK, uint32_t kLocalExperts,
+          uint32_t kEp, uint32_t kWeightsType, uint32_t kCubeCores = MegaMoeUrma::kAic,
+          uint32_t kVectorCores = 2U * MegaMoeUrma::kAic>
 __aicore__ inline void SharedBody(MegaMoeUrma::Arguments& args)
 {
+    using Spec = MegaMoeUrma::MegaMoeSpec<kCapacity, kHidden, kIntermediate, kTopK, kLocalExperts, kEp, kWeightsType,
+                                          kCubeCores, kVectorCores>;
     MegaMoeUrmaPrologue(args);
-    MegaMoeUrma::ProcessShared(args);
+    MegaMoeUrma::ProcessShared<Spec>(args);
 }
 
-template <bool kShared, uint32_t kSkSlot>
+template <bool kShared, uint32_t kSkSlot, uint32_t kCapacity, uint32_t kHidden, uint32_t kIntermediate,
+          uint32_t kTopK, uint32_t kLocalExperts, uint32_t kEp, uint32_t kWeightsType,
+          uint32_t kCubeCores = MegaMoeUrma::kAic, uint32_t kVectorCores = 2U * MegaMoeUrma::kAic>
 __aicore__ inline void MegaMoeUrmaSk(const MegaMoeUrma::Arguments* args, sk::SkSystemArgs* system_args)
 {
     system_args->SkInit();
@@ -48,9 +64,11 @@ __aicore__ inline void MegaMoeUrmaSk(const MegaMoeUrma::Arguments* args, sk::SkS
     // parameter view is read-only.
     MegaMoeUrma::Arguments block = *args;
     if constexpr (kShared)
-        SharedBody(block);
+        SharedBody<kCapacity, kHidden, kIntermediate, kTopK, kLocalExperts, kEp, kWeightsType, kCubeCores,
+                   kVectorCores>(block);
     else
-        RoutedBody(block);
+        RoutedBody<kCapacity, kHidden, kIntermediate, kTopK, kLocalExperts, kEp, kWeightsType, kCubeCores,
+                   kVectorCores>(block);
 }
 #endif
 

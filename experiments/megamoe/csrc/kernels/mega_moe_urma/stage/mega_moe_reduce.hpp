@@ -33,6 +33,7 @@ __aicore__ inline void WaitPackInverseReady(const Arguments& args)
 // scratch. Only the final dependency array survives initialization, at its
 // existing non-overlapping metadata offset. Each route slot stays distinct,
 // including repeated expert choices for one token.
+template <class S>
 __aicore__ inline void BuildReduceDependencies(const Arguments& args, uint64_t firstRoute, uint32_t routes,
                                                AscendC::LocalTensor<int64_t>& inverse,
                                                AscendC::LocalTensor<uint64_t>& dependencies)
@@ -50,11 +51,11 @@ __aicore__ inline void BuildReduceDependencies(const Arguments& args, uint64_t f
     const uint32_t wordStride = args.topkIdBytes / sizeof(uint32_t);
     for (uint32_t i = 0U; i < routes; ++i) {
         const uint32_t expert = words.GetValue(i * wordStride);
-        const uint32_t peer = expert / args.config.localExperts;
+        const uint32_t peer = expert / S::kLocalExperts;
         const uint64_t row = static_cast<uint64_t>(inverse.GetValue(i));
         uint64_t dependency;
         // Unitflag self is protected by the final Reorder CV, not AIC GMM2.
-        const uint64_t peerRow = row - info->outgoing[peer * args.config.localExperts];
+        const uint64_t peerRow = row - info->outgoing[peer * S::kLocalExperts];
         dependency = uint64_t(peer) * args.config.maxPeerChunks + peerRow / args.config.cvRows;
         dependencies.SetValue(i, dependency);
     }
@@ -105,11 +106,12 @@ static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract:
               ReduceUbContract::remoteCacheOffset % 32U == 0U && ReduceUbContract::selfCacheOffset % 32U == 0U &&
               ReduceUbContract::issuedOffset % 32U == 0U && ReduceUbContract::routeRingOffset % 32U == 0U);
 
+template <class S>
 __aicore__ inline bool AllReduceInputsReady(const Arguments& args)
 {
     auto* flag =
         reinterpret_cast<__gm__ int32_t*>(args.localFlags + static_cast<uint64_t>(kLocalFlagIncomingDone) * kFlagBytes);
-    return AscendC::ReadGmByPassDCache(flag) == static_cast<int32_t>(args.config.world);
+    return AscendC::ReadGmByPassDCache(flag) == static_cast<int32_t>(S::kEp);
 }
 
 __aicore__ inline bool ReduceBitSet(AscendC::LocalTensor<uint32_t>& bits, uint32_t index)
@@ -125,6 +127,7 @@ __aicore__ inline void SetReduceBit(AscendC::LocalTensor<uint32_t>& bits, uint32
 
 // Never wait inside a token probe. A false dependency immediately returns to
 // the scanner. Only positive observations are cached, for this invocation.
+template <class S>
 __aicore__ inline bool TryReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
                                       AscendC::LocalTensor<uint32_t>& remoteCache,
                                       AscendC::LocalTensor<uint32_t>& selfCache, uint32_t firstRoute)
@@ -168,14 +171,14 @@ __aicore__ inline void GateReduceInputs()
 // slot metadata, not a queue waiting for a batch of ready tokens to accumulate.
 // Consumer commands are submitted before reusing a full slot; no token switch
 // resets events or drains any hardware engine.
-template <typename Element>
+template <typename Element, class S>
 class ReduceRoutePipeline {
 public:
     __aicore__ inline void Init(const Arguments& args, uint64_t firstToken)
     {
         using namespace AscendC;
         firstToken_ = firstToken;
-        applyRouteWeight_ = args.config.topkWeightsType == 0U;
+        applyRouteWeight_ = S::kWeightsType == 0U;
         returned_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.symmetric + args.config.returnYOffset));
         returned_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
         output_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.output));
@@ -286,15 +289,16 @@ private:
     AscendC::LocalTensor<uint32_t> routes_;
 };
 
-template <typename TraceSink>
+template <class S, typename TraceSink>
 __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink& timer)
 {
     using namespace AscendC;
     using Ub = ReduceUbContract;
-    const uint32_t owned = static_cast<uint32_t>(ReduceOwnedRows(args.config.bs, worker, args.config.world));
+    static_assert(S::kHidden == Ub::hidden && S::kTopK == Ub::topk, "legacy Reduce is H3584/TopK8 only");
+    const uint32_t owned = static_cast<uint32_t>(ReduceOwnedRows<S>(args.config.bs, worker));
     if (owned == 0U) return;
     const uint64_t reduceStart = timer.TraceBegin();
-    const uint64_t firstToken = ReduceRowBegin(args.config.bs, worker, args.config.world);
+    const uint64_t firstToken = ReduceRowBegin<S>(args.config.bs, worker);
     const uint64_t firstRoute = firstToken * Ub::topk;
     GlobalTensor<int64_t> inverse;
     GlobalTensor<float> weights;
@@ -306,9 +310,9 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     LocalTensor<uint32_t> remoteCache(TPosition::VECCALC, Ub::remoteCacheOffset, Ub::remoteCacheBytes / 4U);
     LocalTensor<uint32_t> selfCache(TPosition::VECCALC, Ub::selfCacheOffset, Ub::selfCacheBytes / 4U);
     LocalTensor<uint32_t> issued(TPosition::VECCALC, Ub::issuedOffset, Ub::issuedBytes / 4U);
-    ReduceRoutePipeline<bfloat16_t> pipeline;
+    ReduceRoutePipeline<bfloat16_t, S> pipeline;
     pipeline.Init(args, firstToken);
-    bool allInputsReady = AllReduceInputsReady(args);
+    bool allInputsReady = AllReduceInputsReady<S>(args);
     if (allInputsReady) GateReduceInputs();
     WaitPackInverseReady(args);
     DataCopy(inverseUb, inverse[firstRoute], owned * Ub::topk);
@@ -316,7 +320,7 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
 
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    if (!allInputsReady) BuildReduceDependencies(args, firstRoute, owned * Ub::topk, inverseUb, dependenciesUb);
+    if (!allInputsReady) BuildReduceDependencies<S>(args, firstRoute, owned * Ub::topk, inverseUb, dependenciesUb);
     for (uint32_t word = 0U; word < Ub::issuedBytes / 4U; ++word) issued.SetValue(word, 0U);
     if (!allInputsReady) {
         for (uint32_t word = 0U; word < Ub::remoteCacheBytes / 4U; ++word) remoteCache.SetValue(word, 0U);
@@ -331,12 +335,12 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
             if (ReduceBitSet(issued, token)) continue;
             if (!allInputsReady) {
                 if (probes != 0U && (probes & 7U) == 0U) {
-                    allInputsReady = AllReduceInputsReady(args);
+                    allInputsReady = AllReduceInputsReady<S>(args);
                     if (allInputsReady) GateReduceInputs();
                 }
                 ++probes;
             }
-            if (!allInputsReady && !TryReduceToken(args, dependenciesUb, remoteCache, selfCache, token * Ub::topk)) {
+            if (!allInputsReady && !TryReduceToken<S>(args, dependenciesUb, remoteCache, selfCache, token * Ub::topk)) {
                 // Keep prior ready tokens moving while inspecting other work.
                 if (pipeline.HasPending()) pipeline.ConsumeOne();
                 continue;
@@ -410,11 +414,12 @@ static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract:
               ReduceUbContract::remoteCacheOffset % 32U == 0U && ReduceUbContract::selfCacheOffset % 32U == 0U &&
               ReduceUbContract::issuedOffset % 32U == 0U && ReduceUbContract::routeRingOffset % 32U == 0U);
 
+template <class S>
 __aicore__ inline bool GenericAllReduceInputsReady(const Arguments& args)
 {
     auto* flag =
         reinterpret_cast<__gm__ int32_t*>(args.localFlags + static_cast<uint64_t>(kLocalFlagIncomingDone) * kFlagBytes);
-    return AscendC::ReadGmByPassDCache(flag) == static_cast<int32_t>(args.config.world);
+    return AscendC::ReadGmByPassDCache(flag) == static_cast<int32_t>(S::kEp);
 }
 
 __aicore__ inline bool GenericReduceBitSet(AscendC::LocalTensor<uint32_t>& bits, uint32_t index)
@@ -430,13 +435,13 @@ __aicore__ inline void GenericSetReduceBit(AscendC::LocalTensor<uint32_t>& bits,
 
 // Never wait inside a token probe. A false dependency immediately returns to
 // the scanner. Only positive observations are cached, for this invocation.
-template <uint32_t TopK>
+template <class S, uint32_t TopK>
 __aicore__ inline bool GenericTryReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
                                              AscendC::LocalTensor<uint32_t>& remoteCache,
                                              AscendC::LocalTensor<uint32_t>& selfCache, uint32_t firstRoute)
 {
     using namespace AscendC;
-    const uint32_t expectedSelfTiles = (args.config.hidden + kComputeTileN - 1U) / kComputeTileN;
+    const uint32_t expectedSelfTiles = (S::kHidden + kComputeTileN - 1U) / kComputeTileN;
     for (uint32_t slot = 0U; slot < TopK; ++slot) {
         const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
         const bool self = (dependency & kReduceSelfDependency) != 0U;
@@ -474,15 +479,15 @@ __aicore__ inline void GenericGateReduceInputs()
 // slot metadata, not a queue waiting for a batch of ready tokens to accumulate.
 // Consumer commands are submitted before reusing a full slot; no token switch
 // resets events or drains any hardware engine.
-template <typename Element, bool KeepFp32 = false, uint32_t TopK = 8U>
+template <typename Element, class S, bool KeepFp32 = false, uint32_t TopK = S::kTopK>
 class ReduceRoutePipeline {
 public:
     __aicore__ inline void Init(const Arguments& args, uint64_t firstToken, uint32_t column, uint32_t columns)
     {
         using namespace AscendC;
         firstToken_ = firstToken;
-        applyRouteWeight_ = args.config.topkWeightsType == 0U;
-        stride_ = args.config.hidden;
+        applyRouteWeight_ = S::kWeightsType == 0U;
+        stride_ = S::kHidden;
         column_ = column;
         columns_ = columns;
         returned_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.symmetric + args.config.returnYOffset));
@@ -604,10 +609,11 @@ private:
     AscendC::LocalTensor<uint32_t> routes_;
 };
 
-template <bool KeepFp32 = false, uint32_t TopK = 8U, typename TraceSink, class Observer>
+template <class S, bool KeepFp32, typename TraceSink, class Observer>
 __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uint32_t workers, uint32_t column,
                                      TraceSink& timer, Observer& observer)
 {
+    constexpr uint32_t TopK = S::kTopK;
     using namespace AscendC;
     using Ub = ReduceUbContract;
     const uint32_t owned =
@@ -627,10 +633,10 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
     LocalTensor<uint32_t> remoteCache(TPosition::VECCALC, Ub::remoteCacheOffset, Ub::remoteCacheBytes / 4U);
     LocalTensor<uint32_t> selfCache(TPosition::VECCALC, Ub::selfCacheOffset, Ub::selfCacheBytes / 4U);
     LocalTensor<uint32_t> issued(TPosition::VECCALC, Ub::issuedOffset, Ub::issuedBytes / 4U);
-    ReduceRoutePipeline<bfloat16_t, KeepFp32, TopK> pipeline;
-    const uint32_t columns = args.config.hidden - column < Ub::hidden ? args.config.hidden - column : Ub::hidden;
+    ReduceRoutePipeline<bfloat16_t, S, KeepFp32, TopK> pipeline;
+    const uint32_t columns = S::kHidden - column < Ub::hidden ? S::kHidden - column : Ub::hidden;
     pipeline.Init(args, firstToken, column, columns);
-    bool allInputsReady = GenericAllReduceInputsReady(args);
+    bool allInputsReady = GenericAllReduceInputsReady<S>(args);
     if (allInputsReady) GenericGateReduceInputs();
     static_assert(TopK >= 1U && TopK <= ReduceUbContract::topk);
     if (column == 0U) {
@@ -648,7 +654,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
         }
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        if (!allInputsReady) BuildReduceDependencies(args, firstRoute, owned * TopK, inverseUb, dependenciesUb);
+        if (!allInputsReady) BuildReduceDependencies<S>(args, firstRoute, owned * TopK, inverseUb, dependenciesUb);
     }
     for (uint32_t word = 0U; word < Ub::issuedBytes / 4U; ++word) issued.SetValue(word, 0U);
     if (!allInputsReady) {
@@ -665,13 +671,13 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
             if (GenericReduceBitSet(issued, token)) continue;
             if (!allInputsReady) {
                 if (probes != 0U && (probes & 7U) == 0U) {
-                    allInputsReady = GenericAllReduceInputsReady(args);
+                    allInputsReady = GenericAllReduceInputsReady<S>(args);
                     if (allInputsReady) GenericGateReduceInputs();
                 }
                 ++probes;
             }
             if (!allInputsReady &&
-                !GenericTryReduceToken<TopK>(args, dependenciesUb, remoteCache, selfCache, token * TopK)) {
+                !GenericTryReduceToken<S, TopK>(args, dependenciesUb, remoteCache, selfCache, token * TopK)) {
                 // Keep prior ready tokens moving while inspecting other work.
                 if (pipeline.HasPending()) pipeline.ConsumeOne();
                 continue;
@@ -705,44 +711,18 @@ namespace MegaMoeUrma {
 struct NoReduceObserver {
     __aicore__ inline void Poll() {}
 };
-template <bool KeepFp32 = false, class T, class O>
+template <class S, bool KeepFp32, class T, class O>
 __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32_t workers, T& timer, O& observer)
 {
-    for (uint32_t col = 0; col < a.config.hidden; col += GenericReduce::ReduceUbContract::hidden) {
-        // Native/API validation guarantees [1,8]. Compile-time strides retain
-        // constant division and loop bounds; no per-route runtime TopK division.
-        switch (a.config.topk) {
-            case 1:
-                GenericReduce::ReduceColumns<KeepFp32, 1>(a, worker, workers, col, timer, observer);
-                break;
-            case 2:
-                GenericReduce::ReduceColumns<KeepFp32, 2>(a, worker, workers, col, timer, observer);
-                break;
-            case 3:
-                GenericReduce::ReduceColumns<KeepFp32, 3>(a, worker, workers, col, timer, observer);
-                break;
-            case 4:
-                GenericReduce::ReduceColumns<KeepFp32, 4>(a, worker, workers, col, timer, observer);
-                break;
-            case 5:
-                GenericReduce::ReduceColumns<KeepFp32, 5>(a, worker, workers, col, timer, observer);
-                break;
-            case 6:
-                GenericReduce::ReduceColumns<KeepFp32, 6>(a, worker, workers, col, timer, observer);
-                break;
-            case 7:
-                GenericReduce::ReduceColumns<KeepFp32, 7>(a, worker, workers, col, timer, observer);
-                break;
-            case 8:
-                GenericReduce::ReduceColumns<KeepFp32, 8>(a, worker, workers, col, timer, observer);
-                break;
-        }
-    }
+    // The active TopK is part of the binary identity, so the route stride is a
+    // compile-time constant rather than a per-token division.
+    for (uint32_t col = 0; col < S::kHidden; col += GenericReduce::ReduceUbContract::hidden)
+        GenericReduce::ReduceColumns<S, KeepFp32>(a, worker, workers, col, timer, observer);
 }
-template <class T>
+template <class S, class T>
 __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32_t workers, T& timer)
 {
     NoReduceObserver observer;
-    ReduceGeneric(a, worker, workers, timer, observer);
+    ReduceGeneric<S, false>(a, worker, workers, timer, observer);
 }
 }  // namespace MegaMoeUrma

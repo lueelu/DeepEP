@@ -4,6 +4,7 @@
 #pragma once
 
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_specialization.hpp"
 #include "kernel_operator.h"
 
 // Device timing records and nonblocking Dispatch receive observation.
@@ -304,6 +305,7 @@ public:
     // Arm only after route summary is acquired and local Dispatch submission
     // is finished, when the owner enters its Combine phase. Empty incoming
     // edges are explicitly recorded, never polled as CV UINT_MAX.
+    template <class S>
     __aicore__ inline void Arm(const Arguments& a, uint32_t peer, uint32_t rows)
     {
 #ifdef DEEPEP_MEGAMOE_TIMER
@@ -311,7 +313,7 @@ public:
         peer_ = peer;
         rows_ = rows;
         epoch_ = a.config.epoch;
-        bytes_ = uint64_t(rows) * (a.config.hidden + a.config.dispatchScaleStride);
+        bytes_ = uint64_t(rows) * (S::kHidden + S::kDispatchScaleStride);
         if (rows == 0U) {
             timer_->RecordDispatchReceive(peer, 0U, 0U, 0U);
             return;

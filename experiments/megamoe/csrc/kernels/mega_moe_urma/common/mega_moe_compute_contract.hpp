@@ -4,6 +4,7 @@
 #pragma once
 
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
+#include "kernels/mega_moe_urma/common/mega_moe_specialization.hpp"
 
 namespace MegaMoeUrma {
 
@@ -66,19 +67,22 @@ struct ComputeBatchRange {
 #define MEGAMOE_URMA_COMPUTE_INLINE inline
 #endif
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t CommunicationWorkers(uint32_t world)
+template <class S>
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t CommunicationWorkers()
 {
-    return world - 1U;
+    return S::kEp - 1U;
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ActivationWorkers(uint32_t world)
+template <class S>
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ActivationWorkers()
 {
-    return kAic - CommunicationWorkers(world);
+    return S::kCubeCores - CommunicationWorkers<S>();
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkers(uint32_t world)
+template <class S>
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkers()
 {
-    return kLocalWorkers - CommunicationWorkers(world);
+    return S::kVectorCores - CommunicationWorkers<S>();
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LocalWorkerIndex(uint32_t block, uint32_t subblock)
@@ -102,30 +106,33 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalRowBegin(uint64_t rows, uint
 
 // Peer owners never reduce. All AIV0 and all noncommunication AIV1 workers
 // enter Reduce independently after releasing their compute resources.
-// Return ReduceWorkers(world) as the sentinel for a communication worker.
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block, uint32_t subblock,
-                                                                 uint32_t world = kWorld)
+// Return ReduceWorkers as the sentinel for a communication worker.
+template <class S>
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block, uint32_t subblock)
 {
-    const uint32_t communicationWorkers = CommunicationWorkers(world);
+    const uint32_t communicationWorkers = CommunicationWorkers<S>();
     return subblock == 0U
                ? block
-               : (block >= communicationWorkers ? kAic + block - communicationWorkers : ReduceWorkers(world));
+               : (block >= communicationWorkers ? S::kCubeCores + block - communicationWorkers : ReduceWorkers<S>());
 }
 
+template <class S>
 MEGAMOE_URMA_COMPUTE_INLINE constexpr bool UseLegacyReduce(const Config& config)
 {
-    return config.hidden == 3584U && config.topk == 8U && config.bs <= 8192U && config.maxPeerChunks <= 512U;
+    return S::kHidden == 3584U && S::kTopK == 8U && config.bs <= 8192U && config.maxPeerChunks <= 512U;
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceOwnedRows(uint64_t rows, uint32_t worker, uint32_t world = kWorld)
+template <class S>
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceOwnedRows(uint64_t rows, uint32_t worker)
 {
-    const uint32_t workers = ReduceWorkers(world);
+    const uint32_t workers = ReduceWorkers<S>();
     return worker < workers && worker < rows ? (rows - 1U - worker) / workers + 1U : 0U;
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceRowBegin(uint64_t rows, uint32_t worker, uint32_t world = kWorld)
+template <class S>
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceRowBegin(uint64_t rows, uint32_t worker)
 {
-    const uint32_t workers = ReduceWorkers(world);
+    const uint32_t workers = ReduceWorkers<S>();
     const uint64_t remainder = rows % workers;
     return static_cast<uint64_t>(worker) * (rows / workers) + (worker < remainder ? worker : remainder);
 }
@@ -182,10 +189,11 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, u
     return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((columns + kComputeTileN - 1U) / kComputeTileN);
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1ComputeTileCount(uint32_t rows, const Config& c)
+template <class S>
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1ComputeTileCount(uint32_t rows)
 {
     return ((rows + kComputeTileM - 1U) / kComputeTileM) *
-           ((c.intermediate + kGmm1LogicalTileN - 1U) / kGmm1LogicalTileN);
+           ((S::kIntermediate + kGmm1LogicalTileN - 1U) / kGmm1LogicalTileN);
 }
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly

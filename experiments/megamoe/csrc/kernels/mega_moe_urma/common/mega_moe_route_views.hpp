@@ -15,10 +15,11 @@ __aicore__ inline const volatile __gm__ DeviceRouteInfo* RouteInfo(const Argumen
 {
     return reinterpret_cast<const volatile __gm__ DeviceRouteInfo*>(a.routeInfo);
 }
+template <class S>
 __aicore__ inline uint32_t RuntimeExpertForExpandedRow(const Arguments& a, uint64_t row)
 {
     const auto* r = RouteInfo(a);
-    uint32_t lo = 0U, hi = a.config.world * a.config.localExperts;
+    uint32_t lo = 0U, hi = S::kExperts;
     while (lo < hi) {
         const uint32_t mid = (lo + hi) / 2U;
         if (r->outgoing[mid + 1U] <= row)
@@ -89,10 +90,11 @@ struct RuntimeGroupSegments {
     }
 };
 
+template <class S>
 __aicore__ inline uint32_t RuntimeExpertForGroup(const Arguments& args, uint32_t group)
 {
     const auto* info = RouteInfo(args);
-    uint32_t lo = 0U, hi = args.config.localExperts;
+    uint32_t lo = 0U, hi = S::kLocalExperts;
     while (lo < hi) {
         const uint32_t mid = (lo + hi) / 2U;
         if (info->groupBase[mid + 1U] <= group)
@@ -103,6 +105,7 @@ __aicore__ inline uint32_t RuntimeExpertForGroup(const Arguments& args, uint32_t
     return lo;
 }
 
+template <class S>
 __aicore__ inline RuntimeGroupSegments RuntimeSegments(const Arguments& args, uint32_t expert, uint32_t first,
                                                        uint32_t rows)
 {
@@ -110,25 +113,27 @@ __aicore__ inline RuntimeGroupSegments RuntimeSegments(const Arguments& args, ui
             expert,
             first,
             first + rows,
-            args.config.world,
+            S::kEp,
             args.config.cvRows,
             args.config.maxPeerChunks,
-            args.config.sourceRowCapacity};
+            S::kSourceRowCapacity};
 }
 
+template <class S>
 __aicore__ inline RuntimeGroupSegments RuntimeSegments(const Arguments& args, const Fragment& fragment)
 {
     const auto* info = RouteInfo(args);
     const uint32_t first = (fragment.segmentBegin - info->groupBase[fragment.expert]) * kComputeTileM;
-    return RuntimeSegments(args, fragment.expert, first, fragment.rows);
+    return RuntimeSegments<S>(args, fragment.expert, first, fragment.rows);
 }
 
+template <class S>
 __aicore__ inline Fragment RuntimeFragment(const Arguments& args, uint32_t group)
 {
     const auto* info = RouteInfo(args);
-    const uint32_t expert = RuntimeExpertForGroup(args, group);
+    const uint32_t expert = RuntimeExpertForGroup<S>(args, group);
     const uint32_t first = (group - info->groupBase[expert]) * kComputeTileM;
-    const uint32_t rows = RouteMin(kComputeTileM, info->sources[expert][args.config.world] - first);
+    const uint32_t rows = RouteMin(kComputeTileM, info->sources[expert][S::kEp] - first);
     // segmentBegin 在本协议中是 group ID；不是一张预构建 Segment 表的偏移。
     // Cursor自行判断结束，segmentCount=0表示未物化；避免每次轮询重扫全部来源。
     return {expert,
@@ -136,17 +141,17 @@ __aicore__ inline Fragment RuntimeFragment(const Arguments& args, uint32_t group
             uint64_t(info->compactBase[expert]) + first,
             rows,
             0U,
-            info->gmm1Base[expert] +
-                uint64_t(group - info->groupBase[expert]) * Gmm1ComputeTileCount(kComputeTileM, args.config),
-            uint64_t(group) * (args.config.hidden / kComputeTileN)};
+            info->gmm1Base[expert] + uint64_t(group - info->groupBase[expert]) * Gmm1ComputeTileCount<S>(kComputeTileM),
+            uint64_t(group) * (S::kHidden / kComputeTileN)};
 }
 
 // 随机访问仅供需要单条 descriptor 的调用方；连续消费应使用 MakeCursor，
 // 避免为每个 ordinal 重新从 source0 遍历。
+template <class S>
 __aicore__ inline RowSegment RuntimeSegment(const Arguments& args, uint32_t group, uint32_t ordinal)
 {
-    const auto fragment = RuntimeFragment(args, group);
-    auto cursor = RuntimeSegments(args, fragment).MakeCursor();
+    const auto fragment = RuntimeFragment<S>(args, group);
+    auto cursor = RuntimeSegments<S>(args, fragment).MakeCursor();
     RowSegment segment{};
     for (uint32_t i = 0U; i <= ordinal; ++i) {
         if (!cursor.Next(segment)) return {};
@@ -161,10 +166,11 @@ namespace MegaMoeUrma {
 // Send/Pack read only the early outgoing prefix. Receive helpers require the
 // late summary handoff. Both parts are immutable once individually published;
 // transport addresses and peer/CV traversal order remain unchanged.
+template <class S>
 __aicore__ inline uint32_t RuntimeSendCvCount(const Arguments& args, uint32_t peer)
 {
     const auto* routes = RouteInfo(args);
-    const uint32_t le = args.config.localExperts;
+    const uint32_t le = S::kLocalExperts;
     const uint32_t rows = routes->outgoing[(peer + 1U) * le] - routes->outgoing[peer * le];
     return (rows + args.config.cvRows - 1U) / args.config.cvRows;
 }
@@ -175,11 +181,12 @@ __aicore__ inline uint32_t RuntimeReceiveCvCount(const Arguments& args, uint32_t
     return routes->recvCvBase[peer + 1U] - routes->recvCvBase[peer];
 }
 
+template <class S>
 __aicore__ inline Chunk RuntimeSendChunk(const Arguments& args, uint32_t peer, uint32_t cv)
 {
-    if (peer >= args.config.world) return {};
+    if (peer >= S::kEp) return {};
     const auto* routes = RouteInfo(args);
-    const uint32_t localExperts = args.config.localExperts;
+    const uint32_t localExperts = S::kLocalExperts;
     const uint32_t base = routes->outgoing[peer * localExperts];
     const uint32_t rows = routes->outgoing[(peer + 1U) * localExperts] - base;
     const uint64_t first = uint64_t(cv) * args.config.cvRows;
@@ -189,18 +196,19 @@ __aicore__ inline Chunk RuntimeSendChunk(const Arguments& args, uint32_t peer, u
     return {peer,
             cv,
             uint64_t(base) + first,
-            uint64_t(args.config.rank) * args.config.sourceRowCapacity + first,
+            uint64_t(args.config.rank) * S::kSourceRowCapacity + first,
             remaining < args.config.cvRows ? remaining : args.config.cvRows,
             0U,
             0U,
             0U};
 }
 
+template <class S>
 __aicore__ inline Chunk RuntimeReceiveChunk(const Arguments& args, uint32_t peer, uint32_t cv)
 {
-    if (peer >= args.config.world) return {};
+    if (peer >= S::kEp) return {};
     const auto* routes = RouteInfo(args);
-    const uint32_t rows = routes->incoming[peer][args.config.localExperts];
+    const uint32_t rows = routes->incoming[peer][S::kLocalExperts];
     const uint64_t first = uint64_t(cv) * args.config.cvRows;
     if (first >= rows) return {};
     const uint32_t remaining = rows - static_cast<uint32_t>(first);
@@ -208,7 +216,7 @@ __aicore__ inline Chunk RuntimeReceiveChunk(const Arguments& args, uint32_t peer
     // expert/source prefixes rather than an eagerly generated Link array.
     return {peer,
             cv,
-            uint64_t(peer) * args.config.sourceRowCapacity + first,
+            uint64_t(peer) * S::kSourceRowCapacity + first,
             routes->returnBase[peer] + first,
             remaining < args.config.cvRows ? remaining : args.config.cvRows,
             0U,
@@ -216,19 +224,21 @@ __aicore__ inline Chunk RuntimeReceiveChunk(const Arguments& args, uint32_t peer
             0U};
 }
 
+template <class S>
 __aicore__ inline uint64_t RuntimePackRoundRows(const Arguments& args, uint32_t round)
 {
     uint64_t rows = 0U;
-    for (uint32_t peer = 0U; peer < args.config.world; ++peer) rows += RuntimeSendChunk(args, peer, round).rows;
+    for (uint32_t peer = 0U; peer < S::kEp; ++peer) rows += RuntimeSendChunk<S>(args, peer, round).rows;
     return rows;
 }
 
 // First expert with an upper prefix strictly beyond this peer-local row.
 // Equal prefixes belong to empty experts and must be skipped.
+template <class S>
 __aicore__ inline uint32_t RuntimePeerRowExpert(const Arguments& args, uint32_t peer, uint32_t row)
 {
     const auto* routes = RouteInfo(args);
-    uint32_t first = 0U, last = args.config.localExperts;
+    uint32_t first = 0U, last = S::kLocalExperts;
     while (first < last) {
         const uint32_t middle = first + (last - first) / 2U;
         if (routes->incoming[peer][middle + 1U] <= row)
@@ -242,17 +252,19 @@ __aicore__ inline uint32_t RuntimePeerRowExpert(const Arguments& args, uint32_t 
 }  // namespace MegaMoeUrma
 
 namespace MegaMoeUrma {
+template <class S>
 __aicore__ inline Chunk RuntimeReceiveChunkByIndex(const Arguments& a, uint32_t index)
 {
     const auto* r = RouteInfo(a);
     uint32_t peer = 0U;
-    while (peer + 1U < a.config.world && r->recvCvBase[peer + 1U] <= index) ++peer;
-    return RuntimeReceiveChunk(a, peer, index - r->recvCvBase[peer]);
+    while (peer + 1U < S::kEp && r->recvCvBase[peer + 1U] <= index) ++peer;
+    return RuntimeReceiveChunk<S>(a, peer, index - r->recvCvBase[peer]);
 }
 
 // Same expert/M256 intersections and destination order as the old span table.
 // A span is identified by its first peer-local row. This is unique even when
 // one M-group crosses several CVs, and fits the existing one-bit-per-row bound.
+template <class S>
 struct RuntimePeerSpans {
     const volatile __gm__ DeviceRouteInfo* info;
     uint32_t peer, rank, row, end, expert;
@@ -263,8 +275,8 @@ struct RuntimePeerSpans {
           rank(a.config.rank),
           row(chunk.cv * a.config.cvRows),
           end(row + chunk.rows),
-          expert(RuntimePeerRowExpert(a, peer, row)),
-          sourcePitch(a.config.sourceRowCapacity)
+          expert(RuntimePeerRowExpert<S>(a, peer, row)),
+          sourcePitch(S::kSourceRowCapacity)
     {
     }
     __aicore__ inline bool Next(PeerReorderSpan& span, uint32_t& bit)
@@ -282,9 +294,10 @@ struct RuntimePeerSpans {
         return true;
     }
 };
+template <class S>
 __aicore__ inline PeerReorderRange RuntimePeerReorderRange(const Arguments& a, uint32_t index)
 {
-    RuntimePeerSpans cursor(a, RuntimeReceiveChunkByIndex(a, index));
+    RuntimePeerSpans<S> cursor(a, RuntimeReceiveChunkByIndex<S>(a, index));
     PeerReorderSpan span{};
     uint32_t bit, count = 0U;
     while (cursor.Next(span, bit)) ++count;
