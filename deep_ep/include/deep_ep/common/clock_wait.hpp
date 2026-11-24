@@ -8,11 +8,26 @@
 
 namespace deep_ep {
 
-// One record per (call index, logical core): enter, release, batch, core.
-constexpr uint32_t kClockWaitRecordWords = 4U;
+// Bumped whenever the record layout changes; a wheel with a different value
+// must not be mixed with a Host that allocates the newer storage.
+constexpr uint32_t kClockWaitRecordSchema = 2U;
+
+// One record per (call index, logical core) carries four meaningful fields but
+// occupies a 128-byte physical slot. With the original 32-byte slot, adjacent
+// cores on one cache line overwrote each other and only 28 of 56 records
+// survived a 100-call graph. The physical stride is therefore part of the ABI.
+constexpr uint32_t kClockWaitRecordWords = 4U;          // valid fields per record
+constexpr uint32_t kClockWaitRecordStrideWords = 16U;   // 128-byte physical slot
+constexpr uint32_t kClockWaitRecordStrideBytes = kClockWaitRecordStrideWords * sizeof(uint64_t);
+constexpr uint32_t kClockWaitRecordAlignmentBytes = kClockWaitRecordStrideBytes;
+
 constexpr uint32_t kClockWaitRecordEnter = 0U;
 constexpr uint32_t kClockWaitRecordRelease = 1U;
 constexpr uint32_t kClockWaitRecordBatch = 2U;
 constexpr uint32_t kClockWaitRecordCore = 3U;
+
+static_assert(kClockWaitRecordStrideWords >= kClockWaitRecordWords,
+              "the physical record slot cannot be narrower than its fields");
+static_assert(kClockWaitRecordStrideBytes == 128U, "the admitted record slot is 128 bytes");
 
 }  // namespace deep_ep

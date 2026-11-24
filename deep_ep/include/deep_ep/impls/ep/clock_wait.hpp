@@ -39,8 +39,9 @@ __aicore__ inline uint64_t ClockWaitNow()
     return static_cast<uint64_t>(AscendC::GetSystemCycle());
 }
 
-// Every participating logical core waits. Records are written to a private
-// 32-byte slot so no core can overwrite another core's evidence.
+// Every participating logical core waits. Each core owns a 128-byte physical
+// record slot: neighbouring cores must not share a cache line, or a store from
+// one core drops the evidence of its neighbour.
 __aicore__ inline void clock_wait_body(const ClockWaitArgs& args, CoreContext core)
 {
     if (args.deadlines == nullptr || args.index < 0 || args.cores <= 0) return;
@@ -48,14 +49,17 @@ __aicore__ inline void clock_wait_body(const ClockWaitArgs& args, CoreContext co
     const uint32_t cores = static_cast<uint32_t>(args.cores);
     if (core.index >= cores) return;
 
-    auto* table = reinterpret_cast<__gm__ uint64_t*>(args.deadlines);
+    // Volatile keeps the Host-refreshed deadline and the record stores from
+    // being cached across the spin: a replay must observe the table it was
+    // launched with, and the Host reads the records after the stream drains.
+    auto* table = reinterpret_cast<__gm__ volatile uint64_t*>(args.deadlines);
     const uint64_t deadline = table[args.index];
     const uint64_t enter = ClockWaitNow();
 
-    __gm__ uint64_t* slot = nullptr;
+    __gm__ volatile uint64_t* slot = nullptr;
     if (args.diagnostic != 0 && args.records != nullptr) {
-        slot = reinterpret_cast<__gm__ uint64_t*>(args.records) +
-            (uint64_t(args.index) * cores + core.index) * kClockWaitRecordWords;
+        slot = reinterpret_cast<__gm__ volatile uint64_t*>(args.records) +
+            (uint64_t(args.index) * cores + core.index) * kClockWaitRecordStrideWords;
         slot[kClockWaitRecordEnter] = enter;
         slot[kClockWaitRecordBatch] = uint64_t(args.batch);
         slot[kClockWaitRecordCore] = core.index;

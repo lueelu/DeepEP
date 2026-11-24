@@ -319,3 +319,125 @@ def test_cannot_change_the_fixed_exp200_prefix(count):
     args = st.parse_args(['--delay-exp-before', str(count)])
     with pytest.raises(ValueError, match='fixed batch'):
         st.validate_args(args, 16)
+
+
+def _wait_rows(iterations, cores, stride, table, batch_tag=1):
+    rows = []
+    for index in range(iterations):
+        node = []
+        for core in range(cores):
+            slot = [0] * stride
+            slot[0] = table[index] - 1_000
+            slot[1] = table[index] + 10
+            slot[2] = batch_tag
+            slot[3] = core
+            node.append(slot)
+        rows.append(node)
+    return rows
+
+
+def test_wait_record_evidence_needs_a_128_byte_slot():
+    table = [10 ** 6 * (index + 1) for index in range(4)]
+    rows = _wait_rows(4, 3, 16, table)
+    evidence = st.validate_wait_records(rows, iterations=4, cores=3, words=4, stride_words=16,
+                                        batch_tag=1, table=table, rank=0, label="replay")
+    assert len(evidence["local_release"]) == 4 and evidence["core_skew"] == [0, 0, 0, 0]
+
+    narrow = [[slot[:4] for slot in node] for node in rows]
+    with pytest.raises(RuntimeError, match="slot width"):
+        st.validate_wait_records(narrow, iterations=4, cores=3, words=4, stride_words=16,
+                                 batch_tag=1, table=table, rank=0, label="replay")
+
+    missing = _wait_rows(4, 3, 16, table)
+    missing[2][1][0] = -1
+    with pytest.raises(RuntimeError, match="no wait record"):
+        st.validate_wait_records(missing, iterations=4, cores=3, words=4, stride_words=16,
+                                 batch_tag=1, table=table, rank=0, label="replay")
+
+    stolen = _wait_rows(4, 3, 16, table)
+    stolen[1][2][3] = 1
+    with pytest.raises(RuntimeError, match="not this call"):
+        st.validate_wait_records(stolen, iterations=4, cores=3, words=4, stride_words=16,
+                                 batch_tag=1, table=table, rank=0, label="replay")
+
+    early = _wait_rows(4, 3, 16, table)
+    early[1][0][1] = table[1] - 5
+    with pytest.raises(RuntimeError, match="released early"):
+        st.validate_wait_records(early, iterations=4, cores=3, words=4, stride_words=16,
+                                 batch_tag=1, table=table, rank=0, label="replay")
+
+    late = _wait_rows(4, 3, 16, table)
+    late[0][0][0] = table[0] + 5
+    late[0][0][1] = table[0] + 10
+    with pytest.raises(RuntimeError, match="entered after its deadline"):
+        st.validate_wait_records(late, iterations=4, cores=3, words=4, stride_words=16,
+                                 batch_tag=1, table=table, rank=0, label="replay")
+
+    # The capture pass has no deadlines yet, so it only proves completeness.
+    st.validate_wait_records(_wait_rows(4, 3, 16, table), iterations=4, cores=3, words=4,
+                             stride_words=16, batch_tag=1, table=None, rank=0, label="capture")
+
+
+def test_wait_table_contract_rejects_the_previous_abi():
+    class Native:
+        low_latency_clock_wait_record_words = 4
+        low_latency_clock_wait_record_fields = ["enter", "release", "batch", "core"]
+        low_latency_clock_wait_schema = 2
+        low_latency_clock_wait_record_stride_words = 16
+        low_latency_clock_wait_record_stride_bytes = 128
+        low_latency_clock_wait_record_alignment_bytes = 128
+        low_latency_clock_cycles_per_second = 1_000_000_000
+
+        def low_latency_clock_wait_table(self):
+            return None
+
+    assert st.clock_wait_table_contract(Native()) == (4, 16)
+    Native.low_latency_clock_wait_schema = 1
+    Native.low_latency_clock_wait_record_stride_words = 4
+    Native.low_latency_clock_wait_record_stride_bytes = 32
+    Native.low_latency_clock_wait_record_alignment_bytes = 32
+    with pytest.raises(RuntimeError, match="schema 2"):
+        st.clock_wait_table_contract(Native())
+
+
+def test_graph_replay_perf_requires_one_wait_before_every_dispatch(tmp_path):
+    rows = []
+    for index in range(3):
+        rows.append(f"clock_wait_table,{index + 1},{index * 10}")
+        rows.append(f"dispatch_server_dedup_kernel,{index + 2},{index * 10 + 5}")
+    (tmp_path / "kernel_details.csv").write_text(
+        "Name,Duration(us),Start Time(us)\n" + "\n".join(rows))
+    assert st.graph_replay_perf(tmp_path, 3, "dispatch") == [2.0, 3.0, 4.0]
+    with pytest.raises(ValueError, match="expected 4 each"):
+        st.graph_replay_perf(tmp_path, 4, "dispatch")
+
+    grouped = []
+    for index in range(3):
+        grouped.append(f"clock_wait_table,{index + 1},{index * 10}")
+    for index in range(3):
+        grouped.append(f"dispatch_server_dedup_kernel,{index + 2},{index * 10 + 40}")
+    (tmp_path / "kernel_details.csv").write_text(
+        "Name,Duration(us),Start Time(us)\n" + "\n".join(grouped))
+    with pytest.raises(ValueError, match="alternate"):
+        st.graph_replay_perf(tmp_path, 3, "dispatch")
+
+
+def test_reference_base_is_ahead_of_every_rank():
+    models = [
+        {"rank": 0, "l0": 1_000, "r0": 1_000, "alpha_num": 1, "alpha_den": 1,
+         "windows": [{"l": 1_000, "r": 1_000}]},
+        {"rank": 1, "l0": 900, "r0": 1_200, "alpha_num": 1, "alpha_den": 1,
+         "windows": [{"l": 1_100, "r": 1_400}]},
+    ]
+    assert st.reference_base(models, 200_000) == 1_400 + 200_000 * 1000
+
+
+def test_graph_calibration_arguments_are_bounded():
+    base = ["--clock-align", "--clock-align-mode", "graph", "--dispatch-only", "--do-cpu-sync", "0",
+            "--num-processes", "16"]
+    assert st.validate_args(st.parse_args(base), 16) == 16
+    for extra in (["--clock-align-calibration-windows", "0"],
+                  ["--clock-align-calibration-gap-secs", "-1"],
+                  ["--clock-align-model-max-age-secs", "0"]):
+        with pytest.raises(ValueError):
+            st.validate_args(st.parse_args(base + extra), 16)

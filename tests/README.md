@@ -234,7 +234,11 @@ master 地址、master 端口和 SHMEM endpoint 必须通过 CLI、JSON 或环�
 
 默认执行正确性和 kernel 测量。`--skip-perf-test` 只检查正确性；`--skip-check` 的结果标记为 `skipped`，不能作为精度通过证据。诊断选项 `--trace-ops` 会影响测量。计时与跨 rank 汇总口径见[性能说明](../docs/performance.md)。
 
-周期对齐有两条路径。`--clock-align` 默认走 `--clock-align-mode stream`，每个迭代前由 Host 入队一次 `sleep_at`，保持原有口径。`--clock-align-mode graph` 需要同时给出 `--dispatch-only` 和 `--do-cpu-sync 0`：先把每个迭代的 wait+Dispatch 捕获进一张 NPU graph，再按 `--clock-align-replays` 重放，每次重放前刷新 GM 死线表；验收读取最后一次重放的 per-core 记录（enter/release/batch/core），检查每个活动 AIV 核都已等待、无提前释放，并汇总跨 rank 的释放偏差与迟到。该模式不做 profiler 耗时测量，也不包含 SuperKernel 融合解析，结果写入 `clock_graph/.../clock_alignment.json`。
+周期对齐有两条路径。`--clock-align` 默认走 `--clock-align-mode stream`，每个迭代前由 Host 入队一次 `sleep_at`。`--clock-align-mode graph` 需要同时给出 `--dispatch-only` 和 `--do-cpu-sync 0`：先准备资源、完成首次编译和核绑定、在 capture stream 上捕获 `num_iters` 对 wait+Dispatch，之后才做校准，最后按 `--clock-align-replays` 逐次重放。
+
+时钟模型是以 rank 0 为参考的仿射模型 `R(L) = R0 + alpha * (L - L0)`。校准按 `--clock-align-calibration-windows` 采集多个相隔 `--clock-align-calibration-gap-secs` 的四时间戳窗口，用整数有理数拟合 alpha；三个及以上窗口会把最后一个留作 holdout 残差检查，窗口不足时明确标记 rate 不可解析，而不是假定零漂移。死线由同一模型反算并向上取整，释放统计也走正算，避免只修一个方向留下固定偏移。`--clock-align-model-max-age-secs` 决定重放前是重新锚定还是重拟合。
+
+每次重放都在图外重新取锚点、选择未来的共同起点、在原地址刷新死线表、把 records 清成哨兵，重放后单独校验该次的全部记录：每个活动 AIV 核的 `enter/release/batch/core` 必须齐全，`enter` 早于死线、`release` 不早于死线。记录槽为 128 B（schema 2，`low_latency_clock_wait_record_stride_bytes`），与旧的四 word 存储不兼容，遇到旧 wheel 会直接报版本不匹配。最后一次重放由 profiler 采样，从 `kernel_details.csv` 提取 Dispatch Duration 并校验 100 个 wait 与 100 个 Dispatch 交替出现；`--skip-perf-test` 关闭这次采样。验收范围只到模型域：逐次偏差、传播后的两两误差界与 holdout 残差都会写入 `clock_graph/.../clock_alignment.json`，不包含 SuperKernel 融合解析，也不据此声称物理首指令对齐。
 
 ## 日志与结果
 

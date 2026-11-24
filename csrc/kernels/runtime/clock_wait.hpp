@@ -2,7 +2,8 @@
 
 // Host JIT entry of the table-driven clock wait. The generated source contains
 // no deadline value and no call index: both are runtime arguments, so all
-// captured wait nodes share one compiled kernel.
+// captured wait nodes share one compiled kernel. Record storage uses the
+// 128-byte physical stride from the shared ABI header.
 #pragma once
 
 #include <cstdint>

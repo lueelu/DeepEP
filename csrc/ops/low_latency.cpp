@@ -200,6 +200,13 @@ void bind_low_latency(py::module_& module)
     module.attr("low_latency_clock_wait_record_words") = deep_ep::kClockWaitRecordWords;
     module.attr("low_latency_clock_wait_record_fields") = std::vector<std::string>{
         "enter", "release", "batch", "core"};
+    module.attr("low_latency_clock_wait_schema") = deep_ep::kClockWaitRecordSchema;
+    module.attr("low_latency_clock_wait_record_stride_words") =
+        deep_ep::kClockWaitRecordStrideWords;
+    module.attr("low_latency_clock_wait_record_stride_bytes") =
+        deep_ep::kClockWaitRecordStrideBytes;
+    module.attr("low_latency_clock_wait_record_alignment_bytes") =
+        deep_ep::kClockWaitRecordAlignmentBytes;
     module.def("low_latency_clock_sync",
                [](Session& session, py::object comm_args, py::object samples, uint32_t sample_count,
                   uint32_t warmup_sample_count, uint64_t magic, uint64_t timeout_cycles,
@@ -238,6 +245,8 @@ void bind_low_latency(py::module_& module)
     // table and the call index is a runtime argument, so a replay only needs to
     // refresh the table contents. Cores must match the Dispatch launch exactly
     // because the record stride is a function of the participating core count.
+    // Each record owns a 128-byte physical slot (schema 2); a narrower slot let
+    // neighbouring cores overwrite each other's evidence.
     module.def("low_latency_clock_wait_table",
                [](Session& session, py::object deadlines, int64_t num_iters, int64_t index,
                   py::object records, int64_t batch, bool diagnostic, uintptr_t stream_address) {
@@ -252,10 +261,11 @@ void bind_low_latency(py::module_& module)
                    uint8_t* output = nullptr;
                    if (diagnostic) {
                        output = tensor(records, {num_iters, int64_t(cores),
-                                                 int64_t(deep_ep::kClockWaitRecordWords)}, "int64");
+                                                 int64_t(deep_ep::kClockWaitRecordStrideWords)}, "int64");
                        require_npu(records, "records");
-                       if (reinterpret_cast<uintptr_t>(output) % 32U != 0U) {
-                           throw std::invalid_argument("LL clock wait records require 32-byte alignment");
+                       if (reinterpret_cast<uintptr_t>(output) % deep_ep::kClockWaitRecordAlignmentBytes) {
+                           throw std::invalid_argument(
+                               "LL clock wait records require 128-byte alignment");
                        }
                    }
                    py::gil_scoped_release release;
@@ -263,7 +273,8 @@ void bind_low_latency(py::module_& module)
                                                     table, index, output, batch, diagnostic);
                },
                "Wait until deadlines[index] (device cycles) on every active AIV core; "
-               "records, when requested, are int64[num_iters][cores][4].");
+               "records, when requested, are int64[num_iters][cores][16] with the four "
+               "leading words per slot holding enter, release, batch and core.");
     module.def("low_latency_layout", [](int p, int b, int h, int k, int e, const std::string& dtype) {
         // A rejected shape is a Host-only capability result, not a launch failure.
         check_dispatch_dtype(dtype);
