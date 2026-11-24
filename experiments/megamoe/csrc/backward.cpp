@@ -145,12 +145,13 @@ BackwardResult BF16Plan::backward(torch::Tensor gradY, torch::Tensor topkWeights
                                          ptr(backwardWorkspace), reinterpret_cast<const uint8_t*>(&tiling), ffts_addr_,
                                          splitExperts);
     }
-    for (const auto* tensor :
-         {&context, &gradY, &topkWeights, &weight1, &weight2, &expertTokenNums, &trainingSavedState, &dispatchOutput,
-          &gradX, &gradTopkWeights, &gradWeight1, &gradWeight2, &backwardWorkspace}) {
+    for (const auto* tensor : {&gradY, &topkWeights, &weight1, &weight2}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
-    if (timer.defined()) c10_npu::NPUCachingAllocator::recordStream(timer.storage().data_ptr(), stream);
+    // Rebuilt dispatch and hook-restored storage can belong to a different stream.
+    RecordIfForeign(context);
+    RecordIfForeign(trainingSavedState);
+    RecordIfForeign(dispatchOutput);
     return {gradX, gradTopkWeights, gradWeight1, gradWeight2, timer};
 }
 

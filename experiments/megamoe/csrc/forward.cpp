@@ -257,11 +257,16 @@ ForwardResult BF16Plan::forward(torch::Tensor out, torch::Tensor x, torch::Tenso
                                         ptr(routingState), dispatchOutput.defined() ? ptr(dispatchOutput) : nullptr,
                                         ptr(workspace_), reinterpret_cast<const uint8_t*>(&tiling), ffts_addr_);
     }
-    for (const auto* tensor : {&context, &x, &topkIds, &topkWeights, &weight1, &weight2, &out, &expertTokenNums,
-                               &routingState, &dispatchOutput, &workspace_}) {
-        if (tensor->defined()) c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+    // The remaining outputs and scratch were allocated on the kernel stream.
+    for (const auto* tensor : {&x, &topkIds, &topkWeights, &weight1, &weight2, &out}) {
+        c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
-    if (timer.defined()) c10_npu::NPUCachingAllocator::recordStream(timer.storage().data_ptr(), stream);
+    RecordIfForeign(context);
+    RecordIfForeign(workspace_);
+    if (weight_before_gmm2_) {
+        RememberAllocation(routingState);
+        if (dispatchOutput.defined()) RememberAllocation(dispatchOutput);
+    }
     return {out, expertTokenNums, weight_before_gmm2_ ? routingState : torch::Tensor(), dispatchOutput, timer};
 }
 

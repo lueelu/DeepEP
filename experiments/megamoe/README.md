@@ -160,7 +160,7 @@ y.backward(grad_y)
 buffer.destroy()                  # 所有反向完成后，所有 rank 同序释放
 ```
 
-推理时构造 `need_grad=False` 的 buffer，填入相同的输入和权重，调用 `bf16_mega_moe(y, w1, w2, buffer)` 即可。训练 buffer 在 `torch.no_grad()` 下仍按训练顺序乘权，同时跳过构图和跨调用保存。
+推理时构造 `need_grad=False` 的 buffer，填入相同的输入和权重，调用 `bf16_mega_moe(y, w1, w2, buffer)` 即可。连续推理若复用预分配的 `y`，应在调用流上先排入对上一份结果的读取，再发起下一次前向。其他流也在读取该结果时，调用流须先等待这些读取完成。训练 buffer 在 `torch.no_grad()` 下仍按训练顺序乘权，同时跳过构图和跨调用保存。
 
 BF16 支持 EP=2～1024，E 须能被 EP 整除，每卡 1～32 个路由专家，E≤2048。B=1～16384，1≤K≤min(32,E)，H 和 I 均为 256 的倍数，具体形状还须满足 Dispatch 和激活的 UB 容量。`max_recv_tokens` 按单个 rank 接收的路由行数配置。训练必须显式传入；推理和 W4A8 使用相同的默认上限 `num_max_tokens_per_rank × EP × min(K,L)`。每个 token 的 TopK 专家互不重复，最多有 `min(K,L)` 条路由落到同一 rank，因此该值覆盖路由集中到热卡的情况。已知峰值时可指定较紧的容量。
 
@@ -174,6 +174,8 @@ BF16 支持 EP=2～1024，E 须能被 EP 整除，每卡 1～32 个路由专家�
 训练时 `SymmBuffer(..., save_dispatched_x=True)` 默认将专家端 X 和 TopK weight 保存在本次前向的 autograd context 中。行序依次为本地专家、源 EP rank、源内 token/TopK slot。BF16、MXFP8 的 Gate/Up 也按此顺序保存，MXFP8 的 scale 和 clipping 掩码与对应行对齐。
 
 框架自行重建时设置 `save_dispatched_x=False`，并在每次前向前设置 `sym_buffer.dispatch_rebuilder` 为该 microbatch 的无参函数。反向调用该函数取得连续的设备端 UInt8 缓冲。缓冲依次存放 `[max_recv_tokens, H]` BF16 X 和 `[max_recv_tokens]` 原 dtype 的 p，两段分别按 512 字节对齐。异步重建时，回调须让调用流等待生产端事件。每个前向独立记录回调，支持多前向后逆序反向。直接调用原生 Plan 的框架可以在 `plan.forward(..., capture_timer=False, save_dispatched_x=False)` 后将重建张量传入 `backward`。
+
+反向临时 workspace 在算子流上分配，用完即可按流序复用。反向在同一流读取前向保存的原始张量时，最后一个引用释放后，该流即可复用这块显存。若框架重建了 `dispatch_output`，或 autograd hook 换回了新的存储，算子会登记反向使用流，保护尚未完成的读取。
 
 同一 EP 组的调用顺序、配置和 p 的 dtype 须一致。
 
@@ -410,7 +412,7 @@ python experiments/megamoe/tests/bf16/test_mega_moe.py 0,1,2,3,4,5,6,7 \
 
 `summary.json` 中的三路性能报告分别列出 NPU Event 和设备 kernel 耗时（ms）。Event 单独采样。kernel 耗时按 rank 和轮次统计，分别对一次前向或反向中的计算、通信区间取并集，重叠部分只计一次。两列均取正式轮次的后半段，逐轮取最慢 rank 再求平均。各 rank 的原始样本和 profiler 导出保存在 `--output` 指定的新目录。
 
-**多 microbatch 生命周期。** 两卡回归在同一 `SymmBuffer` 上连续前向、逆序反向，逐字节比较各 microbatch 与串行执行的输出和梯度。加 `--stress-iterations 32` 可检查连续复用。
+**多 microbatch 生命周期。** 两卡回归在同一 `SymmBuffer` 上连续前向、逆序反向，逐字节比较各 microbatch 与串行执行的输出和梯度。三种保存模式均覆盖跨流恢复保存张量、使用框架重建的 `dispatch_output` 和非连续 `grad_y`。加 `--stress-iterations 32` 可检查连续复用。
 
 ```bash
 torchrun --standalone --nproc-per-node=2 experiments/megamoe/tests/bf16/bf16_lifecycle.py

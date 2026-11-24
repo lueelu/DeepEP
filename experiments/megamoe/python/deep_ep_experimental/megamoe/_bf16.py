@@ -153,8 +153,6 @@ def run(y, w1, w2, b, shared_w1, shared_w2, stats, activation, clamp, fast_math)
             if stats is not None:
                 stats.add_(counts)
                 stats.record_stream(runtime.stream)
-        for t in (x, ids, p, w1, w2, y, counts):
-            t.record_stream(runtime.stream)
         caller.wait_stream(runtime.stream)
-        result_y.record_stream(caller)
-        counts.record_stream(caller)
+        if caller != runtime.stream:
+            result_y.record_stream(caller)

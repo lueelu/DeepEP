@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 #include <string>
 #include <tuple>
 #include <torch/extension.h>
@@ -110,6 +111,18 @@ private:
     MegaMoeBf16TilingData TilingForCall(int64_t m, int64_t k, int64_t n, int64_t topk, int64_t experts,
                                         int64_t max_recv, double limit, const std::string& mode, uint32_t weight_type,
                                         bool trans_w);
+    // Weak ownership lets autograd discard or replace saved tensors between calls.
+    struct Allocation {
+        c10::weak_intrusive_ptr<c10::StorageImpl> storage;
+        const void* data;
+        const void* context;
+        size_t bytes;
+        c10::Stream stream;
+    };
+    std::vector<Allocation> allocations_;
+    void RememberAllocation(const torch::Tensor& tensor);
+    void RecordIfForeign(const torch::Tensor& tensor) const;
+
     PlatformInfo platform_;
     MegaMoeBf16TilingData tiling_{};
     torch::Tensor Context(const torch::Tensor& like);

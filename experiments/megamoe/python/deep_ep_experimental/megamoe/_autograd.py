@@ -57,8 +57,11 @@ class BF16Function(torch.autograd.Function):
             with npu_api().stream(runtime.stream):
                 if capture is not None:
                     capture.begin_backward()
+                contiguous_dy = dy.contiguous()
+                if contiguous_dy is not dy:
+                    dy.record_stream(runtime.stream)
                 result = ctx.plan.backward(
-                    dy.contiguous(),
+                    contiguous_dy,
                     p,
                     w1,
                     w2,
@@ -73,8 +76,7 @@ class BF16Function(torch.autograd.Function):
                 if capture is not None:
                     capture.backward = result.timer
             caller.wait_stream(runtime.stream)
-            for t in (dy, p, w1, w2, counts, saved, dispatched):
-                t.record_stream(runtime.stream)
-            for t in (result.dx, result.dtopk_weights, result.dw1, result.dw2):
-                t.record_stream(caller)
+            if caller != runtime.stream:
+                for t in (result.dx, result.dtopk_weights, result.dw1, result.dw2):
+                    t.record_stream(caller)
         return None, None, None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None

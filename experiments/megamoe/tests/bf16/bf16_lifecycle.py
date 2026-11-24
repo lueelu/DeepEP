@@ -77,9 +77,9 @@ def main():
         assert result is None and y.data_ptr() == pointer
         return values, y, counts
 
-    def backward(index, graph):
+    def backward(index, graph, dy=None):
         values, y, counts = graph
-        y.backward(batches[index][3])
+        y.backward(batches[index][3] if dy is None else dy)
         assert values[1].grad.dtype == values[1].dtype
         dx, dp, dw1, dw2 = (v.grad.cpu() for v in values)
         return dict(y=y.detach().cpu(), counts=counts.cpu(), dx=dx, dp=dp, dw1=dw1, dw2=dw2)
@@ -113,6 +113,41 @@ def main():
         check(0, backward(0, forward(op)), expected[0])
     for i in reversed(range(len(pending))):
         check(i, backward(i, pending.pop()), expected[i])
+
+    # Hooks and framework redispatch can supply a fresh allocation on a third stream.
+    transfer = torch.npu.Stream()
+
+    def foreign_copy(tensor):
+        caller = torch.npu.current_stream()
+        transfer.wait_stream(caller)
+        with torch.npu.stream(transfer):
+            copied = tensor.clone()
+            tensor.record_stream(transfer)
+        caller.wait_stream(transfer)
+        return copied
+
+    def unpack(tensor):
+        return foreign_copy(tensor) if tensor.dtype == torch.uint8 else tensor
+
+    for i, (mode, _, _) in enumerate(modes):
+        if i and modes[i - 1][0] == mode:
+            continue
+        with torch.autograd.graph.saved_tensors_hooks(lambda t: t.detach(), unpack):
+            graph = forward(op, i)
+        dy = batches[i][3].T.contiguous().T
+        check(i, backward(i, graph, dy), expected[i])
+        del graph
+
+        # Give the rebuilder identical dispatch bytes from a matching forward.
+        saved_graph = forward(op, i)
+        dispatch = saved_graph[1].grad_fn.saved_tensors[-1]
+        del saved_graph
+        op.save_dispatched_x = False
+        op.dispatch_rebuilder = lambda source=dispatch: foreign_copy(source)
+        check(i, backward(i, forward(op, i)), expected[i])
+        op.save_dispatched_x = True
+        op.dispatch_rebuilder = None
+        del dispatch
 
     legacy = backward(0, forward(op, legacy_layout=True))
     for name in ("dw1", "dw2"):
