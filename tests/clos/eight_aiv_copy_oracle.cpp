@@ -275,6 +275,7 @@ struct CombineSenderT {
     template <uint32_t Phase>
     uint32_t PutSelectedRows(uint32_t, int32_t*, uint32_t, uint32_t, uint32_t count) {
         assert(combine_phase == 0);
+        count = std::min(count, 32U); // Sender may accept less than one visit.
         combine_rows += count;
         return count;
     }
@@ -295,6 +296,7 @@ struct CombineSender {
     template <uint32_t Phase>
     unsigned PutSelectedRows(unsigned, int32_t*, unsigned, unsigned, unsigned count) {
         assert(combine_phase == 0 && combine_copies == 0);
+        count = std::min(count, 32U);
         combine_rows += count;
         return count;
     }
@@ -317,11 +319,11 @@ template <unsigned Phase>
 void CheckTokenCombineOrdering() {
     for (unsigned world : {2U, 16U, 64U, 128U, 256U})
         for (unsigned rows : {0U, 3U, 65U})
-            for (bool weighted : {false, true}) {
+            for (unsigned visit : {8U, 64U, 128U}) for (bool weighted : {false, true}) {
                 CombineTilingData td{};
                 td.world_size = world;
                 td.block_dim = 8;
-                td.udma_wqes_per_visit = 8;
+                td.udma_wqes_per_visit = visit;
                 td.has_topk_weights = weighted;
                 std::vector<int32_t> indices(world * rows + 32), prefix(world * world);
                 for (unsigned peer = 0; peer < world; ++peer) prefix[peer * world] = (peer + 1) * rows;
@@ -345,12 +347,12 @@ void CheckCombineOrdering()
 {
     for (unsigned rows : {0U, 3U, 65U, 513U})
         for (bool weighted : {false, true})
-            for (bool legacy_after : {false, true}) {
+            for (unsigned visit : {8U, 64U, 128U}) for (bool legacy_after : {false, true}) {
                 CombineTilingData td{};
                 td.world_size = 2;
                 td.block_dim = 8;
                 td.udma_workers_per_peer = 1;
-                td.udma_wqes_per_visit = 8;
+                td.udma_wqes_per_visit = visit;
                 td.pipeline_chunk_tokens = 32;
                 td.has_topk_weights = weighted;
                 td.udma_self_copy_after_submit = legacy_after;
@@ -470,7 +472,7 @@ void CheckCachedDispatch()
         for (bool opt_in : {false, true})
             for (unsigned cores : {8U, 16U})
                 for (unsigned tokens : {0U, 3U, 513U, 2049U, 4099U})
-                    for (unsigned visit : {4U, 8U, 16U, 31U, 32U, 257U})
+                    for (unsigned visit : {4U, 8U, 16U, 31U, 32U, 64U, 128U, 257U})
                         for (unsigned workers : {1U, 2U}) for (bool metadata : {false, true}) {
                             DispatchTilingData td{};
                             td.world_size = world;

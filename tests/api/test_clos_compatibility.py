@@ -49,6 +49,23 @@ def test_multi_buffer_bootstrap_uses_fresh_uid_and_capacity_independent_identity
     """)
 
 
+def test_extended_visit_config_is_explicit_and_preserved():
+    run_host("""
+        from deep_ep.backends.direct.config import Config
+        for visit in (4,8,16,32,64,128):
+            config = Config(8, udma_peers_per_worker=8, udma_wqes_per_visit=visit)
+            assert config.udma_wqes_per_visit == visit and config._udma_wqes_explicit
+        assert Config().udma_wqes_per_visit == 8
+        for bad in (0,33,96,129,256,(1<<32)+64):
+            try:
+                Config(8, udma_wqes_per_visit=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('invalid visit accepted')
+    """)
+
+
 def test_qp_reservation_participates_in_rank_consensus_and_buffer_identity():
     run_host("""
         import os
@@ -1275,7 +1292,10 @@ constexpr bool reject(int index,int64_t value,int cores=8) {
 }
 static_assert(matches(8,8,8,false,{1,0,8,1,1,1,32,0,0})); // Legacy marker stays legal.
 static_assert(reject(0,2) && reject(1,4) && reject(2,4) && reject(3,3));
-static_assert(reject(4,3) && reject(5,3) && reject(6,3) && reject(6,64));
+static_assert(reject(4,3) && reject(5,3) && reject(6,3) && reject(6,256));
+static_assert(reject(6,96) && reject(6,129) && reject(6,(int64_t{1}<<32)+64));
+static_assert(matches(64,16,8,false,{1,0,16,8,1,1,64,2,0}));
+static_assert(matches(64,16,8,true,{1,0,16,8,1,1,128,2,1}));
 static_assert(reject(7,-1) && reject(7,1) && reject(7,3));
 static_assert(reject(8,-1) && reject(8,1) && reject(8,2) && reject(8,3));
 static_assert(reject(7,2,-2) && reject(7,2,7) && reject(7,2,6));

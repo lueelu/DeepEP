@@ -42,7 +42,9 @@ ASCEND_DEEPEP_SCHEDULE_FN bool ValidPeers(uint32_t peers)
 }
 ASCEND_DEEPEP_SCHEDULE_FN bool ValidVisit(uint32_t wqes)
 {
-    return wqes == 4 || wqes == 8 || wqes == 16 || wqes == 32;
+    // A peer visit can span several fixed-size WQE submissions. It does not
+    // resize the sender's kBatchWqes scratch or change SQ admission granularity.
+    return wqes == 4 || wqes == 8 || wqes == 16 || wqes == 32 || wqes == 64 || wqes == 128;
 }
 ASCEND_DEEPEP_SCHEDULE_FN uint32_t Workers(uint32_t world, uint32_t peers,
     uint32_t order = kRankOrder, uint32_t ranks_per_group = 0)

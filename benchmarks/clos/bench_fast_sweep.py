@@ -39,7 +39,7 @@ def qp_plan_spec(plans):
     )
 
 
-def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32), quick=False):
+def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128), quick=False):
     result = []
     for order in ORDERS:
         grouped = order == "group_round_robin"
@@ -130,7 +130,7 @@ def parse_args(argv=None):
     p.add_argument("--samples", type=int, default=8)
     p.add_argument("--final-samples", type=int, default=30)
     p.add_argument("--top", type=int, default=3)
-    p.add_argument("--visits", type=int, nargs="+", default=[4, 8, 16, 32])
+    p.add_argument("--visits", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128])
     p.add_argument("--quick", action="store_true", help="rank and group_round_robin search")
     p.add_argument("--strategies", nargs="+", help="restrict to exact strategy IDs for a matched A/B run")
     p.add_argument("--include-weighted-combine", action="store_true", help="also measure returned FP32 top-k weights")
@@ -188,8 +188,8 @@ def parse_args(argv=None):
         p.error("experts must be divisible by EP and cover topk")
     if args.warmup < 0 or min(args.samples, args.final_samples, args.top) < 1:
         p.error("invalid sampling parameters")
-    if not args.visits or not set(args.visits) <= {4, 8, 16, 32}:
-        p.error("visits must be 4/8/16/32")
+    if not args.visits or not set(args.visits) <= {4, 8, 16, 32, 64, 128}:
+        p.error("visits must be 4/8/16/32/64/128")
     if len({tuple(c.values()) for c in args.case}) != len(args.case):
         p.error("duplicate cases")
     return args

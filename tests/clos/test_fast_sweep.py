@@ -89,6 +89,38 @@ def test_multi_mode_cli_and_conflicts():
             sweep.parse_args(argv)
 
 
+def test_extended_visit_scan_keeps_qp_reservation_fixed(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sweep",
+            "--ep-size",
+            "64",
+            "--ranks-per-group",
+            "16",
+            "--case",
+            "8192,6144,8,8",
+            "--visits",
+            "32",
+            "64",
+            "128",
+            "--strategies",
+            "rank_p8_w1_q1_v32",
+            "rank_p8_w1_q1_v64",
+            "rank_p8_w1_q1_v128",
+            "--plan-only",
+        ],
+    )
+    sweep.main()
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["qp_plans"] == "rank:8:1:1"
+    assert {c["visit"] for c in plan["plans"][0]["configs"]} == {32, 64, 128}
+    for bad in (0, 33, 96, 129, 256):
+        with pytest.raises(SystemExit):
+            sweep.parse_args(["--visits", str(bad)])
+
+
 def test_weighted_fixed_strategy_plan(tmp_path, monkeypatch, capsys):
     argv = [
         "sweep",

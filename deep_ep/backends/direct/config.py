@@ -112,7 +112,7 @@ class Config:
         self.__post_init__()
 
     def __post_init__(self) -> None:
-        for name, allowed in (("udma_peers_per_worker", (1, 2, 4, 8)), ("udma_wqes_per_visit", (4, 8, 16, 32))):
+        for name, allowed in (("udma_peers_per_worker", (1, 2, 4, 8)), ("udma_wqes_per_visit", (4, 8, 16, 32, 64, 128))):
             value = getattr(self, name)
             _validate_positive_int(name, value)
             if value not in allowed:

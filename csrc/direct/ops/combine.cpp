@@ -213,8 +213,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                         udma_peers_per_worker == 8,
                     "udma_peers_per_worker must be 1, 2, 4 or 8");
         TORCH_CHECK(udma_wqes_per_visit == 4 || udma_wqes_per_visit == 8 || udma_wqes_per_visit == 16 ||
-                        udma_wqes_per_visit == 32,
-                    "udma_wqes_per_visit must be 4, 8, 16 or 32");
+                        udma_wqes_per_visit == 32 || udma_wqes_per_visit == 64 || udma_wqes_per_visit == 128,
+                    "udma_wqes_per_visit must be 4, 8, 16, 32, 64 or 128");
         const int64_t workers =
             shmem.TokenSchedule()
                 ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
