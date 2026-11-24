@@ -31,6 +31,7 @@ EXP_PREFIX_REPEATS = 100
 SAMPLING_PROTOCOL = 'initial-reduce-exp100-batch-v3'
 TCPSTORE_SAMPLING_PROTOCOL = 'initial-tcpstore-exp100-batch-v2'
 CLOCK_ALIGNMENT_PROTOCOL = 'tilexr-sleep-at-per-iteration-v1'
+CLOCK_ALIGNMENT_GRAPH_PROTOCOL = 'tilexr-graph-wait-table-v1'
 CLOCK_CYCLES_PER_SECOND = 1_000_000_000
 BALANCED_ROUTE_SEED = 20261014
 
@@ -103,15 +104,17 @@ def comparison_metadata(args, world, m):
     runtime=getattr(args,'runtime_identity',None)
     if runtime is None: return None  # CPU fixtures / legacy custom callers.
     clock_aligned = bool(getattr(args, "clock_align", False))
+    graph_aligned = clock_aligned and getattr(args, "clock_align_mode", "stream") == "graph"
+    alignment_protocol = CLOCK_ALIGNMENT_GRAPH_PROTOCOL if graph_aligned else CLOCK_ALIGNMENT_PROTOCOL
     return dict(**runtime, comparison_schema=1, sampling_protocol=sampling_protocol(args),
                 host_coordination=args.group_backend,
                 exp_prefix_repeats=0 if clock_aligned else EXP_PREFIX_REPEATS,
                 per_iteration_exp=0, per_iteration_all_reduce=False,
                 per_iteration_host_collective=False,
-                per_iteration_rank_alignment=CLOCK_ALIGNMENT_PROTOCOL if clock_aligned else "none",
-                per_iteration_device_alignment=CLOCK_ALIGNMENT_PROTOCOL if clock_aligned else "none",
+                per_iteration_rank_alignment=alignment_protocol if clock_aligned else "none",
+                per_iteration_device_alignment=alignment_protocol if clock_aligned else "none",
                 clock_alignment=getattr(args, "clock_alignment_metadata", None),
-                perf_enabled=not args.skip_perf_test, world_size=world,
+                perf_enabled=not args.skip_perf_test and not graph_aligned, world_size=world,
                 local_world_size=int(os.environ.get('LOCAL_WORLD_SIZE',args.num_processes)),
                 case=case_config(args,m), route=args.route, seed=args.seed,
                 routing=routing_metadata(world, args.num_tokens, args.num_experts, args.seed, args.route),
@@ -225,6 +228,11 @@ def make_parser():
     parser.add_argument("--num-iters", type=int, default=100)
     parser.add_argument("--clock-align", action="store_true",
                         help="Queue an absolute device-cycle wait before every measured operation")
+    parser.add_argument("--clock-align-mode", choices=("stream", "graph"), default="stream",
+                        help="stream: host-enqueue one sleep_at before each iteration; graph: capture one "
+                             "wait+dispatch pair per iteration and refresh the deadline table per replay")
+    parser.add_argument("--clock-align-replays", type=int, default=3,
+                        help="Graph-mode replays with a refreshed deadline table; acceptance reads the last")
     parser.add_argument("--clock-align-samples", type=int, default=64)
     parser.add_argument("--clock-align-warmup-samples", type=int, default=8)
     parser.add_argument("--clock-align-lead-us", type=int, default=200000)
@@ -531,7 +539,16 @@ def validate_args(args, world):
     if diagnostic_requested(args) and args.skip_check:
         raise ValueError("Stage diagnostics require correctness checks")
     if args.clock_align:
-        if args.skip_perf_test or diagnostic_requested(args):
+        if getattr(args, "clock_align_mode", "stream") == "graph":
+            if not args.dispatch_only:
+                raise ValueError("Graph clock alignment requires --dispatch-only")
+            if args.do_cpu_sync != 0:
+                raise ValueError("Graph clock alignment requires --do-cpu-sync 0; host count reads cannot be captured")
+            if not 1 <= args.clock_align_replays <= 16:
+                raise ValueError("clock-align-replays must be in [1,16]")
+            if diagnostic_requested(args):
+                raise ValueError("Graph clock alignment excludes reference profiling")
+        elif args.skip_perf_test or diagnostic_requested(args):
             raise ValueError("Clock alignment is only supported by plain OFF performance sampling")
         if not 8 <= args.clock_align_samples <= 256:
             raise ValueError("clock-align-samples must be in [8,256]")
@@ -774,6 +791,8 @@ def control_device(args, torch):
 
 def sampling_protocol(args):
     if getattr(args, "clock_align", False):
+        if getattr(args, "clock_align_mode", "stream") == "graph":
+            return CLOCK_ALIGNMENT_GRAPH_PROTOCOL
         return CLOCK_ALIGNMENT_PROTOCOL
     return TCPSTORE_SAMPLING_PROTOCOL if args.group_backend == "tcpstore" else SAMPLING_PROTOCOL
 
@@ -959,7 +978,8 @@ def clock_sleep_deadline(model, reference_cycle):
     return deadline
 
 
-def prepare_clock_alignment(buffer, args, operation):
+def prepare_clock_alignment(buffer, args, operation, allocate_releases=True):
+    """Estimate each rank's clock model; graph mode keeps its own deadline table."""
     import torch
     from deep_ep._native import require_native
     from deep_ep._runtime import runtime_of
@@ -997,8 +1017,10 @@ def prepare_clock_alignment(buffer, args, operation):
         raise RuntimeError("Clock models do not follow EP rank order")
     reference_target = int(models[0]["last_cycle"]) + args.clock_align_lead_us * 1000
     first_deadline = clock_sleep_deadline(model, reference_target)
-    releases = torch.empty((args.num_iters,), dtype=torch.int64, device=f"npu:{runtime.device}")
-    releases.record_stream(runtime.stream)
+    releases = None
+    if allocate_releases:
+        releases = torch.empty((args.num_iters,), dtype=torch.int64, device=f"npu:{runtime.device}")
+        releases.record_stream(runtime.stream)
     metadata = dict(
         schema="deepep_clock_alignment.v1",
         source="TileXR PR 218 four-timestamp estimator and sleep-at semantics",
@@ -1052,6 +1074,156 @@ def finish_clock_alignment(state, args, operation, profile_dir):
         json.dumps(dict(summary=summary, local_model=state["model"], local_release_cycles=releases,
                         local_corrected_cycles=corrected, reference_targets=targets), indent=2) + "\n"
     )
+    if not hasattr(args, "clock_alignment_metadata"):
+        args.clock_alignment_metadata = {}
+    args.clock_alignment_metadata[operation] = summary
+    return summary
+
+
+def clock_wait_table_contract(native):
+    """Read the installed wheel's in-graph wait ABI before touching the device."""
+    fields = [str(name) for name in getattr(native, "low_latency_clock_wait_record_fields", [])]
+    words = getattr(native, "low_latency_clock_wait_record_words", None)
+    cycles = getattr(native, "low_latency_clock_cycles_per_second", None)
+    if (words != 4 or fields != ["enter", "release", "batch", "core"] or
+            cycles != CLOCK_CYCLES_PER_SECOND or not hasattr(native, "low_latency_clock_wait_table")):
+        raise RuntimeError("Rebuild the wheel with the in-graph clock wait-table ABI")
+    return int(words)
+
+
+def graph_clock_alignment(buffer, invoke, args, operation, rank, world, mode, check=None):
+    """Capture one wait+operation pair per iteration, then replay with a refreshed table.
+
+    The captured nodes keep the deadline table by address and take the call index
+    as a scalar, so one compiled kernel serves every node. Records are written by
+    every active AIV core and are the acceptance evidence.
+    """
+    import torch
+    import torch_npu  # noqa: F401
+    from deep_ep._native import require_native
+    from deep_ep._runtime import runtime_of
+
+    if operation != "dispatch":
+        raise ValueError("Graph clock alignment covers dispatch only")
+    if bool(args.do_cpu_sync):
+        raise ValueError("Graph clock alignment cannot capture host count reads")
+    if not hasattr(torch.npu, "NPUGraph"):
+        raise RuntimeError("Installed torch_npu does not expose NPUGraph capture")
+    native = require_native("LL graph clock alignment")
+    words = clock_wait_table_contract(native)
+    runtime = runtime_of(buffer)
+    if runtime.low_latency_comm_args is None:
+        raise RuntimeError("Graph clock alignment requires the LL communication argument tensor")
+    cores = int(native.low_latency_core_config()["active_aiv"])
+    iterations = int(args.num_iters)
+    if cores <= 0 or iterations < 1:
+        raise ValueError("Graph clock alignment requires active AIV cores and positive iterations")
+    device = f"npu:{runtime.device}"
+    stream = runtime.stream
+
+    # Warm up on the capture stream: the JIT compile, core pinning and the first
+    # wait launch must all happen before the stream enters capture mode.
+    completion_boundary(args)
+    for _ in range(max(1, args.warmup)):
+        invoke()
+    torch.npu.synchronize()
+    batch = 1
+    with torch.npu.stream(stream):
+        deadlines = torch.zeros((iterations,), dtype=torch.int64, device=device)
+        records = torch.zeros((iterations, cores, words), dtype=torch.int64, device=device)
+        for index in range(min(max(1, args.warmup), iterations)):
+            native.low_latency_clock_wait_table(
+                runtime.native, deadlines, iterations, index, records, batch, False, stream.npu_stream
+            )
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    captured = None
+    with torch.npu.graph(graph, stream=stream):
+        for index in range(iterations):
+            native.low_latency_clock_wait_table(
+                runtime.native, deadlines, iterations, index, records, batch, True, stream.npu_stream
+            )
+            captured = invoke()
+    torch.npu.synchronize()
+
+    # Calibrate after capture: the deadline table address is already frozen, only
+    # its contents depend on the freshly measured clock model.
+    state = prepare_clock_alignment(buffer, args, operation, allocate_releases=False)
+    model, reference_target = state["model"], int(state["metadata"]["reference_target"])
+    interval = int(args.clock_align_interval_us) * 1000
+    table, targets = [], []
+    for replay in range(args.clock_align_replays):
+        base = reference_target + replay * iterations * interval
+        targets = [base + index * interval for index in range(iterations)]
+        table = [clock_sleep_deadline(model, target) for target in targets]
+        with torch.npu.stream(stream):
+            deadlines.copy_(torch.tensor(table, dtype=torch.int64, device=device))
+            graph.replay()
+        torch.npu.synchronize()
+
+    if check is not None and captured is not None:
+        # The captured Dispatch output must be correct on replay, not only at capture.
+        check(captured)
+
+    rows = records.cpu().tolist()
+    local_enter, local_release, core_skew = [], [], []
+    early = 0
+    for index in range(iterations):
+        node = rows[index]
+        if len(node) != cores:
+            raise RuntimeError(f"Node {index} exposes {len(node)} wait slots, expected {cores}")
+        node_enters, node_releases = [], []
+        for core, record in enumerate(node):
+            if len(record) != words:
+                raise RuntimeError(f"Node {index} core {core} record width {len(record)} != {words}")
+            enter, release, tag, owner = (int(value) for value in record)
+            if tag != batch or owner != core or enter <= 0 or release < enter:
+                raise RuntimeError(
+                    f"Rank {rank} node {index} core {core} has an invalid wait record {record}")
+            node_enters.append(enter)
+            node_releases.append(release)
+        early += sum(1 for value in node_releases if value < table[index])
+        local_enter.append(max(node_enters))
+        local_release.append(max(node_releases))
+        core_skew.append(max(node_releases) - min(node_releases))
+
+    offset = int(model["offset_cycles"])
+    corrected = [value + offset for value in local_release]
+    peers = host_gather(args, corrected, f"{operation}.graph.clock.releases")
+    if not isinstance(peers, list) or len(peers) != world:
+        raise RuntimeError("Graph clock releases did not gather every rank")
+    skews = [max(row) - min(row) for row in zip(*peers)]
+    lateness = [value - target for row, target in zip(zip(*peers), targets) for value in row]
+    margins = [deadline - enter for deadline, enter in zip(table, local_enter)]
+    summary = dict(
+        **state["metadata"],
+        schema="deepep_clock_alignment.graph.v1",
+        protocol=CLOCK_ALIGNMENT_GRAPH_PROTOCOL,
+        route=mode, iterations=iterations, replays=int(args.clock_align_replays),
+        cores=cores, batch_id=batch, record_words=words,
+        record_fields=["enter", "release", "batch", "core"],
+        deadline_margin_min_ns=min(margins),
+        deadline_margin_p50_ns=statistics.median(margins),
+        core_skew_p50_ns=statistics.median(core_skew),
+        core_skew_max_ns=max(core_skew),
+        early_releases=early,
+        release_skew_p50_ns=statistics.median(skews),
+        release_skew_p99_ns=percentile(skews, 0.99),
+        release_skew_max_ns=max(skews),
+        release_lateness_p50_ns=statistics.median(lateness),
+        release_lateness_p99_ns=percentile(lateness, 0.99),
+        release_lateness_max_ns=max(lateness),
+        acceptance=dict(records_complete=True, all_cores_waited=True, no_early_release=early == 0),
+    )
+    directory = (Path(args.run_directory) / f"case_{args.case_id:05d}" / mode / "clock_graph" /
+                 operation / f"rank_{rank:03d}")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "clock_alignment.json").write_text(json.dumps(dict(
+        summary=summary, deadline_table=table, reference_targets=targets,
+        local_enter_cycles=local_enter, local_release_cycles=local_release,
+        corrected_release_cycles=corrected, records=rows,
+    ), indent=2) + "\n")
     if not hasattr(args, "clock_alignment_metadata"):
         args.clock_alignment_metadata = {}
     args.clock_alignment_metadata[operation] = summary
@@ -1343,11 +1515,18 @@ def run_case(buffer, args, rank, world, m, mode):
             "config": case_config(args, m),
             "tested_operations": ["dispatch"],
         }
-        perf = sample_operation(buffer, dispatch,
-            lambda output: verify_dispatch(output[0], output[3], entries, args, world, m),
-            args, 'dispatch', rank, m, mode, progress)
-        if perf is not None:
-            result['dispatch'] = perf
+        if args.clock_align and getattr(args, 'clock_align_mode', 'stream') == 'graph':
+            progress("dispatch.graph")
+            result['clock_alignment'] = graph_clock_alignment(
+                buffer, dispatch, args, 'dispatch', rank, world, mode,
+                check=lambda output: verify_dispatch(output[0], output[3], entries, args, world, m))
+            result['perf'] = 'skipped: graph clock acceptance'
+        else:
+            perf = sample_operation(buffer, dispatch,
+                lambda output: verify_dispatch(output[0], output[3], entries, args, world, m),
+                args, 'dispatch', rank, m, mode, progress)
+            if perf is not None:
+                result['dispatch'] = perf
         if rank == 0:
             print(json.dumps(result, ensure_ascii=False), flush=True)
         completion_boundary(args)
@@ -1448,6 +1627,8 @@ def worker(local_rank, args):
     native = require_native("LL ST")
     if not callable(getattr(native, "dispatch_low_latency", None)):
         raise RuntimeError("Installed wheel has no LL native entry; rebuild and install the migrated package")
+    if args.clock_align and getattr(args, "clock_align_mode", "stream") == "graph":
+        clock_wait_table_contract(native)
     validate_native_cases(native, cases, world)
     control = None
     if args.group_backend == "tcpstore":
@@ -1597,6 +1778,13 @@ def worker(local_rank, args):
                     trace_call(case, "buffer.destroy", buffer.destroy)
                     buffer = None
         if rank == 0:
+            if args.clock_align and getattr(args, 'clock_align_mode', 'stream') == 'graph':
+                clock_note = ("one captured wait+Dispatch pair per iteration with the deadline table refreshed per "
+                              "replay; records prove every active AIV core waited")
+            elif args.clock_align:
+                clock_note = "fresh four-timestamp calibration and one device sleep-at before every measured call"
+            else:
+                clock_note = "fixed Exp100 before active profiler.step"
             report = {
                 "status": "completed",
                 "world_size": world,
@@ -1607,8 +1795,7 @@ def worker(local_rank, args):
                 "measurement": "torch_npu profiler kernel tasks; per-rank statistics and slowest rank mean",
                 "alignment": (
                     f"{sampling_protocol(args)}; one initial Host batch alignment; "
-                    + ("fresh four-timestamp calibration and one device sleep-at before every measured call"
-                       if args.clock_align else "fixed Exp100 before active profiler.step")
+                    + clock_note
                     + "; no per-iteration Host collective; Dispatch correctness validated after all repetitions"
                 ),
                 "host_coordination": args.group_backend,

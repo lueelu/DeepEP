@@ -234,6 +234,8 @@ master 地址、master 端口和 SHMEM endpoint 必须通过 CLI、JSON 或环�
 
 默认执行正确性和 kernel 测量。`--skip-perf-test` 只检查正确性；`--skip-check` 的结果标记为 `skipped`，不能作为精度通过证据。诊断选项 `--trace-ops` 会影响测量。计时与跨 rank 汇总口径见[性能说明](../docs/performance.md)。
 
+周期对齐有两条路径。`--clock-align` 默认走 `--clock-align-mode stream`，每个迭代前由 Host 入队一次 `sleep_at`，保持原有口径。`--clock-align-mode graph` 需要同时给出 `--dispatch-only` 和 `--do-cpu-sync 0`：先把每个迭代的 wait+Dispatch 捕获进一张 NPU graph，再按 `--clock-align-replays` 重放，每次重放前刷新 GM 死线表；验收读取最后一次重放的 per-core 记录（enter/release/batch/core），检查每个活动 AIV 核都已等待、无提前释放，并汇总跨 rank 的释放偏差与迟到。该模式不做 profiler 耗时测量，也不包含 SuperKernel 融合解析，结果写入 `clock_graph/.../clock_alignment.json`。
+
 ## 日志与结果
 
 HT 阶段日志的 `dispatch.enter/combine.enter` 包含 Host 准备和提交；`return` 只表示接口返回；`readback.done` 表示设备回读结束，随后 `precision.passed` 才表示比较通过。阶段间隔不是 kernel 耗时。
