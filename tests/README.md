@@ -244,8 +244,6 @@ capture 只登记操作、不执行，因此 records 在 capture 后必须仍是
 
 最后一次重放由 profiler 采样（replay 在 active step 内、`step()` 之前），从 `kernel_details.csv` 提取 Dispatch Duration 并校验 100 个 wait 与 100 个 Dispatch 交替出现，AOT 的 `dispatch_server_dedup_kernel` 与 JIT 的 `dispatch_jit` 都映射到同一逻辑 Dispatch；`--skip-perf-test` 关闭这次采样。`--clock-align-graph-exp-prefix 100` 在校准之后、fresh anchor 之前补上正式 Exp 前缀，原生验收保持 0。验收范围只到模型域：逐次偏差、传播后的两两误差界、holdout 残差与校准年龄都会写入 `clock_graph/.../clock_alignment.json`，不包含 SuperKernel 融合解析，也不据此声称物理首指令对齐。
 
-AOT/JIT 匹配比较使用 [ll_clock_benchmark.py](elastic/ll_clock_benchmark.py)：每版各跑一次（`--label aot|jit --report <json>`，内部固定 graph 模式、`--do-cpu-sync 0`、Exp 100），报告中记录 wheel 身份、公共模型模块 SHA256、等待 ABI 与全部采样条件；`--compare a.json b.json` 在任何一项不一致时拒绝给出差值，只比较同一协议下的最慢 rank tail50 均值与 P99。
-
 ## 日志与结果
 
 HT 阶段日志的 `dispatch.enter/combine.enter` 包含 Host 准备和提交；`return` 只表示接口返回；`readback.done` 表示设备回读结束，随后 `precision.passed` 才表示比较通过。阶段间隔不是 kernel 耗时。
