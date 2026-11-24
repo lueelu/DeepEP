@@ -198,6 +198,13 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     tuning_session_ = tuning && std::strcmp(tuning, "1") == 0;
     if (tuning_session_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
         throw std::invalid_argument("tuning session requires shared-Jetty peer scheduling and a fixed group size");
+    const char* qp_plans = std::getenv("DEEPEP_CLOS_QP_PLANS");
+    qp_plan_spec_ = qp_plans ? qp_plans : "";
+    if (!qp_plan_spec_.empty()) {
+        if (!(data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) || !shared_jetty_ || token_schedule_)
+            throw std::invalid_argument("QP reservations require shared-Jetty UDMA peer scheduling");
+        qp_reservation_ = ascend_deepep::udma::QpReservation(qp_plan_spec_, rank_, world_size_, ranks_per_group_);
+    }
 }
 
 std::vector<int64_t> ShmemInstance::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
@@ -227,9 +234,12 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
     using namespace ascend_deepep::udma;
     if (values.empty()) {
         const auto order = combine ? combine_peer_order_ : dispatch_peer_order_;
+        const auto p = order == kGroupRoundRobinOrder ? peers_per_group_per_worker_ : uint32_t(peers);
+        if (!qp_reservation_.Allows(order, p, workers_per_peer_, qps_per_worker_))
+            throw std::invalid_argument("UDMA launch uses QPs outside DEEPEP_CLOS_QP_PLANS; reserve all plans before Buffer initialization");
         return {order,
                 ranks_per_group_,
-                order == kGroupRoundRobinOrder ? peers_per_group_per_worker_ : uint32_t(peers),
+                p,
                 workers_per_peer_,
                 qps_per_worker_,
                 uint32_t(visit),
@@ -255,6 +265,8 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
     if (order == kGroupRoundRobinOrder &&
         (p > 4 || ((group + owners - 1) / owners) * (world_size_ / group) > kGroupPeerCapacity))
         throw std::invalid_argument("UDMA launch plan exceeds the round-robin peer table");
+    if (!qp_reservation_.Allows(order, p, w, q))
+        throw std::invalid_argument("UDMA launch uses QPs outside DEEPEP_CLOS_QP_PLANS; reserve all plans before Buffer initialization");
     return {uint32_t(order), uint32_t(group), uint32_t(p), uint32_t(w),
             uint32_t(q),     uint32_t(v),     copy,        uint32_t(weight)};
 }
@@ -431,7 +443,8 @@ void ShmemInstance::InitRuntime()
     config << "direct:" << device << ':' << rank_ << ':' << world_size_ << ':' << data_op_engine_type_ << ':'
            << shared_jetty_ << ':' << token_schedule_ << ':' << dispatch_peer_order_ << ':' << combine_peer_order_
            << ':' << ranks_per_group_ << ':' << peers_per_group_per_worker_ << ':' << workers_per_peer_ << ':'
-           << qps_per_worker_ << ':' << tuning_session_ << ':' << auto_resources_ << ':' << bootstrap_key_;
+           << qps_per_worker_ << ':' << tuning_session_ << ':' << auto_resources_ << ':' << bootstrap_key_
+           << ":qp_plans=" << qp_plan_spec_;
     const bool first = !deepep_has_instances();
     instance_id_ = deepep_reserve_instance(config.str().c_str());
     bool runtime_started = false;
@@ -460,6 +473,7 @@ void ShmemInstance::InitRuntime()
                     std::vector<uint64_t> masks(world_size_);
                     for (int peer = 0; peer < world_size_; ++peer)
                         masks[peer] =
+                            !qp_reservation_.Masks().empty() ? qp_reservation_.Masks()[peer] :
                             (tuning_session_ || auto_resources_)
                                 ? ascend_deepep::udma::TuningPeerMask(rank_, peer, world_size_, ranks_per_group_)
                             : token_schedule_ ? ascend_deepep::udma::TokenPeerMask(rank_, peer)

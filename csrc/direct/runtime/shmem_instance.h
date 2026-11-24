@@ -8,6 +8,7 @@
 #include <tuple>
 #include <vector>
 #include <torch/custom_class.h>
+#include "runtime/udma_qp_reservation.h"
 
 std::vector<int64_t> GetShmemUniqueId();
 std::tuple<int64_t, std::vector<int64_t>> GetShmemBootstrap(const std::string& key);
@@ -122,6 +123,8 @@ private:
     bool shared_jetty_;
     bool tuning_session_ = false;
     bool auto_resources_ = false;
+    std::string qp_plan_spec_;
+    ascend_deepep::udma::QpReservation qp_reservation_;
     bool token_schedule_;
     uint32_t dispatch_peer_order_ = 0;
     uint32_t combine_peer_order_ = 0;

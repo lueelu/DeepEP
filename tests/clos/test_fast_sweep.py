@@ -298,6 +298,7 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
         sweep.COMBINE_SELF_COPY_ENV: "0",
         sweep.COMBINE_AFTER_SUBMIT_ENV: "0",
         "DEEPEP_CLOS_TUNING_SESSION": "0",
+        sweep.QP_PLANS_ENV: "",
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -458,3 +459,118 @@ int main() {
             pytest.skip("compiled, but Windows application control blocked execution (4551)")
         raise
     assert "QP_UNION_OK" in result.stdout
+
+
+def test_qp_reservation_uses_all_operations_but_not_visit_or_copy_mode():
+    a = dict(order="rank", peers=8, workers=1, qps=1, visit=8)
+    b = dict(a, visit=32, self_copy_mode="parallel_self_copy")
+    c = dict(a, order="group_round_robin", peers=2, qps=2)
+    plans = [dict(operations={"cached_dispatch": [a, b], "combine_weighted": [c]})]
+    assert sweep.qp_plan_spec(plans) == "group_round_robin:2:1:2;rank:8:1:1"
+
+
+def test_exact_qp_reservation_matches_worker_assignment(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    harness = tmp_path / "reservation.cpp"
+    harness.write_text(r"""
+#include "runtime/udma_qp_reservation.h"
+#include <cassert>
+#include <iostream>
+using namespace ascend_deepep::udma;
+// These checks execute during compilation even when Windows blocks the EXE.
+constexpr bool pair_coverage(uint32_t world,uint32_t group,uint32_t order,uint32_t p,uint32_t lanes,
+                             uint32_t rank,uint32_t peer) {
+  uint64_t expected=rank==peer ? 0 : 1;
+  for (uint32_t src : {rank,peer})
+  for (uint32_t owner=0;owner<Workers(world,p,order,group);++owner)
+  for (uint32_t i=0;i<WorkerCount(src,world,owner,p,order,group);++i) {
+    const auto dst=WorkerPeer(src,world,owner,p,i,order,group);
+    if (dst==(src==rank ? peer : rank)) for(uint32_t lane=0;lane<lanes;++lane)
+      expected |= uint64_t{1}<<(owner*lanes+lane);
+  }
+  const auto actual=QpReservation::Mask(rank,peer,world,group,order,p,lanes);
+  return actual==expected && actual==QpReservation::Mask(peer,rank,world,group,order,p,lanes);
+}
+static_assert(pair_coverage(4,4,0,1,2,0,3));
+static_assert(pair_coverage(8,8,0,2,1,0,7));
+static_assert(pair_coverage(16,16,2,2,2,3,15));
+static_assert(pair_coverage(32,16,0,4,1,0,31));
+static_assert(pair_coverage(64,16,0,8,1,0,63));
+static_assert(pair_coverage(128,16,3,2,2,17,127));
+static_assert(pair_coverage(256,16,1,8,1,127,255));
+static_assert(pair_coverage(64,16,0,8,1,0,0));
+int main() {
+  for (uint32_t world : {4U,8U,16U,32U,64U,128U,256U}) {
+    const uint32_t group = world < 16 ? world : 16;
+    for (uint32_t order=0; order<4; ++order)
+    for (uint32_t p : {1U,2U,4U,8U})
+    for (uint32_t lanes : {1U,2U}) {
+      const auto owners=Workers(world,p,order,group);
+      if (owners*lanes>32 || (order==3 && (p>4 || ((group+owners-1)/owners)*(world/group)>64))) continue;
+      const char* names[]={"rank","group","group_staggered","group_round_robin"};
+      const auto spec=std::string(names[order])+":"+std::to_string(p)+":1:"+std::to_string(lanes);
+      std::vector<QpReservation> reservations;
+      for (uint32_t rank=0; rank<world; ++rank) reservations.emplace_back(spec,rank,world,group);
+      for (uint32_t rank=0; rank<world; ++rank) {
+        std::vector<uint64_t> expected(world,1); expected[rank]=0;
+        // Oracle enumerates real sender assignments at BOTH ends. It does not
+        // reconstruct masks with Owner(), the function used by the reservation.
+        for (uint32_t src=0; src<world; ++src)
+        for (uint32_t owner=0; owner<owners; ++owner)
+        for (uint32_t i=0; i<WorkerCount(src,world,owner,p,order,group); ++i) {
+          const auto dst=WorkerPeer(src,world,owner,p,i,order,group);
+          if (src==rank || dst==rank) for (uint32_t lane=0; lane<lanes; ++lane)
+            expected[src==rank ? dst : src] |= uint64_t{1}<<(owner*lanes+lane);
+        }
+        assert(reservations[rank].Masks()==expected);
+        assert(reservations[rank].Allows(order,p,1,lanes));
+        assert(reservations[rank].Allows(order,p,lanes,1));
+        for (uint32_t peer=0; peer<world; ++peer) {
+          assert(expected[peer]==reservations[peer].Masks()[rank]);
+          assert((expected[peer]&~TuningPeerMask(rank,peer,world,group))==0);
+        }
+      }
+    }
+  }
+  const QpReservation narrow("rank:8:1:1",0,64,16);
+  assert(!narrow.Allows(0,4,1,1));
+  assert(!narrow.Allows(0,8,1,2));
+  const QpReservation both("rank:8:1:1;rank:4:1:1",0,64,16);
+  assert(both.Allows(0,8,1,1) && both.Allows(0,4,1,1));
+  for (const auto* bad : {"rank:0:1:1","rank:8:2:2","rank:8:1:1;","rank:8:1", "rank:8:1:1:1", "rank:-1:1:1", "unknown:8:1:1", ";"}) {
+    bool rejected=false;
+    try { QpReservation unused(bad,0,64,16); } catch (const std::invalid_argument&) { rejected=true; }
+    assert(rejected);
+  }
+  assert(QpReservation().Masks().empty());
+  assert(QpReservation().Allows(3,4,2,1));
+  for (uint32_t world : {32U,64U}) {
+    QpReservation r(world==32 ? "rank:4:1:1" : "rank:8:1:1",0,world,16);
+    uint32_t before=0,after=0;
+    for (uint32_t peer=0;peer<world;++peer) for (uint32_t bit=0;bit<32;++bit) {
+      before+=(TuningPeerMask(0,peer,world,16)>>bit)&1;
+      after+=(r.Masks()[peer]>>bit)&1;
+    }
+    assert(after<before);
+    std::cout << "EP" << world << " peer-QP entries " << before << " -> " << after << '\n';
+  }
+  std::cout << "QP_RESERVATION_OK\n";
+}
+""")
+    binary = tmp_path / "reservation.exe"
+    subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-UNDEBUG", "-I" + str(ROOT / "csrc/direct"), str(harness), "-o", str(binary)],
+        check=True,
+        capture_output=True,
+        timeout=90,
+    )
+    try:
+        result = subprocess.run([str(binary)], capture_output=True, text=True, check=True, timeout=90)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
+    assert "QP_RESERVATION_OK" in result.stdout
+    print(result.stdout)

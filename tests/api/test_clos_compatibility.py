@@ -49,6 +49,33 @@ def test_multi_buffer_bootstrap_uses_fresh_uid_and_capacity_independent_identity
     """)
 
 
+def test_qp_reservation_participates_in_rank_consensus_and_buffer_identity():
+    run_host("""
+        import os
+        from deep_ep.backends.direct import buffer
+        buffer.load_native_module = lambda: SimpleNamespace(get_shmem_bootstrap=lambda key: (0, []))
+        buffer._bootstrap_all_gather = lambda group, comm, size, value: [value] * size
+        group = object()
+        def prepare():
+            return buffer._prepare_shmem_bootstrap(group, None, 0, 2, 64<<20, 'udma', False, 'tcp://host:123')
+        os.environ.pop('DEEPEP_CLOS_QP_PLANS', None)
+        original = prepare()[1]
+        os.environ['DEEPEP_CLOS_QP_PLANS'] = 'rank:8:1:1'
+        reserved = prepare()[1]
+        assert original != reserved and prepare()[1] == reserved
+        def mismatched(group, comm, size, value):
+            options, state, uid = value
+            return [value, (options[:-1], state, uid)]
+        buffer._bootstrap_all_gather = mismatched
+        try:
+            prepare()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('QP reservation mismatch was accepted')
+    """)
+
+
 @pytest.mark.parametrize("peer_state", [-1, 7])
 def test_multi_buffer_bootstrap_rejects_incompatible_or_divergent_ids_before_uid(peer_state):
     run_host(f"""
@@ -1225,6 +1252,12 @@ struct ShmemInstance {
     bool auto_resources_=true;
     uint32_t dispatch_peer_order_=0, combine_peer_order_=0, peers_per_group_per_worker_=1;
     uint32_t workers_per_peer_=1, qps_per_worker_=1;
+    // Reservation construction is tested separately. Exercise both outcomes
+    // here while keeping the extracted native launch guards constexpr.
+    struct Reservation {
+        bool allowed=true;
+        constexpr bool Allows(uint32_t,uint32_t,uint32_t,uint32_t) const { return allowed; }
+    } qp_reservation_;
     // PLAN_TYPE
     // BODY
 };
@@ -1263,6 +1296,16 @@ constexpr bool resources() {
     return true;
 }
 static_assert(resources());
+constexpr bool unreserved() {
+    ShmemInstance instance{8,8};
+    instance.qp_reservation_.allowed=false;
+    const std::array<int64_t,9> plan{1,0,8,1,1,1,32,2,0};
+    return instance.ResolveLaunch(plan,false,1,32,8).order==UINT32_MAX &&
+           instance.ResolveLaunch(plan,true,1,32,8).order==UINT32_MAX &&
+           instance.ResolveLaunch(std::array<int64_t,0>{},false,2,16,8).order==UINT32_MAX &&
+           instance.ResolveLaunch(std::array<int64_t,0>{},true,2,16,8).order==UINT32_MAX;
+}
+static_assert(unreserved());
 // CASES
 """
     checks = "\n".join(

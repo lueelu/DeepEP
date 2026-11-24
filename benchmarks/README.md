@@ -5,6 +5,19 @@ Modified by Joyce_An 2026
 
 # EP benchmark 工具
 
+## Clos 单次初始化摸测
+
+`clos/bench_fast_sweep.py` 在候选策略过滤完成后，自动将本次所有算子（包括准备 handle 的 fresh dispatch）的 QP 映射并集传给 SHMEM，每个进程只初始化一个 Buffer。`--plan-only` 和输出 `plan.json` 中的 `qp_plans` 记录建链范围；`BUFFER_READY` 记录初始化耗时。visit 不改变 QP 映射，固定 P/W/Q 的 visit 扫描不会额外预建其他策略的连接。此脚本仍是性能摸测入口，**不做精度验证**。
+
+其他固定策略脚本可在创建 Buffer 前设置，例如 EP64、rank/P8/W1/Q1：
+
+```bash
+export DEEPEP_CLOS_QP_PLANS='rank:8:1:1'
+# 同一 Buffer 如还要测试 P4，使用 'rank:8:1:1;rank:4:1:1'
+```
+
+格式为 `order:P:W:Q`，多组用分号分隔；order 支持 `rank/group/group_staggered/group_round_robin`，沿用 Buffer 的固定 G。必须包含 dispatch、cached dispatch、combine 和准备阶段实际会用到的 QP。所有 rank 必须配置一致；初始化后不可扩大范围，超出已建链范围的调用会在提交 kernel 前报错。多 Buffer 复用也会校验配置一致。未设置时保留原有完整候选范围。该选项仅支持全 Clos shared-Jetty UDMA peer 路径，不修改发送策略、QP 编号、visit、权重方式或大页设置。须使用当前 lock 指定的 SHMEM，重编 Host，并在设备上验证初始化和算子精度；连接数量减少不等同于已测得初始化加速。
+
 通用入口提供配置检查、确定性负载规划和 JSON/CSV 结果协议。当前支持无设备 dry-run；native 测量适配器未接入，非 dry-run 返回非零，不以模拟时间代替通信测量。
 
 HT 和 LL 有独立的设备正确性与 kernel 测量入口，运行方式见[测试说明](../tests/README.md)，统计口径见[性能说明](../docs/performance.md)。
