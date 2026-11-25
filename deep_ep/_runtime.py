@@ -257,7 +257,7 @@ class Runtime:
             self.notify_lock = threading.RLock()
             self.notify_failed = False
             self.notify_inflight = None
-            self.stream = npu.Stream(device=self.device)
+            self.stream = npu.current_stream(self.device) if self._megamoe_train else npu.Stream(device=self.device)
             self.native = (
                 native.create_combine_runtime(
                     rank, size, capacity, address, timeout, bootstrap == "mpi", use_1g_huge_pages, uid

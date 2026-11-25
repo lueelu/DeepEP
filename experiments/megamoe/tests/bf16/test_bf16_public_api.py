@@ -4,7 +4,6 @@
 
 """Unified BF16 bridge: real autograd with a CPU native Plan double."""
 
-import contextlib
 import importlib
 import inspect
 import threading
@@ -21,13 +20,7 @@ def buffer(monkeypatch):
     calls, plans = [], []
     stream = SimpleNamespace(wait_stream=lambda other: None)
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda *a: None)
-    monkeypatch.setattr(
-        bf16,
-        "npu_api",
-        lambda: SimpleNamespace(current_stream=lambda *a: stream, stream=lambda *a: contextlib.nullcontext()),
-    )
-    auto = importlib.import_module("deep_ep_experimental.megamoe._autograd")
-    monkeypatch.setattr(auto, "npu_api", bf16.npu_api)
+    monkeypatch.setattr(api, "npu_api", lambda: SimpleNamespace(current_stream=lambda device: stream))
 
     class Plan:
         def __init__(self, *args):
@@ -76,15 +69,12 @@ def buffer(monkeypatch):
     b.gmm1_save_type = "bf16"
     b.mma_type = "bf16xbf16"
     b._plan = b._plan_key = b._plan_bs = None
-    b._runtime = SimpleNamespace(
-        closed=True,
-        ensure_alive=lambda: None,
-        native=SimpleNamespace(capacity=2 << 20),
-        rank=0,
-        world_size=2,
-        device=0,
-        stream=stream,
-    )
+    b._runtime = object.__new__(api._MegaRuntime)
+    b._runtime.closed = True
+    b._runtime.ensure_alive = lambda: None
+    b._runtime.native = SimpleNamespace(capacity=2 << 20)
+    b._runtime.rank, b._runtime.world_size = 0, 2
+    b._runtime.device, b._runtime.stream = 0, stream
     return b, calls, plans
 
 
@@ -121,6 +111,24 @@ def test_public_signature_and_export():
     ]
     package = importlib.import_module("deep_ep_experimental.megamoe")
     assert package.bf16_mega_moe is api.bf16_mega_moe
+
+
+def test_bf16_waits_only_when_caller_changes_stream(buffer, monkeypatch):
+    b, _, _ = buffer
+    waits = []
+    first = b._runtime.stream
+    first.wait_stream = lambda previous: waits.append((first, previous))
+    second = SimpleNamespace(wait_stream=lambda previous: waits.append((second, previous)))
+    current = first
+    monkeypatch.setattr(api, "npu_api", lambda: SimpleNamespace(current_stream=lambda device: current))
+    _, _, w1, w2 = inputs(b)
+    y = call(b, w1, w2)
+    current = second
+    call(b, w1, w2)
+    call(b, w1, w2)
+    current = first
+    y.sum().backward()
+    assert waits == [(second, first), (first, second)]
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -205,7 +213,6 @@ def test_forward_and_prepare_validate_routing_inputs_once(buffer, monkeypatch):
             raise ValueError(error)
 
     monkeypatch.setattr(api, "collective_check", check)
-    monkeypatch.setattr(api, "npu_api", bf16.npu_api)
     b.prepare(3)
     call(b, w1, w2)
     assert checked == [3, 3]

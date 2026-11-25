@@ -44,6 +44,15 @@ class _MegaRuntime(Runtime):
         self._megamoe_train = bf16
         super().__init__(group, capacity, timeout, debug_collectives=debug_collectives, **kwargs)
 
+    def use_bf16_caller_stream(self):
+        # The buffer lock orders submissions on the host. Order the shared SHMEM window
+        # on the device as well when successive BF16 calls use different streams.
+        caller = npu_api().current_stream(self.device)
+        if caller != self.stream:
+            caller.wait_stream(self.stream)
+            self.stream = caller
+        return caller
+
 
 def _pair(value, name):
     if not isinstance(value, tuple) or len(value) != 2:
@@ -272,9 +281,13 @@ class SymmBuffer:
             collective_check(self.group, "prepare", error, bs)
             try:
                 runtime = self._runtime
-                runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
-                with npu_api().stream(runtime.stream):
+                if self.mma_type == "bf16xbf16":
+                    runtime.use_bf16_caller_stream()
                     self._prepare(bs)
+                else:
+                    runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
+                    with npu_api().stream(runtime.stream):
+                        self._prepare(bs)
             except Exception as failure:
                 error = str(failure)
             collective_check(self.group, f"prepare BS={bs}", error)

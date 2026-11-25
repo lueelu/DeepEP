@@ -109,8 +109,13 @@ def main():
     expected = [backward(i, forward(op, i)) for i in range(len(batches))]
     assert not torch.equal(expected[0]["dw1"], expected[1]["dw1"]), "same-plan microbatches must be distinguishable"
     pending = [forward(op, i) for i in range(len(batches))]
+    # Reuse the same Plan on a second stream, including its context and workspace.
+    last = len(pending) - 1
+    plan = op._plan
     with torch.npu.stream(torch.npu.Stream()):
-        check(0, backward(0, forward(op)), expected[0])
+        replay = forward(op, last)
+        assert op._plan is plan
+        check(last, backward(last, replay), expected[last])
     for i in reversed(range(len(pending))):
         check(i, backward(i, pending.pop()), expected[i])
 

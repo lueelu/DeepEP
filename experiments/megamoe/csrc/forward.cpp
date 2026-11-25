@@ -261,8 +261,12 @@ ForwardResult BF16Plan::forward(torch::Tensor out, torch::Tensor x, torch::Tenso
     for (const auto* tensor : {&x, &topkIds, &topkWeights, &weight1, &weight2, &out}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
-    RecordIfForeign(context);
-    RecordIfForeign(workspace_);
+    if (stream.unwrap() != context_stream_) {
+        c10_npu::NPUCachingAllocator::recordStream(context.storage().data_ptr(), stream);
+    }
+    if (stream.unwrap() != workspace_stream_) {
+        c10_npu::NPUCachingAllocator::recordStream(workspace_.storage().data_ptr(), stream);
+    }
     if (weight_before_gmm2_) {
         RememberAllocation(routingState);
         if (dispatchOutput.defined()) RememberAllocation(dispatchOutput);

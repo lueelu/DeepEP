@@ -11,7 +11,7 @@ import math
 import torch
 from ._autograd import BF16Function
 
-from deep_ep._native import npu_api, require_native
+from deep_ep._native import require_native
 from deep_ep._runtime import integer
 
 
@@ -136,23 +136,18 @@ def run(y, w1, w2, b, shared_w1, shared_w2, stats, activation, clamp, fast_math)
     with b._lock:
         runtime = b._runtime
         runtime.ensure_alive()
-        caller = npu_api().current_stream(runtime.device)
-        runtime.stream.wait_stream(caller)
-        with npu_api().stream(runtime.stream):
-            plan = prepare_plan(b, bs, limit, mode)
-            if gradients:
-                result_y, counts = BF16Function.apply(b, plan, config, x, ids, p, w1, w2, y)
-            else:
-                capture = getattr(b, "_timer_capture", None)
-                if capture is not None:
-                    capture.claim()
-                result = plan.forward(y, x, ids, p, w1, w2, config.max_recv, limit, mode, capture is not None, False)
-                if capture is not None:
-                    capture.forward = result.timer
-                result_y, counts = result.y, result.counts
-            if stats is not None:
-                stats.add_(counts)
-                stats.record_stream(runtime.stream)
-        caller.wait_stream(runtime.stream)
-        if caller != runtime.stream:
-            result_y.record_stream(caller)
+        caller = runtime.use_bf16_caller_stream()
+        plan = prepare_plan(b, bs, limit, mode)
+        if gradients:
+            _, counts = BF16Function.apply(b, plan, config, x, ids, p, w1, w2, y)
+        else:
+            capture = getattr(b, "_timer_capture", None)
+            if capture is not None:
+                capture.claim()
+            result = plan.forward(y, x, ids, p, w1, w2, config.max_recv, limit, mode, capture is not None, False)
+            if capture is not None:
+                capture.forward = result.timer
+            counts = result.counts
+        if stats is not None:
+            stats.add_(counts)
+            stats.record_stream(caller)

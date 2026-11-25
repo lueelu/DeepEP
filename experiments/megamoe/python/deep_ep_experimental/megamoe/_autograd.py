@@ -6,7 +6,6 @@
 
 import torch
 from torch.autograd.function import once_differentiable
-from deep_ep._native import npu_api
 
 
 class BF16Function(torch.autograd.Function):
@@ -50,33 +49,27 @@ class BF16Function(torch.autograd.Function):
         runtime = b._runtime
         with b._lock:
             runtime.ensure_alive()
-            caller = npu_api().current_stream(runtime.device)
             if dispatched is None:
                 dispatched = ctx.rebuild_dispatch()
-            runtime.stream.wait_stream(caller)
-            with npu_api().stream(runtime.stream):
-                if capture is not None:
-                    capture.begin_backward()
-                contiguous_dy = dy.contiguous()
-                if contiguous_dy is not dy:
-                    dy.record_stream(runtime.stream)
-                result = ctx.plan.backward(
-                    contiguous_dy,
-                    p,
-                    w1,
-                    w2,
-                    counts,
-                    saved,
-                    dispatched,
-                    config.max_recv,
-                    config.limit,
-                    config.save_type,
-                    capture is not None,
-                )
-                if capture is not None:
-                    capture.backward = result.timer
-            caller.wait_stream(runtime.stream)
-            if caller != runtime.stream:
-                for t in (result.dx, result.dtopk_weights, result.dw1, result.dw2):
-                    t.record_stream(caller)
+            caller = runtime.use_bf16_caller_stream()
+            if capture is not None:
+                capture.begin_backward()
+            contiguous_dy = dy.contiguous()
+            if contiguous_dy is not dy:
+                dy.record_stream(caller)
+            result = ctx.plan.backward(
+                contiguous_dy,
+                p,
+                w1,
+                w2,
+                counts,
+                saved,
+                dispatched,
+                config.max_recv,
+                config.limit,
+                config.save_type,
+                capture is not None,
+            )
+            if capture is not None:
+                capture.backward = result.timer
         return None, None, None, result.dx, None, result.dtopk_weights, result.dw1, result.dw2, None

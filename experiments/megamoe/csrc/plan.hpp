@@ -136,6 +136,8 @@ private:
     uint64_t ffts_addr_;
     torch::Tensor context_;
     torch::Tensor workspace_;
+    c10::optional<c10::Stream> context_stream_;
+    c10::optional<c10::Stream> workspace_stream_;
     bool weight_before_gmm2_;
 
     int context_rank_ = -1;

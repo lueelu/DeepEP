@@ -356,7 +356,7 @@ void BF16Plan::prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t lo
                 "forward workspace capacity");
 
     auto workspace = AllocateForwardTransientWorkspace(context_, tiling);
-    RememberAllocation(workspace);
+    workspace_stream_ = c10_npu::getCurrentNPUStream(workspace.get_device()).unwrap();
     tiling_ = tiling;
     workspace_ = std::move(workspace);
 }
@@ -405,6 +405,8 @@ void BF16Plan::close()
     address_ = 0;
     context_ = torch::Tensor();
     workspace_ = torch::Tensor();
+    context_stream_.reset();
+    workspace_stream_.reset();
 }
 
 torch::Tensor BF16Plan::Context(const torch::Tensor& like)
@@ -423,7 +425,7 @@ torch::Tensor BF16Plan::Context(const torch::Tensor& like)
         // Publish the persistent state only after initialization succeeds.
         // A failed first call must remain retryable instead of leaving a
         // defined but partially initialized context behind.
-        RememberAllocation(new_context);
+        context_stream_ = c10_npu::getCurrentNPUStream(new_context.get_device()).unwrap();
         context_ = new_context;
         context_rank_ = rank;
         context_world_size_ = world_size;

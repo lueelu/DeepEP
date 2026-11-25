@@ -148,8 +148,10 @@ BackwardResult BF16Plan::backward(torch::Tensor gradY, torch::Tensor topkWeights
     for (const auto* tensor : {&gradY, &topkWeights, &weight1, &weight2}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
+    if (stream.unwrap() != context_stream_) {
+        c10_npu::NPUCachingAllocator::recordStream(context.storage().data_ptr(), stream);
+    }
     // Rebuilt dispatch and hook-restored storage can belong to a different stream.
-    RecordIfForeign(context);
     RecordIfForeign(trainingSavedState);
     RecordIfForeign(dispatchOutput);
     return {gradX, gradTopkWeights, gradWeight1, gradWeight2, timer};
