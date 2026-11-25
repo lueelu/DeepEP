@@ -222,6 +222,58 @@ def test_events_do_not_load_native_extension(event_backend, monkeypatch):
     events.EventOverlap(events.EventHandle()).current_stream_wait()
 
 
+@pytest.mark.parametrize("consume_outputs", [True, False])
+def test_selected_consumers_preserve_producer_protection_and_ownership(event_backend, monkeypatch, consume_outputs):
+    import gc
+    import weakref
+
+    from deep_ep.backends.direct import elastic
+
+    log, npu = event_backend
+
+    class Tensor:
+        device = SimpleNamespace(type="npu", index=0)
+
+        def __init__(self, name):
+            self.name = name
+
+        def record_stream(self, stream):
+            log.append((self.name, stream))
+            if stream == "broken-consumer":
+                raise RuntimeError("registration failed")
+
+    class Owner:
+        pass
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(Tensor=Tensor))
+    producer = SimpleNamespace(device=0)
+    instance = elastic.ElasticBuffer.__new__(elastic.ElasticBuffer)
+    instance._communication_stream = producer
+    output, plan, source, owner = Tensor("output"), Tensor("plan"), Tensor("source"), Owner()
+    refs = [weakref.ref(value) for value in (output, plan, source, owner)]
+    overlap = instance._finish_comm_event(
+        True, (output, plan, source, owner), consumer_tensors=(output,) if consume_outputs else ()
+    )
+    assert log == [("record", producer), ("output", producer), ("plan", producer), ("source", producer)]
+    del output, plan, source, owner
+    gc.collect()
+    assert all(ref() is not None for ref in refs)
+
+    if consume_outputs:
+        npu.current_stream = lambda device: "broken-consumer"
+        with pytest.raises(RuntimeError, match="registration failed"):
+            overlap.current_stream_wait(release_handle=True)
+        assert overlap.event is not None and all(ref() is not None for ref in refs)
+
+    for stream in ("consumer-one", "consumer-two"):
+        npu.current_stream = lambda device, current=stream: current
+        begin = len(log)
+        overlap.current_stream_wait(release_handle=stream == "consumer-two")
+        assert log[begin:] == [("wait", stream)] + ([("output", stream)] if consume_outputs else [])
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
 @pytest.mark.parametrize("value", [None, -1, 0, True, 1.5, 2**63])
 def test_capacity_rejection(value):
     with pytest.raises(ValueError):

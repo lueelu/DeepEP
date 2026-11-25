@@ -1009,9 +1009,6 @@ class ElasticBuffer:
             if not cached_mode:
                 handle_topk_idx = resolved_topk_idx.clone() if do_handle_copy else resolved_topk_idx
 
-        # The communication-stream context has exited. Reuse caller streams
-        # across the registration batches below, only for this dispatch call.
-        output_streams = {}
         if not cached_mode:
             handle = EPHandle(
                 do_expand,
@@ -1031,7 +1028,6 @@ class ElasticBuffer:
                 None,
                 None,
             )
-            _record_recv_outputs_on_current_stream(*public_handle, streams=output_streams)
             handle._buffer_token = self._handle_token
             handle._buffer_owner = self
             handle._udma_policy = policy
@@ -1039,14 +1035,12 @@ class ElasticBuffer:
             handle._dispatch_plan = dispatch_plan
             handle._expand_layout = expand_layout
             handle._single_source_slots = single_source_slots
-            _record_recv_outputs_on_current_stream(single_source_slots, streams=output_streams)
-            _record_recv_outputs_on_current_stream(handle.topk_idx, *dispatch_layout, streams=output_streams)
-            if expand_layout is not None:
-                _record_recv_outputs_on_current_stream(*expand_layout[:3], streams=output_streams)
 
-        _record_recv_outputs_on_current_stream(
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, dispatch_plan, streams=output_streams
-        )
+        # Only returned data is registered on the caller/consumer stream.
+        # Handle metadata remains owned and protected for communication-stream use.
+        # Expert counts are a Python list; FP8 scales are part of returned recv_x.
+        consumer_tensors = (recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights)
+        _record_recv_outputs_on_current_stream(*consumer_tensors)
 
         if x_scales is not None:
             recv_x = (recv_x, recv_x_scales)
@@ -1063,6 +1057,7 @@ class ElasticBuffer:
                 topk_weights,
                 handle,
             ),
+            consumer_tensors=consumer_tensors,
         )
         if host_timing is not None:
             host_timing.end_dispatch_host_timing()
@@ -1243,10 +1238,18 @@ class ElasticBuffer:
         )
         return combined_x, combined_topk_weights, event
 
-    def _finish_comm_event(self, async_with_compute_stream: bool, extra_tensors: Tuple[Any, ...]) -> EventOverlap:
+    def _finish_comm_event(
+        self,
+        async_with_compute_stream: bool,
+        extra_tensors: Tuple[Any, ...],
+        *,
+        consumer_tensors: Optional[Tuple[Any, ...]] = None,
+    ) -> EventOverlap:
         event = _try_record_event(self._communication_stream)
         if async_with_compute_stream:
-            return EventOverlap._from_resources(event, _compact_extra_tensors(extra_tensors))
+            return EventOverlap._from_resources(
+                event, _compact_extra_tensors(extra_tensors), consumer_tensors=consumer_tensors
+            )
         event.current_stream_wait()
         return EventOverlap()
 
