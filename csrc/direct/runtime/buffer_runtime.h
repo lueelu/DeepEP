@@ -66,6 +66,19 @@ public:
         torch::Tensor topk_idx, int64_t num_experts, int64_t num_aiv,
         c10::optional<int64_t> allocation_stream_id = c10::nullopt);
 
+    using FreshDispatchHostResult =
+        std::tuple<std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
+                              c10::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,
+                              torch::Tensor, torch::Tensor, torch::Tensor, c10::optional<torch::Tensor>>,
+                   std::vector<torch::Tensor>, torch::Tensor>;
+    FreshDispatchHostResult IntranodeDispatchFromTopk(
+        torch::Tensor x, c10::optional<torch::Tensor> x_scales, torch::Tensor topk_idx,
+        c10::optional<torch::Tensor> topk_weights, int64_t num_experts, int64_t expert_alignment,
+        int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
+        int64_t num_max_nvl_chunked_recv_tokens, c10::optional<int64_t> allocation_stream_id,
+        c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
+        bool defer_public_expert_prefix, const std::vector<int64_t>& launch_plan, bool simt_layout);
+
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
                std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     IntranodeDispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<torch::Tensor> topk_idx,
@@ -82,21 +95,18 @@ public:
     std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
                std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                c10::optional<torch::Tensor>>
-    IntranodeDispatchWithPlan(torch::Tensor x, c10::optional<torch::Tensor> x_scales,
-                              c10::optional<torch::Tensor> topk_idx, c10::optional<torch::Tensor> topk_weights,
-                              c10::optional<torch::Tensor> num_tokens_per_rank, torch::Tensor is_token_in_rank,
-                              c10::optional<torch::Tensor> num_tokens_per_expert, int64_t cached_num_recv_tokens,
-                              c10::optional<torch::Tensor> cached_rank_prefix_matrix,
-                              c10::optional<torch::Tensor> cached_channel_prefix_matrix, int64_t expert_alignment,
-                              int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
-                              int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy,
-                              c10::optional<int64_t> allocation_stream_id = c10::nullopt,
-                              c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt,
-                              int64_t udma_peers_per_worker = 4, int64_t udma_wqes_per_visit = 8,
-                              c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt,
-                              const std::vector<int64_t>& launch_plan = {},
-                              c10::optional<torch::Tensor> cached_send_head = c10::nullopt,
-                              bool allow_omit_topk_output = false);
+    IntranodeDispatchWithPlan(
+        torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<torch::Tensor> topk_idx,
+        c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> num_tokens_per_rank,
+        torch::Tensor is_token_in_rank, c10::optional<torch::Tensor> num_tokens_per_expert,
+        int64_t cached_num_recv_tokens, c10::optional<torch::Tensor> cached_rank_prefix_matrix,
+        c10::optional<torch::Tensor> cached_channel_prefix_matrix, int64_t expert_alignment, int64_t num_worst_tokens,
+        int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
+        bool zero_copy, c10::optional<int64_t> allocation_stream_id = c10::nullopt,
+        c10::optional<int64_t> num_max_tokens_per_rank = c10::nullopt, int64_t udma_peers_per_worker = 4,
+        int64_t udma_wqes_per_visit = 8, c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt,
+        const std::vector<int64_t>& launch_plan = {}, c10::optional<torch::Tensor> cached_send_head = c10::nullopt,
+        bool allow_omit_topk_output = false);
 
     std::tuple<std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
                           c10::optional<torch::Tensor>, std::vector<int64_t>, torch::Tensor, torch::Tensor,

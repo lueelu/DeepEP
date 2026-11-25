@@ -104,7 +104,8 @@ static auto buffer_runtime_registry =
               torch::arg("udma_wqes_per_visit") = 8,
               torch::arg("cached_dispatch_plan") = c10::IValue(),
               torch::arg("launch_plan") = std::vector<int64_t>{},
-              torch::arg("cached_send_head") = c10::IValue(), torch::arg("allow_omit_topk_output") = false})
+              torch::arg("cached_send_head") = c10::IValue(),
+              torch::arg("allow_omit_topk_output") = false})
         .def("intranode_dispatch_with_handle", &BufferRuntime::IntranodeDispatchWithHandle, "",
              {torch::arg("x"),
               torch::arg("x_scales"),
@@ -129,6 +130,14 @@ static auto buffer_runtime_registry =
               torch::arg("cached_dispatch_plan") = c10::IValue(),
               torch::arg("defer_public_expert_prefix") = false,
               torch::arg("launch_plan") = std::vector<int64_t>{}})
+        .def("intranode_dispatch_from_topk", &BufferRuntime::IntranodeDispatchFromTopk, "",
+             {torch::arg("x"), torch::arg("x_scales"), torch::arg("topk_idx"), torch::arg("topk_weights"),
+              torch::arg("num_experts"), torch::arg("expert_alignment"), torch::arg("num_worst_tokens"),
+              torch::arg("num_aiv"), torch::arg("num_max_nvl_chunked_send_tokens"),
+              torch::arg("num_max_nvl_chunked_recv_tokens"), torch::arg("allocation_stream_id"),
+              torch::arg("num_max_tokens_per_rank"), torch::arg("udma_peers_per_worker"),
+              torch::arg("udma_wqes_per_visit"), torch::arg("defer_public_expert_prefix"), torch::arg("launch_plan"),
+              torch::arg("simt_layout")})
         .def("intranode_combine", &BufferRuntime::IntranodeCombine, "",
              {torch::arg("x"), torch::arg("topk_weights"), torch::arg("bias_0"), torch::arg("bias_1"),
               torch::arg("src_idx"), torch::arg("rank_prefix_matrix"), torch::arg("channel_prefix_matrix"),

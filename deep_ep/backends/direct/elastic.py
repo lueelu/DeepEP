@@ -809,6 +809,11 @@ class ElasticBuffer:
         )
         if simt_layout not in ("0", "1"):
             raise ValueError("DEEPEP_CLOS_V2_SIMT_LAYOUT must be 0 or 1")
+        host_entry_option = os.environ.get("DEEPEP_CLOS_DISPATCH_HOST_ENTRY", "1")
+        if host_entry_option not in ("0", "1"):
+            raise ValueError("DEEPEP_CLOS_DISPATCH_HOST_ENTRY must be 0 or 1")
+        # Older wheels keep the existing two-entry path. Rebuilt wheels default
+        # to one Host entry; the explicit zero is an identical-build A/B control.
         if simt_layout == "1" and fused_layout == "1":
             raise ValueError("V2 SIMT layout requires separate layout/notify")
         host_prep = os.environ.get("DEEPEP_CLOS_NOTIFY_HOST_PREP", "0") if not cached_mode else "0"
@@ -826,6 +831,12 @@ class ElasticBuffer:
             allocation_stream = self._communication_stream if allocate_on_comm_stream else _current_npu_stream()
         dependency = previous_event or _try_record_event(None)
         with _use_stream_after_event(self._communication_stream, dependency):
+            host_entry = (
+                not cached_mode
+                and fused_layout == "0"
+                and host_entry_option == "1"
+                and getattr(load_native_module(), "dispatch_host_entry_version", 0) == 1
+            )
             if cached_mode:
                 dispatch_layout = handle._dispatch_layout
                 rank_prefix_matrix, channel_prefix_matrix, _, _, is_token_in_rank, _ = dispatch_layout
@@ -866,6 +877,10 @@ class ElasticBuffer:
                             is_token_in_rank = torch.empty(
                                 (x_tensor.shape[0], self.num_ranks), device=x_tensor.device, dtype=torch.bool
                             )
+                elif host_entry:
+                    # Allocate and launch layout inside the following native
+                    # fresh-dispatch call, keeping intermediate tensors native.
+                    num_tokens_per_rank = num_tokens_per_expert = is_token_in_rank = None
                 elif simt_layout == "1":
                     if getattr(load_native_module(), "v2_simt_layout_version", 0) != 1:
                         raise RuntimeError("rebuild host and kernels for V2 SIMT layout")
@@ -891,29 +906,30 @@ class ElasticBuffer:
                 udma_peers_per_worker=policy.peers_per_worker if policy else self._udma_config.udma_peers_per_worker,
                 udma_wqes_per_visit=policy.wqes_per_visit if policy else self._udma_config.udma_wqes_per_visit,
             )
-            dispatch_args = (
-                x_tensor,
-                x_scales,
-                kernel_topk_idx,
-                topk_weights,
-                num_tokens_per_rank,
-                is_token_in_rank,
-                num_tokens_per_expert,
-                handle.num_recv_tokens if cached_mode else 0,
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                resolved_alignment,
-                0 if cached_mode or resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
-                config.num_aiv,
-                config.num_max_nvl_chunked_send_tokens,
-                config.num_max_nvl_chunked_recv_tokens,
-                False,
-                allocation_stream_id,
-                resolved_capacity,
-                config.udma_peers_per_worker,
-                config.udma_wqes_per_visit,
-                handle._dispatch_plan if cached_mode else None,
-            )
+            if not host_entry:
+                dispatch_args = (
+                    x_tensor,
+                    x_scales,
+                    kernel_topk_idx,
+                    topk_weights,
+                    num_tokens_per_rank,
+                    is_token_in_rank,
+                    num_tokens_per_expert,
+                    handle.num_recv_tokens if cached_mode else 0,
+                    rank_prefix_matrix,
+                    channel_prefix_matrix,
+                    resolved_alignment,
+                    0 if cached_mode or resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
+                    config.num_aiv,
+                    config.num_max_nvl_chunked_send_tokens,
+                    config.num_max_nvl_chunked_recv_tokens,
+                    False,
+                    allocation_stream_id,
+                    resolved_capacity,
+                    config.udma_peers_per_worker,
+                    config.udma_wqes_per_visit,
+                    handle._dispatch_plan if cached_mode else None,
+                )
             if cached_mode:
                 metadata_options = topk_weights is not None and any(
                     os.environ.get(name, "1") == "1"
@@ -928,6 +944,26 @@ class ElasticBuffer:
                     *dispatch_args, policy.native_plan() if policy else [], *extra
                 )
                 public_handle = None
+            elif host_entry:
+                result, public_handle, is_token_in_rank = self._native.intranode_dispatch_from_topk(
+                    x_tensor,
+                    x_scales,
+                    kernel_topk_idx,
+                    topk_weights,
+                    resolved_num_experts,
+                    resolved_alignment,
+                    0 if resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
+                    config.num_aiv,
+                    config.num_max_nvl_chunked_send_tokens,
+                    config.num_max_nvl_chunked_recv_tokens,
+                    allocation_stream_id,
+                    resolved_capacity,
+                    config.udma_peers_per_worker,
+                    config.udma_wqes_per_visit,
+                    do_expand,
+                    policy.native_plan() if policy else [],
+                    simt_layout == "1",
+                )
             else:
                 # Expand writes the final expert prefix before this API returns.
                 result, public_handle = self._native.intranode_dispatch_with_handle(

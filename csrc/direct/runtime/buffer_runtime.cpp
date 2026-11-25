@@ -325,12 +325,34 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor>
 BufferRuntime::GetDispatchLayoutV2Simt(torch::Tensor topk_idx, int64_t num_experts, int64_t num_aiv,
-                                     c10::optional<int64_t> allocation_stream_id)
+                                       c10::optional<int64_t> allocation_stream_id)
 {
     TORCH_CHECK(num_aiv > 0, "V2 SIMT layout requires resolved num_sms");
-    return ascend_deepep::ops::GetDispatchLayout(
-        topk_idx, num_experts, static_cast<int>(rank_), static_cast<int>(num_ranks_), static_cast<int>(num_device_aiv_),
-        RequireShmem().FftsAddr(), allocation_stream_id, false, num_aiv);
+    return ascend_deepep::ops::GetDispatchLayout(topk_idx, num_experts, static_cast<int>(rank_),
+                                                 static_cast<int>(num_ranks_), static_cast<int>(num_device_aiv_),
+                                                 RequireShmem().FftsAddr(), allocation_stream_id, false, num_aiv);
+}
+
+BufferRuntime::FreshDispatchHostResult BufferRuntime::IntranodeDispatchFromTopk(
+    torch::Tensor x, c10::optional<torch::Tensor> x_scales, torch::Tensor topk_idx,
+    c10::optional<torch::Tensor> topk_weights, int64_t num_experts, int64_t expert_alignment, int64_t num_worst_tokens,
+    int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
+    c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
+    int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, bool defer_public_expert_prefix,
+    const std::vector<int64_t>& launch_plan, bool simt_layout)
+{
+    TORCH_CHECK(num_aiv > 0 && num_aiv <= num_device_aiv_, "fresh dispatch requires resolved device AIV cores");
+    // Same layout kernels and allocation policy as the two-call path. Keep all
+    // layout owners alive through notify/dispatch submission without a Python
+    // round trip. This is Host entry composition, not device-kernel fusion.
+    auto layout = simt_layout ? GetDispatchLayoutV2Simt(topk_idx, num_experts, num_aiv, allocation_stream_id)
+                              : GetDispatchLayout(topk_idx, num_experts, allocation_stream_id);
+    auto result = IntranodeDispatchWithHandle(
+        x, x_scales, topk_idx, topk_weights, std::get<0>(layout), std::get<3>(layout), std::get<2>(layout), 0,
+        c10::nullopt, c10::nullopt, expert_alignment, num_worst_tokens, num_aiv, num_max_nvl_chunked_send_tokens,
+        num_max_nvl_chunked_recv_tokens, false, allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker,
+        udma_wqes_per_visit, c10::nullopt, defer_public_expert_prefix, launch_plan);
+    return {std::get<0>(result), std::get<1>(result), std::get<3>(layout)};
 }
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
@@ -381,7 +403,8 @@ BufferRuntime::IntranodeDispatchWithPlan(
         static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
         symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
         KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
-        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan, cached_send_head, allow_omit_topk_output);
+        cached_dispatch_plan, nullptr, false, dispatch_output_control_, launch_plan, cached_send_head,
+        allow_omit_topk_output);
     symmetric_workspace_active_ = true;
     return result;
 }
