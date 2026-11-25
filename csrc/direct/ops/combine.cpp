@@ -396,7 +396,10 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     const char* compact_weights = std::getenv("DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS");
     TORCH_CHECK(!compact_weights || std::strcmp(compact_weights, "0") == 0 || std::strcmp(compact_weights, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS must be 0 or 1");
-    tiling.combine_compact_weights = compact_weights && std::strcmp(compact_weights, "1") == 0 &&
+    const bool compact_weights_enabled = !compact_weights || std::strcmp(compact_weights, "1") == 0;
+    // V2 supplies the original send prefixes. Older native callers without
+    // that mapping retain their token-addressed weight layout.
+    tiling.combine_compact_weights = compact_weights_enabled && send_channel_prefix_matrix.has_value() &&
         topk_weights.has_value() && use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
         !pipeline_chunk_tokens && !expanded_x.has_value();
     if (tiling.combine_compact_weights) {

@@ -557,10 +557,8 @@ def main(argv=None):
         raise RuntimeError("rebuild version-4 host and kernel libraries for cached-plan channel packing")
     if args.trace_samples and getattr(native, "dispatch_device_timing_version", 0) != 2:
         raise RuntimeError("rebuild host and kernel libraries for device traces")
-    if args.combine_diagnostics and (
-        args.trace_samples < 1 or getattr(native, "combine_device_timing_version", 0) != 2
-    ):
-        raise RuntimeError("combine diagnostics requires trace samples and version-2 host/kernel libraries")
+    if args.combine_diagnostics and args.trace_samples and getattr(native, "combine_device_timing_version", 0) != 2:
+        raise RuntimeError("combine device traces require version-2 host/kernel libraries")
     if 1 in args.metadata_modes and getattr(native, "dispatch_channel_metadata_version", 0) != 4:
         raise RuntimeError("rebuild host and kernel libraries for channel metadata")
     if any(mode != "off" for mode in args.overlap_modes) and getattr(native, "dispatch_overlap_version", 0) != 1:
@@ -798,17 +796,21 @@ def main(argv=None):
                                 for expanded in (False, True) if plan_name == "auto" else (False,):
                                     set_metadata_output_mode("off")
                                     os.environ[COMPACT_ENV] = "0"
+                                    os.environ["DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS"] = "0"
                                     expected = consumer_snapshot(dx, di, dw if weighted else None, core, expanded)
                                     set_metadata_output_mode(output_mode)
                                     for compact in args.compact_self_modes:
                                         os.environ[COMPACT_ENV] = str(compact)
-                                        actual = consumer_snapshot(dx, di, dw if weighted else None, core, expanded)
-                                        for got, want in zip(actual, expected):
-                                            if want is None:
-                                                if got is not None:
-                                                    raise AssertionError("optimization changed optional outputs")
-                                            else:
-                                                torch.testing.assert_close(got, want, rtol=0, atol=0)
+                                        for compact_weight in args.compact_weight_modes:
+                                            os.environ["DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS"] = str(compact_weight)
+                                            actual = consumer_snapshot(dx, di, dw if weighted else None, core, expanded)
+                                            for got, want in zip(actual, expected):
+                                                if want is None:
+                                                    if got is not None:
+                                                        raise AssertionError("optimization changed optional outputs")
+                                                else:
+                                                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+                                    os.environ["DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS"] = "0"
                                     os.environ[COMPACT_ENV] = "0"
                             precision_cases.append(
                                 dict(

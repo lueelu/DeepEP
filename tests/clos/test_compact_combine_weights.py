@@ -22,9 +22,14 @@ def test_compact_weight_production_mapping(tmp_path, corrupt_prefix):
     copy = cpp_functions(
         (source / "kernels/combine/udma_combine_self_copy.h").read_text(), "CopySelfField", "CopyCompactSelf"
     )
+    host = (source / "ops/combine.cpp").read_text()
+    begin = host.index("    const bool compact_weights_enabled =")
+    end = host.index(";", host.index("    tiling.combine_compact_weights =", begin)) + 1
+    gate = host[begin:end]
     harness = Path(__file__).with_name("compact_combine_weights_oracle.cpp").read_text()
     harness = harness.replace("// PRODUCTION_MAPPING", mapping).replace("// PRODUCTION_SENDER", sender)
     harness = harness.replace("// PRODUCTION_COPY", copy)
+    harness = harness.replace("// PRODUCTION_GATE", gate)
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("C++17 compiler required for production-body CPU oracle")

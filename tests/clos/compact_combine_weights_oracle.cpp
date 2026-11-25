@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <vector>
 #define __aicore__
 #define __gm__
@@ -66,6 +67,26 @@ struct Sender : Base {
 };
 
 int main() {
+    // Execute the host's actual default/override gate, including legacy callers
+    // and paths whose data cannot be sent before aggregate completion.
+    for (const char* compact_weights : {static_cast<const char*>(nullptr), "0", "1"})
+    for (unsigned excluded = 0; excluded < 9; ++excluded) {
+        CombineTilingData tiling{};
+        std::optional<int> send_channel_prefix_matrix = 1, topk_weights = 1, expanded_x;
+        bool use_udma = true, epilogue = true, aggregate = false;
+        unsigned pipeline_chunk_tokens = 0;
+        if (excluded == 1) send_channel_prefix_matrix.reset();
+        if (excluded == 2) topk_weights.reset();
+        if (excluded == 3) use_udma = false;
+        if (excluded == 4) epilogue = false;
+        if (excluded == 5) tiling.udma_token_schedule = 1;
+        if (excluded == 6) aggregate = true;
+        if (excluded == 7) pipeline_chunk_tokens = 32;
+        if (excluded == 8) expanded_x = 1;
+        // PRODUCTION_GATE
+        assert(bool(tiling.combine_compact_weights) ==
+               (excluded == 0 && (!compact_weights || std::strcmp(compact_weights, "1") == 0)));
+    }
     for (uint32_t world : {4U, 8U, 16U, 32U})
     for (uint32_t topk : {1U, 6U, 8U, 10U, 128U})
     for (uint32_t tokens : {3U, 65U, 2051U})
