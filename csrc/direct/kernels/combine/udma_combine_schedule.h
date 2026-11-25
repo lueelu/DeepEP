@@ -18,14 +18,15 @@ __aicore__ inline void CombineRemoteImpl(
     static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto indices = resource.template GetBufferByByte<int32_t>(sender_bytes);
-    const bool simt_weights = Phase == 0 && CombineSimtWeightsEnabled(td);
+    const bool compact_weights = Phase == 0 && td.combine_compact_weights;
+    const bool simt_weights = !compact_weights && Phase == 0 && CombineSimtWeightsEnabled(td);
     if (simt_weights) {
         const uint64_t started = trace.Now();
         CombineRemoteWeights(weights, src_idx, rank_prefix, workspace, td, core);
         trace.Add(Trace::TopkCycles, started);
     }
     CombineSenderT<Capacity, Qps, Trace> sender(td, core, reinterpret_cast<__ubuf__ uint8_t*>(wq.GetPhyAddr()), workspace,
-        x, weights, UINT32_MAX, 0, 1, 0, !simt_weights);
+        x, weights, UINT32_MAX, 0, 1, 0, !simt_weights && !compact_weights);
     sender.SetTrace(&trace);
     trace.Set(Trace::PayloadPeers, sender.Count());
     AscendC::GlobalTensor<int32_t> src_gm, rank_gm;
@@ -33,7 +34,7 @@ __aicore__ inline void CombineRemoteImpl(
     rank_gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
     // Dispatch stores all channels of one source rank contiguously. Ownership
     // here is per peer, so channel boundaries need not split the return stream.
-    const uint32_t fields = td.has_topk_weights && !simt_weights ? 2U : 1U;
+    const uint32_t fields = td.has_topk_weights && !simt_weights && !compact_weights ? 2U : 1U;
     uint32_t row[Capacity]{}, end[Capacity]{}, loaded[Capacity]{}, cursor[Capacity]{}, field[Capacity]{};
     uint32_t ready_chunk[Capacity];
     if constexpr (Phase == 3) {
@@ -112,6 +113,23 @@ __aicore__ inline void CombineRemoteImpl(
     if constexpr (Phase == 1) {
         sender.Flush(); // Drain WQE staging, not the asynchronous payload reads.
     } else {
+        if (compact_weights) {
+            // All payload is submitted first. Each worker owns a disjoint
+            // contiguous slice of the peer's dispatch-ordered input rows.
+            sender.Flush();
+            for (uint32_t p = 0; p < sender.Count(); ++p) {
+                const uint32_t peer = sender.Rank(p);
+                const uint32_t base = peer ? rank_gm.GetValue((peer - 1) * td.world_size + td.rank) : 0;
+                const uint32_t length = rank_gm.GetValue(peer * td.world_size + td.rank) - base;
+                const uint32_t lane = core % td.udma_workers_per_peer;
+                const uint32_t begin = base + uint64_t(length) * lane / td.udma_workers_per_peer;
+                const uint32_t finish = base + uint64_t(length) * (lane + 1U) / td.udma_workers_per_peer;
+                if (begin < finish) {
+                    sender.BeginVisit(p);
+                    sender.PutCompactWeights(p, begin, base, finish - begin);
+                }
+            }
+        }
         trace.Mark(Trace::PayloadQueued);
         sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core % td.udma_workers_per_peer);
         trace.Mark(Trace::Published);

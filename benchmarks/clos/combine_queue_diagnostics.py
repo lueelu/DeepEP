@@ -12,6 +12,7 @@ from stage_metrics import prepare_v2_sample
 
 TRACE_ENV = "DEEPEP_CLOS_COMBINE_DEVICE_TIMING"
 COMPACT_ENV = "DEEPEP_CLOS_COMBINE_COMPACT_SELF"
+COMPACT_WEIGHT_ENV = "DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS"
 
 
 def capture_combine_stages(directory, samples):
@@ -24,7 +25,9 @@ def capture_combine_stages(directory, samples):
     selected = [row for row in rows if row["Name"] in names]
     if [row["Name"] for row in selected] != names * (samples + 4):
         raise RuntimeError("unexpected combine kernel sequence; retain raw export")
-    result = {name: [float(row["Duration(us)"]) for row in selected[i::3]][2:-2] for i, name in enumerate(names) if i}
+    result = {name: [float(row["Duration(us)"]) for row in selected[i::3]][2:-2] for i, name in enumerate(names)}
+    # prepare_v2_sample issues this alignment notify outside the timed API.
+    result["alignment_notify_us"] = result.pop(names[0])
     if any(not math.isfinite(value) or value <= 0 for values in result.values() for value in values):
         raise ValueError("invalid combine duration")
     return result
@@ -63,12 +66,14 @@ def run_combine_diagnostics(
     expected_w = cpu_w.masked_fill(owners < 0, 0)
     results = []
     configs = [
-        (core, weighted, compact)
+        (core, weighted, compact, compact_weight)
         for core in args.cores
         for weighted in (False, True)
         for compact in args.compact_self_modes
+        for compact_weight in getattr(args, "compact_weight_modes", [0])
     ]
     os.environ[TRACE_ENV] = "0"
+    old_compact_weight = os.environ.get(COMPACT_WEIGHT_ENV)
 
     def done(value):
         if value[-1].event is not None:
@@ -84,9 +89,10 @@ def run_combine_diagnostics(
             raise AssertionError("unweighted combine returned weights")
 
     try:
-        for turn, (core, weighted, compact) in enumerate(configs + configs[::-1]):
-            group.agree(["combine_diagnostic", turn, core, weighted, compact])
+        for turn, (core, weighted, compact, compact_weight) in enumerate(configs + configs[::-1]):
+            group.agree(["combine_diagnostic", turn, core, weighted, compact, compact_weight])
             os.environ[COMPACT_ENV] = str(compact)
+            os.environ[COMPACT_WEIGHT_ENV] = str(compact_weight)
             # Prepare input outside all measured passes, without a second Buffer.
             received = done(
                 buffer.dispatch(
@@ -124,7 +130,7 @@ def run_combine_diagnostics(
                 start = time.perf_counter_ns()
                 invoke()
                 api.append((time.perf_counter_ns() - start) / 1000)
-            capture = out / f"combine_round{turn}_aiv{core}_weighted{int(weighted)}_compact{compact}"
+            capture = out / f"combine_round{turn}_aiv{core}_weighted{int(weighted)}_compact{compact}_cw{compact_weight}"
             prof = torch_npu.profiler
             with prof.profile(
                 activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
@@ -144,7 +150,7 @@ def run_combine_diagnostics(
             (capture / "samples.json").write_text(json.dumps(stages, indent=2), encoding="utf-8")
             traces, diagnostic_api = [], []
             os.environ[TRACE_ENV] = "1"
-            for _ in range(args.trace_warmup):
+            for _ in range(args.trace_warmup if args.trace_samples else 0):
                 prepare_v2_sample(buffer, flush)
                 invoke()
             for _ in range(args.trace_samples):
@@ -170,7 +176,7 @@ def run_combine_diagnostics(
                 check(value, weighted)
             os.environ[TRACE_ENV] = "0"
             check(invoke(), weighted)
-            diagnostic_stats = rank_max_stats(group, diagnostic_api)
+            diagnostic_stats = rank_max_stats(group, diagnostic_api) if diagnostic_api else None
             (capture / "device_trace.json").write_text(json.dumps(traces, indent=2), encoding="utf-8")
             (capture / "trace_overhead.json").write_text(
                 json.dumps(
@@ -190,15 +196,20 @@ def run_combine_diagnostics(
                     reduce_cores=args.reduce_cores,
                     weighted=weighted,
                     compact_self=compact,
+                    compact_weights=compact_weight,
                     policy=asdict(plan),
                     stats_us=stats,
                     payload_bytes_per_rank=payload,
                     payload_gbps=payload / stats["v1_combine_udma_comm_kernel"]["mean"] / 1000,
-                    note="Alignment notify is excluded; communication Begin is inside comm. Reduce is separate.",
+                    note="Alignment notify is reported separately, outside API; communication Begin is inside comm.",
                 )
             )
             (out / "combine_summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     finally:
         os.environ[TRACE_ENV] = "0"
         os.environ[COMPACT_ENV] = "0"
+        if old_compact_weight is None:
+            os.environ.pop(COMPACT_WEIGHT_ENV, None)
+        else:
+            os.environ[COMPACT_WEIGHT_ENV] = old_compact_weight
     group.agree("combine_diagnostics_passed")

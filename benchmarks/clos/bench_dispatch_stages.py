@@ -512,6 +512,8 @@ def main(argv=None):
         "--combine-diagnostics", action="store_true", help="also trace ordinary combine in the same Buffer"
     )
     parser.add_argument("--reduce-cores", type=int, default=48)
+    parser.add_argument("--combine-only", action="store_true", help="skip dispatch timing; reuse its precision setup")
+    parser.add_argument("--compact-weight-modes", type=int, nargs="+", choices=[0, 1], default=[0])
     parser.add_argument(
         "--compact-self-modes",
         type=int,
@@ -526,6 +528,8 @@ def main(argv=None):
     parser.add_argument("--shmem-port", type=int, default=29882)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.combine_only:
+        args.combine_diagnostics = True
     if (
         min(args.tokens, args.hidden, args.topk, args.experts, args.samples, args.reduce_cores, *args.cores) <= 0
         or min(args.warmup, args.trace_samples, args.trace_warmup) < 0
@@ -586,6 +590,7 @@ def main(argv=None):
     for key in (
         TRACE_ENV,
         "DEEPEP_CLOS_COMBINE_DEVICE_TIMING",
+        "DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS",
         CHANNEL_ENV,
         COMPACT_ENV,
         METADATA_ENV,
@@ -834,7 +839,7 @@ def main(argv=None):
         idx = idx.to(dtype=topk_idx_t, device="npu")
         weights = cpu_w.npu()
         results = []
-        for op in ("fresh", "fresh_weighted", "cached", "cached_weighted"):
+        for op in () if args.combine_only else ("fresh", "fresh_weighted", "cached", "cached_weighted"):
             configs = [
                 (core, flag, metadata, tile, plan_name, overlap_mode, output_mode)
                 for core in args.cores

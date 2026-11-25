@@ -446,7 +446,8 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
     c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, c10::optional<torch::Tensor> expanded_x,
     c10::optional<torch::Tensor> single_source_slots, c10::optional<torch::Tensor> early_aggregate_map,
-    int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv, const std::vector<int64_t>& launch_plan)
+    int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv, const std::vector<int64_t>& launch_plan,
+    c10::optional<torch::Tensor> send_channel_prefix_matrix)
 {
     TORCH_CHECK(reduce_num_aiv >= 0 && reduce_num_aiv <= num_device_aiv_,
                 "reduce_num_aiv must be between zero and the device AIV count");
@@ -482,7 +483,8 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
         notify_workspace_bytes_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(), KernelWorkspace(),
         allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit, &epilogue,
         expanded_x, single_source_slots, aggregate, pipeline_chunk_tokens ? early_aggregate_map : c10::nullopt,
-        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv, launch_plan);
+        pipeline_chunk_tokens ? original_values : c10::nullopt, pipeline_chunk_tokens, reduce_num_aiv, launch_plan,
+        send_channel_prefix_matrix);
     symmetric_workspace_active_ = true;
     epilogue->SetOwner(c10::intrusive_ptr<BufferRuntime>::reclaim_copy(this));
     return epilogue;

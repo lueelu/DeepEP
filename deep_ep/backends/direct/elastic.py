@@ -1146,7 +1146,7 @@ class ElasticBuffer:
         )
         (
             rank_prefix_matrix,
-            _,
+            send_channel_prefix_matrix,
             recv_channel_prefix_matrix,
             recv_src_idx,
             _,
@@ -1216,6 +1216,7 @@ class ElasticBuffer:
                 pipeline_chunk,
                 reduce_sms,
                 policy.native_plan() if policy else [],
+                send_channel_prefix_matrix,
             )
             if previous_event_before_epilogue is not None:
                 previous_event_before_epilogue.current_stream_wait()

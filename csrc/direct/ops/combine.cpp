@@ -154,7 +154,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     c10::optional<torch::Tensor> expanded_x, c10::optional<torch::Tensor> single_source_slots,
     std::function<void()> aggregate, c10::optional<torch::Tensor> pipeline_mapping,
     c10::optional<torch::Tensor> pipeline_values, int64_t pipeline_chunk_tokens, int64_t reduce_num_aiv,
-    const std::vector<int64_t>& launch_plan)
+    const std::vector<int64_t>& launch_plan, c10::optional<torch::Tensor> send_channel_prefix_matrix)
 {
     const auto udma_launch =
         shmem.ResolveLaunch(launch_plan, true, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
@@ -162,7 +162,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     udma_wqes_per_visit = udma_launch.visit;
     StreamAllocator allocator(allocation_stream_id);
     allocator.Record({x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
-                      expanded_x, single_source_slots});
+                      expanded_x, single_source_slots, send_channel_prefix_matrix});
     CheckNpuContiguous(x, "x");
     CheckNpuContiguous(src_idx, "src_idx");
     CheckNpuContiguous(rank_prefix_matrix, "rank_prefix_matrix");
@@ -393,6 +393,32 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(!self_db || std::strcmp(self_db, "0") == 0 || std::strcmp(self_db, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER must be 0 or 1");
     tiling.combine_self_double_buffer = self_db && std::strcmp(self_db, "1") == 0 && tiling.compact_self_rows;
+    const char* compact_weights = std::getenv("DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS");
+    TORCH_CHECK(!compact_weights || std::strcmp(compact_weights, "0") == 0 || std::strcmp(compact_weights, "1") == 0,
+                "DEEPEP_CLOS_COMBINE_COMPACT_WEIGHTS must be 0 or 1");
+    tiling.combine_compact_weights = compact_weights && std::strcmp(compact_weights, "1") == 0 &&
+        topk_weights.has_value() && use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
+        !pipeline_chunk_tokens && !expanded_x.has_value();
+    if (tiling.combine_compact_weights) {
+        TORCH_CHECK(send_channel_prefix_matrix.has_value(),
+                    "compact combine weights require the original dispatch send channel prefixes");
+        CheckNpuContiguous(*send_channel_prefix_matrix, "send_channel_prefix_matrix");
+        TORCH_CHECK(send_channel_prefix_matrix->scalar_type() == torch::kInt32 &&
+                        send_channel_prefix_matrix->sizes() == channel_prefix_matrix.sizes() &&
+                        send_channel_prefix_matrix->device() == x.device(),
+                    "send channel prefixes must be int32 [world_size, dispatch_channels] on the input device");
+        // Weight-only reduction reuses UB after payload reduction has drained:
+        // 2 * 512 B vectors, aligned prefix table, then 16 token rows of heads.
+        const int64_t prefix_bytes = CheckedMulInt64(
+            CheckedMulInt64(world_size, num_channels, "combine weight prefixes"), 4, "combine weight prefix bytes");
+        const int64_t head_bytes = CheckedMulInt64(world_size, 16 * 4, "combine weight head tile");
+        TORCH_CHECK(1024 + AlignUpInt64(prefix_bytes, 32) + head_bytes <= platform::kKernelUbBytes,
+                    "compact combine weight metadata exceeds UB capacity");
+        tiling.combine_send_channel_prefix = reinterpret_cast<uint64_t>(send_channel_prefix_matrix->data_ptr());
+        // Retain the padded workspace reservation; the dense view fits inside
+        // it, so changing this mode never reallocates the symmetric Buffer.
+        tiling.topk_weights_row_stride = static_cast<uint32_t>(topk_weights_row_bytes);
+    }
     tiling.x_buffer_offset = static_cast<uint64_t>(workspace.x_buffer_offset);
     tiling.topk_weights_buffer_offset = static_cast<uint64_t>(workspace.topk_weights_buffer_offset);
     tiling.udma_completion_signal_offset = static_cast<uint64_t>(workspace.udma_completion_signal_offset);
@@ -444,6 +470,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         (void)pipeline_mapping;
         (void)pipeline_values;
         (void)pipeline_ready;
+        (void)send_channel_prefix_matrix;
         auto phase_tiling = tiling;
         if (phase == CombinePhase::Reduction) {
             phase_tiling.block_dim = static_cast<uint32_t>(reduce_aivs);

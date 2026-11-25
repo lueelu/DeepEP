@@ -209,7 +209,7 @@ __aicore__ inline void CombineSelfCopy(
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(x_event_id);
                 staging_buffer_idx = (staging_buffer_idx + 1) & staging_buffer_mask;
 
-                if (tiling.has_topk_weights != 0) {
+                if (tiling.has_topk_weights != 0 && !tiling.combine_compact_weights) {
                     const auto weight_event_id = staging_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
                     AscendC::LocalTensor<uint8_t> weight_staging_ub = staging_ub[staging_buffer_idx * staging_stride];
                     AscendC::LocalTensor<float> weight_staging_float_ub = weight_staging_ub.ReinterpretCast<float>();
@@ -238,6 +238,18 @@ __aicore__ inline void CombineSelfCopy(
     // Also order a subsequent sender's scalar stores to the reused UB.
     AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+    if (tiling.combine_compact_weights && core_idx >= first_copy_aiv) {
+        // The payload fallback may scatter rows, but weights always use the
+        // dense contributor layout, including unaligned top-k row widths.
+        const uint32_t worker = core_idx - first_copy_aiv;
+        const uint32_t begin = uint64_t(source_rank_tokens) * worker / copy_aivs;
+        const uint32_t end = uint64_t(source_rank_tokens) * (worker + 1U) / copy_aivs;
+        const uint64_t src = uint64_t(source_rank_base) + begin;
+        const uint64_t dst = uint64_t(rank) * token_capacity + begin;
+        CopySelfField(resource, topk_weights + src * topk_weights_row_bytes,
+                      symmetric_buffer + tiling.topk_weights_buffer_offset + dst * topk_weights_row_bytes,
+                      uint64_t(end - begin) * topk_weights_row_bytes);
+    }
 }
 #endif
 } // namespace ascend_deepep::udma

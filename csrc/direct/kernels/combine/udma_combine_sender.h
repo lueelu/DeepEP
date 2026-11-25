@@ -238,6 +238,29 @@ public:
         Flush();
     }
 
+    // Payload spans are drained before reusing the request area for a dense
+    // weight descriptor. Base owns physical-SQ credit and sparse CQE tracking.
+    __aicore__ void PutCompactWeights(uint32_t p, uint32_t row, uint32_t peer_begin, uint32_t rows)
+    {
+        Flush();
+        const uint32_t row_bytes = td_.num_topk * uint32_t(sizeof(float));
+        // Bound each descriptor to 64 KiB, with whole rows and no padding.
+        const uint32_t chunk_rows = 65536U / row_bytes;
+        while (rows) {
+            const uint32_t count = rows < chunk_rows ? rows : chunk_rows;
+            const uint64_t slot = uint64_t(td_.rank) * td_.token_capacity + row - peer_begin;
+            Base::PutAbsolute(p, peers_[Base::QueuePeer(p)].remote_base + td_.topk_weights_buffer_offset +
+                                   slot * row_bytes,
+                              reinterpret_cast<__gm__ uint8_t*>(weights_ + uint64_t(row) * row_bytes),
+                              count * row_bytes);
+            row += count;
+            rows -= count;
+        }
+        // No outstanding base descriptors when the next visit changes QP or
+        // the final SO markers reuse scratch. This does not wait for payload.
+        Base::Flush();
+    }
+
     // One visit is at most udma_wqes_per_visit WQEs for one peer.
     // Baseline Qps=1 keeps its original batching, with no extra flush.
     __aicore__ void BeginVisit(uint32_t p)

@@ -157,7 +157,8 @@ static auto buffer_runtime_registry =
               torch::arg("early_aggregate_map") = c10::IValue(),
               torch::arg("pipeline_chunk_tokens") = int64_t(0),
               torch::arg("reduce_num_aiv") = int64_t(0),
-              torch::arg("launch_plan") = std::vector<int64_t>{}})
+              torch::arg("launch_plan") = std::vector<int64_t>{},
+              torch::arg("send_channel_prefix_matrix") = c10::IValue()})
         .def("expand", &BufferRuntime::Expand, "",
              {torch::arg("x"), torch::arg("x_scales"), torch::arg("topk_idx"), torch::arg("topk_weights"),
               torch::arg("num_tokens_per_expert"), torch::arg("expert_alignment"),

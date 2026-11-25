@@ -462,7 +462,8 @@ def test_udma_combine_core_overrides_reach_native_and_preserve_handle():
                 ({'num_sms':48,'combine_num_sms':20,'reduce_num_sms':8}, (20,8)),
                 ({'combine_num_sms':64,'reduce_num_sms':16}, (64,16))]:
             assert b.combine(SimpleNamespace(size=lambda dim: (128,2816)[dim], element_size=lambda: 2, dtype="torch.bfloat16"), h, **opts) == ("out", None, "event")
-            assert (calls[-1][8], calls[-1][-2]) == expected
+            assert (calls[-1][8], calls[-1][-3]) == expected
+            assert calls[-1][-1] is layout[1]
             assert policies[-1] == expected[0]
             assert calls[-1][6] is layout[2]
             assert h.num_sms == 48 and h._dispatch_layout is layout
@@ -484,7 +485,7 @@ def test_udma_combine_core_overrides_reach_native_and_preserve_handle():
         h._expand_layout = (None, None, object(), None)
         b.combine(SimpleNamespace(size=lambda dim: (128,2816)[dim], element_size=lambda: 2, dtype="torch.bfloat16"), h, combine_num_sms=8, reduce_num_sms=16)
         assert aggregates[-1][4] == 48
-        assert (calls[-1][8], calls[-1][-2]) == (8,16)
+        assert (calls[-1][8], calls[-1][-3]) == (8,16)
         before = len(calls)
         b._aggregate_pipeline_chunk_tokens = 32
         try:
@@ -564,7 +565,8 @@ def test_serial_expanded_combine_uses_unexpanded_plan_after_aggregate():
                     overlap = early or bool(chunk)
                     expected = base.for_launch(32,5632,'weighted' if weights is not None else 'combine',
                                                bf16=True,expanded=overlap)
-                    assert calls[-1][-1] == expected.native_plan()
+                    assert calls[-1][-2] == expected.native_plan()
+                    assert calls[-1][-1] is h._dispatch_layout[1]
                     assert events == (['begin'] if single and overlap else ['aggregate','begin'])
                     assert calls[-1][15] is (x if single else None)
                     assert calls[-1][16] is (h._single_source_slots if single else None)

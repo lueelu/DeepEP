@@ -133,6 +133,7 @@ void PackRemoteChannelMetadata(R&, Sender&, GM_ADDR, GM_ADDR, const DispatchTili
 }
 static bool in_combine;
 static unsigned combine_phase, combine_rows, combine_copies;
+static unsigned compact_weight_rows, expected_payload_rows;
 static bool combine_expects_copy;
 static bool token_combine;
 static unsigned token_windows, token_published;
@@ -281,6 +282,10 @@ struct CombineSenderT {
     }
     void Flush() { assert(combine_phase == 0); }
     void FlushForIndex() { Flush(); }
+    void PutCompactWeights(uint32_t, uint32_t, uint32_t, uint32_t rows) {
+        assert(combine_phase == 0 && combine_rows == expected_payload_rows && combine_copies == 0);
+        compact_weight_rows += rows;
+    }
     void Publish(GM_ADDR, uint64_t, uint32_t, uint32_t) { assert(combine_phase == 0); combine_phase = 2; }
     void Quiet() { assert(combine_phase == 4); combine_phase = 5; }
 };
@@ -347,7 +352,9 @@ void CheckCombineOrdering()
 {
     for (unsigned rows : {0U, 3U, 65U, 513U})
         for (bool weighted : {false, true})
-            for (unsigned visit : {8U, 64U, 128U}) for (bool legacy_after : {false, true}) {
+            for (unsigned visit : {8U, 64U, 128U}) for (bool legacy_after : {false, true})
+            for (bool compact : {false, true}) {
+                if (compact && Phase != 0) continue;
                 CombineTilingData td{};
                 td.world_size = 2;
                 td.block_dim = 8;
@@ -355,17 +362,21 @@ void CheckCombineOrdering()
                 td.udma_wqes_per_visit = visit;
                 td.pipeline_chunk_tokens = 32;
                 td.has_topk_weights = weighted;
+                td.combine_compact_weights = compact && weighted;
                 td.udma_self_copy_after_submit = legacy_after;
                 std::vector<int32_t> indices(rows + 8), prefix{0, 0, int32_t(rows), 0};
                 Resource resource;
                 DisabledDispatchDeviceTrace trace(0);
                 in_combine = true;
                 combine_rows = combine_copies = 0;
+                compact_weight_rows = 0;
+                expected_payload_rows = rows;
                 combine_expects_copy = Phase == 0 || Phase == 2;
                 CombineRemoteImpl<64, Phase, 2>(resource, nullptr, nullptr,
                     reinterpret_cast<GM_ADDR>(indices.data()), reinterpret_cast<GM_ADDR>(prefix.data()),
                     nullptr, nullptr, td, 0, trace);
-                assert(combine_rows == rows * (weighted ? 2U : 1U));
+                assert(combine_rows == rows * (weighted && !compact ? 2U : 1U));
+                assert(compact_weight_rows == (compact && weighted ? rows : 0U));
                 assert(combine_copies == unsigned(combine_expects_copy));
                 assert(combine_phase == (Phase == 1 ? 0U : 5U));
                 in_combine = false;

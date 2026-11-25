@@ -33,6 +33,8 @@ constexpr uint32_t kCombineOutputBytes = kCombineInputBufferBytes;
 constexpr uint32_t kCombineTopkInputOffset = 0;
 constexpr uint32_t kCombineTopkInputBufferBytes = kCombineMaxTopk * sizeof(float);
 constexpr uint32_t kCombineTopkAccumulatorOffset = kCombineTopkInputOffset + kCombineTopkInputBufferBytes;
+constexpr uint32_t kCombineWeightMetaOffset = kCombineTopkAccumulatorOffset + kCombineTopkInputBufferBytes;
+constexpr uint32_t kCombineWeightHeadTokens = 16;
 constexpr uint32_t kCombineDtypeBfloat16 = 0;
 constexpr uint32_t kCombineDtypeFloat16 = 1;
 
@@ -61,6 +63,16 @@ __aicore__ inline uint64_t ContributorSlot(const ascend_deepep::CombineTilingDat
         row = channel_prefix.GetValue(td.rank * td.num_channels + ch) + ordinal;
     }
     return uint64_t(contributor) * td.token_capacity + row;
+}
+
+__aicore__ inline uint64_t CompactWeightSlot(const ascend_deepep::CombineTilingData& td,
+    AscendC::LocalTensor<int32_t>& send_prefix, uint32_t contributor, uint32_t token, uint32_t ordinal)
+{
+    const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1U) / td.num_channels;
+    const uint32_t channel = token / channel_tokens;
+    // Original send prefixes are inclusive ends, unlike recv-channel starts.
+    const uint32_t begin = channel ? send_prefix.GetValue(contributor * td.num_channels + channel - 1U) : 0U;
+    return uint64_t(contributor) * td.token_capacity + begin + ordinal;
 }
 
 template <typename T, bool DoCommunication = true, bool DoReduction = true, uint32_t Phase = 0,
@@ -242,27 +254,68 @@ __aicore__ inline void V1CombineUdmaImpl(
             AscendC::LocalTensor<float> weight_accumulator_ub =
                 resource.template GetBufferByByte<float>(kCombineTopkAccumulatorOffset);
             const int32_t aligned_num_topk = CombineAlignUpElements(num_topk, 8);
+            // Payload UB is no longer live. Keep both FP32 vectors in [0,1024),
+            // then the aligned original send-prefix table and a head tile.
+            const uint32_t prefix_elements = tiling.world_size * tiling.num_channels;
+            const uint32_t head_offset = kCombineWeightMetaOffset +
+                (prefix_elements * sizeof(int32_t) + 31U) / 32U * 32U;
+            auto prefix_ub = resource.template GetBufferByByte<int32_t>(kCombineWeightMetaOffset);
+            auto heads_ub = resource.template GetBufferByByte<int32_t>(head_offset);
+            if (tiling.combine_compact_weights && token_begin < token_end) {
+                AscendC::GlobalTensor<int32_t> prefixes;
+                prefixes.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tiling.combine_send_channel_prefix));
+                AscendC::DataCopyExtParams copy{1, prefix_elements * uint32_t(sizeof(int32_t)), 0, 0, 0};
+                AscendC::DataCopyPad(prefix_ub, prefixes, copy,
+                                    AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+            }
+            int32_t head_tile_begin = token_begin;
             // EVENT_ID3 protects the single input buffer; EVENT_ID5 protects output.
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
 
             for (int32_t token = token_begin; token < token_end; ++token) {
+                if (tiling.combine_compact_weights && (token - token_begin) % kCombineWeightHeadTokens == 0) {
+                    head_tile_begin = token;
+                    const uint32_t count = CombineMin(kCombineWeightHeadTokens, token_end - token);
+                    // Scalar readers of the previous tile finish before reuse.
+                    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+                    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+                    AscendC::DataCopyExtParams copy{1, count * tiling.world_size * uint32_t(sizeof(int32_t)), 0, 0, 0};
+                    AscendC::DataCopyPad(heads_ub, send_head_gm[uint64_t(token) * world_size], copy,
+                                        AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+                }
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID5);
                 AscendC::Duplicate(weight_accumulator_ub, 0.0F, aligned_num_topk);
                 AscendC::PipeBarrier<PIPE_V>();
 
                 for (int32_t contributor = 0; contributor < world_size; ++contributor) {
-                    const int32_t ordinal = send_head_gm.GetValue(token * world_size + contributor);
+                    const int32_t ordinal = tiling.combine_compact_weights
+                        ? heads_ub.GetValue((token - head_tile_begin) * world_size + contributor)
+                        : send_head_gm.GetValue(token * world_size + contributor);
                     if (ordinal < 0) {
                         continue;
                     }
-                    const uint64_t local_slot = ContributorSlot(tiling, channel_starts, contributor, token, ordinal);
+                    const uint64_t local_slot = tiling.combine_compact_weights
+                        ? CompactWeightSlot(tiling, prefix_ub, contributor, token, ordinal)
+                        : ContributorSlot(tiling, channel_starts, contributor, token, ordinal);
                     AscendC::DataCopyExtParams weight_copy_params(1, topk_weights_row_bytes, 0, 0, 0);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
-                    AscendC::DataCopyPad(
-                        weight_input_bytes_ub,
-                        local_shmem_gm[tiling.topk_weights_buffer_offset + local_slot * tiling.topk_weights_row_stride],
-                        weight_copy_params, uint8_pad_params);
+                    if (tiling.combine_compact_weights) {
+                        AscendC::GlobalTensor<float> weight_source;
+                        weight_source.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(symmetric_buffer +
+                            tiling.topk_weights_buffer_offset + local_slot * tiling.topk_weights_row_stride));
+                        AscendC::DataCopyPad(weight_input_ub, weight_source, weight_copy_params,
+                            AscendC::DataCopyPadExtParams<float>{true, 0,
+                                static_cast<uint8_t>(aligned_num_topk - num_topk), 0.0F});
+                    } else {
+                        AscendC::DataCopyPad(weight_input_bytes_ub,
+                            local_shmem_gm[tiling.topk_weights_buffer_offset + local_slot * tiling.topk_weights_row_stride],
+                            weight_copy_params, uint8_pad_params);
+                    }
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
                     AscendC::Add(weight_accumulator_ub, weight_accumulator_ub, weight_input_ub, aligned_num_topk);

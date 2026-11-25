@@ -195,7 +195,7 @@ def test_combine_profiler_excludes_alignment_and_checks_sequence(tmp_path):
         for i, name in enumerate(names * 6):
             writer.writerow([name, i * 100, [999, 20, 30][i % 3]])
     result = bench.capture_combine_stages(tmp_path, 2)
-    assert result == {names[1]: [20, 20], names[2]: [30, 30]}
+    assert result == {names[1]: [20, 20], names[2]: [30, 30], "alignment_notify_us": [999, 999]}
     with pytest.raises(RuntimeError, match="sequence"):
         bench.capture_combine_stages(tmp_path, 3)
 

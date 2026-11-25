@@ -181,6 +181,10 @@ struct alignas(8) CombineTilingData {
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
     uint32_t combine_wqe_fast = 0;
     uint32_t combine_self_double_buffer = 0;
+    // Ordinary peer-schedule weights use dense rows within each contributor's
+    // capacity-sized partition. Payload addressing remains unchanged.
+    uint32_t combine_compact_weights = 0;
+    uint64_t combine_send_channel_prefix = 0;
 };
 
 struct alignas(8) ExpandTilingData {
