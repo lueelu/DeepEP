@@ -585,8 +585,9 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 args = (cores, 2048 if bucket == 'small' else 5632, op)
                 plan = base.for_launch(*args, bf16=True)
                 assert plan is base.for_launch(*args, bf16=True)
-                expected_order = 0 if (cores == 8 and ep in (8,16,32)) or (cores == 32 and ep in (4,8,16)) else order
-                assert plan.native_plan()[:7] == [1, expected_order, group, p, w, q, visit]
+                expected_order = 0
+                rank_p = p * (ep//group if order == 3 else 1)
+                assert plan.native_plan()[:7] == [1, expected_order, group, rank_p, w, q, visit]
                 assert plan.self_copy == (copy or 2)
                 assert plan.send_workers <= cores and plan.send_workers * q <= 32
                 assert plan.valid_group_capacity()
@@ -672,7 +673,8 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
                 for row_bytes in (8192,8193,8194,9216,10240,12286,12287,12288):
                     plan = base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     expected_mode = 2 if row_bytes <= 8192 else mode
-                    assert plan.native_plan() == [1,3,group,1,1,1,8,2,expected_mode]
+                    expected_order, expected_p = (0,4) if ep == 32 else (3,1)
+                    assert plan.native_plan() == [1,expected_order,group,expected_p,1,1,8,2,expected_mode]
                     assert plan.send_workers == group
                     assert plan.send_workers < 32 and plan.valid_group_capacity()
                     assert plan is base.for_launch(cores,row_bytes,'weighted',bf16=True)
@@ -689,7 +691,7 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
             # Width/topology scopes remain unchanged; EP32 combine is not inherited.
             for size in (7168,7170,8190,8191,12289,12290):
                 p = base.for_launch(32,size,'weighted',bf16=True)
-                assert p.peer_order == (2 if ep == 32 and size <= 12288 else 0)
+                assert p.peer_order == 0
             for cores in ((8,20,64) if ep == 32 else (8,20)):
                 p = base.for_launch(cores,8192,'weighted',bf16=True)
                 assert p.peer_order == 0
@@ -733,8 +735,9 @@ def test_weight_preference_does_not_return_to_simt_as_rows_grow():
                             simt = plan.weight_mode != 1 and plan.send_workers < cores
                             # The low-core rank override preserves the weight
                             # mode selected before removing the RR self owner.
-                            rank_keeps_udma = (ep == 8 and cores == 8 and group == 8
-                                              and known and 2048 <= size <= 12288)
+                            rank_keeps_udma = cores == 8 and known and (
+                                (ep == 8 and group == 8 and 2048 <= size <= 12288) or
+                                (ep == 4 and group == 4 and 4096 < size <= 12288))
                             assert simt == (preferred and plan.send_workers < cores and not rank_keeps_udma)
                             # Capacity fallback is separate from the row rule:
                             # no helper must remain legal even in the SIMT band.
@@ -754,13 +757,13 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                                ranks_per_group=group, topology_known=True)
                 for cores in (range(8,16,2) if tier == 8 else range(32,64,2)):
                     plan = base.for_launch(cores,2048 if bucket == 'small' else 5632,op,bf16=True)
-                    expected_order = 0 if (tier == 8 and ep in (8,16,32)) or (tier == 32 and ep in (4,8,16)) else order
-                    assert plan.native_plan()[:7] == [1,expected_order,group,p,w,q,visit]
+                    rank_p = p * (ep//group if order == 3 else 1)
+                    assert plan.native_plan()[:7] == [1,0,group,rank_p,w,q,visit]
                     assert base.config(cores).num_aiv == cores
+                    selected_senders = ((group+p-1)//p if order == 3 else (ep-2)//p+1)*w
                     if op == 'combine':
-                        assert plan.self_copy == (1 if cores >= 2*plan.send_workers else 2)
+                        assert plan.self_copy == (1 if cores >= 2*selected_senders else 2)
                     if op == 'weighted':
-                        selected_senders = ((group+p-1)//p if order == 3 else (ep-2)//p+1)*w
                         assert plan.weight_mode == (2 if cores > selected_senders else 1)
         # Scan legal budgets and both sides of row-width boundaries, including
         # unknown topology and widths outside the measured profiles.
@@ -795,6 +798,9 @@ def test_low_core_rank_defaults_match_measured_plans():
         # P/W/Q, visit, copy and UDMA weight mode are preserved, including
         # EP8 weighted combine's newly available helper slot.
         expected = {
+            (4,'dispatch'): (1,1,2,32,3,0),
+            (4,'combine'): (1,2,1,32,6,0),
+            (4,'weighted'): (1,2,1,32,6,1),
             (8,'dispatch'): (2,1,2,32,4,0),
             (8,'combine'): (1,1,2,32,7,0),
             (8,'weighted'): (1,1,1,32,7,1),
@@ -837,19 +843,23 @@ def test_32_core_rank_defaults_preserve_payload_and_weight_plans():
             (16,'dispatch'): (4,2,1,16,8,2,0,0),
             (16,'combine'): (2,1,1,8,8,1,0,0),
             (16,'weighted'): (2,1,1,4,8,2,2,1),
+            (32,'dispatch'): (4,1,1,32,8,2,0,0),
+            (32,'combine'): (4,1,1,32,8,1,0,0),
+            (32,'weighted'): (4,1,1,32,8,2,2,1),
         }
         for (ep,op),(p,w,q,visit,senders,copy,small_mode,large_mode) in expected.items():
+            group = min(ep,16)
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
-                           ranks_per_group=ep,topology_known=True)
+                           ranks_per_group=group,topology_known=True)
             for cores in (0,32,34,48,62):
                 for hidden,mode in ((2816,small_mode),(6144,large_mode)):
                     plan = base.for_launch(cores,hidden*2,op,bf16=True)
-                    assert plan.native_plan() == [1,0,ep,p,w,q,visit,copy,mode]
+                    assert plan.native_plan() == [1,0,group,p,w,q,visit,copy,mode]
                     assert plan.send_workers == senders
                     assert plan.send_workers*q <= 32
         # Rank is also selected outside fitted topologies/row widths, without
         # manufacturing physical groups or changing the user's actual budget.
-        for ep in (4,8,16):
+        for ep in (4,8,16,32):
             for group in (1,2,4,ep):
                 for known in (False,True):
                     base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
@@ -864,7 +874,7 @@ def test_32_core_rank_defaults_preserve_payload_and_weight_plans():
     """)
 
 
-def test_reported_300_operator_plans_preserve_fields_except_rank_order_and_copy_first():
+def test_reported_300_operator_plans_allow_rank_conversion_and_copy_first_removal():
     # Frozen native plans from the November 16 EP8-128 reports, not generated
     # from the selector. Keep all five operators for each of the 60 shapes.
     run_host("""
@@ -889,11 +899,13 @@ def test_reported_300_operator_plans_preserve_fields_except_rank_order_and_copy_
                            ranks_per_group=group, topology_known=True)
             plan = base.for_launch(cores,hidden*2,op,bf16=True)
             historical = json.loads(row['native_plan'])
-            # Preserve the historical fixture; normalize only explicitly
-            # changed order/copy fields, never regenerate expected plans.
+            # Preserve the historical fixture; normalize only rank order,
+            # its RR ownership width, and copy-first. Never regenerate it.
             historical[7] = historical[7] or 2
             senders = int(row['send_aivs'])
-            if ep in (4,8,16) and cores == 32:
+            if ep in (4,8,16,32) and cores == 32:
+                if historical[1] == 3:
+                    historical[3] *= ep//group
                 historical[1] = 0
                 senders = ((ep-2)//historical[3]+1)*historical[4]
             assert plan.native_plan() == historical, (key, op, plan)
@@ -968,7 +980,7 @@ def test_ep32_dispatch_profile_survives_extra_cores_with_separate_combine_tiers(
             assert base.config(cores).num_aiv == cores
             for size in (5632,8192,12288):
                 plan = base.for_launch(cores,size,'dispatch',bf16=True)
-                assert plan.native_plan() == [1,1,8,4,1,1,32,2,0]
+                assert plan.native_plan() == [1,1 if cores >= 64 else 0,8,4,1,1,32,2,0]
                 report = effective_udma_config(buffer,num_aiv=cores,row_bytes=size,bf16=True)
                 assert report['operation_plans']['dispatch'] == asdict(plan)
             for size in (1024,2048,4096,14336):
@@ -978,7 +990,7 @@ def test_ep32_dispatch_profile_survives_extra_cores_with_separate_combine_tiers(
             for options in ({'expanded':True}, {'v2':False}, {'bf16':False}):
                 assert base.for_launch(cores,5632,'dispatch',**{'bf16':True,**options}).peer_order == 0
                 for op in ('combine','weighted'):
-                    assert base.for_launch(cores,12288,op,bf16=True).peer_order == (3 if cores < 64 else 0)
+                    assert base.for_launch(cores,12288,op,bf16=True).peer_order == 0
     """)
 
 
