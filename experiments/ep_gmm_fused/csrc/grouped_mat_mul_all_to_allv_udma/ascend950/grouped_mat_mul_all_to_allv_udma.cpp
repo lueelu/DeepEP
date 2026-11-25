@@ -62,12 +62,15 @@ constexpr TilingProfile kDefaultTiling{KernelVariant::kM0_128, 128, 256, 256, 10
 constexpr TilingProfile kK1024N2048Tiling{KernelVariant::kM0_128, 128, 256, 256, 10, 8, 64, 4, 4, 0, 2, 4, 1};
 constexpr TilingProfile kK512N2048Tiling{KernelVariant::kM0_128, 128, 256, 256, 16, 32, 16, 1, 20, 0, 2, 16, 1};
 
-// CatCCOS 54522865 search winners for four ranks and 28 experts.
-// M=131084 is the measured local input size, not a rank-invariant selection key.
+// EP4 / 28 experts lean-staging profiles. The 2026-11-25 Event search found
+// 256-row staging at M=65536 (3544.5 / 6989.6 us) and msprof confirmed the same
+// profile is also faster at M=131072 (6834.4 / 13546.3 us), so EP4 selects it
+// for the whole K/N pair. M stays out of the key because the inverse input rows
+// are local to a rank under imbalanced routing.
 constexpr TilingProfile kEp4K3072N3584Tiling{
-    KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 16, 16, 1, 16, 2048, 3, 8, 8};
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 1, 2, 64, 1, 16, 256, 3, 1, 8};
 constexpr TilingProfile kEp4K6144N3584Tiling{
-    KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 16, 16, 1, 16, 2048, 2, 8, 8};
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 1, 32, 64, 1, 16, 256, 3, 16, 8};
 
 // EP64 / 896 experts, 2026-11-15 Event search: c21e4912f8fac930 / 2ef5abd707b6fd40.
 // Performance-selected profiles; full numerical validation remains pending.

@@ -92,6 +92,16 @@ constexpr TilingProfile kM131072K3584N6144ExportTiling{
 constexpr TilingProfile kM131072K3584N3072ExportTiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 32, 32, 1, 16, 2048, 2, 16, 1, 8, 8};
 
+// EP4 / 28 experts, M=65536 export winners from the 2026-11-25 Event search,
+// confirmed by msprof (100 calls, max-rank p50): N6144 7068.9 us / 94.51% MFU,
+// N3072 3579.6 us / 93.32% MFU. Halving M halves the staging demand, so these
+// profiles keep 512 stage rows and double the export/self-copy workers instead
+// of the 2048-row staging used by the M=131072 profiles above.
+constexpr TilingProfile kM65536K3584N6144ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 2, 64, 64, 1, 16, 512, 2, 8, 1, 16, 8};
+constexpr TilingProfile kM65536K3584N3072ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 2, 64, 64, 1, 16, 512, 3, 8, 1, 0, 4};
+
 TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
                            bool outputAllToAllV)
 {
@@ -101,6 +111,14 @@ TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSiz
     // This operator requires the input M/K/N and the export mode to be
     // rank-invariant; those values are therefore safe selection keys.
     const bool isFourRank28ExpertCase = worldSize == 4 && expertNum == 28;
+    if (isFourRank28ExpertCase && outputAllToAllV && m == 65536 && k == 3584) {
+        if (n == 6144) {
+            return kM65536K3584N6144ExportTiling;
+        }
+        if (n == 3072) {
+            return kM65536K3584N3072ExportTiling;
+        }
+    }
     if (isFourRank28ExpertCase && outputAllToAllV && m == 131072 && k == 3584) {
         if (n == 6144) {
             return kM131072K3584N6144ExportTiling;

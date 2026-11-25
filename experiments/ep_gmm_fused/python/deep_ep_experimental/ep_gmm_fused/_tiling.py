@@ -234,6 +234,19 @@ def default_tiling(case):
             and n in (6144, 3072)
         ):
             values = [256, 256, 256, 32, 2048, 2, 16, 1, 8, 4 if n == 6144 else 8]
+        elif (
+            export
+            and case["world_size"] == 4
+            and case["expert_num"] == 28
+            and m == 65536
+            and k == 3584
+            and n in (6144, 3072)
+        ):
+            values = (
+                [256, 256, 256, 64, 512, 2, 8, 1, 16, 8]
+                if n == 6144
+                else [256, 256, 256, 64, 512, 3, 8, 1, 0, 4]
+            )
     elif operator == GROUPED_MATMUL:
         values = [128, 256, 256, 10, 32, 0, 2, 1]
         if case["world_size"] > 8:
@@ -244,7 +257,7 @@ def default_tiling(case):
             elif k == 512:
                 values = [128, 256, 256, 16, 16, 0, 2, 1]
         elif case["world_size"] == 4 and case["expert_num"] == 28 and n == 3584 and k in (3072, 6144):
-            values = [256, 256, 256, 8, 8, 2048, 3 if k == 3072 else 2, 8]
+            values = [256, 256, 256, 1, 1 if k == 3072 else 16, 256, 3, 8]
         elif case["world_size"] == 64 and case["expert_num"] == 896 and n == 3584 and k in (3072, 6144):
             # Same performance-selected EP64 profiles as the native launcher.
             values = [128, 256, 256, 1, 1 if k == 3072 else 16, 256, 3, 1]
