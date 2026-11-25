@@ -223,7 +223,10 @@ def test_events_do_not_load_native_extension(event_backend, monkeypatch):
 
 
 @pytest.mark.parametrize("consume_outputs", [True, False])
-def test_selected_consumers_preserve_producer_protection_and_ownership(event_backend, monkeypatch, consume_outputs):
+@pytest.mark.parametrize("same_stream_outputs", [True, False])
+def test_selected_consumers_preserve_producer_protection_and_ownership(
+    event_backend, monkeypatch, consume_outputs, same_stream_outputs
+):
     import gc
     import weakref
 
@@ -252,9 +255,16 @@ def test_selected_consumers_preserve_producer_protection_and_ownership(event_bac
     output, plan, source, owner = Tensor("output"), Tensor("plan"), Tensor("source"), Owner()
     refs = [weakref.ref(value) for value in (output, plan, source, owner)]
     overlap = instance._finish_comm_event(
-        True, (output, plan, source, owner), consumer_tensors=(output,) if consume_outputs else ()
+        True,
+        (output, plan, source, owner),
+        consumer_tensors=(output,) if consume_outputs else (),
+        producer_tensors=(source,) if same_stream_outputs else None,
     )
-    assert log == [("record", producer), ("output", producer), ("plan", producer), ("source", producer)]
+    assert log == [("record", producer)] + (
+        [("source", producer)]
+        if same_stream_outputs
+        else [("output", producer), ("plan", producer), ("source", producer)]
+    )
     del output, plan, source, owner
     gc.collect()
     assert all(ref() is not None for ref in refs)

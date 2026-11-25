@@ -71,10 +71,11 @@ class EventOverlap:
             if isinstance(t, torch.Tensor) and t.device.type == "npu" and t.device.index == self.event._device
         )
 
-    def _track_tensors(self, resources) -> None:
+    def _track_tensors(self, resources, producer_tensors=None) -> None:
         self._stream_tensors = self._filter_tensors(resources)
         # Protect producer-stream use even if the wrapper is abandoned.
-        for tensor in self._stream_tensors:
+        producers = self._stream_tensors if producer_tensors is None else self._filter_tensors(producer_tensors)
+        for tensor in producers:
             tensor.record_stream(self.event._stream)
 
     @classmethod
@@ -84,11 +85,12 @@ class EventOverlap:
         resources: Tuple[Any, ...],
         *,
         consumer_tensors: Optional[Tuple[Any, ...]] = None,
+        producer_tensors: Optional[Tuple[Any, ...]] = None,
     ) -> "EventOverlap":
         """Own backend resources without changing public extra_tensors semantics."""
         overlap = cls(event)
         overlap._retained_objects = resources
-        overlap._track_tensors(resources)
+        overlap._track_tensors(resources, producer_tensors)
         if consumer_tensors is not None:
             overlap._consumer_tensors = overlap._filter_tensors(consumer_tensors)
         return overlap

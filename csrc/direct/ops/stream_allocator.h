@@ -38,7 +38,11 @@ public:
             c10_npu::NPUStreamGuard guard(allocation_);
             return torch::empty(sizes, options);
         }();
-        Record({tensor});
+        // Only this freshly allocated storage has known allocation provenance.
+        // Reuse on its allocation stream is ordered without allocator events.
+        // Record() for incoming/cached tensors must remain unconditional: the
+        // caller's allocation setting says nothing about their storage owner.
+        if (allocation_ != execution_) Record({tensor});
         return tensor;
     }
 

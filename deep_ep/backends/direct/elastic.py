@@ -1058,6 +1058,11 @@ class ElasticBuffer:
                 handle,
             ),
             consumer_tensors=consumer_tensors,
+            # Returned outputs and a newly built plan were allocated on this
+            # communication stream. Retain their owners, but only inputs need
+            # producer registration here. A cached plan is protected by native
+            # dispatch's input Record(), independently of this call's setting.
+            producer_tensors=(x_tensor, x_scales, topk_weights) if allocate_on_comm_stream else None,
         )
         if host_timing is not None:
             host_timing.end_dispatch_host_timing()
@@ -1245,11 +1250,15 @@ class ElasticBuffer:
         extra_tensors: Tuple[Any, ...],
         *,
         consumer_tensors: Optional[Tuple[Any, ...]] = None,
+        producer_tensors: Optional[Tuple[Any, ...]] = None,
     ) -> EventOverlap:
         event = _try_record_event(self._communication_stream)
         if async_with_compute_stream:
             return EventOverlap._from_resources(
-                event, _compact_extra_tensors(extra_tensors), consumer_tensors=consumer_tensors
+                event,
+                _compact_extra_tensors(extra_tensors),
+                consumer_tensors=consumer_tensors,
+                producer_tensors=producer_tensors,
             )
         event.current_stream_wait()
         return EventOverlap()
