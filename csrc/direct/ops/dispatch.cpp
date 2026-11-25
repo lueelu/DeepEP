@@ -721,6 +721,9 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_qps_per_worker = udma_launch.qps;
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
+    LastDispatchLaunch() = {tiling.udma_peer_order,     tiling.udma_peers_per_worker, tiling.udma_workers_per_peer,
+                            tiling.udma_qps_per_worker, tiling.udma_wqes_per_visit,   tiling.block_dim,
+                            tiling.cached_channel};
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
     // Sending AIVs never copy self before submitting payload. The old overlap
     // environment variable can no longer restore that ordering.

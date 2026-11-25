@@ -1,7 +1,16 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
+
 namespace ascend_deepep::ops {
 // Per-launch observation only: never consulted when selecting the next launch.
+// order, P, W, Q, visit, communication cores, whole-channel cached payload.
+inline std::array<uint32_t, 7>& LastDispatchLaunch()
+{
+    static thread_local std::array<uint32_t, 7> launch{};
+    return launch;
+}
 inline bool& LastDispatchChannelMetadata()
 {
     static thread_local bool enabled = false;

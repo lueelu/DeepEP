@@ -1,7 +1,7 @@
-"""One SHMEM initialization, existing full-Clos peer schedules, performance only.
+"""One SHMEM initialization, existing full-Clos peer schedules and staged tuning.
 
 Launch on each node with torchrun. --plan-only needs no torch/NPU installation.
-No numerical validation is performed; every report explicitly records that.
+Legacy mode is performance-only. --small-rank-sweep checks finalist precision.
 """
 
 import argparse
@@ -152,7 +152,17 @@ def parse_args(argv=None):
     p.add_argument("--replay-report", type=Path, help="rerun each operator's winner from a prior report")
     p.add_argument("--smoke", action="store_true", help="one legal candidate per peer order")
     p.add_argument("--plan-only", action="store_true")
+    p.add_argument(
+        "--small-rank-sweep",
+        action="store_true",
+        help="staged EP4/8 rank sweep: six operators, API timing and finalist precision",
+    )
+    p.add_argument("--reduce-cores", type=int, default=48)
     args = p.parse_args(argv)
+    if args.small_rank_sweep:
+        from rank_sweep import validate_args
+
+        validate_args(p, args, argv)
     if args.replay_report and args.combine_self_copy_modes and len(args.combine_self_copy_modes) != 1:
         p.error("replay accepts only one explicit self-copy mode")
     args.replay_mode_override = (
@@ -443,6 +453,10 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
 
 def main():
     args = parse_args()
+    if args.small_rank_sweep:
+        from rank_sweep import run
+
+        return run(args)
     shapes = args.case
     plans = []
     replay = json.loads(args.replay_report.read_text()) if args.replay_report else None
@@ -647,10 +661,8 @@ def main():
                 ),
             }
             if weighted:
-                invocations["combine_weighted"] = (
-                    lambda owned=owned, handle=handle, a=a, w=owned_weights: buffer.combine(
-                        owned, handle, topk_weights=w, num_sms=a, async_with_compute_stream=True
-                    )
+                invocations["combine_weighted"] = lambda owned=owned, handle=handle, a=a, w=owned_weights: (
+                    buffer.combine(owned, handle, topk_weights=w, num_sms=a, async_with_compute_stream=True)
                 )
             item = dict(shape=shape, operations={})
             for op, invoke in invocations.items():
@@ -786,11 +798,20 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         import sys
         import traceback
 
-        if "--output" in sys.argv and "RANK" in os.environ:
-            destination = Path(sys.argv[sys.argv.index("--output") + 1]) / f"rank{os.environ['RANK']}" / "exit.json"
-            write(destination, dict(code=1, complete=False, traceback=traceback.format_exc()))
+        try:
+            if "--output" in sys.argv and "RANK" in os.environ:
+                destination = Path(sys.argv[sys.argv.index("--output") + 1]) / f"rank{os.environ['RANK']}" / "exit.json"
+                write(destination, dict(code=1, complete=False, traceback=traceback.format_exc()))
+        except OSError:
+            traceback.print_exc()
+        if "--small-rank-sweep" in sys.argv and "RANK" in os.environ:
+            # Do not enter native collective destruction after a failed rank.
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
         raise

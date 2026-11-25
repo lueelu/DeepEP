@@ -9,7 +9,21 @@ Modified by Joyce_An 2026
 
 visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变。visit 是一个 peer 每轮的 WQE 预算，64/128 会拆为多个最多32条的提交，不扩大 WQE 暂存区，也不改变 SQ 信用保护。带权重等多字段路径按 WQE 计数，不等于同等数量的 token。新增取值需同步更新 Python 和 Host 库。
 
-`clos/bench_fast_sweep.py` 在候选策略过滤完成后，自动将本次所有算子（包括准备 handle 的 fresh dispatch）的 QP 映射并集传给 SHMEM，每个进程只初始化一个 Buffer。`--plan-only` 和输出 `plan.json` 中的 `qp_plans` 记录建链范围；`BUFFER_READY` 记录初始化耗时。visit 不改变 QP 映射，固定 P/W/Q 的 visit 扫描不会额外预建其他策略的连接。此脚本仍是性能摸测入口，**不做精度验证**。
+`clos/bench_fast_sweep.py` 在候选策略过滤完成后，自动将本次所有算子（包括准备 handle 的 fresh dispatch）的 QP 映射并集传给 SHMEM，每个进程只初始化一个 Buffer。`--plan-only` 和输出 `plan.json` 中的 `qp_plans` 记录建链范围；`BUFFER_READY` 记录初始化耗时。visit 不改变 QP 映射，固定 P/W/Q 的 visit 扫描不会额外预建其他策略的连接。普通模式**不做精度验证**；下面的精简 rank 模式会检查入围配置。
+
+### EP4/8 精简 rank 摸测
+
+```bash
+torchrun --nproc_per_node=8 benchmarks/clos/bench_fast_sweep.py \
+  --small-rank-sweep --ep-size 8 --no-huge-pages --reduce-cores 48 \
+  --warmup 3 --samples 8 --final-samples 30 --top 3 --output rank_ep8
+```
+
+EP4 将进程数和 `--ep-size` 都改为4。使用空的新输出目录，清除所有 `DEEPEP_CLOS_*` 覆盖变量，重编安装当前 Host/kernel 和锁定的 SHMEM。模式会核验实际大页关闭、下发的 P/W/Q/visit、dispatch 连续 metadata 与 combine 连续权重/本卡直读；不改变库默认值。`--plan-only` 可在无设备环境查看候选。
+
+每个 EP、每个 rank 只初始化一次 Buffer，涵盖 T4096/8192、H2816/4096/6144、通信8/32核、K8/E256/BF16/expand0，以及 fresh/cached/combine 各自的无权和带权路径。先在 T8192、H2816/6144 下比较三组 P/W/Q 与 visit16/32，再给选中的 P/W/Q 扫 visit4/8/64/128。EP4 使用 P1W1Q1、P1W1Q2、P1W2Q1；EP8/8核将最后一组替换为 P2W2Q1，EP8/32核仍用 P1W2Q1。其余 shape 只验证代表配置与实际 auto；H4096 继承 H6144 候选，检查泛化。
+
+初筛不逐候选检查精度；入围配置使用独立 CPU 参考进行三次连续复用、零容差检查，再正反顺序各采样30次。全部配置固定 rank，仅变 P/W/Q/visit，保留生产默认优化。报告中的“最优”只指本次分阶段候选，不是穷举最优。`summary.csv` 给出通信带宽、独立完整 API 和各阶段 mean/P50/P95；`rank*/` 保留原始样本、profiler 和实际 launch。带宽分子仅为去重后的 BF16 payload（含本卡、不含权重），各次采样取最慢 rank；不将不同阶段的最慢值相加推断 API。combine notify 使用独立诊断采样，额外 rendezvous 不进入 API 计时。失败会保留已完成数据并退出，不能把未完成的覆盖记作通过。
 
 其他固定策略脚本可在创建 Buffer 前设置，例如 EP64、rank/P8/W1/Q1：
 

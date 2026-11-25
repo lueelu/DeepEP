@@ -468,6 +468,15 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         tiling.pipeline_topk = static_cast<uint32_t>(pipeline_mapping->size(1));
     }
     const auto ffts_addr = shmem.FftsAddr();
+    LastCombineLaunch() = {tiling.udma_peer_order,
+                           tiling.udma_peers_per_worker,
+                           tiling.udma_workers_per_peer,
+                           tiling.udma_qps_per_worker,
+                           tiling.udma_wqes_per_visit,
+                           tiling.block_dim,
+                           static_cast<uint32_t>(reduce_aivs),
+                           tiling.combine_compact_weights,
+                           tiling.combine_direct_self};
     // Capture the prepared tensors/tiling by value once; no recomputation or
     // allocation between communication and reduction, and no host synchronize.
     auto launch = [=](CombinePhase phase) {

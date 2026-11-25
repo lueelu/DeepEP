@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <torch/custom_class.h>
 #include <tuple>
@@ -13,6 +15,14 @@ class BufferRuntime;
 }
 
 namespace ascend_deepep::ops {
+
+// Read-only launch observation for benchmarks; never used to choose a policy.
+// order, P, W, Q, visit, communication cores, reduce cores, compact weights, direct self.
+inline std::array<uint32_t, 9>& LastCombineLaunch()
+{
+    static thread_local std::array<uint32_t, 9> launch{};
+    return launch;
+}
 
 using CombineResult = std::tuple<torch::Tensor, c10::optional<torch::Tensor>>;
 

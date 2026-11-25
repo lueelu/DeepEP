@@ -14,6 +14,7 @@
 #include "ops/dispatch_host_timing.h"
 #include "ops/dispatch_device_timing.h"
 #include "ops/dispatch_channel_metadata.h"
+#include "ops/combine.h"
 #include <pybind11/stl.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -27,6 +28,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("take_dispatch_device_timing", &ascend_deepep::ops::TakeDispatchDeviceTiming);
     m.def("take_combine_device_timing", &ascend_deepep::ops::TakeCombineDeviceTiming);
     m.def("last_dispatch_channel_metadata", [] { return ascend_deepep::ops::LastDispatchChannelMetadata(); });
+    m.def("last_combine_launch", [] { return ascend_deepep::ops::LastCombineLaunch(); });
+    m.def("last_dispatch_launch", [] { return ascend_deepep::ops::LastDispatchLaunch(); });
     m.def("last_dispatch_channel_metadata_tile_tokens",
           [] { return ascend_deepep::ops::LastDispatchChannelMetadataTileTokens(); });
     m.attr("dispatch_channel_metadata_version") = 4;
