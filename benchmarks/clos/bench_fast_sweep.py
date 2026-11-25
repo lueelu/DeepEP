@@ -155,7 +155,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--small-rank-sweep",
         action="store_true",
-        help="staged EP4/8 rank sweep: six operators, API timing and finalist precision",
+        help="staged EP4/8/16/32 rank sweep: six operators, API timing and finalist precision",
     )
     p.add_argument("--reduce-cores", type=int, default=48)
     args = p.parse_args(argv)

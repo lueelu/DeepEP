@@ -11,7 +11,7 @@ visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变
 
 `clos/bench_fast_sweep.py` 在候选策略过滤完成后，自动将本次所有算子（包括准备 handle 的 fresh dispatch）的 QP 映射并集传给 SHMEM，每个进程只初始化一个 Buffer。`--plan-only` 和输出 `plan.json` 中的 `qp_plans` 记录建链范围；`BUFFER_READY` 记录初始化耗时。visit 不改变 QP 映射，固定 P/W/Q 的 visit 扫描不会额外预建其他策略的连接。普通模式**不做精度验证**；下面的精简 rank 模式会检查入围配置。
 
-### EP4/8 精简 rank 摸测
+### EP4/8/16/32 精简 rank 摸测
 
 ```bash
 torchrun --nproc_per_node=8 benchmarks/clos/bench_fast_sweep.py \
@@ -19,9 +19,31 @@ torchrun --nproc_per_node=8 benchmarks/clos/bench_fast_sweep.py \
   --warmup 3 --samples 8 --final-samples 30 --top 3 --output rank_ep8
 ```
 
-EP4 将进程数和 `--ep-size` 都改为4。使用空的新输出目录，清除所有 `DEEPEP_CLOS_*` 覆盖变量，重编安装当前 Host/kernel 和锁定的 SHMEM。模式会核验实际大页关闭、下发的 P/W/Q/visit、dispatch 连续 metadata 与 combine 连续权重/本卡直读；不改变库默认值。`--plan-only` 可在无设备环境查看候选。
+EP4/16 单机运行时，将进程数和 `--ep-size` 同时改为4/16。EP32 可用两台各16卡的机器，在两台分别执行（`MASTER_ADDR` 为首台可达地址，`NODE_RANK` 分别为0/1）：
 
-每个 EP、每个 rank 只初始化一次 Buffer，涵盖 T4096/8192、H2816/4096/6144、通信8/32核、K8/E256/BF16/expand0，以及 fresh/cached/combine 各自的无权和带权路径。先在 T8192、H2816/6144 下比较三组 P/W/Q 与 visit16/32，再给选中的 P/W/Q 扫 visit4/8/64/128。EP4 使用 P1W1Q1、P1W1Q2、P1W2Q1；EP8/8核将最后一组替换为 P2W2Q1，EP8/32核仍用 P1W2Q1。其余 shape 只验证代表配置与实际 auto；H4096 继承 H6144 候选，检查泛化。
+```bash
+torchrun --nnodes=2 --nproc_per_node=16 --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port=29500 \
+  benchmarks/clos/bench_fast_sweep.py \
+  --small-rank-sweep --ep-size 32 --no-huge-pages --reduce-cores 48 \
+  --warmup 3 --samples 8 --final-samples 30 --top 3 --output rank_ep32
+```
+
+两台参数必须一致，并开放 torchrun、控制面（默认29610）及 SHMEM（默认29620）端口。各节点保存自己的逐rank结果，rank0保存总表；回收结果时合并两台的 `rank*/` 目录。每个 EP 独立启动任务，不能用一个32进程任务同时测多个 EP。使用空的新输出目录，清除所有 `DEEPEP_CLOS_*` 覆盖变量，重编安装当前 Host/kernel 和锁定的 SHMEM。模式会核验实际大页关闭、下发的 P/W/Q/visit、dispatch 连续 metadata 与 combine 连续权重/本卡直读；不改变库默认值。`--plan-only` 可在无设备环境查看候选。
+
+每个 EP、每个 rank 只初始化一次 Buffer，涵盖 T4096/8192、H2816/4096/6144、通信8/32核、K8/E256/BF16/expand0，以及 fresh/cached/combine 各自的无权和带权路径。先在 T8192、H2816/6144 下比较三组 P/W/Q 与 visit16/32，再给选中的 P/W/Q 扫 visit4/8/64/128。其余 shape 只验证代表配置与实际 auto；H4096 继承 H6144 候选，检查泛化。
+
+三组分别为单worker、双QP和双worker，P取满足通信核数及32个QP槽位限制的最小合法值。32核不限制为8个发送核。以下括号为实际发送核数，另加当前auto对照；EP4/8候选保持不变。
+
+| EP | 通信核数 | 单worker P/W/Q | 双QP P/W/Q | 双worker P/W/Q |
+|---|---|---|---|---|
+| 4 | 8/32 | 1/1/1（3） | 1/1/2（3） | 1/2/1（6） |
+| 8 | 8 | 1/1/1（7） | 1/1/2（7） | 2/2/1（8） |
+| 8 | 32 | 1/1/1（7） | 1/1/2（7） | 1/2/1（14） |
+| 16 | 8 | 2/1/1（8） | 2/1/2（8） | 4/2/1（8） |
+| 16 | 32 | 1/1/1（15） | 1/1/2（15） | 1/2/1（30） |
+| 32 | 8 | 4/1/1（8） | 4/1/2（8） | 8/2/1（8） |
+| 32 | 32 | 1/1/1（31） | 2/1/2（16） | 2/2/1（32） |
 
 初筛不逐候选检查精度；入围配置使用独立 CPU 参考进行三次连续复用、零容差检查，再正反顺序各采样30次。全部配置固定 rank，仅变 P/W/Q/visit，保留生产默认优化。报告中的“最优”只指本次分阶段候选，不是穷举最优。`summary.csv` 给出通信带宽、独立完整 API 和各阶段 mean/P50/P95；`rank*/` 保留原始样本、profiler 和实际 launch。带宽分子仅为去重后的 BF16 payload（含本卡、不含权重），各次采样取最慢 rank；不将不同阶段的最慢值相加推断 API。combine notify 使用独立诊断采样，额外 rendezvous 不进入 API 计时。失败会保留已完成数据并退出，不能把未完成的覆盖记作通过。
 

@@ -17,8 +17,26 @@ sweep = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sweep)
 
 
-@pytest.mark.parametrize("ep", [4, 8])
-def test_matrix_policy_and_qp_reservation(ep):
+@pytest.mark.parametrize(
+    "ep,cores,expected",
+    [
+        (4, 8, [(1, 1, 1, 3), (1, 1, 2, 3), (1, 2, 1, 6)]),
+        (4, 32, [(1, 1, 1, 3), (1, 1, 2, 3), (1, 2, 1, 6)]),
+        (8, 8, [(1, 1, 1, 7), (1, 1, 2, 7), (2, 2, 1, 8)]),
+        (8, 32, [(1, 1, 1, 7), (1, 1, 2, 7), (1, 2, 1, 14)]),
+        (16, 8, [(2, 1, 1, 8), (2, 1, 2, 8), (4, 2, 1, 8)]),
+        (16, 32, [(1, 1, 1, 15), (1, 1, 2, 15), (1, 2, 1, 30)]),
+        (32, 8, [(4, 1, 1, 8), (4, 1, 2, 8), (8, 2, 1, 8)]),
+        (32, 32, [(1, 1, 1, 31), (2, 1, 2, 16), (2, 2, 1, 32)]),
+    ],
+)
+def test_rank_shortlist_core_allocation(ep, cores, expected):
+    actual = sweep.shortlist(ep, cores, visits=(32,))
+    assert [(c["peers"], c["workers"], c["qps"], c["payload_aivs"]) for c in actual] == expected
+
+
+@pytest.mark.parametrize("ep,group", [(4, 4), (8, 8), (16, 16), (32, 16), (32, 8)])
+def test_matrix_policy_and_qp_reservation(ep, group):
     from tests.api.test_clos_compatibility import run_host
 
     run_host(f"""
@@ -26,8 +44,9 @@ def test_matrix_policy_and_qp_reservation(ep):
         from rank_sweep import cases, shortlist, SweepPolicy, policy_config, OPS, op_kind, VISITS
         from bench_fast_sweep import qp_plan_spec
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
-        from dataclasses import asdict
+        from dataclasses import asdict, replace
         base = resolve_udma_policy(True, {ep}, 'udma', None, None, None, None, None)
+        base = replace(base, ranks_per_group={group}, topology_known=True)
         wrapper = SweepPolicy(base)
         shapes = cases()
         assert len(shapes) == 12
@@ -44,6 +63,7 @@ def test_matrix_policy_and_qp_reservation(ep):
                     plan = wrapper.for_launch(a, h*2, op_kind(op), bf16=True)
                     plan.validate_num_aiv(a)
                     assert plan.send_workers == c['payload_aivs'] <= a
+                    assert plan.send_workers * c['qps'] <= 32
                     before, after = asdict(original), asdict(plan)
                     for field in ('peer_order','peers_per_worker','workers_per_peer','qps_per_worker','wqes_per_visit'):
                         before.pop(field); after.pop(field)
@@ -52,22 +72,24 @@ def test_matrix_policy_and_qp_reservation(ep):
                 wrapper.config = policy_config(original, {ep}, True)
                 assert wrapper.for_launch(a, h*2, op_kind(op), bf16=True) == original
         spec = qp_plan_spec([dict(operations={{'all':configs}})])
-        assert len(spec.split(';')) <= 4
+        assert len(spec.split(';')) <= 8
         assert all(v.startswith('rank:') for v in spec.split(';'))
     """)
 
 
-def test_cli_plan_and_rejected_selectors(monkeypatch, capsys):
+@pytest.mark.parametrize("ep", [4, 8, 16, 32])
+def test_cli_plan_and_rejected_selectors(monkeypatch, capsys, ep):
     monkeypatch.syspath_prepend(str(BENCH))
     import bench_fast_sweep as entry
 
-    args = entry.parse_args(["--small-rank-sweep", "--ep-size", "8", "--plan-only"])
+    args = entry.parse_args(["--small-rank-sweep", "--ep-size", str(ep), "--plan-only"])
     assert args.seed == 20261122 and not args.huge_pages and args.reduce_cores == 48
     sweep.run(args)
     plan = json.loads(capsys.readouterr().out)
+    assert plan["ep"] == ep
     assert len(plan["cases"]) == 12 and len(plan["operators"]) == 6
     for extra in (
-        ["--ep-size", "16"],
+        ["--ep-size", "64"],
         ["--huge-pages"],
         ["--case", "4096,2816,8,8"],
         ["--seed=1"],
@@ -198,11 +220,14 @@ def test_measure_keeps_profiler_notify_outside_full_api(tmp_path, monkeypatch):
     assert not rows[0]["precision_checked"]
 
 
-def test_session_reserves_once_and_reuses_buffer_for_all_shapes():
+@pytest.mark.parametrize("ep", [4, 8, 16, 32])
+def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep):
     from tests.api.test_clos_compatibility import run_host
 
-    run_host("""
+    run_host(
+        """
         import os, tempfile, json
+        ep = TEST_EP
         from pathlib import Path
         from unittest.mock import patch
         sys.path.insert(0, 'benchmarks/clos')
@@ -211,7 +236,7 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes():
         import stage_metrics
         from deep_ep.backends.direct import elastic, _native
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
-        os.environ.update(RANK='0',WORLD_SIZE='4',LOCAL_RANK='0',MASTER_ADDR='localhost')
+        os.environ.update(RANK='0',WORLD_SIZE=str(ep),LOCAL_RANK='0',MASTER_ADDR='localhost')
         for key in list(os.environ):
             if key.startswith('DEEPEP_CLOS_'): del os.environ[key]
         dist = ModuleType('torch.distributed')
@@ -219,7 +244,7 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes():
         sys.modules['torch.distributed'] = torch.distributed = dist
         sys.modules['torch_npu'] = ModuleType('torch_npu')
         torch.npu = SimpleNamespace(set_device=lambda n:None,synchronize=lambda:None,empty_cache=lambda:None)
-        group = SimpleNamespace(size=lambda:4,rank=lambda:0,gather=lambda x:[x]*4,agree=lambda x:None)
+        group = SimpleNamespace(size=lambda:ep,rank=lambda:0,gather=lambda x:[x]*ep,agree=lambda x:None)
         entry.StoreGroup = lambda *a:group
         stage_metrics.L2CacheFlush = lambda *a:None
         stage_metrics.prepare_v2_sample = lambda *a:None
@@ -232,9 +257,11 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes():
             def __init__(self,g,**kw):
                 assert not kw['use_1g_huge_pages'] and kw['num_max_tokens_per_rank']==8192
                 assert os.environ['DEEPEP_CLOS_TUNING_SESSION']=='1'
-                assert 'rank:1:2:1' in os.environ['DEEPEP_CLOS_QP_PLANS']
+                for a in (8,32):
+                    for c in runner.shortlist(ep,a):
+                        assert f"rank:{c['peers']}:{c['workers']}:{c['qps']}" in os.environ['DEEPEP_CLOS_QP_PLANS']
                 initialized.append(self)
-                self._udma_auto_policy = resolve_udma_policy(True,4,'udma',None,None,None,None,None).bind_group(g)
+                self._udma_auto_policy = resolve_udma_policy(True,ep,'udma',None,None,None,None,None).bind_group(g)
                 self.runtime = SimpleNamespace(use_1g_huge_pages=lambda:False)
             @property
             def udma_auto_policy(self): return self._udma_auto_policy
@@ -251,10 +278,11 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes():
             native = root/'_clos_C.so'; native.write_bytes(b'host')
             (root/'libdeepep_clos_kernels.so').write_bytes(b'kernel')
             (root/'.libs').mkdir(); (root/'.libs/libshmem.so').write_bytes(b'shmem')
-            args = entry.parse_args(['--small-rank-sweep','--ep-size','4','--output',str(root/'result')])
+            args = entry.parse_args(['--small-rank-sweep','--ep-size',str(ep),'--output',str(root/'result')])
             with patch.object(runner.importlib.util,'find_spec',return_value=SimpleNamespace(origin=str(native))):
                 runner.run(args)
             report = json.loads((args.output/'report.json').read_text())
             assert report['buffer_initializations']==1 and not report['huge_pages']
         assert len(initialized)==1 and destroyed==initialized and executed==runner.cases()
-    """)
+    """.replace("TEST_EP", str(ep))
+    )

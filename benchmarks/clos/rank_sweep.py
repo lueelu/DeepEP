@@ -18,12 +18,13 @@ from types import SimpleNamespace
 
 OPS = ("fresh", "fresh_weighted", "cached", "cached_weighted", "combine", "combine_weighted")
 VISITS = (4, 8, 16, 32, 64, 128)
+SUPPORTED_EPS = (4, 8, 16, 32)
 
 
 def validate_args(parser, args, argv):
     argv = sys.argv[1:] if argv is None else argv
-    if args.ep_size not in (4, 8):
-        parser.error("small-rank-sweep requires EP4 or EP8")
+    if args.ep_size not in SUPPORTED_EPS:
+        parser.error("small-rank-sweep requires EP4/8/16/32")
     if args.case or args.strategies or args.replay_report or args.quick or args.smoke:
         parser.error("small-rank-sweep owns its case/candidate matrix; do not supply other selectors")
     if args.combine_self_copy_modes or args.combine_parallel_self_copy or args.combine_self_copy_after_submit:
@@ -62,7 +63,15 @@ def candidate(p, w, q, visit, ep):
 
 
 def shortlist(ep, cores, visits=(16, 32)):
-    triples = [(1, 1, 1), (1, 1, 2), (2, 2, 1) if ep == 8 and cores == 8 else (1, 2, 1)]
+    if ep not in SUPPORTED_EPS or cores not in (8, 32):
+        raise ValueError("rank shortlist requires EP4/8/16/32 and 8/32 communication cores")
+    # Compare single worker, dual QP and dual worker. Use the smallest legal P
+    # for each, respecting both the AIV and physical QP-slot budgets. A 32-core
+    # launch can use up to all 32 senders; there is no eight-sender restriction.
+    triples = []
+    for w, q in ((1, 1), (1, 2), (2, 1)):
+        p = next(p for p in (1, 2, 4, 8) if math.ceil((ep - 1) / p) * w <= min(cores, 32 // q))
+        triples.append((p, w, q))
     return [candidate(p, w, q, v, ep) for p, w, q in triples for v in visits]
 
 
