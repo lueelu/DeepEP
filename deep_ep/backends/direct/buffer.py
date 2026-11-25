@@ -1014,14 +1014,23 @@ def _pack_x_and_scales(x: Any, x_scales: Optional[Any], return_tuple: bool) -> U
     return x
 
 
-def _record_recv_outputs_on_current_stream(*tensors: Any) -> None:
+def _record_recv_outputs_on_current_stream(*tensors: Any, streams: Optional[dict] = None) -> None:
     # Register owned outputs/handles for caller use, independently of the
     # allocation stream. SHMEM payload views must never enter this path.
     import torch
 
+    # Share only within one caller-stream scope, never across API calls or a
+    # stream-context change. Keep every registration, including repeated tensors.
+    if streams is None:
+        streams = {}
     for tensor in tensors:
-        if tensor is not None and tensor.device.type == "npu":
-            tensor.record_stream(torch.npu.current_stream(tensor.device))
+        if tensor is None:
+            continue
+        device = tensor.device
+        if device.type == "npu":
+            if device not in streams:
+                streams[device] = torch.npu.current_stream(device)
+            tensor.record_stream(streams[device])
 
 
 def _validate_operation_flags(async_finish: bool, allocate_on_comm_stream: bool) -> None:

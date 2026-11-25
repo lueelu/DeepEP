@@ -1009,6 +1009,9 @@ class ElasticBuffer:
             if not cached_mode:
                 handle_topk_idx = resolved_topk_idx.clone() if do_handle_copy else resolved_topk_idx
 
+        # The communication-stream context has exited. Reuse caller streams
+        # across the registration batches below, only for this dispatch call.
+        output_streams = {}
         if not cached_mode:
             handle = EPHandle(
                 do_expand,
@@ -1028,7 +1031,7 @@ class ElasticBuffer:
                 None,
                 None,
             )
-            _record_recv_outputs_on_current_stream(*public_handle)
+            _record_recv_outputs_on_current_stream(*public_handle, streams=output_streams)
             handle._buffer_token = self._handle_token
             handle._buffer_owner = self
             handle._udma_policy = policy
@@ -1036,12 +1039,14 @@ class ElasticBuffer:
             handle._dispatch_plan = dispatch_plan
             handle._expand_layout = expand_layout
             handle._single_source_slots = single_source_slots
-            _record_recv_outputs_on_current_stream(single_source_slots)
-            _record_recv_outputs_on_current_stream(handle.topk_idx, *dispatch_layout)
+            _record_recv_outputs_on_current_stream(single_source_slots, streams=output_streams)
+            _record_recv_outputs_on_current_stream(handle.topk_idx, *dispatch_layout, streams=output_streams)
             if expand_layout is not None:
-                _record_recv_outputs_on_current_stream(*expand_layout[:3])
+                _record_recv_outputs_on_current_stream(*expand_layout[:3], streams=output_streams)
 
-        _record_recv_outputs_on_current_stream(recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, dispatch_plan)
+        _record_recv_outputs_on_current_stream(
+            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, dispatch_plan, streams=output_streams
+        )
 
         if x_scales is not None:
             recv_x = (recv_x, recv_x_scales)

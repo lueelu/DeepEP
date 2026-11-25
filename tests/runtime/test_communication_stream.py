@@ -1,6 +1,7 @@
 """CPU checks for Direct V1/V2 process/device communication-stream ownership."""
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from threading import Barrier
 from types import SimpleNamespace
 import sys
@@ -65,3 +66,67 @@ def test_creation_failure_does_not_publish_a_stream(streams):
     streams.fail = False
     assert buffer.get_global_comm_stream() is elastic.get_global_comm_stream()
     assert len(streams.created) == 1
+
+
+def test_output_registration_preserves_devices_order_and_duplicates(monkeypatch):
+    import gc
+    import weakref
+
+    @dataclass(frozen=True)
+    class Device:
+        type: str
+        index: int
+
+    queries, registrations = [], []
+    current = {0: object(), 1: object()}
+
+    def current_stream(device):
+        queries.append(device.index)
+        return current[device.index]
+
+    class Tensor:
+        def __init__(self, name, device):
+            self.name, self.device = name, device
+
+        def record_stream(self, stream):
+            registrations.append((self.name, stream))
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(npu=SimpleNamespace(current_stream=current_stream)))
+    first = Tensor("first", Device("npu", 0))
+    second = Tensor("second", Device("npu", 1))
+    cpu = Tensor("cpu", Device("cpu", 0))
+    refs = [weakref.ref(t) for t in (first, second)]
+    cache = {}
+    # Separate dispatch batches retain their original registration order.
+    buffer._record_recv_outputs_on_current_stream(None, cpu, first, streams=cache)
+    buffer._record_recv_outputs_on_current_stream(second, first, streams=cache)
+    assert queries == [0, 1]
+    assert registrations == [("first", current[0]), ("second", current[1]), ("first", current[0])]
+    # A later API call must observe changed caller streams, even on the same device.
+    current[0] = object()
+    buffer._record_recv_outputs_on_current_stream(first, first)
+    assert queries == [0, 1, 0]
+    assert registrations[-2:] == [("first", current[0])] * 2
+    del first, second
+    gc.collect()
+    assert all(ref() is None for ref in refs)  # The stream cache must not extend tensor ownership.
+
+
+def test_output_registration_does_not_hide_failures(monkeypatch):
+    from collections import namedtuple
+
+    device = namedtuple("Device", "type index")("npu", 0)
+    calls = []
+
+    def fail(stream):
+        calls.append(stream)
+        raise RuntimeError("registration failed")
+
+    stream = object()
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(npu=SimpleNamespace(current_stream=lambda device: stream))
+    )
+    tensor = SimpleNamespace(device=device, record_stream=fail)
+    with pytest.raises(RuntimeError, match="registration failed"):
+        buffer._record_recv_outputs_on_current_stream(tensor, tensor)
+    assert calls == [stream]
