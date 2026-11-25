@@ -124,6 +124,9 @@ def _load_native():
         ) from exc
     if module.runtime_protocol != 1:
         raise ImportError("Unsupported DeepEP runtime protocol")
+    init_jit = getattr(module, "init_jit", None)
+    if init_jit is not None:
+        init_jit(str(directory))
     library = Path(module.shmem_library_path()).resolve()
     if library != bundle / "libshmem.so":
         raise ImportError(

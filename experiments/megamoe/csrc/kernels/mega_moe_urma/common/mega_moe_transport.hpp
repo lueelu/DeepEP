@@ -136,9 +136,10 @@ __aicore__ inline __gm__ int32_t* LocalCompletionFlag(const Arguments& args, uin
     return reinterpret_cast<__gm__ int32_t*>(args.localFlags + static_cast<uint64_t>(index) * kFlagBytes);
 }
 
+template <class S>
 __aicore__ inline uint64_t PeerPhaseSlot(const Arguments& args, uint32_t phase, uint32_t source)
 {
-    return args.config.barrierOffset + (static_cast<uint64_t>(phase) * args.config.world + source) * kFlagBytes;
+    return args.config.barrierOffset + (static_cast<uint64_t>(phase) * S::kEp + source) * kFlagBytes;
 }
 
 // AIC completion certifies contiguous scratch, not self returnY. Communication
@@ -160,13 +161,14 @@ __aicore__ inline void MarkReorderComplete(const Arguments& args)
 // These observations also permit single-slot route-inbox reuse: all peers
 // publish finished only after acquiring their incoming summary, even for
 // empty streams. Keep the observers and final local join before returning.
+template <class S>
 __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t owner, bool& peerCounted,
                                                  bool& selfCounted)
 {
     using namespace AscendC;
     if (!peerCounted) {
         const uint32_t peer = PeerForOwner(args.config.rank, owner);
-        auto* finished = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + PeerPhaseSlot(args, 1U, peer));
+        auto* finished = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + PeerPhaseSlot<S>(args, 1U, peer));
         // Empty peer streams can finish a later invocation before this owner
         // observes the prior one. A later finished epoch also certifies the
         // current return data; per-CV payload flags still require exact epochs.
@@ -179,9 +181,9 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
     // All remote finished flags plus AIC28 alone must NOT bypass self reads:
     // scratch can be complete while the last AIV1's self scatter is pending.
     if (owner == 0U && !selfCounted &&
-        ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagAicDone)) == static_cast<int32_t>(kAic) &&
+        ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagAicDone)) == static_cast<int32_t>(S::kCubeCores) &&
         ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagReorderDone)) ==
-            static_cast<int32_t>(CommunicationWorkers(args.config.world))) {
+            static_cast<int32_t>(CommunicationWorkers<S>())) {
         AtomicAdd(LocalCompletionFlag(args, kLocalFlagIncomingDone), 1);
         selfCounted = true;
     }
@@ -190,10 +192,11 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
 
 // The caller has already submitted SO finished and completed its final quiet.
 // Only incoming observations remain; Reduce gets no additional timer/poll work.
+template <class S>
 __aicore__ inline void FinishCombinePeer(const Arguments& args, uint32_t owner, bool& peerCounted, bool& selfCounted)
 {
     using namespace AscendC;
-    while (!ObserveIncomingCompletion(args, owner, peerCounted, selfCounted)) {
+    while (!ObserveIncomingCompletion<S>(args, owner, peerCounted, selfCounted)) {
         const uint64_t start = GetSystemCycle();
         while (GetSystemCycle() - start < 200U) {
         }

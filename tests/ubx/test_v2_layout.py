@@ -19,7 +19,7 @@ def test_shared_metadata_workspace_and_tiling(tmp_path):
     else:
         pytest.skip("Wire ABI check requires a C++17 compiler")
     root = Path(__file__).resolve().parents[2]
-    source = r"""
+    combine_source = r"""
 #include <cassert>
 #include <cstddef>
 #include <vector>
@@ -37,30 +37,52 @@ std::vector<uint64_t> NAME() {
         sizeof(EpServerDedupReadIndexBlock), offsetof(EpServerDedupReadIndexBlock, weightBits),
         uint64_t(EpServerDedupTokenType::Direct), uint64_t(EpServerDedupTokenType::FirstHop),
         uint64_t(EpServerDedupTokenType::Terminal), RDMA::kCoreBytes, RDMA::kBackend,
-        DISPATCH_DEDUP_DATA_TYPE_FP16, DISPATCH_DEDUP_DATA_TYPE_BFP16,
     };
     for (unsigned cores : {16, 28, 56, 64, 72})
         for (unsigned experts : {128, 384, 1024})
             assert(DispatchServerDedupCountLayout(experts, cores).stateBytes < 1024U * 1024U);
-    for (unsigned world : {16, 32, 64, 128, 256}) {
+    for (unsigned world : {16, 32, 64, 128, 256})
         values.push_back(LlTilingKeyForWorld(world));
-        for (unsigned capacity : {1, 32, 48, 256})
-            values.push_back(EpServerDedupEnabled(capacity, 1, world));
-    }
     for (int magic : {0, 1, 0, 1}) values.push_back(DispatchServerDedupWindowOffset(magic));
     return values;
 }
 """
-    paths = []
-    for name, prefix, namespace, rdma in (
-        ("dispatch", "kernels/dispatch/low_latency/common", "DispatchDedup", "LlRdma"),
-        ("combine", "ubx/kernels", "UbxDispatch", "UbxRdma"),
-    ):
-        path = tmp_path / f"{name}.cpp"
-        path.write_text(
-            source.replace("PREFIX", prefix).replace("NS", namespace).replace("RDMA", rdma).replace("NAME", name)
-        )
-        paths.append(str(path))
+    dispatch_source = r"""
+#include <cassert>
+#include <cstddef>
+#include <vector>
+#include <deep_ep/comm/comm_args.hpp>
+#include <deep_ep/common/compiled.hpp>
+#include <deep_ep/layout/ep/token.hpp>
+#include <deep_ep/layout/ep/workspace.hpp>
+using namespace deep_ep;
+std::vector<uint64_t> dispatch() {
+    std::vector<uint64_t> values{
+        sizeof(CommArgs), offsetof(CommArgs, rank), offsetof(CommArgs, rankSize),
+        offsetof(CommArgs, localRankSize), offsetof(CommArgs, peerMems), offsetof(CommArgs, fftsVal),
+        offsetof(CommArgs, reserved0), offsetof(CommArgs, reservedAddresses), offsetof(CommArgs, reservedConfig),
+        kNumRanksPerHost, kEpServerDedupMagicStride, kEpServerDedupControlPrefixBytes,
+        kEpServerDedupPeerBytes, kEpServerDedupWindowBytes, kEpServerDedupWindowUsableBytes,
+        sizeof(EpServerDedupReadIndexBlock), offsetof(EpServerDedupReadIndexBlock, weightBits),
+        uint64_t(EpServerDedupTokenType::Direct), uint64_t(EpServerDedupTokenType::FirstHop),
+        uint64_t(EpServerDedupTokenType::Terminal), rdma::kCoreBytes, rdma::kBackend,
+    };
+    for (unsigned cores : {16, 28, 56, 64, 72})
+        for (unsigned experts : {128, 384, 1024})
+            assert(DispatchServerDedupCountLayout(experts, cores).stateBytes < 1024U * 1024U);
+    for (unsigned world : {16, 32, 64, 128, 256})
+        values.push_back(LlTilingKeyForWorld(world));
+    for (int magic : {0, 1, 0, 1}) values.push_back(DispatchServerDedupWindowOffset(magic));
+    return values;
+}
+"""
+    (tmp_path / "dispatch.cpp").write_text(dispatch_source)
+    path = tmp_path / "combine.cpp"
+    path.write_text(
+        combine_source.replace("PREFIX", "ubx/kernels").replace("NS", "UbxDispatch").replace("RDMA", "UbxRdma")
+        .replace("NAME", "combine")
+    )
+    paths = [str(tmp_path / "dispatch.cpp"), str(path)]
     main = tmp_path / "main.cpp"
     main.write_text(r"""
 #include <cassert>
@@ -105,6 +127,7 @@ int main() {
             "-Werror",
             "-UNDEBUG",
             "-I" + str(root / "csrc"),
+            "-I" + str(root / "deep_ep" / "include"),
             *paths,
             str(main),
             str(root / "csrc/ubx/v2.cpp"),

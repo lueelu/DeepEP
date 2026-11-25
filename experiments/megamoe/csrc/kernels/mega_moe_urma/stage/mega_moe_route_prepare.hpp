@@ -113,28 +113,29 @@ __aicore__ inline void ResetFlagRegion(uint64_t address, uint64_t bytes, uint32_
     }
 }
 
+template <class S>
 __aicore__ inline void ResetInvocationFlags(const Arguments& a, uint32_t worker)
 {
     LocalTensor<int32_t> zeros(TPosition::VECCALC, 0U, 1024U);
     Duplicate<int32_t>(zeros, 0, 1024U);
     RouteFence<HardEvent::V_MTE3>();
     const auto& c = a.config;
-    const uint64_t chunks = uint64_t(c.world) * c.maxPeerChunks;
-    const uint64_t groups = RouteGroupCapacity(uint64_t(c.world) * c.sourceRowCapacity, c.localExperts);
+    const uint64_t chunks = uint64_t(S::kEp) * c.maxPeerChunks;
+    const uint64_t groups = RouteGroupCapacity(uint64_t(S::kEp) * S::kSourceRowCapacity, S::kLocalExperts);
     // Match the Host allocation's minimum size, including its unused padding.
     const uint64_t groupBytes = groups * kFlagBytes < 512U ? 512U : groups * kFlagBytes;
     ResetFlagRegion(a.symmetric + c.dispatchReadyOffset, chunks * kFlagBytes, worker);
     ResetFlagRegion(a.symmetric + c.combineReadyOffset, chunks * kFlagBytes, worker);
-    ResetFlagRegion(a.symmetric + c.barrierOffset + uint64_t(c.world) * kFlagBytes, uint64_t(c.world) * kFlagBytes,
+    ResetFlagRegion(a.symmetric + c.barrierOffset + uint64_t(S::kEp) * kFlagBytes, uint64_t(S::kEp) * kFlagBytes,
                     worker);
     ResetFlagRegion(a.inputScaleDone, groupBytes, worker);
     ResetFlagRegion(a.activationDone, groupBytes, worker);
     ResetFlagRegion(a.gmm2Done, groupBytes, worker);
-    ResetFlagRegion(a.gmmIssued, kAic * kFlagBytes, worker);
+    ResetFlagRegion(a.gmmIssued, S::kCubeCores * kFlagBytes, worker);
     ResetFlagRegion(a.localFlags, (a.sharedExperts ? kSharedLocalFlagCount : 16U) * kFlagBytes, worker);
     ResetFlagRegion(a.packReady, chunks * kFlagBytes, worker);
     if (a.sharedExperts) {
-        const uint64_t maxTokens = c.sourceRowCapacity / c.topk;
+        const uint64_t maxTokens = S::kSourceRowCapacity / S::kTopK;
         const uint64_t sharedGroups = (maxTokens + 255U) / 256U;
         const uint64_t tileBytes = sharedGroups * (a.sharedIntermediate / 256U) * kFlagBytes;
         const uint64_t activationBytes = sharedGroups * kFlagBytes;
@@ -249,14 +250,15 @@ __aicore__ inline void InvalidateRouteSummary(const Arguments& a)
     RouteFlush(a.routeConfig, sizeof(Config));
 }
 
+template <class S>
 __aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
 {
-    const uint32_t experts = a.config.world * a.config.localExperts;
+    const uint32_t experts = S::kExperts;
     const uint32_t each = experts / kLocalWorkers, extra = experts % kLocalWorkers;
     const uint32_t first = worker * each + (worker < extra ? worker : extra);
     const uint32_t owned = each + (worker < extra ? 1U : 0U);
     if (owned == 0U) return;  // empty owners still participate in the enclosing joins
-    const uint32_t total = a.config.bs * a.config.topk;
+    const uint32_t total = a.config.bs * S::kTopK;
     const uint32_t batchItems =
         owned <= 7U ? kExpertRouteBatch
                     : (owned <= 10U ? kExpertWideBatch : (kExpertRouteStorageItems / owned / 64U) * 64U);
@@ -288,7 +290,7 @@ __aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
         RouteFence<HardEvent::S_MTE3>();
         for (uint32_t e = 0; e < owned; ++e) {
             const uint32_t n = counts.GetValue(e), written = totals.GetValue(e);
-            RouteEnqueueSave(a.expertRoutes + (uint64_t(first + e) * a.config.sourceRowCapacity + written) * 4U,
+            RouteEnqueueSave(a.expertRoutes + (uint64_t(first + e) * S::kSourceRowCapacity + written) * 4U,
                              ExpertRouteUb::routes + e * batchItems * 4U, n * 4U);
             totals.SetValue(e, written + n);
         }
@@ -300,9 +302,10 @@ __aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
     RouteSave(a.routeHistogram + uint64_t(first) * 4U, ExpertRouteUb::totals, owned * 4U);
 }
 
+template <class S>
 __aicore__ inline void RouteExpertPrefix(const Arguments& a)
 {
-    const uint32_t experts = a.config.world * a.config.localExperts;
+    const uint32_t experts = S::kExperts;
     RouteLoad(a.routeHistogram, 0U, experts * 4U);
     LocalTensor<uint32_t> counts(TPosition::VECCALC, 0U, experts);
     LocalTensor<uint64_t> exportCounts(TPosition::VECCALC, 8192U, experts);
@@ -323,10 +326,11 @@ __aicore__ inline void RouteExpertPrefix(const Arguments& a)
     RouteSave(a.routeInfo, kRouteInfoUb, (experts + 1U) * 4U);
 }
 
+template <class S>
 __aicore__ inline void RouteExchange(const Arguments& a, uint32_t worker)
 {
-    if (worker >= a.config.world) return;
-    const uint32_t le = a.config.localExperts;
+    if (worker >= S::kEp) return;
+    const uint32_t le = S::kLocalExperts;
     // The leader may build RouteInfo while a slower local sender is still
     // publishing. Read the immutable, separately stored outgoing prefix here;
     // no sender races a DMA overwrite of the shared RouteInfo snapshot.
@@ -369,19 +373,20 @@ struct RouteScheduleOutput {
     }
 };
 
+template <class S>
 __aicore__ inline void RouteSummary(Arguments& a)
 {
-    RouteLoad(a.routeInfo, kRouteInfoUb, (a.config.world * a.config.localExperts + 1U) * 4U);
-    RouteLoad(a.symmetric + a.config.routeInboxOffset, 0U, a.config.world * kRouteMailboxBytes);
+    RouteLoad(a.routeInfo, kRouteInfoUb, (S::kExperts + 1U) * 4U);
+    RouteLoad(a.symmetric + a.config.routeInboxOffset, 0U, S::kEp * kRouteMailboxBytes);
     auto* r = reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    LocalTensor<uint32_t> inbox(TPosition::VECCALC, 0U, a.config.world * kRouteMailboxBytes / 4U);
-    for (uint32_t s = 0; s < a.config.world; ++s) {
+    LocalTensor<uint32_t> inbox(TPosition::VECCALC, 0U, S::kEp * kRouteMailboxBytes / 4U);
+    for (uint32_t s = 0; s < S::kEp; ++s) {
         const uint32_t at = s * kRouteMailboxBytes / 4U;
         r->returnBase[s] = uint64_t(inbox.GetValue(at)) | (uint64_t(inbox.GetValue(at + 1U)) << 32U);
-        for (uint32_t e = 0; e <= a.config.localExperts; ++e) r->incoming[s][e] = inbox.GetValue(at + 2U + e);
+        for (uint32_t e = 0; e <= S::kLocalExperts; ++e) r->incoming[s][e] = inbox.GetValue(at + 2U + e);
     }
-    const bool wave12 = a.config.world == 4U && a.sharedExperts != 0U;
-    BuildRouteSummary(a.config, *r, wave12);
+    const bool wave12 = S::kEp == 4U && a.sharedExperts != 0U;
+    BuildRouteSummary<S>(a.config, *r, wave12);
     // There is no materialized Segment/Link table in this protocol.
     a.config.routeSegmentCount = 0U;
     a.config.routeLinkCount = 0U;
@@ -389,7 +394,7 @@ __aicore__ inline void RouteSummary(Arguments& a)
     constexpr uint32_t receiveOffset = offsetof(DeviceRouteInfo, incoming);
     RouteSave(a.routeInfo + receiveOffset, kRouteInfoUb + receiveOffset, sizeof(DeviceRouteInfo) - receiveOffset);
     RouteScheduleOutput out(a);
-    EmitRouteTasks(a.config, *r, out, wave12);
+    EmitRouteTasks<S>(a.config, *r, out, wave12);
     out.Finish();
     RouteStore(a.routeConfig, 0U, a.config);
     RouteFlush(a.routeConfig, sizeof(Config));
@@ -406,26 +411,28 @@ __aicore__ inline void RouteReloadConfig(Arguments& a)
 // Only local counts are required to issue Pack/Dispatch, including self rows.
 // Keep these values in each engine's Arguments until it acquires the receive
 // summary. RouteConfig GM is published only once, by the summary owner.
+template <class S>
 __aicore__ inline void RouteLocalConfig(Arguments& a)
 {
     const auto* info = RouteInfo(a);
     a.config.packRoundCount = 0U;
     a.config.sendChunkCount = 0U;
-    for (uint32_t peer = 0; peer < a.config.world; ++peer) {
-        const uint32_t begin = peer * a.config.localExperts;
-        const uint32_t rows = info->outgoing[begin + a.config.localExperts] - info->outgoing[begin];
+    for (uint32_t peer = 0; peer < S::kEp; ++peer) {
+        const uint32_t begin = peer * S::kLocalExperts;
+        const uint32_t rows = info->outgoing[begin + S::kLocalExperts] - info->outgoing[begin];
         const uint32_t cvs = (rows + a.config.cvRows - 1U) / a.config.cvRows;
         a.config.packRoundCount = RouteMax(a.config.packRoundCount, cvs);
         a.config.sendChunkCount += cvs;
     }
-    const uint32_t own = a.config.rank * a.config.localExperts;
+    const uint32_t own = a.config.rank * S::kLocalExperts;
     a.config.selfSendRow = info->outgoing[own];
-    a.config.selfRows = info->outgoing[own + a.config.localExperts] - info->outgoing[own];
-    a.config.selfRecvRow = uint64_t(a.config.rank) * a.config.sourceRowCapacity;
+    a.config.selfRows = info->outgoing[own + S::kLocalExperts] - info->outgoing[own];
+    a.config.selfRecvRow = uint64_t(a.config.rank) * S::kSourceRowCapacity;
     a.config.fragmentCount = a.config.recvChunkCount = a.config.computeTaskCount = 0U;
     a.config.receiveRows = a.config.gmm1Tiles = a.config.gmm2Tiles = 0U;
 }
 
+template <class S>
 __aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer)
 {
     timer.CoarseBegin(CoarsePhase::Route);
@@ -440,20 +447,20 @@ __aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer)
     // or double buffer is part of this argument. Keep the tail observers/join.
     if constexpr (g_coreType == AIV) {
         const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
-        ResetInvocationFlags(a, worker);
-        RouteOwnedExperts(a, worker);
+        ResetInvocationFlags<S>(a, worker);
+        RouteOwnedExperts<S>(a, worker);
     }
     // #1: all flag resets, count DMA stores and consumers' cache invalidations precede
     // the leader's first RouteInfo/Config update.
     SyncAll<false>();
     if constexpr (g_coreType == AIV)
-        if (block == 0U && GetSubBlockIdx() == 0U) RouteExpertPrefix(a);
+        if (block == 0U && GetSubBlockIdx() == 0U) RouteExpertPrefix<S>(a);
     // #2: count prefixes are immutable and ready for the exchange senders.
     SyncAll<false>();
-    if constexpr (g_coreType == AIV) RouteExchange(a, LocalWorkerIndex(block, GetSubBlockIdx()));
+    if constexpr (g_coreType == AIV) RouteExchange<S>(a, LocalWorkerIndex(block, GetSubBlockIdx()));
     // The first activation helper will build the incoming summary while other
     // engines progress independently. No receiver wait or full-core join here.
-    RouteLocalConfig(a);
+    RouteLocalConfig<S>(a);
     PipeBarrier<PIPE_ALL>();
     // Incoming metadata is acquired later, per role. This fence only releases
     // this core's route-exchange UB/events before its Pack/compute path.
@@ -480,28 +487,30 @@ __aicore__ inline void WaitRoutePhase(const Arguments& a, uint32_t index, uint32
 // Each active source owner snapshots one mailbox. MTE stores are byte-exact:
 // adjacent incoming rows/returnBase entries may share GM cache lines, so no
 // concurrent Scalar cached writes or DCCI are allowed on these output arrays.
+template <class S>
 __aicore__ inline void ReadRouteSource(const Arguments& a, uint32_t source)
 {
-    if (source >= a.config.world) return;
+    if (source >= S::kEp) return;
     WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(a.symmetric + a.config.routeReadyOffset + source * kFlagBytes),
                   a.config.epoch);
     RouteLoad(a.symmetric + a.config.routeInboxOffset + uint64_t(source) * kRouteMailboxBytes, 0U,
-              8U + (a.config.localExperts + 1U) * 4U);
+              8U + (S::kLocalExperts + 1U) * 4U);
     LocalTensor<uint32_t> inbox(TPosition::VECCALC, 0U, kRouteMailboxBytes / 4U);
     LocalTensor<uint32_t> prefix(TPosition::VECCALC, 2048U, kMaxLocalExperts + 1U);
     LocalTensor<uint64_t> base(TPosition::VECCALC, 4096U, 4U);
-    for (uint32_t e = 0; e <= a.config.localExperts; ++e) prefix.SetValue(e, inbox.GetValue(e + 2U));
+    for (uint32_t e = 0; e <= S::kLocalExperts; ++e) prefix.SetValue(e, inbox.GetValue(e + 2U));
     base.SetValue(0, uint64_t(inbox.GetValue(0)) | (uint64_t(inbox.GetValue(1)) << 32U));
     RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, incoming) + uint64_t(source) * (kMaxLocalExperts + 1U) * 4U,
-              2048U, (a.config.localExperts + 1U) * 4U);
+              2048U, (S::kLocalExperts + 1U) * 4U);
     RouteSave(a.routeInfo + offsetof(DeviceRouteInfo, returnBase) + uint64_t(source) * 8U, 4096U, 8U);
     AscendC::AtomicAdd(RoutePhaseFlag(a, kLocalFlagRouteSourcesDone), 1);
 }
 
+template <class S>
 __aicore__ inline void BuildOwnedRouteExperts(const Arguments& a, uint32_t core)
 {
-    const uint32_t begin = uint64_t(a.config.localExperts) * core / kAic;
-    const uint32_t end = uint64_t(a.config.localExperts) * (core + 1U) / kAic;
+    const uint32_t begin = uint64_t(S::kLocalExperts) * core / S::kCubeCores;
+    const uint32_t end = uint64_t(S::kLocalExperts) * (core + 1U) / S::kCubeCores;
     if (begin != end) {
         // Only incoming is needed and it is immutable after SourcesDone.
         // Do not read the per-expert output arrays while other workers write.
@@ -509,8 +518,8 @@ __aicore__ inline void BuildOwnedRouteExperts(const Arguments& a, uint32_t core)
         constexpr uint32_t incomingBytes = kWorld * (kMaxLocalExperts + 1U) * sizeof(uint32_t);
         RouteLoad(a.routeInfo + incomingOffset, kRouteInfoUb + incomingOffset, incomingBytes);
         auto* r = reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-        SummarizeRouteExperts(a.config, *r, begin, end);
-        constexpr uint32_t quota = (kMaxLocalExperts + kAic - 1U) / kAic;
+        SummarizeRouteExperts<S>(a.config, *r, begin, end);
+        constexpr uint32_t quota = (kMaxLocalExperts + S::kCubeCores - 1U) / S::kCubeCores;
         LocalTensor<uint32_t> sources(TPosition::VECCALC, 0U, quota * (kWorld + 1U));
         LocalTensor<uint32_t> groups(TPosition::VECCALC, 4096U, quota);
         LocalTensor<uint32_t> rows(TPosition::VECCALC, 6144U, quota);
@@ -534,20 +543,21 @@ __aicore__ inline void BuildOwnedRouteExperts(const Arguments& a, uint32_t core)
 }
 
 // Called only by block0 AIV0, after all 28 expert shards are committed.
+template <class S>
 __aicore__ inline void FinishParallelRouteSummary(Arguments& a)
 {
     RouteLoad(a.routeInfo, kRouteInfoUb, sizeof(DeviceRouteInfo));
     auto* r = reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    const bool wave12 = a.config.world == 4U && (!MEGAMOE_URMA_ROUTE_REORDER || a.sharedExperts != 0U);
-    FinishRouteSummaryPrefix(a.config, *r, wave12);
+    const bool wave12 = S::kEp == 4U && (!MEGAMOE_URMA_ROUTE_REORDER || a.sharedExperts != 0U);
+    FinishRouteSummaryPrefix<S>(a.config, *r, wave12);
     LocalTensor<int32_t> exported(TPosition::VECCALC, 0U, kMaxLocalExperts);
-    for (uint32_t e = 0; e < a.config.localExperts; ++e)
-        exported.SetValue(e, static_cast<int32_t>(r->sources[e][a.config.world]));
-    RouteSave(a.expertCountsOutput, 0U, a.config.localExperts * sizeof(int32_t));
+    for (uint32_t e = 0; e < S::kLocalExperts; ++e)
+        exported.SetValue(e, static_cast<int32_t>(r->sources[e][S::kEp]));
+    RouteSave(a.expertCountsOutput, 0U, S::kLocalExperts * sizeof(int32_t));
     constexpr uint32_t receiveOffset = offsetof(DeviceRouteInfo, incoming);
     RouteSave(a.routeInfo + receiveOffset, kRouteInfoUb + receiveOffset, sizeof(DeviceRouteInfo) - receiveOffset);
     RouteScheduleOutput out(a);
-    EmitRouteTasks(a.config, *r, out, wave12);
+    EmitRouteTasks<S>(a.config, *r, out, wave12);
     out.Finish();
     RouteStore(a.routeConfig, 0U, a.config);
     RouteFlush(a.routeConfig, sizeof(Config));
@@ -557,16 +567,17 @@ __aicore__ inline void FinishParallelRouteSummary(Arguments& a)
 
 // No SyncAll: AIV1 continues Pack/Dispatch throughout these AIV0-only phases.
 // S0 invokes this AFTER the existing startup Pack join, not before it.
+template <class S>
 __aicore__ inline void RunAiv0RouteSummary(Arguments& a, uint32_t core, Timer& timer)
 {
     timer.CoarseBegin(CoarsePhase::RouteSummary);
     const uint64_t start = timer.TraceBegin();
-    ReadRouteSource(a, core);
-    WaitRoutePhase(a, kLocalFlagRouteSourcesDone, a.config.world);
-    BuildOwnedRouteExperts(a, core);
+    ReadRouteSource<S>(a, core);
+    WaitRoutePhase(a, kLocalFlagRouteSourcesDone, S::kEp);
+    BuildOwnedRouteExperts<S>(a, core);
     if (core == 0U) {
-        WaitRoutePhase(a, kLocalFlagRouteExpertsDone, kAic);
-        FinishParallelRouteSummary(a);
+        WaitRoutePhase(a, kLocalFlagRouteExpertsDone, S::kCubeCores);
+        FinishParallelRouteSummary<S>(a);
     }
     timer.TraceEnd(TraceEvent::RouteSummary, start);
     timer.CoarseEnd(CoarsePhase::RouteSummary);
@@ -606,13 +617,14 @@ __aicore__ inline void WaitRouteSummary(Arguments& a, Timer& timer)
 // this loop advances the SAME nextPackRound cursor used by normal activation.
 // AIV0 builds the summary; helpers never wait for a remote source while they
 // still have local Pack work. No low-UB ownership is transferred to this loop.
-__aicore__ inline void PrepareActivationRoutes(Arguments& a, uint32_t helper, uint32_t& nextPackRound, PackBatch& pack,
-                                               Timer& timer)
+template <class S>
+__aicore__ inline void PrepareActivationRoutes(Arguments& a, uint32_t helper, uint32_t& nextPackRound,
+                                               PackBatch<S>& pack, Timer& timer)
 {
-    const uint32_t packOwner = helper + CommunicationWorkers(a.config.world);
+    const uint32_t packOwner = helper + CommunicationWorkers<S>();
     while (!RouteSummaryReady(a)) {
         if (nextPackRound < a.config.packRoundCount) {
-            PackOneRound(a, nextPackRound++, packOwner, kAic, pack);
+            PackOneRound<S>(a, nextPackRound++, packOwner, S::kCubeCores, pack);
         } else {
             pack.Close();
             const uint64_t tick = AscendC::GetSystemCycle();

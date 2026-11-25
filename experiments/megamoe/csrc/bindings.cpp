@@ -2,6 +2,7 @@
 // Modified by SimpleBright_Man 2026
 
 #include "forward.hpp"
+#include "jit/mega_moe_jit.hpp"
 #include "shmem.h"
 #include "kernels/mega_moe_common/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
@@ -11,7 +12,10 @@ namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
 {
     using deepep::megamoe::Plan;
-    module.attr("api_protocol") = 10;
+    module.attr("api_protocol") = 11;
+    module.attr("jit_enabled") = true;
+    module.def("init_megamoe_jit", &deepep::megamoe::init_mega_moe_jit, py::arg("package_root"),
+               py::arg("ascend_home") = "");
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size, py::arg("world"), py::arg("experts"), py::arg("tokens"),
                py::arg("topk"), py::arg("hidden"), py::arg("backend") = "mte", py::arg("topk_weights_type") = 0);

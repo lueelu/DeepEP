@@ -1,32 +1,35 @@
-// Copyright (c) 2026, Lu Lu
+﻿// Copyright (c) 2026, Lu Lu
 
 #include "ops/low_latency.hpp"
 #include <pybind11/stl.h>
 #include <climits>
 #include <stdexcept>
 #include <string>
+
+#include <deep_ep/common/compiled.hpp>
+#include <deep_ep/layout/ep/token.hpp>
+#include <deep_ep/layout/ep/workspace.hpp>
+#include <deep_ep/layout/ep/diagnostics.hpp>
+
 #include <vector>
 #include "runtime/session.hpp"
 #include "runtime/ll_core_config.hpp"
 #include "ubx/v2.hpp"
-#include "../kernels/dispatch/low_latency/common/ll_rdma_layout.h"
-#include "../kernels/dispatch/low_latency/common/ll_stage_timer_layout.h"
-#include "../kernels/dispatch/low_latency/common/ll_reference_profile_layout.h"
-#include "../kernels/dispatch/low_latency/common/ll_expert_timer_layout.h"
-#include "../kernels/dispatch/low_latency/common/ll_dispatch_variant.h"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
 #include "host/data_plane/shmem_host_p2p_sync.h"
-#include "../kernels/dispatch/low_latency/common/ep_memory_server_dedup_layout.h"
-#include "../kernels/dispatch/low_latency/common/ep_memory_server_dedup_tiling.h"
 #include "../kernels/combine/low_latency/combine_layout.h"
 #include "../kernels/combine/low_latency/ep_memory_server_dedup_combine_tiling.h"
-#include "../kernels/dispatch/low_latency/launch.hpp"
+#include "kernels/ep/dispatch.hpp"
+#include "deep_ep/comm/comm_args.hpp"
 #include "../kernels/combine/low_latency/launch.hpp"
 #include "../kernels/runtime/clock_alignment.h"
+#include "../kernels/runtime/clock_wait.hpp"
 
 namespace py = pybind11;
 namespace deepep {
+// Declared below; the reference-profile helper runs before it.
+extern "C" uint32_t deepep_ll_reference_profile_enabled();
 namespace {
 using Shape = std::vector<int64_t>;
 constexpr uint64_t kRankBaseBiasBytes = 1024U;
@@ -41,7 +44,7 @@ uint32_t pin_session_cores(Session& session)
 uint8_t* peer_buffer_base(Session& session, int peer)
 {
     if (peer < 0 || peer >= session.world()) throw std::invalid_argument("Invalid LL peer");
-    if (session.ll_rdma() && !DispatchDedup::LlSameHost(session.rank(), peer)) return nullptr;
+    if (session.ll_rdma() && !deep_ep::LlSameHost(session.rank(), peer)) return nullptr;
     auto* original = static_cast<uint8_t*>(peer == session.rank() ? session.workspace() : aclshmem_ptr(session.workspace(), peer));
     if (original == nullptr) throw std::invalid_argument("Invalid LL peer mapping");
     if (session.capacity() != (8ULL << 30)) return original;
@@ -62,68 +65,38 @@ uint8_t* tensor(py::handle value, const Shape& shape, const char* dtype)
     }
     return reinterpret_cast<uint8_t*>(obj.attr("data_ptr")().cast<uintptr_t>());
 }
-uint8_t* stage_timer(py::dict tensors, uint32_t cores, uint32_t& mode, bool allow_reference = false)
+void require_npu(py::handle value, const char* what)
 {
-    mode = 1U;
-    if (tensors.contains("ll_reference_profile") && !tensors["ll_reference_profile"].is_none()) {
-        if (!allow_reference) throw std::invalid_argument("LL reference profiling supports dispatch only");
-        if ((tensors.contains("ll_stage_timer") && !tensors["ll_stage_timer"].is_none()) ||
-            (tensors.contains("ll_expert_timer") && !tensors["ll_expert_timer"].is_none()))
-            throw std::invalid_argument("LL reference profiling cannot be combined with stage/expert tracing");
-        if (!deepep_ll_reference_profile_enabled() || deepep_ll_stage_timer_enabled())
-            throw std::invalid_argument("Rebuild with DEEPEP_LL_REFERENCE_PROFILE=ON and DEEPEP_LL_STAGE_TIMER=OFF");
-        auto profile = py::reinterpret_borrow<py::object>(tensors["ll_reference_profile"]);
-        auto device = profile.attr("device");
-        if (device.attr("type").cast<std::string>() != "npu" ||
-            !device.attr("__eq__")(tensors["input"].attr("device")).cast<bool>())
-            throw std::invalid_argument("LL reference profile must be on the input NPU");
-        auto* pointer = tensor(profile, {cores, LlReferenceProfile::kSlots, LlReferenceProfile::kFields}, "int64");
-        if (reinterpret_cast<uintptr_t>(pointer) % 512U != 0U)
-            throw std::invalid_argument("LL reference profile requires 512-byte alignment");
-        mode = 3U;  // Private launch selector; the reference record's boundary mode remains 1.
-        return pointer;
-    }
-    if (!tensors.contains("ll_stage_timer") || tensors["ll_stage_timer"].is_none()) return nullptr;
-    if (!deepep_ll_stage_timer_enabled()) throw std::invalid_argument("Legacy LL stage tracing was removed; use LL reference profiling");
-    if (tensors.contains("ll_stage_timer_mode")) mode = tensors["ll_stage_timer_mode"].cast<uint32_t>();
-    if (mode != 1U && mode != 2U) throw std::invalid_argument("Invalid LL timer mode");
-    auto timer = py::reinterpret_borrow<py::object>(tensors["ll_stage_timer"]);
-    auto device = timer.attr("device");
+    auto obj = py::reinterpret_borrow<py::object>(value);
+    if (obj.attr("device").attr("type").cast<std::string>() != "npu")
+        throw std::invalid_argument(std::string("LL clock wait requires ") + what + " on the NPU");
+}
+uint8_t* reference_profile(py::dict tensors, uint32_t cores)
+{
+    if (!tensors.contains("ll_reference_profile") || tensors["ll_reference_profile"].is_none()) return nullptr;
+    if (!deepep_ll_reference_profile_enabled())
+        throw std::invalid_argument("Rebuild with DEEPEP_LL_REFERENCE_PROFILE=ON");
+    auto profile = py::reinterpret_borrow<py::object>(tensors["ll_reference_profile"]);
+    auto device = profile.attr("device");
     if (device.attr("type").cast<std::string>() != "npu" ||
         !device.attr("__eq__")(tensors["input"].attr("device")).cast<bool>())
-        throw std::invalid_argument("LL timer must be on the input NPU");
-    auto* pointer = tensor(timer, {cores, LlStageTimer::kSlots, LlStageTimer::kFields}, "int64");
+        throw std::invalid_argument("LL reference profile must be on the input NPU");
+    auto* pointer = tensor(profile, {cores, profile::kSlots, profile::kFields}, "int64");
     if (reinterpret_cast<uintptr_t>(pointer) % 512U != 0U)
-        throw std::invalid_argument("LL timer requires 512-byte alignment for independent core writeback");
+        throw std::invalid_argument("LL reference profile requires 512-byte alignment");
     return pointer;
 }
-uint8_t* expert_timer(py::dict tensors, uint32_t cores, uint32_t experts, uint8_t* stage)
-{
-    if (!tensors.contains("ll_expert_timer") || tensors["ll_expert_timer"].is_none()) return nullptr;
-    if (!stage || !deepep_ll_stage_timer_enabled())
-        throw std::invalid_argument("Expert diagnostics require stage capture and timer ON");
-    auto value=py::reinterpret_borrow<py::object>(tensors["ll_expert_timer"]);
-    auto device=value.attr("device");
-    if (device.attr("type").cast<std::string>() != "npu" ||
-        !device.attr("__eq__")(tensors["input"].attr("device")).cast<bool>())
-        throw std::invalid_argument("Expert timer must be on the input NPU");
-    auto* pointer=tensor(value, {cores, LlExpertTimer::kHeaderRows + experts*LlExpertTimer::StageCount,
-                                LlExpertTimer::kFields}, "int64");
-    if (reinterpret_cast<uintptr_t>(pointer)%512U)
-        throw std::invalid_argument("Expert timer requires 512-byte alignment");
-    return pointer;
-}
-DispatchDedup::EpMemoryServerDedupLayout layout(int p, int b, int h, int k, int e, bool fp8)
+deep_ep::EpMemoryServerDedupLayout layout(int p, int b, int h, int k, int e, bool fp8)
 {
     const uint32_t coreNum = query_ll_core_config().active;
-    DispatchDedup::EpMemoryServerDedupLayout result{};
-    auto mode = fp8 ? DispatchDedup::EpServerDedupInputMode::PrequantizedFp8Packs
-                    : DispatchDedup::EpServerDedupInputMode::Plain16;
+    const auto mode = fp8 ? deep_ep::EpServerDedupInputMode::PrequantizedFp8Packs
+                         : deep_ep::EpServerDedupInputMode::Plain16;
     if (b <= 0 || b > 65536) {
         throw std::invalid_argument("LL dispatch exceeds topology, shape, UB or workspace limits");
     }
-    DispatchDedup::BuildDispatchServerDedupLayout(p, b, h, k, e, &result, mode, coreNum);
-    if (!DispatchDedup::DispatchDedupPacketUbFits(result, b, k, e, p, coreNum) || result.capacityRows > INT32_MAX) {
+    auto result = deep_ep::get_dispatch_buffer_size(uint32_t(p), uint32_t(b), uint32_t(h), uint32_t(k),
+                                                    uint32_t(e), mode, coreNum);
+    if (result.capacityRows > INT32_MAX) {
         throw std::invalid_argument("LL dispatch exceeds topology, shape, UB or workspace limits");
     }
     return result;
@@ -133,44 +106,58 @@ py::bytes bytes(const T& data)
 {
     return py::bytes(reinterpret_cast<const char*>(&data), sizeof(data));
 }
-uint8_t dtype_code(const std::string& dtype)
+void check_dispatch_dtype(const std::string& dtype)
 {
-    if (dtype == "bfloat16") return DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_BFP16;
-    if (dtype == "float16") return DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP16;
-    if (dtype == "float8_e4m3fn") return DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP8E4M3;
-    throw std::invalid_argument("LL dispatch supports BF16/FP16 or packed FP8 E4M3FN");
+    if (dtype != "bfloat16" && dtype != "float8_e4m3fn")
+        throw std::invalid_argument("LL dispatch supports BF16 or packed FP8 E4M3FN");
 }
-static_assert(DispatchDedup::kLlDispatchFp16 == DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP16 &&
-              DispatchDedup::kLlDispatchBf16 == DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_BFP16 &&
-              DispatchDedup::kLlDispatchE4M3 == DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP8E4M3 &&
-              DispatchDedup::kLlDispatchE5M2 == DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP8E5M2,
-              "LL dispatch variant dtype values must match tiling");
-static_assert(DispatchDedup::kLlDispatchPlain16 == uint8_t(DispatchDedup::EpServerDedupInputMode::Plain16) &&
-              DispatchDedup::kLlDispatchQuantize16 == uint8_t(DispatchDedup::EpServerDedupInputMode::Quantize16) &&
-              DispatchDedup::kLlDispatchPrequantized == uint8_t(DispatchDedup::EpServerDedupInputMode::PrequantizedFp8Packs),
-              "LL dispatch variant input mode values must match tiling");
-
-// Both device tiling construction and Host launch selection use these fields.
-// Selection needs no device readback and does not synchronize the stream.
-DispatchDedup::EpServerDedupTilingData dispatch_format_tiling(int world, const std::string& dtype)
+// Combine tiling dtype codes live with the Combine kernels; Dispatch has no
+// dtype enum and only distinguishes "scales present" from plain BF16.
+uint8_t combine_dtype_code(const std::string& dtype)
 {
-    DispatchDedup::EpServerDedupTilingData data{};
-    const bool fp8 = dtype == "float8_e4m3fn";
-    data.tilingKey = DispatchDedup::LlTilingKeyForWorld(world);
-    data.dtype = dtype_code(dtype);
-    data.quantMode = fp8 ? 4 : 0;
-    data.inputMode = static_cast<uint8_t>(fp8 ? DispatchDedup::EpServerDedupInputMode::PrequantizedFp8Packs
-                                            : DispatchDedup::EpServerDedupInputMode::Plain16);
-    data.expandXOutDtype = data.dtype;
-    return data;
+    if (dtype == "bfloat16") return CombineDedup::kEpServerDedupDtypeBf16;
+    if (dtype == "float16") return CombineDedup::kEpServerDedupDtypeFp16;
+    throw std::invalid_argument("LL combine supports BF16 or FP16 expert output");
 }
 }  // namespace
 
+// LL capability exports now live in the Host module: dispatch is compiled
+// through DeepJIT, so no dispatch device translation unit exists any more.
+// Combine/clock still load the device library for their own exports.
+extern "C" uint32_t deepep_ll_core_protocol_version()
+{
+    return deep_ep::kLlCoreProtocolVersion;
+}
+extern "C" uint32_t deepep_ll_rdma_enabled()
+{
+#ifdef DEEPEP_LL_RDMA
+    return 1U;
+#else
+    return 0U;
+#endif
+}
+extern "C" uint32_t deepep_ll_ranks_per_group(uint32_t world)
+{
+    return deep_ep::LlGroupForWorld(world);
+}
+extern "C" uint32_t deepep_ll_reference_profile_enabled()
+{
+#ifdef DEEPEP_LL_REFERENCE_PROFILE
+    return 1U;
+#else
+    return 0U;
+#endif
+}
+extern "C" uint32_t deepep_ll_reference_profile_schema()
+{
+    return profile::kSchema;
+}
+
 void bind_low_latency(py::module_& module)
 {
-    if (deepep_ll_core_protocol_version() != DispatchDedup::kLlCoreProtocolVersion)
+    if (deepep_ll_core_protocol_version() != deep_ep::kLlCoreProtocolVersion)
         throw std::runtime_error("LL Host/device core protocol mismatch; rebuild and reinstall the complete wheel");
-    module.attr("low_latency_core_protocol") = DispatchDedup::kLlCoreProtocolVersion;
+    module.attr("low_latency_core_protocol") = deep_ep::kLlCoreProtocolVersion;
     module.attr("low_latency_roce_qps_per_peer") = 0; // actual active physical cores
     module.attr("low_latency_implementation") = "ndr-hns1825";
 #ifdef DEEPEP_LL_RDMA
@@ -180,40 +167,18 @@ void bind_low_latency(py::module_& module)
     if (deepep_ll_rdma_enabled()) throw std::runtime_error("LL Host/device RDMA build mismatch; rebuild complete wheel");
     module.attr("low_latency_rdma_enabled") = false;
 #endif
-    module.attr("low_latency_stage_timer_enabled") = bool(deepep_ll_stage_timer_enabled());
     const bool reference_enabled = bool(deepep_ll_reference_profile_enabled());
-    if (deepep_ll_reference_profile_schema() != LlReferenceProfile::kSchema ||
-        (reference_enabled && deepep_ll_stage_timer_enabled()))
+    if (deepep_ll_reference_profile_schema() != profile::kSchema)
         throw std::runtime_error("LL Host/device reference profile mismatch; rebuild and reinstall the complete wheel");
     module.attr("low_latency_reference_profile_enabled") = reference_enabled;
     module.def("low_latency_reference_profile_layout", []() {
         py::dict result;
-        result["schema"] = LlReferenceProfile::kSchema;
-        result["slots"] = LlReferenceProfile::kSlots;
-        result["fields"] = LlReferenceProfile::kFields;
+        result["schema"] = profile::kSchema;
+        result["slots"] = profile::kSlots;
+        result["fields"] = profile::kFields;
         std::vector<std::string> names;
-        for (const auto* name : LlReferenceProfile::kNames) names.emplace_back(name);
+        for (const auto* name : profile::kNames) names.emplace_back(name);
         result["words"] = names;
-        return result;
-    });
-    module.def("low_latency_expert_timer_layout", []() {
-        py::dict result;
-        result["schema"]=LlExpertTimer::kSchema;
-        result["header_rows"]=LlExpertTimer::kHeaderRows;
-        result["fields"]=LlExpertTimer::kFields;
-        std::vector<std::string> names;
-        for (const auto* name : LlExpertTimer::kNames) names.emplace_back(name);
-        result["stages"]=names;
-        return result;
-    });
-    module.def("low_latency_stage_timer_layout", []() {
-        py::dict result;
-        result["schema"] = LlStageTimer::kSchema;
-        result["slots"] = LlStageTimer::kSlots;
-        result["fields"] = LlStageTimer::kFields;
-        std::vector<std::string> names;
-        for (const auto* name : LlStageTimer::kNames) names.emplace_back(name);
-        result["stages"] = names;
         return result;
     });
     module.def("low_latency_core_config", []() {
@@ -223,14 +188,26 @@ void bind_low_latency(py::module_& module)
         result["active_aiv"] = cfg.active; result["send_cores"] = cfg.active / 2U;
         result["recv_cores"] = cfg.active / 2U; result["device"] = cfg.device;
         result["runtime_device_queried"] = cfg.device >= 0;
-        result["control_capacity_aiv"] = DispatchDedup::kLlMaxCoreNum;
+        result["control_capacity_aiv"] = cfg.device >= 0 ? deep_ep::jit_num_vec_cores() : 0;
         return result;
     });
     for (uint32_t world : {16U, 32U, 64U, 128U, 256U})
-        if (deepep_ll_ranks_per_group(world) != DispatchDedup::LlGroupForWorld(world))
+        if (deepep_ll_ranks_per_group(world) != deep_ep::LlGroupForWorld(world))
             throw std::runtime_error("LL Host/device tiling-key policy mismatch; rebuild the complete wheel");
-    module.def("low_latency_ranks_per_group", [](uint32_t world) { return DispatchDedup::LlGroupForWorld(world); });
+    module.def("low_latency_ranks_per_group", [](uint32_t world) { return deep_ep::LlGroupForWorld(world); });
     module.attr("low_latency_clock_alignment_version") = clock_alignment::kVersion;
+    module.attr("low_latency_clock_cycles_per_second") = clock_alignment::kCyclesPerSecond;
+    module.attr("low_latency_clock_wait_record_words") = deep_ep::kClockWaitRecordWords;
+    module.attr("low_latency_clock_wait_record_fields") = std::vector<std::string>{
+        "enter", "release", "batch", "core"};
+    module.attr("low_latency_clock_wait_schema") = deep_ep::kClockWaitRecordSchema;
+    module.attr("low_latency_clock_wait_record_stride_words") =
+        deep_ep::kClockWaitRecordStrideWords;
+    module.attr("low_latency_clock_wait_record_stride_bytes") =
+        deep_ep::kClockWaitRecordStrideBytes;
+    module.attr("low_latency_clock_wait_record_alignment_bytes") =
+        deep_ep::kClockWaitRecordAlignmentBytes;
+    module.attr("low_latency_clock_wait_arg_bytes") = deep_ep::kClockWaitArgBytes;
     module.def("low_latency_clock_sync",
                [](Session& session, py::object comm_args, py::object samples, uint32_t sample_count,
                   uint32_t warmup_sample_count, uint64_t magic, uint64_t timeout_cycles,
@@ -241,7 +218,7 @@ void bind_low_latency(py::module_& module)
                        throw std::invalid_argument("Invalid LL clock synchronization configuration");
                    }
                    auto* comm = tensor(
-                       comm_args, {sizeof(DispatchDedup::CommArgs)}, "uint8");
+                       comm_args, {sizeof(deep_ep::CommArgs)}, "uint8");
                    auto* output = tensor(
                        samples, {sample_count, clock_alignment::kSampleWords}, "int64");
                    session.workspace();
@@ -265,9 +242,43 @@ void bind_low_latency(py::module_& module)
                    deepep_clock_sleep_at_kernel_do(
                        reinterpret_cast<void*>(stream_address), local_deadline, output);
                });
+    // In-graph wait shared by every captured call: the deadline lives in a GM
+    // table and the call index is a runtime argument, so a replay only needs to
+    // refresh the table contents. Cores must match the Dispatch launch exactly
+    // because the record stride is a function of the participating core count.
+    // Each record owns a 128-byte physical slot (schema 2); a narrower slot let
+    // neighbouring cores overwrite each other's evidence.
+    module.def("low_latency_clock_wait_table",
+               [](Session& session, py::object deadlines, int64_t num_iters, int64_t index,
+                  py::object records, int64_t batch, bool diagnostic, uintptr_t stream_address) {
+                   if (!session.ll_rdma() || !stream_address || num_iters <= 0 || num_iters > INT32_MAX ||
+                       index < 0 || index >= num_iters) {
+                       throw std::invalid_argument("Invalid LL clock wait-table configuration");
+                   }
+                   const uint32_t cores = pin_session_cores(session);
+                   if (cores == 0U) throw std::invalid_argument("LL clock wait-table has no active cores");
+                   auto* table = tensor(deadlines, {num_iters}, "int64");
+                   require_npu(deadlines, "deadlines");
+                   uint8_t* output = nullptr;
+                   if (diagnostic) {
+                       output = tensor(records, {num_iters, int64_t(cores),
+                                                 int64_t(deep_ep::kClockWaitRecordStrideWords)}, "int64");
+                       require_npu(records, "records");
+                       if (reinterpret_cast<uintptr_t>(output) % deep_ep::kClockWaitRecordAlignmentBytes) {
+                           throw std::invalid_argument(
+                               "LL clock wait records require 128-byte alignment");
+                       }
+                   }
+                   py::gil_scoped_release release;
+                   deep_ep::launch_clock_wait_table(cores, reinterpret_cast<void*>(stream_address),
+                                                    table, index, output, batch, diagnostic);
+               },
+               "Wait until deadlines[index] (device cycles) on every active AIV core; "
+               "records, when requested, are int64[num_iters][cores][16] with the four "
+               "leading words per slot holding enter, release, batch and core.");
     module.def("low_latency_layout", [](int p, int b, int h, int k, int e, const std::string& dtype) {
         // A rejected shape is a Host-only capability result, not a launch failure.
-        dtype_code(dtype);
+        check_dispatch_dtype(dtype);
         try {
             auto plan = layout(p, b, h, k, e, dtype == "float8_e4m3fn");
             py::dict result;
@@ -280,56 +291,44 @@ void bind_low_latency(py::module_& module)
     });
     module.def("low_latency_comm_args", [](Session& session) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
-        if (session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
-            session.world() > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE ||
-            session.world() < 16 || session.world() % DispatchDedup::LlGroupForWorld(session.world()) != 0) {
+        if (session.capacity() != deep_ep::kEpServerDedupPeerBytes ||
+            session.world() > deep_ep::DISPATCH_DEDUP_MAX_RANK_SIZE ||
+            session.world() < 16 || session.world() % deep_ep::LlGroupForWorld(session.world()) != 0) {
             throw std::invalid_argument("LL requires exactly 8 GiB of symmetric workspace");
         }
         pin_session_cores(session);
-        DispatchDedup::CommArgs args{};
+        deep_ep::CommArgs args{};
         args.rank = session.rank();
         args.rankSize = session.world();
-        args.localRank = session.rank() % DispatchDedup::LlGroupForWorld(session.world());
-        args.localRankSize = DispatchDedup::LlGroupForWorld(session.world());
-        args.reserved0 = DispatchDedup::kLlPhysicalRanksPerHost;
+        args.localRank = session.rank() % deep_ep::LlGroupForWorld(session.world());
+        args.localRankSize = deep_ep::LlGroupForWorld(session.world());
+        args.reserved0 = deep_ep::kNumRanksPerHost;
         args.peerMemBytes = session.capacity();
         args.fftsVal = shmemx_get_ffts_config();
         if (session.ll_rdma()) {
             args.reservedAddresses[0] = static_cast<uint8_t*>(session.workspace());
             args.reservedAddresses[1] = static_cast<uint8_t*>(session.ll_rdma_stage());
-            args.reservedConfig[0] = LlRdma::kBackend;
+            args.reservedConfig[0] = deep_ep::rdma::kBackend;
             args.reservedConfig[1] = session.ll_rdma_qps();
         }
         for (int peer = 0; peer < session.world(); ++peer) {
             args.peerMems[peer] = peer_buffer_base(session, peer);
-            if (session.ll_rdma() && !DispatchDedup::LlSameHost(session.rank(), peer)) continue;
+            if (session.ll_rdma() && !deep_ep::LlSameHost(session.rank(), peer)) continue;
             if (args.peerMems[peer] == nullptr || reinterpret_cast<uintptr_t>(args.peerMems[peer]) % 32) {
                 throw std::invalid_argument("LL requires aligned MTE mappings for every peer");
             }
         }
         return bytes(args);
     });
-    module.def("low_latency_dispatch_tiling", [](int p, int b, int h, int k, int e, const std::string& dtype,
-                                                 int num_max_tokens_per_rank) {
-        const bool fp8 = dtype == "float8_e4m3fn";
-        layout(p, b, h, k, e, fp8);
-        auto data = dispatch_format_tiling(p, dtype);
-        data.bs = b;
-        data.h = h;
-        data.numMaxTokensPerRank = num_max_tokens_per_rank;
-        data.topK = k;
-        data.moeExpertNum = e;
-        data.expertTokenNumsType = 1;
-        return bytes(data);
-    });
     module.def("low_latency_combine_tiling",
                [](int p, int b, int h, int k, int e, const std::string& dtype, int num_max_tokens_per_rank, bool rdma) {
                    if (rdma) {
-                       return bytes(ubx::v2_tiling(p, b, h, k, e, dtype_code(dtype), num_max_tokens_per_rank,
-                                                 query_ll_core_config().active, DispatchDedup::kLlPhysicalRanksPerHost));
+                       return bytes(ubx::v2_tiling(p, b, h, k, e, combine_dtype_code(dtype), num_max_tokens_per_rank,
+                                                 query_ll_core_config().active, deep_ep::kNumRanksPerHost));
                    }
                    CombineDedup::Layout plan{};
-                   if ((dtype != "bfloat16" && dtype != "float16") || !CombineDedup::BuildLayout(p, b, h, k, e, plan)) {
+                   if ((dtype != "bfloat16" && dtype != "float16") ||
+                       !CombineDedup::BuildLayout(p, b, h, k, e, plan, query_ll_core_config().active)) {
                        throw std::invalid_argument("LL combine exceeds dtype, topology, UB or workspace limits");
                    }
                    CombineDedup::EpServerDedupCombineTilingData data{};
@@ -338,35 +337,38 @@ void bind_low_latency(py::module_& module)
                    data.numMaxTokensPerRank = num_max_tokens_per_rank;
                    data.topK = k;
                    data.moeExpertNum = e;
-                   data.dtype = dtype_code(dtype);
+                   data.dtype = combine_dtype_code(dtype);
                    return bytes(data);
                },
                py::arg("world"), py::arg("tokens"), py::arg("hidden"), py::arg("topk"), py::arg("experts"),
                py::arg("dtype"), py::arg("capacity"), py::arg("rdma") = false);
     module.def("dispatch_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int rows,
-                                          const std::string& dtype, uintptr_t stream_address) {
+                                          int capacity, const std::string& dtype, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
-        dtype_code(dtype);
+        check_dispatch_dtype(dtype);
+        // DeepEP-Ascend carries no dtype enum: FP8 is exactly "scales present",
+        // everything else is plain BF16 on the same kernel.
         const bool fp8 = dtype == "float8_e4m3fn";
-        const auto plan = layout(session.world(), b, h, k, e, fp8);
-        const auto format = dispatch_format_tiling(session.world(), dtype);
-        if (DispatchDedup::LlDispatchInputClass(format.dtype, format.quantMode, format.expandXOutDtype,
-                                                format.inputMode) == DispatchDedup::kLlDispatchInvalidVariant)
-            throw std::invalid_argument("Unsupported LL dispatch format");
+        const uint32_t cores = pin_session_cores(session);
+        const auto mode = fp8 ? deep_ep::EpServerDedupInputMode::PrequantizedFp8Packs
+                              : deep_ep::EpServerDedupInputMode::Plain16;
+        const auto plan = deep_ep::get_dispatch_buffer_size(
+            uint32_t(session.world()), uint32_t(capacity), uint32_t(h), uint32_t(k), uint32_t(e), mode, cores);
+        const uint32_t group = deep_ep::LlGroupForWorld(uint32_t(session.world()));
         const int64_t c = plan.capacityRows;
-        if (!stream_address || rows < c || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes) {
-            throw std::invalid_argument("Invalid LL output capacity, workspace or stream");
+        if (!stream_address || rows < c || b <= 0 || b > int(capacity) ||
+            session.capacity() != deep_ep::kEpServerDedupPeerBytes) {
+            throw std::invalid_argument("Invalid LL token count, output capacity, workspace or stream");
         }
         auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
-        deepep::EpServerDedupKernelArgs args{};
-        args.coreNum = pin_session_cores(session);
-        args.stageTimer = stage_timer(tensors, args.coreNum, args.timerMode, true);
-        args.expertTimer = expert_timer(tensors, args.coreNum, e, args.stageTimer);
-        args.commArgs = get("comm_args", {sizeof(DispatchDedup::CommArgs)}, "uint8");
-        args.x = get("input", {b, h}, dtype.c_str());
-        args.expertIds = get("indices", {b, k}, "int32");
-        args.expertScales = get("weights", {b, k}, "float32");
-        args.expandXOut = get("output", {rows, h}, dtype.c_str());
+        const bool dedup = deep_ep::EpServerDedupEnabled(uint32_t(capacity), uint32_t(session.world()));
+
+        void* comm_args = get("comm_args", {sizeof(deep_ep::comm::CommArgs)}, "uint8");
+        void* peer_ptrs = static_cast<uint8_t*>(comm_args) + offsetof(deep_ep::comm::CommArgs, peerMems);
+        void* x = get("input", {b, h}, dtype.c_str());
+        void* expert_ids = get("indices", {b, k}, "int32");
+        void* expert_scales = get("weights", {b, k}, "float32");
+        void* expand_x_out = get("output", {rows, h}, dtype.c_str());
         // Both formats occupy four bytes per 128 hidden elements. The kernel
         // transports opaque bytes: FP32 per-128 or packed E8M0 per-32.
         const char* scale_dtype = "int32";
@@ -376,38 +378,59 @@ void bind_low_latency(py::module_& module)
                 scale_dtype = "float32";
             }
         }
-        args.dynamicScalesOut = fp8 ? get("output_scales", {rows, (h + 127) / 128}, scale_dtype) : nullptr;
-        args.expertTokenNumsOut = get("expert_recv_counts", {e / session.world()}, "int64");
-        args.sendCountsOut = get("send_counts", {e}, "int32");
-        args.tokenTypeOut = get("token_type", {c}, "int32");
-        args.destinationIndexOut = get("destination_index", {c, 3}, "int32");
-        args.relayReadIndexOut = get("relay_read_index", {c, k, 2}, "int32");
-        args.sourceMaskOut = get("source_mask", {b}, "int32");
-        args.expertScalesOut = get("source_weights", {b, k}, "float32");
-        args.tilingData = get("tiling", {sizeof(DispatchDedup::EpServerDedupTilingData)}, "uint8");
-        args.inputScales = fp8 ? get("scales", {b, (h + 127) / 128}, scale_dtype) : nullptr;
+        void* dynamic_scales_out = fp8 ? get("output_scales", {rows, (h + 127) / 128}, scale_dtype) : nullptr;
+        void* expert_token_nums_out = get("expert_recv_counts", {e / session.world()}, "int64");
+        void* send_counts_out = get("send_counts", {e}, "int32");
+        void* token_type_out = get("token_type", {c}, "int32");
+        void* destination_index_out = get("destination_index", {c, 3}, "int32");
+        void* relay_read_index_out = get("relay_read_index", {c, k, 2}, "int32");
+        // Per-rank send metadata is sized by the admitted capacity M, while the
+        // kernel only fills the first B rows.
+        void* source_mask_out = get("source_mask", {capacity}, "int32");
+        void* source_weights_out = get("source_weights", {capacity, k}, "float32");
+        void* input_scales = fp8 ? get("scales", {b, (h + 127) / 128}, scale_dtype) : nullptr;
+        void* profile_out = reference_profile(tensors, cores);
+        void* rdma_remote_base = session.ll_rdma() ? session.workspace() : nullptr;
+        void* rdma_stage_base = session.ll_rdma() ? session.ll_rdma_stage() : nullptr;
         session.workspace();  // Validate the owning context before launch.
         py::gil_scoped_release release;
         session.invalidate_dispatch_controls();
-        dispatch_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
+        deep_ep::launch_dispatch(
+            x, expert_ids, expert_scales, expand_x_out, dynamic_scales_out,
+            expert_token_nums_out, send_counts_out, token_type_out, destination_index_out,
+            relay_read_index_out, source_mask_out, source_weights_out, input_scales,
+            peer_ptrs, rdma_remote_base, rdma_stage_base, profile_out,
+            session.rank(), b, deep_ep::kNumRanksPerHost,
+            session.ll_rdma() ? int(deep_ep::rdma::kBackend) : 0,
+            session.ll_rdma() ? int(session.ll_rdma_qps()) : 0,
+            int64_t(session.capacity()), shmemx_get_ffts_config(),
+            session.world(), capacity, fp8 ? h : h * 2, k, e, int(cores),
+            int(deep_ep::jit_num_ubuf_bytes_per_vec_core()),
+            int(group), fp8, dedup, session.ll_rdma(),
+            reinterpret_cast<void*>(stream_address));
     });
-    module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e,
+    module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int capacity,
                                          const std::string& dtype, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         CombineDedup::Layout plan{};
-        if (!stream_address || session.capacity() != DispatchDedup::kEpServerDedupPeerBytes ||
-            (dtype != "bfloat16" && dtype != "float16")) {
+        if (!stream_address || session.capacity() != deep_ep::kEpServerDedupPeerBytes ||
+            (dtype != "bfloat16" && dtype != "float16") || b <= 0 || capacity < b) {
             throw std::invalid_argument("Invalid LL combine dtype, shape, workspace or stream");
         }
         uint32_t cores = 0;
         if (session.ll_rdma()) {
             cores = pin_session_cores(session);
             plan.capacityRows =
-                ubx::v2_capacity(session.world(), b, h, k, e, cores, DispatchDedup::kLlPhysicalRanksPerHost);
-        } else if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan)) {
+                ubx::v2_capacity(session.world(), b, h, k, e, cores, deep_ep::kNumRanksPerHost);
+        } else if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active)) {
             throw std::invalid_argument("Invalid LL combine shape");
         }
-        const int64_t c = plan.capacityRows;
+        // Row metadata was sized by the Dispatch capacity M, while the kernel
+        // still works row-by-row over the actual B tokens.
+        const uint64_t world = uint64_t(session.world());
+        const uint64_t perRankExperts = uint64_t(e) / world;
+        const int64_t c = int64_t(world * uint64_t(capacity) *
+                                  (uint64_t(k) < perRankExperts ? uint64_t(k) : perRankExperts));
         int32_t device = -1;
         if (session.ll_rdma() && aclrtGetDevice(&device) != 0)
             throw std::runtime_error("LL Combine requires a current NPU");
@@ -420,7 +443,7 @@ void bind_low_latency(py::module_& module)
             return pointer;
         };
         deepep::EpServerDedupCombineKernelArgs args{};
-        args.commArgs = get("comm_args", {sizeof(DispatchDedup::CommArgs)}, "uint8");
+        args.commArgs = get("comm_args", {sizeof(deep_ep::CommArgs)}, "uint8");
         // Python validates rows against the dispatch handle. The device selects
         // rows below the actual receive count; C_B sizes metadata, not expert storage.
         const auto input_shape = tensors["input"].attr("shape").cast<Shape>();
@@ -430,10 +453,10 @@ void bind_low_latency(py::module_& module)
         args.expertOut = get("input", input_shape, dtype.c_str());
         args.destinationIndex = get("destination_index", {c, 3}, "int32");
         args.sendCounts = get("send_counts", {e}, "int32");
-        args.expertScales = get("source_weights", {b, k}, "float32");
+        args.expertScales = get("source_weights", {capacity, k}, "float32");
         args.tokenType = get("token_type", {c}, "int32");
         args.relayReadIndex = get("relay_read_index", {c, k, 2}, "int32");
-        args.sourceMask = get("source_mask", {b}, "int32");
+        args.sourceMask = get("source_mask", {capacity}, "int32");
         args.yOut = get("output", {b, h}, dtype.c_str());
         args.tilingData = get("tiling", {sizeof(CombineDedup::EpServerDedupCombineTilingData)}, "uint8");
         session.workspace();

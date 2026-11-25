@@ -125,7 +125,7 @@ struct SharedAddUb {
 };
 static_assert(SharedAddUb::end == 144U * 1024U);
 
-template <class TraceSink>
+template <class S, class TraceSink>
 __aicore__ inline void SharedAdd(const Arguments& a, uint32_t worker, TraceSink& timer)
 {
     using namespace AscendC;
@@ -141,9 +141,9 @@ __aicore__ inline void SharedAdd(const Arguments& a, uint32_t worker, TraceSink&
     LocalTensor<float> fy(TPosition::VECCALC, U::expanded, U::slots * U::width);
     LocalTensor<bfloat16_t> result(TPosition::VECCALC, U::output, U::slots * U::width);
     const auto start = timer.TraceBegin();
-    const uint64_t total = uint64_t(a.config.bs) * a.config.hidden;
+    const uint64_t total = uint64_t(a.config.bs) * S::kHidden;
     const uint64_t tiles = (total + U::width - 1U) / U::width;
-    const uint64_t count = worker < tiles ? (tiles - 1U - worker) / kLocalWorkers + 1U : 0U;
+    const uint64_t count = worker < tiles ? (tiles - 1U - worker) / S::kVectorCores + 1U : 0U;
     for (uint32_t slot = 0; slot < U::slots; ++slot) {
         SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
         SetFlag<HardEvent::MTE3_V>(static_cast<TEventID>(slot));
@@ -154,7 +154,7 @@ __aicore__ inline void SharedAdd(const Arguments& a, uint32_t worker, TraceSink&
         while (submitted < count && submitted - consumed < U::slots) {
             const uint32_t slot = submitted % U::slots, base = slot * U::width;
             const auto event = static_cast<TEventID>(slot);
-            const uint64_t offset = (worker + submitted * kLocalWorkers) * U::width;
+            const uint64_t offset = (worker + submitted * S::kVectorCores) * U::width;
             const uint32_t n = total - offset < U::width ? total - offset : U::width;
             WaitFlag<HardEvent::V_MTE2>(event);
             DataCopy(x[base], routed[offset], n);
@@ -164,7 +164,7 @@ __aicore__ inline void SharedAdd(const Arguments& a, uint32_t worker, TraceSink&
         }
         const uint32_t slot = consumed % U::slots, base = slot * U::width;
         const auto event = static_cast<TEventID>(slot);
-        const uint64_t offset = (worker + consumed * kLocalWorkers) * U::width;
+        const uint64_t offset = (worker + consumed * S::kVectorCores) * U::width;
         const uint32_t n = total - offset < U::width ? total - offset : U::width;
         WaitFlag<HardEvent::MTE2_V>(event);
         Cast(fy[base], y[base], RoundMode::CAST_NONE, n);
@@ -207,11 +207,11 @@ __aicore__ inline Arguments SharedView(const Arguments& a)
     v.gmm2Contiguous = a.sharedOutput;
     return v;
 }
+template <class S>
 __aicore__ inline Fragment SharedFragment(const Arguments& a, uint32_t group)
 {
     const uint32_t row = group * 256U, rows = a.config.bs - row < 256U ? a.config.bs - row : 256U;
-    return {
-        0, 0, row, rows, 0, uint64_t(group) * (a.sharedIntermediate / 256), uint64_t(group) * (a.config.hidden / 256)};
+    return {0, 0, row, rows, 0, uint64_t(group) * (a.sharedIntermediate / 256), uint64_t(group) * (S::kHidden / 256)};
 }
 template <class T>
 struct SharedOutputBackend {
@@ -229,7 +229,7 @@ struct SharedOutputBackend {
         WriteGmByPassDCache(ComputeFlag(a.sharedGmm1Done, tile), 1);
     }
 };
-template <bool First, class T>
+template <class S, bool First, class T>
 __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
 {
     auto v = SharedView(a);
@@ -238,29 +238,33 @@ __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
     TileCompletion<SharedOutputBackend<T>> pending(backend);
     bool active = false;
     for (uint32_t group = 0; group < (a.config.bs + 255) / 256; ++group) {
-        const auto f = SharedFragment(a, group);
-        const uint32_t count = First ? a.sharedIntermediate / 256 : a.config.hidden / 256;
-        const uint32_t first = FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(First, core), kAic);
+        const auto f = SharedFragment<S>(a, group);
+        const uint32_t count = First ? a.sharedIntermediate / 256 : S::kHidden / 256;
+        const uint32_t first =
+            FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(First, core), S::kCubeCores);
         if (first >= count) continue;
-        const UrmaMegaMoeImpl::BlockJobContext job{core, kAic};
-        auto config = UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape(v, f), job, kComputeTileM);
+        const UrmaMegaMoeImpl::BlockJobContext job{core, S::kCubeCores};
+        auto config =
+            UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape<S>(v, f, a.sharedIntermediate), job, kComputeTileM);
         // Both builders have the same ProblemConfig type; shared gate/up stays planar.
-        if constexpr (!First) config = UrmaGmmConfig::BuildGmm2ProblemConfig(FragmentShape(v, f), job, kComputeTileM);
-        auto addr = First ? Gmm1Addresses(v, f) : Gmm2Addresses(v, f);
+        if constexpr (!First)
+            config = UrmaGmmConfig::BuildGmm2ProblemConfig(FragmentShape<S>(v, f, a.sharedIntermediate), job,
+                                                           kComputeTileM);
+        auto addr = First ? Gmm1Addresses<S>(v, f, a.sharedIntermediate) : Gmm2Addresses<S>(v, f, a.sharedIntermediate);
         if constexpr (First) {
-            addr.aGlobal = reinterpret_cast<GM_ADDR>(a.x + f.rowBegin * a.config.hidden);
-            addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(a.xScale + f.rowBegin * (a.config.hidden / 32));
+            addr.aGlobal = reinterpret_cast<GM_ADDR>(a.x + f.rowBegin * S::kHidden);
+            addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(a.xScale + f.rowBegin * (S::kHidden / 32));
         } else {
-            addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(a.sharedOutput + f.rowBegin * a.config.hidden * 2);
+            addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(a.sharedOutput + f.rowBegin * S::kHidden * 2);
             if constexpr (g_coreType == AIC)
                 WaitComputeFlag(a.sharedActivationDone, group, (a.sharedIntermediate / 256) * ((f.rows + 127) / 128));
         }
         gmm.UpdateProblem(config, addr);
         gmm.Begin();
         active = true;
-        for (uint32_t tile = first; tile < count; tile += kAic) {
+        for (uint32_t tile = first; tile < count; tile += S::kCubeCores) {
             TraceMeta meta = FragmentTraceMeta(f, group);
-            meta.expert = a.config.world * a.config.localExperts;
+            meta.expert = S::kExperts;
             meta.tileN = tile * 256;
             meta.columns = 256;
             const auto start = timer.TraceBegin();
@@ -291,6 +295,7 @@ struct SharedWaitScope {
         }
     }
 };
+template <class S>
 class SharedActivationState {
 public:
     __aicore__ inline SharedActivationState(const Arguments& a, uint32_t worker, Timer& t)
@@ -309,10 +314,10 @@ public:
         for (uint32_t j = 0; j < owned_; ++j) {
             const uint32_t local = (cursor_ + j) % owned_;
             if (done_[local / 64] & (uint64_t{1} << (local % 64))) continue;
-            const uint32_t task = worker_ + local * kAic;
+            const uint32_t task = worker_ + local * S::kCubeCores;
             const auto assignment = SharedTaskAt(task, a_.sharedIntermediate);
             const uint32_t group = assignment.group, tile = assignment.tile, slice = assignment.slice;
-            const auto f = SharedFragment(a_, group);
+            const auto f = SharedFragment<S>(a_, group);
             if (slice * 128 >= f.rows) {
                 Mark(local);
                 continue;
@@ -340,7 +345,7 @@ public:
             LocalTensor<bfloat16_t> up(TPosition::VECIN, highUb + planeBytes, 64U * 256U);
             const uint32_t m = slice * 128U, rows = f.rows - m < 128U ? f.rows - m : 128U;
             auto meta = ComputeTileTraceMeta(FragmentTraceMeta(f, group), m, n, rows, 256U);
-            meta.expert = a_.config.world * a_.config.localExperts;
+            meta.expert = S::kExperts;
             const auto start = timer_.TraceBegin();
             for (uint32_t sub = 0; sub < rows; sub += 64U) {
                 const uint32_t actual = rows - sub < 64U ? rows - sub : 64U;
@@ -380,6 +385,7 @@ private:
     uint32_t total_ = 0, owned_ = 0, finished_ = 0, cursor_ = 0;
 };
 
+template <class S>
 struct SharedIncoming {
     const Arguments& a;
     uint32_t core;
@@ -388,19 +394,20 @@ struct SharedIncoming {
     __aicore__ inline void Poll()
     {
         dispatch.Poll();
-        if (core < CommunicationWorkers(a.config.world)) ObserveIncomingCompletion(a, core, peer, self);
+        if (core < CommunicationWorkers<S>()) ObserveIncomingCompletion<S>(a, core, peer, self);
     }
 };
 
+template <class S>
 __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Timer& timer)
 {
-    const uint32_t activationWorkers = ActivationWorkers(args.config.world);
-    const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
+    const uint32_t activationWorkers = ActivationWorkers<S>();
+    const uint32_t communicationWorkers = CommunicationWorkers<S>();
     uint32_t nextPackRound = kPackStartupRounds;
-    PackBatch pack(args, timer);
-    PrepareActivationRoutes(args, worker, nextPackRound, pack, timer);
+    PackBatch<S> pack(args, timer);
+    PrepareActivationRoutes<S>(args, worker, nextPackRound, pack, timer);
     timer.CoarseBegin(CoarsePhase::Activation);
-    SharedActivationState shared(args, worker + communicationWorkers, timer);
+    SharedActivationState<S> shared(args, worker + communicationWorkers, timer);
     UrmaActivation epilogue;
     // Match main MegaMoE's unclamped SwiGLU. The epilogue default is zero,
     // which clamps every up value to zero and makes the entire FFN zero.
@@ -423,8 +430,8 @@ __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Tim
         // Skip groups without this worker's activation tile, but never skip a
         // scale gather merely because its owner has no activation in that group.
         while (nextActivation < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextActivation);
-            const uint32_t tileCount = FragmentGmm1Tiles(args, fragment);
+            const auto fragment = LoadFragment<S>(args, nextActivation);
+            const uint32_t tileCount = FragmentGmm1Tiles<S>(args, fragment);
             if (!activationPrepared) {
                 activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, activationWorkers);
                 activationPrepared = true;
@@ -440,21 +447,21 @@ __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Tim
                     idle = false;
                 }
                 pack.Close();  // Activation reuses DMA event IDs.
-                RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
+                RunReadyActivationTile<S>(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
                 activationTile += activationWorkers;
                 progress = true;
             }
             break;
         }
         if (!progress && nextGather < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextGather);
-            if (AreGroupInputsReady(args, fragment)) {
+            const auto fragment = LoadFragment<S>(args, nextGather);
+            if (AreGroupInputsReady<S>(args, fragment)) {
                 if (idle) {
                     (void)idleStart;
                     idle = false;
                 }
                 pack.Close();  // Scale gather reuses DMA event IDs.
-                GatherInputScale(args, fragment, nextGather, timer);
+                GatherInputScale<S>(args, fragment, nextGather, timer);
                 nextGather += activationWorkers;
                 progress = true;
             }
@@ -467,7 +474,7 @@ __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Tim
                 (void)idleStart;
                 idle = false;
             }
-            PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, pack);
+            PackOneRound<S>(args, nextPackRound, worker + communicationWorkers, S::kCubeCores, pack);
             ++nextPackRound;
             progress = true;
         }
@@ -493,7 +500,7 @@ __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Tim
                 const bool waitingActivation = nextActivation < args.config.fragmentCount;
                 const uint32_t index = waitingActivation ? nextActivation : nextGather;
                 idleEvent = waitingActivation ? TraceEvent::WaitGmm1 : TraceEvent::WaitDispatch;
-                idleMeta = FragmentTraceMeta(LoadFragment(args, index), index);
+                idleMeta = FragmentTraceMeta(LoadFragment<S>(args, index), index);
             }
             const uint64_t backoff = GetSystemCycle();
             while (GetSystemCycle() - backoff < 64U) {

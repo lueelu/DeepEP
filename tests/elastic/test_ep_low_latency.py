@@ -10,6 +10,7 @@ Use --help for launch, configuration, and profiling options.
 import argparse
 import csv
 import hashlib
+import importlib.util
 import math
 import re
 import tempfile
@@ -21,25 +22,47 @@ import random
 import runpy
 import statistics
 import sys
+import time
 from datetime import datetime, timedelta
 
 __test__ = False
+
+
+class _LazyClockModel:
+    """Load the shared model on first use so the script starts without DeepEP.
+
+    ``--plan`` and ``--help`` run from a bare checkout where the package is not
+    importable yet. If the installed wheel predates the model module (an older
+    AOT build), the repository copy is loaded instead, so the AOT and JIT runs
+    still share exactly one implementation of the math.
+    """
+
+    _module = None
+
+    def __getattr__(self, name):
+        module = type(self)._module
+        if module is None:
+            try:
+                from deep_ep.utils import ll_clock_model as module
+            except ImportError:
+                path = PROJECT_ROOT / "deep_ep" / "utils" / "ll_clock_model.py"
+                spec = importlib.util.spec_from_file_location("deep_ep_ll_clock_model", path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            type(self)._module = module
+        return getattr(module, name)
+
+
+ll_clock_model = _LazyClockModel()
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-
-def validate_stage_timer_capability(requested, capability):
-    if not requested:
-        return
-    if not capability["stage_timer"]:
-        raise RuntimeError("All ranks must install a DEEPEP_LL_STAGE_TIMER=ON wheel")
-    if capability["stage_timer_schema"] != 3:
-        raise RuntimeError("LL byte diagnostics require timer schema 3; rebuild/install the matching wheel on every rank")
 
 
 EXP_PREFIX_REPEATS = 100
 SAMPLING_PROTOCOL = 'initial-reduce-exp100-batch-v3'
 TCPSTORE_SAMPLING_PROTOCOL = 'initial-tcpstore-exp100-batch-v2'
 CLOCK_ALIGNMENT_PROTOCOL = 'tilexr-sleep-at-per-iteration-v1'
+CLOCK_ALIGNMENT_GRAPH_PROTOCOL = 'tilexr-graph-wait-table-v1'
 CLOCK_CYCLES_PER_SECOND = 1_000_000_000
 BALANCED_ROUTE_SEED = 20261014
 
@@ -53,15 +76,15 @@ def routing_metadata(world, b, e, seed, route):
 
 
 def diagnostic_requested(args):
-    return args.ll_stage_timer or getattr(args, 'll_reference_profile', False)
+    return bool(getattr(args, 'll_reference_profile', False))
 
 
 def validate_reference_profile_capability(requested, capability):
     if not requested:
         return
-    if (capability.get('reference_profile') is not True or capability.get('stage_timer') is not False or
+    if (capability.get('reference_profile') is not True or
             type(capability.get('reference_profile_schema')) is not int or capability['reference_profile_schema'] != 4):
-        raise RuntimeError('All ranks need the matching reference-profile schema 1 wheel with legacy stage tracing OFF')
+        raise RuntimeError('All ranks need the matching reference-profile schema 4 wheel')
     fingerprint = capability.get('installed_source_sha256')
     if not isinstance(fingerprint, str) or re.fullmatch(r'[0-9a-f]{64}', fingerprint) is None:
         raise RuntimeError('Reference profiling requires the installed source fingerprint on every rank')
@@ -112,13 +135,17 @@ def comparison_metadata(args, world, m):
     runtime=getattr(args,'runtime_identity',None)
     if runtime is None: return None  # CPU fixtures / legacy custom callers.
     clock_aligned = bool(getattr(args, "clock_align", False))
+    graph_aligned = clock_aligned and getattr(args, "clock_align_mode", "stream") == "graph"
+    alignment_protocol = CLOCK_ALIGNMENT_GRAPH_PROTOCOL if graph_aligned else CLOCK_ALIGNMENT_PROTOCOL
     return dict(**runtime, comparison_schema=1, sampling_protocol=sampling_protocol(args),
                 host_coordination=args.group_backend,
-                exp_prefix_repeats=0 if clock_aligned else EXP_PREFIX_REPEATS,
+                exp_prefix_repeats=(int(getattr(args, "clock_align_graph_exp_prefix", 0))
+                                    if graph_aligned
+                                    else 0 if clock_aligned else EXP_PREFIX_REPEATS),
                 per_iteration_exp=0, per_iteration_all_reduce=False,
                 per_iteration_host_collective=False,
-                per_iteration_rank_alignment=CLOCK_ALIGNMENT_PROTOCOL if clock_aligned else "none",
-                per_iteration_device_alignment=CLOCK_ALIGNMENT_PROTOCOL if clock_aligned else "none",
+                per_iteration_rank_alignment=alignment_protocol if clock_aligned else "none",
+                per_iteration_device_alignment=alignment_protocol if clock_aligned else "none",
                 clock_alignment=getattr(args, "clock_alignment_metadata", None),
                 perf_enabled=not args.skip_perf_test, world_size=world,
                 local_world_size=int(os.environ.get('LOCAL_WORLD_SIZE',args.num_processes)),
@@ -127,11 +154,11 @@ def comparison_metadata(args, world, m):
                 route_sha256=getattr(args, 'sample_route_sha256', None),
                 warmup=args.warmup, num_iters=args.num_iters, perf_tail=args.perf_tail,
                 delay_rows=args.delay_rows, delay_cols=args.delay_cols, group_backend=args.group_backend,
-                timer_mode=('reference' if getattr(args, 'll_reference_profile', False) else args.ll_timer_mode) if diagnostic_requested(args) else None,
+                timer_mode='reference' if diagnostic_requested(args) else None,
                 timer_iters=args.ll_timer_iters if diagnostic_requested(args) else 0,
-                frequency_hz=args.ll_timer_frequency_hz, stage_capture=args.ll_stage_timer,
+                frequency_hz=args.ll_timer_frequency_hz,
                 reference_capture=bool(getattr(args, 'll_reference_profile', False)),
-                expert_capture=args.ll_expert_timer, do_handle_copy=args.do_handle_copy,
+                do_handle_copy=args.do_handle_copy,
                 correctness_repeats=args.correctness_repeats, repeat_combine=args.repeat_combine,
                 skip_check=args.skip_check, dispatch_only=args.dispatch_only,
                 fresh_buffer_per_case=args.fresh_buffer_per_case,
@@ -144,13 +171,13 @@ def comparison_metadata(args, world, m):
 def validate_native_cases(native, cases, world):
     """Host-only capability checks for every combination, before communication."""
     for case in cases:
-        dtype = {"bf16": "bfloat16", "fp16": "float16", "fp8": "float8_e4m3fn"}[case.dtype]
+        dtype = {"bf16": "bfloat16", "fp8": "float8_e4m3fn"}[case.dtype]
         shape = (world, case.num_tokens, case.hidden, case.num_topk, case.num_experts)
         try:
             if native.low_latency_layout(*shape, dtype) is None:
                 raise ValueError("dispatch layout rejected")
             native.low_latency_combine_tiling(
-                *shape, "float16" if case.dtype == "fp16" else "bfloat16", validate_args(case, world)
+                *shape, "bfloat16", validate_args(case, world)
             )
         except (ValueError, RuntimeError) as exc:
             raise ValueError(
@@ -188,7 +215,7 @@ def make_parser():
     parser.add_argument("--hidden", nargs="+", action=MatrixValues, type=int, default=7168)
     parser.add_argument("--num-topk", nargs="+", action=MatrixValues, type=int, default=8)
     parser.add_argument("--num-experts", nargs="+", action=MatrixValues, type=int, default=128)
-    parser.add_argument("--dtype", nargs="+", action=MatrixValues, choices=("bf16", "fp16", "fp8"), default="bf16")
+    parser.add_argument("--dtype", nargs="+", action=MatrixValues, choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
         "--fp8-scale-dtype",
         nargs="+",
@@ -234,14 +261,29 @@ def make_parser():
     parser.add_argument("--num-iters", type=int, default=100)
     parser.add_argument("--clock-align", action="store_true",
                         help="Queue an absolute device-cycle wait before every measured operation")
+    parser.add_argument("--clock-align-mode", choices=("stream", "graph"), default="stream",
+                        help="stream: host-enqueue one sleep_at before each iteration; graph: capture one "
+                             "wait+dispatch pair per iteration and refresh the deadline table per replay")
+    parser.add_argument("--clock-align-replays", type=int, default=3,
+                        help="Graph-mode replays with a refreshed deadline table; acceptance reads the last")
+    parser.add_argument("--clock-align-calibration-windows", type=int, default=3,
+                        help="Spaced four-timestamp windows fitted into one affine rate; 3+ holds the last out")
+    parser.add_argument("--clock-align-calibration-gap-secs", type=float, default=5.0,
+                        help="Host sleep between calibration windows; the slope needs a span that can resolve drift")
+    parser.add_argument("--clock-align-model-max-age-secs", type=float, default=60.0,
+                        help="Refit instead of re-anchoring once the fitted rate is older than this")
+    parser.add_argument("--clock-align-max-pair-error-ns", type=float, default=None,
+                        help="Fail before submitting the graph when the two-rank error budget exceeds this; "
+                             "unset reports the budget without claiming a precision")
+    parser.add_argument("--clock-align-graph-exp-prefix", type=int, default=0,
+                        help="Graph mode: run the fixed Exp prefix after calibration and before the fresh "
+                             "anchor; the benchmark protocol uses 100, the native acceptance run uses 0")
     parser.add_argument("--clock-align-samples", type=int, default=64)
     parser.add_argument("--clock-align-warmup-samples", type=int, default=8)
     parser.add_argument("--clock-align-lead-us", type=int, default=200000)
     parser.add_argument("--clock-align-interval-us", type=int, default=1000)
     parser.add_argument("--clock-align-timeout-secs", type=int, default=10)
-    parser.add_argument("--ll-stage-timer", action="store_true", help="Separate device-stage diagnostic calls; requires timer-enabled wheel")
-    parser.add_argument("--ll-reference-profile", action="store_true", help="Separate dispatch-only reference cycle capture; requires reference ON and legacy timer OFF wheel")
-    parser.add_argument('--ll-expert-timer', action='store_true', help='Opt-in dispatch per-expert receive work; implies stage capture, requires ABI 5')
+    parser.add_argument("--ll-reference-profile", action="store_true", help="Separate dispatch-only reference cycle capture; requires a reference-profile wheel")
     parser.add_argument("--ll-timer-iters", type=int, default=5)
     parser.add_argument("--ll-timer-mode", choices=("observe", "drain"), default="observe")
     parser.add_argument("--ll-timer-frequency-hz", type=float, default=1_000_000_000, help="GetSystemCycle frequency; default 1GHz (ticks/1000 us)")
@@ -253,40 +295,60 @@ def make_parser():
     return parser
 
 
-DISPATCH_PROFILER_ENTRIES = ("dispatch_server_dedup_kernel",)
+DISPATCH_LOGICAL_NAME = "dispatch_server_dedup_kernel"
+# AOT and JIT expose different task names for the same logical Dispatch. Both
+# are admitted here, once, so the ordinary and graph extraction paths agree.
+DISPATCH_PROFILER_ENTRIES = ("dispatch_server_dedup_kernel", "dispatch_jit")
+WAIT_PROFILER_ENTRY = "clock_wait_table"
+PROFILER_LOGICAL_NAMES = {name: DISPATCH_LOGICAL_NAME for name in DISPATCH_PROFILER_ENTRIES}
 
 
-def kernel_durations(root, kernel, expected):
-    """Read only the requested device kernel from torch_npu text exports."""
-    rows = []
-    entries = DISPATCH_PROFILER_ENTRIES if kernel == "dispatch_server_dedup_kernel" else (kernel,)
+def profiler_kernel_records(root, entries, logical=None):
+    """Read matching device tasks from torch_npu text exports, ordered by start.
+
+    Each row keeps the real task name, its source CSV, start and duration, and
+    the logical name used for statistics. An alias never loses the original.
+    """
     pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, entries)) + r")\b")
-    actual_entries = set()
-    actual_task_names = set()
+    aliases = PROFILER_LOGICAL_NAMES if logical is None else logical
+    rows = []
     for path in sorted(Path(root).rglob("kernel_details.csv")):
         with path.open(newline="", encoding="utf-8-sig") as stream:
             for row in csv.DictReader(stream):
                 normalized = {key.replace(" ", "").lower(): value for key, value in row.items() if key}
                 name = normalized.get("name", normalized.get("opname", ""))
-                matches = pattern.findall(name)
-                if not matches:
+                match = pattern.search(name)
+                if not match:
                     continue
-                actual_entries.update(matches)
-                if kernel == "dispatch_server_dedup_kernel" and len(actual_entries) > 1:
-                    raise ValueError(f"Mixed dispatch profiler entries in {root}: {sorted(actual_entries)}")
-                actual_task_names.add(name.strip())
-                if kernel == "dispatch_server_dedup_kernel" and len(actual_task_names) > 1:
-                    raise ValueError(f"Mixed dispatch profiler task names in {root}: {sorted(actual_task_names)}")
                 value = float(normalized.get("duration(us)", normalized.get("taskduration(us)", "nan")))
                 if not math.isfinite(value) or value <= 0:
                     raise ValueError(f"Invalid kernel duration in {path}: {value}")
                 start = normalized.get("starttime(us)")
-                rows.append((float(start) if start else None, value))
+                entry = match.group(0)
+                rows.append(dict(entry=entry, logical=aliases.get(entry, entry), name=name.strip(),
+                                 duration=value, start=float(start) if start else None,
+                                 source=str(path)))
+    if rows and all(row["start"] is not None for row in rows):
+        rows.sort(key=lambda row: row["start"])
+    return rows
+
+
+def kernel_durations(root, kernel, expected):
+    """Read only the requested device kernel from torch_npu text exports."""
+    dispatch = kernel == DISPATCH_LOGICAL_NAME
+    entries = DISPATCH_PROFILER_ENTRIES if dispatch else (kernel,)
+    rows = profiler_kernel_records(root, entries)
+    if dispatch:
+        rows = [row for row in rows if row["logical"] == DISPATCH_LOGICAL_NAME]
+        actual_entries = {row["entry"] for row in rows}
+        if len(actual_entries) > 1:
+            raise ValueError(f"Mixed dispatch profiler entries in {root}: {sorted(actual_entries)}")
+        actual_task_names = {row["name"] for row in rows}
+        if len(actual_task_names) > 1:
+            raise ValueError(f"Mixed dispatch profiler task names in {root}: {sorted(actual_task_names)}")
     if len(rows) != expected:
         raise ValueError(f"{kernel}: expected {expected} profiler records, found {len(rows)} in {root}")
-    if all(start is not None for start, _ in rows):
-        rows.sort(key=lambda row: row[0])
-    return [value for _, value in rows]
+    return [row["duration"] for row in rows]
 
 
 def sample_stats(values):
@@ -461,7 +523,6 @@ def parse_args(argv=None):
                     ]
                 )
     args = make_parser().parse_args(configured + argv)
-    if args.ll_expert_timer: args.ll_stage_timer=True
     if args.ll_reference_profile and not any(value == '--ll-timer-iters' or value.startswith('--ll-timer-iters=') for value in configured + argv):
         args.ll_timer_iters = 1
     for name in ("output_dir", "output"):
@@ -535,10 +596,7 @@ def validate_args(args, world):
         raise ValueError("ll-timer-iters must be 1..1000")
     if args.ll_timer_frequency_hz is not None and (not math.isfinite(args.ll_timer_frequency_hz) or args.ll_timer_frequency_hz <= 0):
         raise ValueError("Timer counter frequency must be positive and finite")
-    if args.ll_expert_timer: args.ll_stage_timer=True
     if getattr(args, 'll_reference_profile', False):
-        if args.ll_stage_timer or args.ll_expert_timer:
-            raise ValueError('Reference profiling cannot run with legacy stage/expert tracing')
         if not args.dispatch_only:
             raise ValueError('Reference profiling requires --dispatch-only')
         if args.ll_timer_mode != 'observe':
@@ -546,10 +604,36 @@ def validate_args(args, world):
     if diagnostic_requested(args) and args.skip_check:
         raise ValueError("Stage diagnostics require correctness checks")
     if args.clock_align:
-        if args.skip_perf_test or diagnostic_requested(args):
+        if getattr(args, "clock_align_mode", "stream") == "graph":
+            if not args.dispatch_only:
+                raise ValueError("Graph clock alignment requires --dispatch-only")
+            if args.do_cpu_sync != 0:
+                raise ValueError("Graph clock alignment requires --do-cpu-sync 0; host count reads cannot be captured")
+            if not 1 <= args.clock_align_replays <= 16:
+                raise ValueError("clock-align-replays must be in [1,16]")
+            if diagnostic_requested(args):
+                raise ValueError("Graph clock alignment excludes reference profiling")
+        elif args.skip_perf_test or diagnostic_requested(args):
             raise ValueError("Clock alignment is only supported by plain OFF performance sampling")
         if not 8 <= args.clock_align_samples <= 256:
             raise ValueError("clock-align-samples must be in [8,256]")
+        if not 1 <= args.clock_align_calibration_windows <= 16:
+            raise ValueError("clock-align-calibration-windows must be in [1,16]")
+        if args.clock_align_calibration_windows < 3:
+            raise ValueError(
+                "A formal clock run needs at least 3 calibration windows: two train the rate and one "
+                "is held out for the residual check")
+        if not 0.0 <= args.clock_align_calibration_gap_secs <= 120.0:
+            raise ValueError("clock-align-calibration-gap-secs must be in [0,120]")
+        if not 0.0 < args.clock_align_model_max_age_secs <= 3600.0:
+            raise ValueError("clock-align-model-max-age-secs must be in (0,3600]")
+        if args.clock_align_max_pair_error_ns is not None:
+            limit = args.clock_align_max_pair_error_ns
+            if not math.isfinite(limit) or limit <= 0:
+                raise ValueError("clock-align-max-pair-error-ns must be positive and finite")
+        if args.clock_align_graph_exp_prefix not in (0, EXP_PREFIX_REPEATS):
+            raise ValueError(
+                f"clock-align-graph-exp-prefix must be 0 or the fixed {EXP_PREFIX_REPEATS} prefix")
         if not 0 <= args.clock_align_warmup_samples <= 32:
             raise ValueError("clock-align-warmup-samples must be in [0,32]")
         if not 1000 <= args.clock_align_lead_us <= 10_000_000:
@@ -789,6 +873,8 @@ def control_device(args, torch):
 
 def sampling_protocol(args):
     if getattr(args, "clock_align", False):
+        if getattr(args, "clock_align_mode", "stream") == "graph":
+            return CLOCK_ALIGNMENT_GRAPH_PROTOCOL
         return CLOCK_ALIGNMENT_PROTOCOL
     return TCPSTORE_SAMPLING_PROTOCOL if args.group_backend == "tcpstore" else SAMPLING_PROTOCOL
 
@@ -923,68 +1009,25 @@ def enqueue_exp_prefix(delay):
         torch.exp(delay, out=delay)
 
 
-def estimate_clock_model(rows, rank):
-    """Use TileXR's minimum-effective-RTT offset estimator for this short batch."""
-    candidates = []
-    for sequence, row in enumerate(rows):
-        if len(row) != 8:
-            continue
-        t0, t1, t2, t3, reported_rtt, reported_offset, packed, _ = map(int, row)
-        actual_sequence = packed & 0xffffffff
-        status = (packed >> 32) & 0xffffffff
-        if (status != 0 or actual_sequence != sequence or min(t0, t1, t2, t3) <= 0 or
-                t3 < t0 or t2 < t1 or t3 - t0 < t2 - t1):
-            continue
-        rtt = (t3 - t0) - (t2 - t1)
-        offset_sum = (t1 - t0) + (t2 - t3)
-        offset = (abs(offset_sum) // 2) * (-1 if offset_sum < 0 else 1)
-        if rtt != reported_rtt or offset != reported_offset:
-            continue
-        candidates.append((rtt, sequence, offset, t0 + (t3 - t0) // 2))
-    minimum = max(4, math.ceil(len(rows) * 0.75))
-    if len(candidates) < minimum:
-        raise RuntimeError(
-            f"Clock calibration rank {rank} has {len(candidates)}/{len(rows)} valid samples; require {minimum}"
-        )
-    best = min(candidates)
-    return dict(
-        rank=rank,
-        state="ready",
-        anchor_cycle=best[3],
-        offset_cycles=0 if rank == 0 else best[2],
-        rate_correction=0.0,
-        min_round_trip_cycles=0 if rank == 0 else best[0],
-        error_bound_cycles=0 if rank == 0 else (best[0] + 1) // 2,
-        valid_samples=len(candidates),
-        rejected_samples=len(rows) - len(candidates),
-        sample_sequence=best[1],
-    )
-
-
-def clock_sleep_deadline(model, reference_cycle):
-    """Invert the frozen affine model and round toward a non-early deadline."""
-    rate = float(model["rate_correction"])
-    displacement = math.ceil(
-        (-float(model["offset_cycles"]) -
-         rate * (int(reference_cycle) - int(model["anchor_cycle"]))) / (1.0 + rate)
-    )
-    deadline = int(reference_cycle) + displacement
-    if not 0 <= deadline < 1 << 64:
-        raise ValueError("Clock alignment deadline is outside uint64")
-    return deadline
-
-
-def prepare_clock_alignment(buffer, args, operation):
-    import torch
+def clock_alignment_state(buffer, native=None):
+    """Resolve the clock entries once; calibration and replay share them."""
     from deep_ep._native import require_native
     from deep_ep._runtime import runtime_of
 
-    native = require_native("LL clock alignment")
+    native = native or require_native("LL clock alignment")
     if getattr(native, "low_latency_clock_alignment_version", None) != 1:
         raise RuntimeError("Rebuild the wheel with LL clock alignment v1")
     runtime = runtime_of(buffer)
     if runtime.low_latency_comm_args is None:
         raise RuntimeError("Clock alignment requires an initialized LL communication argument tensor")
+    return dict(runtime=runtime, native=native)
+
+
+def clock_window(state, args, operation, window, keep_rows=False):
+    """Run one four-timestamp exchange and reduce it to a calibration anchor."""
+    import torch
+
+    runtime = state["runtime"]
     generation = getattr(args, "_clock_alignment_generation", 0) + 1
     args._clock_alignment_generation = generation
     operation_id = 1 if operation == "dispatch" else 2
@@ -993,7 +1036,7 @@ def prepare_clock_alignment(buffer, args, operation):
         (args.clock_align_samples, 8), dtype=torch.int64, device=f"npu:{runtime.device}"
     )
     with torch.npu.stream(runtime.stream):
-        native.low_latency_clock_sync(
+        state["native"].low_latency_clock_sync(
             runtime.native,
             runtime.low_latency_comm_args,
             samples,
@@ -1005,36 +1048,201 @@ def prepare_clock_alignment(buffer, args, operation):
         )
     runtime.stream.synchronize()
     rows = samples.cpu().tolist()
-    model = estimate_clock_model(rows, runtime.rank)
-    local = {**model, "last_cycle": int(rows[-1][3])}
-    models = host_gather(args, local, f"{operation}.clock.models")
-    if [item["rank"] for item in models] != list(range(runtime.world_size)):
-        raise RuntimeError("Clock models do not follow EP rank order")
-    reference_target = int(models[0]["last_cycle"]) + args.clock_align_lead_us * 1000
-    first_deadline = clock_sleep_deadline(model, reference_target)
-    releases = torch.empty((args.num_iters,), dtype=torch.int64, device=f"npu:{runtime.device}")
-    releases.record_stream(runtime.stream)
+    anchor = ll_clock_model.window_from_rows(rows, runtime.rank, window)
+    return (anchor, rows) if keep_rows else anchor
+
+
+def validate_clock_models(models, world, phase="calibration", rank=None, replay_id=None):
+    """Admission for every gathered model, with the failing phase in the error."""
+    where = f"phase={phase} rank={rank}" + ("" if replay_id is None else f" replay={replay_id}")
+    try:
+        ll_clock_model.validate_models(models, world)
+    except ValueError as exc:
+        raise RuntimeError(f"Clock model admission failed ({where}): {exc}") from exc
+    return models
+
+
+def calibrate_clock_model(state, args, operation, replay_id=None):
+    """Fit one affine model from windows spaced far enough apart to see drift.
+
+    One window resolves the offset only; the slope needs a span whose anchor
+    errors are small against the rate being claimed, so the windows are
+    separated by a Host sleep and each uses a fresh protocol generation. The
+    gathered models are admitted immediately: an unresolved, clamped or
+    unvalidated rank must stop the run here, not at the first deadline. The raw
+    rows are returned so a report can keep the untouched evidence.
+    """
+    count = int(args.clock_align_calibration_windows)
+    gap = float(args.clock_align_calibration_gap_secs)
+    windows, raw = [], []
+    for index in range(count):
+        anchor, rows = clock_window(state, args, operation, index, keep_rows=True)
+        windows.append(anchor)
+        raw.append(rows)
+        if index + 1 < count and gap > 0.0:
+            time.sleep(gap)
+    rank = state["runtime"].rank
+    world = state["runtime"].world_size
+    model = ll_clock_model.fit_model(windows, rank)
+    models = host_gather(args, model, f"{operation}.clock.models")
+    validate_clock_models(models, world, "calibration", rank, replay_id)
+    return model, models, raw
+
+
+def reference_base(models, lead_us):
+    """Common reference-domain instant that is still ahead of every rank."""
+    latest = max(ll_clock_model.reference_now(item) for item in models)
+    return latest + int(lead_us) * 1000
+
+
+def deadline_budgets(model, table, phase, rank, replay_id=None):
+    """Per-iteration budget at the deadline actually handed to the device."""
+    budgets = []
+    for index, deadline in enumerate(table):
+        try:
+            budgets.append(ll_clock_model.error_budget(model, deadline))
+        except ValueError as exc:
+            suffix = "" if replay_id is None else f" replay={replay_id}"
+            raise RuntimeError(
+                f"Clock error budget unavailable (phase={phase} rank={rank} node={index}{suffix}): "
+                f"{exc}") from exc
+    return budgets
+
+
+def peer_payloads(payloads, world, iterations, phase, rank, replay_id=None):
+    """Validate one gathered peer payload list: coverage, order and lengths."""
+    where = f"phase={phase} rank={rank}" + ("" if replay_id is None else f" replay={replay_id}")
+    if not isinstance(payloads, list) or len(payloads) != world:
+        raise RuntimeError(f"Clock peer payload needs {world} ranks ({where})")
+    if [item.get("rank") if isinstance(item, dict) else None for item in payloads] != list(range(world)):
+        raise RuntimeError(f"Clock peer payload does not follow EP rank order ({where})")
+    for item in payloads:
+        for field in ("release", "error_ns"):
+            values = item.get(field)
+            if values is None:
+                continue
+            if not isinstance(values, list) or len(values) != iterations:
+                raise RuntimeError(f"Clock peer {field} length differs on rank {item.get('rank')} ({where})")
+    return payloads
+
+
+def per_iteration_pair_bounds(errors_by_rank, world):
+    """Worst-rank and worst-two-rank budgets per iteration.
+
+    The pair bound takes the two largest budgets of the same iteration, so it
+    never adds extremes collected from different iterations.
+    """
+    iterations = len(errors_by_rank[0]) if errors_by_rank else 0
+    global_max, pair = [], []
+    for index in range(iterations):
+        column = [int(row[index]) for row in errors_by_rank]
+        global_max.append(max(column))
+        if world <= 1:
+            pair.append(0)
+        else:
+            top = sorted(column, reverse=True)[:2]
+            pair.append(top[0] + top[1])
+    return global_max, pair
+
+
+def check_submit_budget(payloads, world, iterations, limit, phase, rank, replay_id=None):
+    """Fail before a graph is submitted when the two-rank budget exceeds the limit."""
+    payloads = peer_payloads(payloads, world, iterations, phase, rank, replay_id)
+    errors = [item["error_ns"] for item in payloads]
+    for row in errors:
+        for value in row:
+            if not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    f"Clock peer budget {value!r} is invalid (phase={phase} rank={rank})")
+    limits = {item.get("limit") for item in payloads}
+    if len(limits) != 1:
+        raise RuntimeError(
+            f"--clock-align-max-pair-error-ns differs across ranks: {sorted(limits, key=str)}")
+    global_max, pair = per_iteration_pair_bounds(errors, world)
+    peak = max(pair) if pair else 0
+    if limit is not None and peak > limit:
+        suffix = "" if replay_id is None else f" replay={replay_id}"
+        raise RuntimeError(
+            f"Clock pair error bound {peak} ns exceeds --clock-align-max-pair-error-ns={limit} "
+            f"(phase={phase} rank={rank}{suffix})")
+    return dict(
+        global_max_error_ns=max(global_max) if global_max else 0,
+        pair_error_bounds_ns=pair,
+        pair_error_bound_ns_max=peak,
+        max_pair_error_ns_limit=None if limit is None else int(limit),
+        accuracy_status="reported_only" if limit is None else "threshold_met",
+    )
+
+
+def release_rows(payloads, world, iterations, phase, rank, replay_id=None):
+    """Per-rank corrected releases, validated like every other peer payload."""
+    payloads = peer_payloads(payloads, world, iterations, phase, rank, replay_id)
+    return [item["release"] for item in payloads]
+
+
+def prepare_clock_alignment(buffer, args, operation, allocate_releases=True):
+    """Calibrate each rank and choose the common target of iteration zero.
+
+    The budget is evaluated at the deadline actually handed to the device, not
+    at the anchor, so a long horizon is not reported as an anchor-only error.
+    """
+    import torch
+
+    state = clock_alignment_state(buffer)
+    model, models, raw = calibrate_clock_model(state, args, operation)
+    runtime = state["runtime"]
+    reference_target = reference_base(models, args.clock_align_lead_us)
+    first_deadline = ll_clock_model.local_deadline(model, reference_target)
+    releases = None
+    if allocate_releases:
+        releases = torch.empty((args.num_iters,), dtype=torch.int64, device=f"npu:{runtime.device}")
+        releases.record_stream(runtime.stream)
+    targets = [reference_target + index * args.clock_align_interval_us * 1000
+               for index in range(args.num_iters)]
+    deadlines = [ll_clock_model.local_deadline(model, target) for target in targets]
+    budgets = deadline_budgets(model, deadlines, operation, runtime.rank)
+    limit = args.clock_align_max_pair_error_ns
+    payloads = host_gather(
+        args,
+        dict(rank=runtime.rank, error_ns=[item["total_ns"] for item in budgets], limit=limit),
+        f"{operation}.clock.budget",
+    )
+    budget_summary = check_submit_budget(payloads, runtime.world_size, len(targets), limit,
+                                         operation, runtime.rank)
     metadata = dict(
-        schema="deepep_clock_alignment.v1",
-        source="TileXR PR 218 four-timestamp estimator and sleep-at semantics",
+        schema="deepep_clock_alignment.v2",
+        model_schema=ll_clock_model.MODEL_SCHEMA,
+        source="four-timestamp exchange with an affine rate fit and a held-out residual",
         cycles_per_second=CLOCK_CYCLES_PER_SECOND,
         samples=args.clock_align_samples,
         warmup_samples=args.clock_align_warmup_samples,
+        calibration_windows=int(args.clock_align_calibration_windows),
+        calibration_gap_secs=float(args.clock_align_calibration_gap_secs),
         lead_us=args.clock_align_lead_us,
         interval_us=args.clock_align_interval_us,
         reference_target=reference_target,
         first_local_deadline=first_deadline,
-        max_model_error_bound_ns=max(item["error_bound_cycles"] for item in models),
+        first_deadline_error=ll_clock_model.error_budget(model, first_deadline),
+        deadline_budget_ns_max=max(item["total_ns"] for item in budgets),
+        rate_ppm=model["rate_ppm"],
+        rate_resolved=bool(model["rate_resolved"]),
+        residual_cycles=model["residual_cycles"],
+        residual_validated=bool(model["residual_validated"]),
+        max_model_error_bound_ns=max(
+            ll_clock_model.error_budget(item, item["l0"])["total_ns"] for item in models
+        ),
         models=models,
+        calibration_rows=raw,
+        **budget_summary,
     )
-    return dict(runtime=runtime, native=native, model=model, releases=releases, metadata=metadata)
+    return dict(runtime=runtime, native=state["native"], model=model, releases=releases, metadata=metadata)
 
 
 def enqueue_clock_alignment(state, args, iteration):
     import torch
 
     target = state["metadata"]["reference_target"] + iteration * args.clock_align_interval_us * 1000
-    deadline = clock_sleep_deadline(state["model"], target)
+    deadline = ll_clock_model.local_deadline(state["model"], target)
     release = state["releases"][iteration:iteration + 1]
     with torch.npu.stream(state["runtime"].stream):
         state["native"].low_latency_clock_sleep_at(
@@ -1043,16 +1251,33 @@ def enqueue_clock_alignment(state, args, iteration):
 
 
 def finish_clock_alignment(state, args, operation, profile_dir):
+    """Report model-domain releases and the global peer budget.
+
+    The local budget is only one rank's error; the reported worst-rank and
+    two-rank budgets come from every peer's own deadline budget.
+    """
+    model = state["model"]
+    runtime = state["runtime"]
     releases = [int(value) for value in state["releases"].cpu().tolist()]
-    offset = int(state["model"]["offset_cycles"])
-    corrected = [value + offset for value in releases]
-    peers = host_gather(args, corrected, f"{operation}.clock.releases")
+    corrected = [ll_clock_model.forward_reference(model, value) for value in releases]
     targets = [
         state["metadata"]["reference_target"] + index * args.clock_align_interval_us * 1000
         for index in range(args.num_iters)
     ]
-    skews = [max(row) - min(row) for row in zip(*peers)]
-    lateness = [value - target for row, target in zip(zip(*peers), targets) for value in row]
+    deadlines = [ll_clock_model.local_deadline(model, target) for target in targets]
+    bounds = deadline_budgets(model, deadlines, operation, runtime.rank)
+    limit = args.clock_align_max_pair_error_ns
+    peers = host_gather(
+        args,
+        dict(rank=runtime.rank, release=corrected,
+             error_ns=[item["total_ns"] for item in bounds], limit=limit),
+        f"{operation}.clock.releases",
+    )
+    budget_summary = check_submit_budget(peers, runtime.world_size, len(targets), limit,
+                                         operation, runtime.rank)
+    rows = release_rows(peers, runtime.world_size, len(targets), operation, runtime.rank)
+    skews = [max(row) - min(row) for row in zip(*rows)]
+    lateness = [value - target for row, target in zip(zip(*rows), targets) for value in row]
     summary = {
         **state["metadata"],
         "release_skew_p50_ns": statistics.median(skews),
@@ -1061,11 +1286,507 @@ def finish_clock_alignment(state, args, operation, profile_dir):
         "release_lateness_p50_ns": statistics.median(lateness),
         "release_lateness_p99_ns": percentile(lateness, 0.99),
         "release_lateness_max_ns": max(lateness),
+        "local_error_bound_ns_max": max(item["total_ns"] for item in bounds),
+        "release_pair_error_bounds_ns": budget_summary["pair_error_bounds_ns"],
+        "release_pair_error_bound_ns_max": budget_summary["pair_error_bound_ns_max"],
+        "global_max_error_ns": budget_summary["global_max_error_ns"],
+        "accuracy_status": budget_summary["accuracy_status"],
+        "alignment_scope": "model domain; records are required for physical evidence",
     }
     Path(profile_dir).mkdir(parents=True, exist_ok=True)
     (Path(profile_dir) / "clock_alignment.json").write_text(
-        json.dumps(dict(summary=summary, local_model=state["model"], local_release_cycles=releases,
-                        local_corrected_cycles=corrected, reference_targets=targets), indent=2) + "\n"
+        json.dumps(dict(summary=summary, local_model=model, local_release_cycles=releases,
+                        local_corrected_cycles=corrected, reference_targets=targets,
+                        local_error_bounds=bounds), indent=2) + "\n"
+    )
+    if not hasattr(args, "clock_alignment_metadata"):
+        args.clock_alignment_metadata = {}
+    args.clock_alignment_metadata[operation] = summary
+    return summary
+
+
+def clock_wait_table_contract(native):
+    """Read the installed wheel's in-graph wait ABI before touching the device.
+
+    The 128-byte record stride is an ABI property: a wheel that still writes a
+    32-byte slot would silently overlap neighbouring cores, so a mismatch is
+    rejected instead of being reinterpreted.
+    """
+    fields = [str(name) for name in getattr(native, "low_latency_clock_wait_record_fields", [])]
+    words = getattr(native, "low_latency_clock_wait_record_words", None)
+    stride_words = getattr(native, "low_latency_clock_wait_record_stride_words", None)
+    stride_bytes = getattr(native, "low_latency_clock_wait_record_stride_bytes", None)
+    alignment = getattr(native, "low_latency_clock_wait_record_alignment_bytes", None)
+    schema = getattr(native, "low_latency_clock_wait_schema", None)
+    arg_bytes = getattr(native, "low_latency_clock_wait_arg_bytes", None)
+    cycles = getattr(native, "low_latency_clock_cycles_per_second", None)
+    if (words != 4 or fields != ["enter", "release", "batch", "core"] or
+            schema != 2 or stride_words != 16 or stride_bytes != 128 or alignment != 128 or
+            arg_bytes != 40 or
+            cycles != CLOCK_CYCLES_PER_SECOND or not hasattr(native, "low_latency_clock_wait_table")):
+        raise RuntimeError(
+            "Rebuild the wheel with the in-graph clock wait-table ABI "
+            "(schema 2, four fields, 128-byte record slots, 40-byte arguments)"
+        )
+    return int(words), int(stride_words)
+
+
+def validate_wait_records(rows, *, iterations, cores, words, stride_words, batch_tag, table,
+                          rank, label):
+    """Every participating core must own a complete record in every call.
+
+    ``table=None`` checks only record completeness, which is what the capture
+    pass can prove: no real deadline exists yet. A replay passes its deadline
+    table so an enter after the deadline or a release before it also fails.
+    """
+    local_enter, local_release, core_skew = [], [], []
+    late_enters = early = 0
+    for index in range(iterations):
+        node = rows[index]
+        if len(node) != cores:
+            raise RuntimeError(
+                f"Rank {rank} {label} node {index} exposes {len(node)} wait slots, expected {cores}")
+        node_enters, node_releases = [], []
+        for core in range(cores):
+            slot = node[core]
+            if len(slot) != stride_words:
+                raise RuntimeError(
+                    f"Rank {rank} {label} node {index} core {core} slot width {len(slot)} "
+                    f"!= {stride_words}")
+            enter, release, tag, owner = (int(value) for value in slot[:words])
+            if tag != batch_tag or owner != core:
+                raise RuntimeError(
+                    f"Rank {rank} {label} node {index} core {core} slot is not this call's record")
+            if enter <= 0 or release < enter:
+                raise RuntimeError(
+                    f"Rank {rank} {label} node {index} core {core} has no wait record "
+                    f"({list(slot[:words])})")
+            if table is not None:
+                if enter >= table[index]:
+                    late_enters += 1
+                if release < table[index]:
+                    early += 1
+            node_enters.append(enter)
+            node_releases.append(release)
+        local_enter.append(max(node_enters))
+        local_release.append(max(node_releases))
+        core_skew.append(max(node_releases) - min(node_releases))
+    if late_enters:
+        raise RuntimeError(
+            f"Rank {rank} {label} entered after its deadline on {late_enters} cores; "
+            "raise --clock-align-lead-us, widen --clock-align-interval-us, or shorten the "
+            "calibration gap")
+    if early:
+        raise RuntimeError(f"Rank {rank} {label} released early on {early} cores")
+    return dict(local_enter=local_enter, local_release=local_release, core_skew=core_skew)
+
+
+def summarize_replay(model, evidence, targets, table, budgets, budget_summary, args, operation,
+                     rank, world, replay_id, base):
+    """Convert one replay's records into reference-domain skew and peer budgets.
+
+    Budgets were gathered before the graph was submitted, so this only needs the
+    corrected releases; the model domain skew is reported separately from the
+    propagated error bounds.
+    """
+    releases, enters, core_skew = evidence["local_release"], evidence["local_enter"], evidence["core_skew"]
+    corrected = [ll_clock_model.forward_reference(model, value) for value in releases]
+    stage = f"{operation}.graph.clock.releases.{replay_id}"
+    peers = host_gather(args, dict(rank=rank, release=corrected), stage)
+    rows = release_rows(peers, world, len(table), f"{operation}.graph", rank, replay_id)
+    skews = [max(row) - min(row) for row in zip(*rows)]
+    lateness = [value - target for row, target in zip(zip(*rows), targets) for value in row]
+    margins = [deadline - enter for deadline, enter in zip(table, enters)]
+    overshoot = [release - deadline for release, deadline in zip(releases, table)]
+    return dict(
+        replay_id=int(replay_id),
+        base_reference_cycle=int(base),
+        deadline_margin_p50_ns=statistics.median(margins),
+        deadline_margin_min_ns=min(margins),
+        release_overshoot_p50_ns=statistics.median(overshoot),
+        release_overshoot_max_ns=max(overshoot),
+        core_skew_p50_ns=statistics.median(core_skew),
+        core_skew_max_ns=max(core_skew),
+        release_skew_p50_ns=statistics.median(skews),
+        release_skew_p99_ns=percentile(skews, 0.99),
+        release_skew_max_ns=max(skews),
+        release_lateness_p50_ns=statistics.median(lateness),
+        release_lateness_p99_ns=percentile(lateness, 0.99),
+        release_lateness_max_ns=max(lateness),
+        local_error_bound_ns_max=max(item["total_ns"] for item in budgets),
+        pair_error_bounds_ns=budget_summary["pair_error_bounds_ns"],
+        pair_error_bound_ns_max=budget_summary["pair_error_bound_ns_max"],
+        global_max_error_ns=budget_summary["global_max_error_ns"],
+        accuracy_status=budget_summary["accuracy_status"],
+        local_enter_cycles=enters,
+        local_release_cycles=releases,
+        corrected_release_cycles=corrected,
+        deadline_table=table,
+        reference_targets=targets,
+    )
+
+
+def replay_with_profile(graph, stream, directory, iterations, operation):
+    """Replay one graph under the profiler and return the Dispatch durations.
+
+    With ``wait=0, warmup=0, active=1`` the first step is the recording one, so
+    the replay must happen before the first ``profiler.step()``: stepping first
+    would stop and export an empty window.
+    """
+    import torch
+    import torch_npu
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with torch_npu.profiler.profile(
+        schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=0),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(directory)),
+        experimental_config=torch_npu.profiler._ExperimentalConfig(
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            export_type=torch_npu.profiler.ExportType.Text,
+            l2_cache=False, data_simplification=False),
+        profile_memory=True, with_stack=False, with_flops=False, with_modules=False,
+    ) as profiler:
+        with torch.npu.stream(stream):
+            graph.replay()
+        torch.npu.synchronize()
+        profiler.step()
+    return graph_replay_perf(directory, iterations, operation)
+
+
+def graph_replay_perf(root, iterations, operation):
+    """Extract Dispatch durations and prove the wait -> Dispatch order.
+
+    Both AOT and JIT task names map to the same logical Dispatch, so the same
+    extraction works for either build; nothing outside the two admitted names
+    is merged into the samples.
+    """
+    rows = profiler_kernel_records(root, (WAIT_PROFILER_ENTRY, *DISPATCH_PROFILER_ENTRIES))
+    waits = [row for row in rows if row["logical"] == WAIT_PROFILER_ENTRY]
+    dispatches = [row for row in rows if row["logical"] == DISPATCH_LOGICAL_NAME]
+    if len(waits) != iterations or len(dispatches) != iterations:
+        raise ValueError(
+            f"Graph replay profiler saw {len(waits)} waits and {len(dispatches)} Dispatch tasks; "
+            f"expected {iterations} each in {root}")
+    if [row["logical"] for row in rows] != [WAIT_PROFILER_ENTRY, DISPATCH_LOGICAL_NAME] * iterations:
+        raise ValueError(f"Graph replay did not alternate wait -> Dispatch in {root}")
+    return [row["duration"] for row in dispatches]
+
+
+def expected_send_counts(entries, world):
+    """Cumulative (local expert, source rank) status prefix of one rank.
+
+    The public count output follows the existing count ABI: statuses are laid
+    out expert-major with one entry per source rank and each entry is the
+    running total. This is not the per-expert receive count, and it is not the
+    padded capacity region.
+    """
+    values, running = [], 0
+    for rows in entries:
+        per_source = [0] * world
+        for source, _ in rows:
+            per_source[source] += 1
+        for source in range(world):
+            running += per_source[source]
+            values.append(running)
+    return values
+
+
+def fill_count_sentinels(captured):
+    """Overwrite every node's count output so a stale value cannot pass."""
+    for index, output in enumerate(captured):
+        handle = output[3] if len(output) > 3 else None
+        counts = getattr(handle, "send_counts", None)
+        if counts is None:
+            raise AssertionError(f"Captured node {index} lost its count output")
+        counts.fill_(-1)
+
+
+def verify_graph_outputs(captured, expected_counts, check, rank, replay_id):
+    """Every node must rewrite its own counts, payload and scales.
+
+    Counts are compared against values derived from the route and the count
+    ABI, never against another node's output; payload and scales reuse the
+    caller's existing verify_dispatch rules.
+    """
+    for index, output in enumerate(captured):
+        handle = output[3] if len(output) > 3 else None
+        counts = getattr(handle, "send_counts", None)
+        if counts is None:
+            raise AssertionError(f"Rank {rank} replay {replay_id} node {index} lost its count output")
+        actual = [int(value) for value in counts.cpu().tolist()]
+        if len(actual) != len(expected_counts):
+            raise AssertionError(
+                f"Rank {rank} replay {replay_id} node {index} count width {len(actual)} "
+                f"!= {len(expected_counts)}")
+        if actual != expected_counts:
+            mismatch = next(item for item, (a, b) in enumerate(zip(actual, expected_counts)) if a != b)
+            raise AssertionError(
+                f"Rank {rank} replay {replay_id} node {index} count output differs at {mismatch}: "
+                f"got {actual[mismatch]}, expected {expected_counts[mismatch]}")
+        if check is None:
+            continue
+        try:
+            check(output)
+        except AssertionError as exc:
+            raise AssertionError(f"Rank {rank} replay {replay_id} node {index} payload: {exc}") from exc
+    return len(captured)
+
+
+def assert_records_untouched(rows, rank, label):
+    """Capture only records operations; a written record there is a bug."""
+    for node_index, node in enumerate(rows):
+        for core_index, slot in enumerate(node):
+            if any(int(value) != -1 for value in slot):
+                raise RuntimeError(
+                    f"Rank {rank} {label} node {node_index} core {core_index} already has a record "
+                    "before the probe replay")
+
+
+def probe_capture_records(clear, replay, rows, *, iterations, cores, words, stride_words,
+                          batch_tag, rank):
+    """Validate the record path with one explicit replay, never with the capture.
+
+    Capture enqueues the operations but does not execute them, so the record
+    buffer still holds its sentinel. One replay against the all-zero (already
+    expired) deadline table executes every documented wait and must produce a
+    complete record set before calibration starts.
+    """
+    clear()
+    replay()
+    return validate_wait_records(rows(), iterations=iterations, cores=cores, words=words,
+                                 stride_words=stride_words, batch_tag=batch_tag, table=None,
+                                 rank=rank, label="probe_replay")
+
+
+def graph_clock_alignment(buffer, invoke, args, operation, rank, world, mode, check=None,
+                          expected_counts=None):
+    """Capture one wait+operation pair per iteration, then replay with a refreshed table.
+
+    Preparation order is part of the protocol: resources, first compile, core
+    pinning, warmup and capture all finish before calibration, so the model is
+    still fresh when the measured replay runs. Capture only enqueues operations,
+    so records are validated by one explicit probe replay first. Afterwards every
+    replay re-anchors, rewrites the table at the captured address, refills the
+    sentinels and is validated on its own evidence.
+    """
+    import torch
+    import torch_npu  # noqa: F401
+
+    if operation != "dispatch":
+        raise ValueError("Graph clock alignment covers dispatch only")
+    if bool(args.do_cpu_sync):
+        raise ValueError("Graph clock alignment cannot capture host count reads")
+    if not hasattr(torch.npu, "NPUGraph"):
+        raise RuntimeError("Installed torch_npu does not expose NPUGraph capture")
+
+    state = clock_alignment_state(buffer)
+    native, runtime = state["native"], state["runtime"]
+    words, stride_words = clock_wait_table_contract(native)
+    cores = int(native.low_latency_core_config()["active_aiv"])
+    iterations = int(args.num_iters)
+    if cores <= 0 or iterations < 1:
+        raise ValueError("Graph clock alignment requires active AIV cores and positive iterations")
+    if expected_counts is None and check is not None:
+        raise ValueError("Graph clock alignment needs the expected count output with a payload check")
+    device = f"npu:{runtime.device}"
+    stream = runtime.stream
+    replays = int(args.clock_align_replays)
+    limit_ns = args.clock_align_max_pair_error_ns
+    directory = (Path(args.run_directory) / f"case_{args.case_id:05d}" / mode / "clock_graph" /
+                 operation / f"rank_{rank:03d}")
+    directory.mkdir(parents=True, exist_ok=True)
+    # The captured scalar tag cannot change on replay; replay identity stays on
+    # the Host side, next to the per-replay sentinel refill.
+    batch_tag = 1
+
+    deadlines = torch.zeros((iterations,), dtype=torch.int64, device=device)
+    records = torch.full((iterations, cores, stride_words), -1, dtype=torch.int64, device=device)
+
+    completion_boundary(args)
+    for _ in range(max(1, args.warmup)):
+        invoke()
+    torch.npu.synchronize()
+    with torch.npu.stream(stream):
+        # First compile, core pinning and a wait launch before capture starts.
+        for index in range(min(max(1, args.warmup), iterations)):
+            native.low_latency_clock_wait_table(
+                runtime.native, deadlines, iterations, index, records, batch_tag, False,
+                stream.npu_stream)
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    captured = []
+    with torch.npu.graph(graph, stream=stream):
+        for index in range(iterations):
+            native.low_latency_clock_wait_table(
+                runtime.native, deadlines, iterations, index, records, batch_tag, True,
+                stream.npu_stream)
+            captured.append(invoke())
+    torch.npu.synchronize()
+
+    def replay_graph():
+        with torch.npu.stream(stream):
+            graph.replay()
+        torch.npu.synchronize()
+
+    # Capture does not execute anything, so the record buffer must still hold
+    # its sentinel. One explicit replay against the all-zero (already expired)
+    # deadline table proves the record path before calibration. A failure keeps
+    # the exact record snapshot instead of only its exception text.
+    try:
+        assert_records_untouched(records.cpu().tolist(), rank, "capture")
+        probe = probe_capture_records(
+            lambda: records.fill_(-1), replay_graph, lambda: records.cpu().tolist(),
+            iterations=iterations, cores=cores, words=words, stride_words=stride_words,
+            batch_tag=batch_tag, rank=rank)
+    except Exception:
+        (directory / "probe_failure.json").write_text(
+            json.dumps(dict(cores=cores, stride_words=stride_words,
+                            records=records.cpu().tolist()), indent=2) + "\n")
+        raise
+
+    model, models, raw = calibrate_clock_model(state, args, operation)
+    calibration_rows = [dict(phase="initial", windows=raw)]
+    interval = int(args.clock_align_interval_us) * 1000
+    exp_prefix = int(getattr(args, "clock_align_graph_exp_prefix", 0))
+    if exp_prefix:
+        # The formal protocol runs the fixed Exp prefix after calibration and
+        # before the fresh anchor: it belongs to the sampling conditions and
+        # never enters the captured graph.
+        with torch.npu.stream(stream):
+            delay = torch.zeros((args.delay_rows, args.delay_cols), dtype=torch.float32,
+                                device=device)
+            for _ in range(exp_prefix):
+                torch.exp(delay, out=delay)
+        torch.npu.synchronize()
+    reports, perf = [], None
+    reanchor_checks, ages = [], []
+    for replay_id in range(replays):
+        # Re-anchor for every replay; refit only when the rate is older than the
+        # admitted age or the new anchor disagrees with the old prediction. The
+        # recovery is bounded to one refit per replay, never a retry loop.
+        reanchor = None
+        if ll_clock_model.model_age_seconds(model) > float(args.clock_align_model_max_age_secs):
+            model, models, raw = calibrate_clock_model(state, args, operation, replay_id)
+            calibration_rows.append(dict(phase=f"replay {replay_id}", windows=raw))
+        else:
+            window = clock_window(state, args, operation,
+                                  int(args.clock_align_calibration_windows) + replay_id)
+            residual = ll_clock_model.reanchor_residual(model, window)
+            allowed = ll_clock_model.reanchor_limit(model, window)
+            reanchor = dict(residual_cycles=residual, limit_cycles=allowed,
+                            accepted=abs(residual) <= allowed)
+            if abs(residual) > allowed:
+                model, models, raw = calibrate_clock_model(state, args, operation, replay_id)
+                calibration_rows.append(dict(phase=f"replay {replay_id}", windows=raw))
+            else:
+                model = ll_clock_model.reanchor(model, window)
+                models = host_gather(args, model, f"{operation}.clock.reanchor.{replay_id}")
+                validate_clock_models(models, world, "reanchor", rank, replay_id)
+        reanchor_checks.append(reanchor)
+        ages.append(round(ll_clock_model.model_age_seconds(model), 3))
+
+        base = reference_base(models, args.clock_align_lead_us)
+        targets = [base + index * interval for index in range(iterations)]
+        table = [ll_clock_model.local_deadline(model, target) for target in targets]
+        budgets = deadline_budgets(model, table, f"{operation}.graph", rank, replay_id)
+        budget_payloads = host_gather(
+            args,
+            dict(rank=rank, error_ns=[item["total_ns"] for item in budgets], limit=limit_ns),
+            f"{operation}.graph.budget.{replay_id}",
+        )
+        # The two-rank budget is checked before the graph is submitted, so a
+        # model that cannot meet the configured precision never runs.
+        budget_summary = check_submit_budget(budget_payloads, world, iterations, limit_ns,
+                                             f"{operation}.graph", rank, replay_id)
+
+        with torch.npu.stream(stream):
+            records.fill_(-1)   # a missing write must never look like valid evidence
+            deadlines.copy_(torch.tensor(table, dtype=torch.int64, device=device))
+            if captured:
+                fill_count_sentinels(captured)
+        # Same-stream ordering makes the refreshed table, sentinels and counts
+        # visible to the replay without any extra flush of the storages.
+        runtime.stream.synchronize()
+        profiled = not args.skip_perf_test and replay_id + 1 == replays
+        samples = None
+        if profiled:
+            samples = replay_with_profile(graph, stream, directory / f"replay_{replay_id:02d}",
+                                          iterations, operation)
+        else:
+            replay_graph()
+        try:
+            evidence = validate_wait_records(
+                records.cpu().tolist(), iterations=iterations, cores=cores, words=words,
+                stride_words=stride_words, batch_tag=batch_tag, table=table, rank=rank,
+                label=f"replay {replay_id}")
+            checked = (verify_graph_outputs(captured, expected_counts, check, rank, replay_id)
+                       if captured else 0)
+        except Exception:
+            (directory / f"replay_{replay_id:02d}_failure.json").write_text(
+                json.dumps(dict(cores=cores, stride_words=stride_words, table=table,
+                                records=records.cpu().tolist()), indent=2) + "\n")
+            raise
+        report = summarize_replay(model, evidence, targets, table, budgets, budget_summary, args,
+                                  operation, rank, world, replay_id, base)
+        report.update(reanchor=reanchor, count_outputs_checked=checked)
+        reports.append(report)
+        (directory / f"replay_{replay_id:02d}.json").write_text(json.dumps(dict(
+            summary={key: value for key, value in report.items()
+                     if key not in ("local_enter_cycles", "local_release_cycles",
+                                    "corrected_release_cycles")},
+            model=model,
+            records=records.cpu().tolist(),
+        ), indent=2) + "\n")
+        if samples is not None:
+            gathered = host_gather(args, samples, f"{operation}.graph.perf.{replay_id}")
+            perf = summarize_kernel(gathered, DISPATCH_LOGICAL_NAME, args.perf_tail)
+            perf.update(profiled_replay=replay_id, waits_verified=iterations,
+                        record_stride_bytes=stride_words * 8)
+
+    stripped = [{
+        key: value for key, value in item.items()
+        if key not in ("local_enter_cycles", "local_release_cycles",
+                       "corrected_release_cycles", "deadline_table", "reference_targets")
+    } for item in reports]
+    summary = dict(
+        schema="deepep_clock_alignment.graph.v2",
+        protocol=CLOCK_ALIGNMENT_GRAPH_PROTOCOL,
+        route=mode,
+        iterations=iterations,
+        replays=replays,
+        cores=cores,
+        batch_id=batch_tag,
+        record_words=words,
+        record_stride_words=stride_words,
+        record_stride_bytes=stride_words * 8,
+        record_fields=["enter", "release", "batch", "core"],
+        probe=dict(records_complete=True, cores=cores,
+                   valid_samples=probe and len(probe["local_release"]) or 0),
+        samples=args.clock_align_samples,
+        calibration_windows=int(args.clock_align_calibration_windows),
+        calibration_gap_secs=float(args.clock_align_calibration_gap_secs),
+        lead_us=int(args.clock_align_lead_us),
+        interval_us=int(args.clock_align_interval_us),
+        exp_prefix_repeats=exp_prefix,
+        model=model,
+        models=models,
+        replay=stripped[-1],
+        replay_summaries=stripped,
+        reanchor_checks=reanchor_checks,
+        calibration_age_secs=ages,
+        calibration_rows=calibration_rows,
+        acceptance=dict(records_complete=True, all_cores_waited=True, no_early_release=True,
+                        replays_verified=len(reports),
+                        count_outputs_checked=min(item["count_outputs_checked"] for item in reports)
+                        if reports else 0),
+        performance=perf,
+        alignment_scope="model domain; propagated bounds reported separately",
+    )
+    (directory / "clock_alignment.json").write_text(
+        json.dumps(dict(summary=summary, final_replay=reports[-1]), indent=2) + "\n"
     )
     if not hasattr(args, "clock_alignment_metadata"):
         args.clock_alignment_metadata = {}
@@ -1156,32 +1877,22 @@ def create_run_directory(parent, name=None):
 
 
 def new_stage_trace(buffer, operation, args, rank):
-    if getattr(args, 'll_reference_profile', False):
-        from deep_ep.utils.ll_reference_profile import ReferenceTrace
-        return ReferenceTrace(buffer, operation, frequency_hz=args.ll_timer_frequency_hz)
-    from deep_ep.utils.ll_stage_timer import StageTrace
-    if getattr(args, 'll_expert_timer', False) and operation == 'dispatch':
-        import torch.distributed as dist
-        return StageTrace(buffer, operation, args.ll_timer_mode, args.ll_timer_frequency_hz,
-                          expert_config=dict(rank=rank,world=control_world(args),experts=args.num_experts))
-    return StageTrace(buffer, operation, args.ll_timer_mode, args.ll_timer_frequency_hz)
+    from deep_ep.utils.ll_reference_profile import ReferenceTrace
+    return ReferenceTrace(buffer, operation, frequency_hz=args.ll_timer_frequency_hz)
 
 
 def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
                      *, prepared=None, prelude_buffers=None):
     """Sample a stabilized tail, retaining outputs/timers until all launches finish."""
     reference = bool(getattr(args, 'll_reference_profile', False))
-    if reference:
-        from deep_ep.utils.ll_reference_profile import capture
-    else:
-        from deep_ep.utils.ll_stage_timer import capture
+    from deep_ep.utils.ll_reference_profile import capture
     from deep_ep._native import require_native
     import torch
     import torch.distributed as dist
     world = control_world(args)
     logical_group = compiled_group(require_native("LL timer"),world)
-    capture_mode = 'reference' if reference else args.ll_timer_mode
-    capture_directory = 'll_reference_profile' if reference else 'll_stage_timer'
+    capture_mode = 'reference'
+    capture_directory = 'll_reference_profile'
     directory = Path(args.run_directory) / f"case_{args.case_id:05d}" / mode / capture_directory / operation / f"rank_{rank:03d}"
     if prepared is None:
         prepared = []
@@ -1234,7 +1945,6 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
                                       initial_host_alignment='shared_with_perf' if after_perf else 'before_warmup',
                                       per_iteration_exp=0, per_iteration_all_reduce=False,
                                       per_iteration_host_collective=False, per_iteration_rank_alignment="none",
-                                      expert_timer=bool(getattr(args,'ll_expert_timer',False)),
                                       reference_profile=reference))
         if reference:
             metadata.update(profile_seed=args.reference_profile_seed, route_sha256=args.reference_route_sha256)
@@ -1273,7 +1983,7 @@ def run_case(buffer, args, rank, world, m, mode):
     routes = make_routes(world, args.num_tokens, args.num_topk, args.num_experts, args.seed, mode)
     entries = expert_entries(routes, args.num_experts, world, rank)
     counts = [len(rows) for rows in entries]
-    expert_dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    expert_dtype = torch.bfloat16
     x = payload([rank] * args.num_tokens, range(args.num_tokens), args.hidden, expert_dtype)
     if args.dtype == "fp8":
         x = (
@@ -1369,11 +2079,22 @@ def run_case(buffer, args, rank, world, m, mode):
             "config": case_config(args, m),
             "tested_operations": ["dispatch"],
         }
-        perf = sample_operation(buffer, dispatch,
-            lambda output: verify_dispatch(output[0], output[3], entries, args, world, m),
-            args, 'dispatch', rank, m, mode, progress)
-        if perf is not None:
-            result['dispatch'] = perf
+        if args.clock_align and getattr(args, 'clock_align_mode', 'stream') == 'graph':
+            progress("dispatch.graph")
+            clock_summary = graph_clock_alignment(
+                buffer, dispatch, args, 'dispatch', rank, world, mode,
+                check=None if args.skip_check else
+                (lambda output: verify_dispatch(output[0], output[3], entries, args, world, m)),
+                expected_counts=expected_send_counts(entries, world))
+            result['clock_alignment'] = clock_summary
+            if clock_summary.get('performance') is not None:
+                result['dispatch'] = clock_summary['performance']
+        else:
+            perf = sample_operation(buffer, dispatch,
+                lambda output: verify_dispatch(output[0], output[3], entries, args, world, m),
+                args, 'dispatch', rank, m, mode, progress)
+            if perf is not None:
+                result['dispatch'] = perf
         if rank == 0:
             print(json.dumps(result, ensure_ascii=False), flush=True)
         completion_boundary(args)
@@ -1408,8 +2129,8 @@ def run_case(buffer, args, rank, world, m, mode):
                 torch.testing.assert_close(
                     out.cpu(),
                     expected,
-                    rtol=0.01 if args.dtype != "fp16" else 0.003,
-                    atol=0.03125 if args.dtype != "fp16" else 0.004,
+                    rtol=0.01,
+                    atol=0.03125,
                 )
 
         agree_check(check_combine, args, rank)
@@ -1417,8 +2138,8 @@ def run_case(buffer, args, rank, world, m, mode):
         if output[1] is not None or tuple(output[0].shape) != (args.num_tokens, args.hidden):
             raise AssertionError("Instrumented combine output contract differs")
         torch.testing.assert_close(output[0].cpu(), expected,
-                                   rtol=0.003 if args.dtype == "fp16" else 0.01,
-                                   atol=0.004 if args.dtype == "fp16" else 0.03125)
+                                   rtol=0.01,
+                                   atol=0.03125)
     result = {
         "case_id": args.case_id,
         "route": mode,
@@ -1474,6 +2195,8 @@ def worker(local_rank, args):
     native = require_native("LL ST")
     if not callable(getattr(native, "dispatch_low_latency", None)):
         raise RuntimeError("Installed wheel has no LL native entry; rebuild and install the migrated package")
+    if args.clock_align and getattr(args, "clock_align_mode", "stream") == "graph":
+        clock_wait_table_contract(native)
     validate_native_cases(native, cases, world)
     control = None
     if args.group_backend == "tcpstore":
@@ -1514,13 +2237,10 @@ def worker(local_rank, args):
                       "implementation": implementation,
                       "combine_host_protocol": getattr(deep_ep.ElasticBuffer, "ll_combine_host_protocol", 0),
                       "core_protocol": native.low_latency_core_protocol,
-                      "clock_alignment_version": getattr(native, "low_latency_clock_alignment_version", None),
-                      "stage_timer": bool(getattr(native, "low_latency_stage_timer_enabled", False)),
-                      "stage_timer_schema": native.low_latency_stage_timer_layout()["schema"],
-                      "expert_timer_requested": bool(args.ll_expert_timer)}
+                      "clock_alignment_version": getattr(native, "low_latency_clock_alignment_version", None)}
         if getattr(args, 'll_reference_profile', False):
             info = json.loads(Path(deep_ep.__file__).with_name('_build_info.json').read_text(encoding='utf-8'))
-            if info.get('ll_reference_profile') is not True or info.get('ll_stage_timer') is not False:
+            if info.get('ll_reference_profile') is not True:
                 raise RuntimeError('Installed reference build metadata does not match the requested capture')
             capability.update(reference_profile=getattr(native, 'low_latency_reference_profile_enabled', None),
                               reference_profile_schema=native.low_latency_reference_profile_layout()['schema'],
@@ -1537,11 +2257,7 @@ def worker(local_rank, args):
             raise RuntimeError('Requested RDMA is not compiled in this wheel; no MTE fallback')
         if args.clock_align and capability["clock_alignment_version"] != 1:
             raise RuntimeError("Clock-aligned sampling requires LL clock alignment v1 on every rank")
-        validate_stage_timer_capability(args.ll_stage_timer, capability)
         validate_reference_profile_capability(getattr(args, 'll_reference_profile', False), capability)
-        if args.ll_expert_timer and capability['core_protocol'] not in (5, 6, 7, 8, 9, 10):
-            raise RuntimeError('Expert diagnostics require ABI 5 on every rank')
-        args.ll_stage_timer_capabilities = capabilities
         run_directory = [None]
 
         def reserve_directory():
@@ -1630,6 +2346,14 @@ def worker(local_rank, args):
                     trace_call(case, "buffer.destroy", buffer.destroy)
                     buffer = None
         if rank == 0:
+            if args.clock_align and getattr(args, 'clock_align_mode', 'stream') == 'graph':
+                clock_note = ("one captured wait+Dispatch pair per iteration; each replay re-anchors the affine "
+                              "clock model, refreshes the deadline table at the captured address and is verified "
+                              "against its own per-core records; the profiled replay yields Dispatch durations")
+            elif args.clock_align:
+                clock_note = "fresh four-timestamp calibration and one device sleep-at before every measured call"
+            else:
+                clock_note = "fixed Exp100 before active profiler.step"
             report = {
                 "status": "completed",
                 "world_size": world,
@@ -1640,8 +2364,7 @@ def worker(local_rank, args):
                 "measurement": "torch_npu profiler kernel tasks; per-rank statistics and slowest rank mean",
                 "alignment": (
                     f"{sampling_protocol(args)}; one initial Host batch alignment; "
-                    + ("fresh four-timestamp calibration and one device sleep-at before every measured call"
-                       if args.clock_align else "fixed Exp100 before active profiler.step")
+                    + clock_note
                     + "; no per-iteration Host collective; Dispatch correctness validated after all repetitions"
                 ),
                 "host_coordination": args.group_backend,
@@ -1707,14 +2430,19 @@ def main(argv=None):
             {"case_id": i, **case_config(case, validate_args(case, world))} for i, case in enumerate(matrix_cases(args))
         ]
         clock_aligned = bool(args.clock_align)
+        graph_aligned = clock_aligned and getattr(args, "clock_align_mode", "stream") == "graph"
         print(json.dumps({"world_size": world, "case_count": len(cases), "cases": cases,
                           "sampling": dict(protocol=sampling_protocol(args),
-                                           exp_prefix_repeats=0 if clock_aligned else EXP_PREFIX_REPEATS,
+                                           exp_prefix_repeats=(
+                                               int(args.clock_align_graph_exp_prefix) if graph_aligned
+                                               else 0 if clock_aligned else EXP_PREFIX_REPEATS),
                                            host_coordination=args.group_backend,
                                            per_iteration_exp=0, per_iteration_all_reduce=False,
                                            per_iteration_host_collective=False,
                                            per_iteration_rank_alignment=(
-                                               CLOCK_ALIGNMENT_PROTOCOL if clock_aligned else "none"))}, indent=2))
+                                               (CLOCK_ALIGNMENT_GRAPH_PROTOCOL if graph_aligned
+                                                else CLOCK_ALIGNMENT_PROTOCOL)
+                                               if clock_aligned else "none"))}, indent=2))
         return
     configure_endpoints(args, os.environ)
     if local is not None:

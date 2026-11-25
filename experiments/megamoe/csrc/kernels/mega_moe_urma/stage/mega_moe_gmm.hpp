@@ -24,9 +24,10 @@ using UrmaMegaMoeImpl::Get;
 
 // A fragment is a compute M256 group of one expert. Row segments preserve its
 // input/output correspondence with the original source-major communication CVs.
+template <class S>
 __aicore__ inline Fragment LoadFragment(const Arguments& args, uint32_t index)
 {
-    return RuntimeFragment(args, index);
+    return RuntimeFragment<S>(args, index);
 }
 
 __aicore__ inline __gm__ int32_t* ComputeFlag(uint64_t base, uint64_t index)
@@ -41,20 +42,26 @@ __aicore__ inline void WaitComputeFlag(uint64_t base, uint64_t index, uint32_t e
     }
 }
 
+template <class S>
 __aicore__ inline uint32_t FragmentGmm1Tiles(const Arguments& args, const Fragment& fragment)
 {
-    return Gmm1ComputeTileCount(fragment.rows, args.config);
+    return Gmm1ComputeTileCount<S>(fragment.rows);
 }
 
+template <class S>
 __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragment& fragment)
 {
-    return ComputeTileCount(fragment.rows, args.config.hidden);
+    return ComputeTileCount(fragment.rows, S::kHidden);
 }
 
-__aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment)
+// Routed callers pass S::kIntermediate; the optional shared expert keeps its
+// separately planned projection width and passes it explicitly.
+template <class S>
+__aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment,
+                                                             uint32_t intermediate)
 {
-    const uint64_t h = args.config.hidden;
-    const uint64_t n = static_cast<uint64_t>(args.config.intermediate) * 2U;
+    const uint64_t h = S::kHidden;
+    const uint64_t n = static_cast<uint64_t>(intermediate) * 2U;
     const uint64_t scaleH = h / 32U;
     const uint64_t expert = fragment.expert;
     UrmaMegaMoeImpl::GMMAddrInfo addr{};
@@ -69,10 +76,12 @@ __aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& ar
     return addr;
 }
 
-__aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, const Fragment& fragment)
+template <class S>
+__aicore__ inline UrmaMegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, const Fragment& fragment,
+                                                             uint32_t intermediate)
 {
-    const uint64_t h = args.config.hidden;
-    const uint64_t i = args.config.intermediate;
+    const uint64_t h = S::kHidden;
+    const uint64_t i = intermediate;
     const uint64_t scaleI = i / 32U;
     const uint64_t expert = fragment.expert;
     UrmaMegaMoeImpl::GMMAddrInfo addr{};
@@ -111,7 +120,7 @@ static_assert(kActualActivationUb.firstInputOffsetBytes == ActivationUbContract:
                   kActualActivationUb.scaleElementCapacity == ActivationUbContract::scaleElements,
               "URMA activation UB contract must match the shared epilogue");
 
-template <typename RowIO>
+template <class S, typename RowIO>
 __aicore__ inline RowIO FragmentRowIO(const Arguments& args, const Fragment& fragment)
 {
     return {nullptr,
@@ -119,17 +128,19 @@ __aicore__ inline RowIO FragmentRowIO(const Arguments& args, const Fragment& fra
             args.config.rank,
             reinterpret_cast<GM_ADDR>(args.symmetric + args.config.receiveXOffset),
             reinterpret_cast<GM_ADDR>(args.symmetric + args.config.receiveScaleOffset),
-            args.config.hidden,
-            args.config.hidden / 32U,
+            S::kHidden,
+            S::kHidden / 32U,
             reinterpret_cast<GM_ADDR>(args.gmm2Output),
             reinterpret_cast<GM_ADDR>(args.symmetric + args.config.returnYOffset),
-            args.config.hidden,
-            RuntimeSegments(args, fragment)};
+            S::kHidden,
+            RuntimeSegments<S>(args, fragment)};
 }
 
-__aicore__ inline UrmaMegaMoeImpl::ProblemShape FragmentShape(const Arguments& args, const Fragment& fragment)
+template <class S>
+__aicore__ inline UrmaMegaMoeImpl::ProblemShape FragmentShape(const Arguments& args, const Fragment& fragment,
+                                                              uint32_t intermediate)
 {
-    return {fragment.rows, static_cast<int64_t>(args.config.intermediate) * 2, args.config.hidden, 0};
+    return {fragment.rows, static_cast<int64_t>(intermediate) * 2, S::kHidden, 0};
 }
 
 __aicore__ inline TraceMeta FragmentTraceMeta(const Fragment& fragment, uint32_t index)
@@ -175,15 +186,15 @@ __aicore__ inline void CompleteComputeContext()
 // their independent completion backend and do not consume these two channels.
 using UrmaContinuousGmm = ContinuousMatmul<UrmaProblemConfig>;
 
-template <class TimerT>
+template <class S, class TimerT>
 __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
                                           uint32_t firstTile, bool gmm1, UrmaContinuousGmm& pipeline,
                                           RoutedCompletionProducer& completion, TimerT& timer)
 {
-    const UrmaMegaMoeImpl::BlockJobContext job{block, kAic};
-    const Fragment fragment = LoadFragment(args, fragmentIndex);
+    const UrmaMegaMoeImpl::BlockJobContext job{block, S::kCubeCores};
+    const Fragment fragment = LoadFragment<S>(args, fragmentIndex);
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
-    const auto shape = FragmentShape(args, fragment);
+    const auto shape = FragmentShape<S>(args, fragment, S::kIntermediate);
     auto config = gmm1 ? UrmaRoutedGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM)
                        : UrmaRoutedGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
     UrmaMegaMoeImpl::GmmKernel::BlockScheduler schedule(
@@ -192,7 +203,7 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
             Te::MakeCoord(static_cast<int64_t>(config.tileM), static_cast<int64_t>(config.tileN))});
     if constexpr (g_coreType == AIC) {
         const uint64_t flags = gmm1 ? args.inputScaleDone : args.activationDone;
-        const uint32_t expected = gmm1 ? 1U : FragmentGmm1Tiles(args, fragment);
+        const uint32_t expected = gmm1 ? 1U : FragmentGmm1Tiles<S>(args, fragment);
         const bool ready = ReadGmByPassDCache(ComputeFlag(flags, fragmentIndex)) >= static_cast<int32_t>(expected);
         // In particular, never retain the last GMM1 flag while blocking on
         // its activation: that would prevent the helper from making progress.
@@ -202,20 +213,21 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
     }
     const Phase phase = gmm1 ? Phase::Gmm1 : Phase::Gmm2;
     timer.Begin(phase);
-    const auto addresses = gmm1 ? Gmm1Addresses(args, fragment) : Gmm2Addresses(args, fragment);
+    const auto addresses = gmm1 ? Gmm1Addresses<S>(args, fragment, S::kIntermediate)
+                                : Gmm2Addresses<S>(args, fragment, S::kIntermediate);
     pipeline.UpdateProblem(config, addresses, gmm1);
     ContinuousComputeRows rowIO;
-    static_cast<UrmaInputRows&>(rowIO) = FragmentRowIO<UrmaInputRows>(args, fragment);
+    static_cast<UrmaInputRows&>(rowIO) = FragmentRowIO<S, UrmaInputRows>(args, fragment);
     rowIO.gather = gmm1;
     rowIO.storeToUb = true;
     if (!gmm1) {
         rowIO.inputX = addresses.aGlobal;
-        rowIO.inputStride = args.config.intermediate;
+        rowIO.inputStride = S::kIntermediate;
     }
     pipeline.SetRowIO(rowIO);
     pipeline.Begin();  // Idempotent; only the invocation's first owned tile opens events.
     const uint32_t count = schedule.GetTileNum();
-    for (uint32_t tile = firstTile; tile < count; tile += kAic) {
+    for (uint32_t tile = firstTile; tile < count; tile += S::kCubeCores) {
         const auto coord = schedule.GetBlockCoord(tile);
         const auto tileShape = schedule.GetBlockShape(coord);
         const uint32_t m = Get<UrmaMegaMoeImpl::M_VALUE>(coord);
@@ -256,7 +268,7 @@ __aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32
 // Only an AIC and its paired AIV0 enter this routine. They use the identical
 // host-planned expert schedule and global tile ownership. SwiGLU remains
 // independent; the GMM1 M-group window covers earlier activation latency.
-template <class TimerT>
+template <class S, class TimerT>
 __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, TimerT& timer)
 {
     UrmaContinuousGmm pipeline;
@@ -266,20 +278,20 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
         const auto task = LoadComputeTask(args, step);
         const auto range = LoadComputeBatch(args, task.batchIndex);
         if (range.begin == range.end) continue;
-        const auto first = LoadFragment(args, range.begin);
+        const auto first = LoadFragment<S>(args, range.begin);
         const bool isGmm1 = task.stage == ComputeBatchStage::Gmm1;
         const uint64_t tileBegin = isGmm1 ? first.gmm1TileBegin : first.gmm2TileBegin;
-        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1Tiles(args, first) : FragmentGmm2Tiles(args, first);
+        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1Tiles<S>(args, first) : FragmentGmm2Tiles<S>(args, first);
         const uint64_t tileLimit = static_cast<uint64_t>(range.end - range.begin) * tilesPerGroup;
         // Jump directly between this core's groups before loading their GM
         // descriptors or building matmul configs. AIC/AIV0 keep identical
         // tile order and close the context on their last owned group.
-        for (uint64_t tile = FirstOwnedComputeTile(tileBegin, RoutedOwnerResidue(isGmm1, block), kAic);
+        for (uint64_t tile = FirstOwnedComputeTile(tileBegin, RoutedOwnerResidue(isGmm1, block), S::kCubeCores);
              tile < tileLimit;) {
-            const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, kAic);
-            const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * kAic;
+            const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, S::kCubeCores);
+            const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * S::kCubeCores;
             const uint32_t fragmentIndex = range.begin + owned.group;
-            RunComputeFragment(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, completion, timer);
+            RunComputeFragment<S>(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, completion, timer);
             hasWork = true;
             tile = nextTile;
         }
@@ -291,9 +303,10 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
     }
 }
 
+template <class S>
 __aicore__ inline bool AreGroupInputsReady(const Arguments& args, const Fragment& fragment)
 {
-    auto cursor = RuntimeSegments(args, fragment).MakeCursor();
+    auto cursor = RuntimeSegments<S>(args, fragment).MakeCursor();
     RowSegment segment{};
     while (cursor.Next(segment)) {
         if (segment.sourceRank == args.config.rank) {
@@ -315,11 +328,11 @@ __aicore__ inline bool AreGroupInputsReady(const Arguments& args, const Fragment
 // A single worker owns a whole group's scales. Arbitrary segment row offsets
 // cannot be represented safely by the MX zZ L1 copy, so gather just this small
 // plane in aligned UB rows, then store compact GM rows for the original loader.
-template <uint32_t FixedBytes>
+template <class S, uint32_t FixedBytes>
 __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragment& fragment, uint32_t index,
                                             Timer& timer)
 {
-    const uint32_t scaleBytes = FixedBytes ? FixedBytes : args.config.hidden / 32U;
+    const uint32_t scaleBytes = FixedBytes ? FixedBytes : S::kHidden / 32U;
     const uint32_t scaleStride = (scaleBytes + 31U) / 32U * 32U;
     GlobalTensor<uint8_t> source, destination;
     source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveScaleOffset));
@@ -330,22 +343,23 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     // ends at192KiB, below the persistent counters at240KiB.
     static_assert(128U * 1024U + kComputeTileM * (8192U / 32U) <= kAiv1PersistentUbBase);
     const uint64_t start = timer.TraceBegin();
-    auto cursor = RuntimeSegments(args, fragment).MakeCursor();
+    auto cursor = RuntimeSegments<S>(args, fragment).MakeCursor();
     RowSegment segment{};
     while (cursor.Next(segment)) {
-        DataCopyPad(scratch[segment.tileRow * scaleStride], source[segment.receiveRow * args.config.dispatchScaleStride],
-                    {static_cast<uint16_t>(segment.rows), scaleBytes, args.config.dispatchScaleStride - scaleBytes, 0U, 0U}, {false, 0U, 0U, 0U});
+        DataCopyPad(scratch[segment.tileRow * scaleStride], source[segment.receiveRow * S::kDispatchScaleStride],
+                    {static_cast<uint16_t>(segment.rows), scaleBytes, S::kDispatchScaleStride - scaleBytes, 0U, 0U},
+                    {false, 0U, 0U, 0U});
     }
     GlobalTensor<uint8_t> weights;
     LocalTensor<uint8_t> weightScratch(TPosition::VECCALC, 192U * 1024U, kComputeTileM * 32U);
-    if (args.config.topkWeightsType) {
+    if (S::kWeightsType) {
         weights.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredRouteWeights));
-        auto weightCursor = RuntimeSegments(args, fragment).MakeCursor();
+        auto weightCursor = RuntimeSegments<S>(args, fragment).MakeCursor();
         RowSegment part{};
         while (weightCursor.Next(part)) {
             DataCopyPad(weightScratch[part.tileRow * 32U],
-                        source[part.receiveRow * args.config.dispatchScaleStride + scaleStride],
-                        {static_cast<uint16_t>(part.rows), 4U, args.config.dispatchScaleStride - 4U, 0U, 0U},
+                        source[part.receiveRow * S::kDispatchScaleStride + scaleStride],
+                        {static_cast<uint16_t>(part.rows), 4U, S::kDispatchScaleStride - 4U, 0U, 0U},
                         {false, 0U, 0U, 0U});
         }
     }
@@ -353,7 +367,7 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
     DataCopyPad(destination[fragment.rowBegin * scaleBytes], scratch,
                 {static_cast<uint16_t>(fragment.rows), scaleBytes, 0U, 0U, 0U});
-    if (args.config.topkWeightsType) {
+    if (S::kWeightsType) {
         DataCopyPad(weights[fragment.rowBegin * 32U], weightScratch,
                     {1U, fragment.rows * 32U, 0U, 0U, 0U});
     }
@@ -361,29 +375,32 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WriteGmByPassDCache(ComputeFlag(args.inputScaleDone, index), 1);
     auto meta = FragmentTraceMeta(fragment, index);
-    meta.bytes = static_cast<uint64_t>(fragment.rows) * (scaleBytes + (args.config.topkWeightsType ? 4U : 0U));
+    meta.bytes = static_cast<uint64_t>(fragment.rows) * (scaleBytes + (S::kWeightsType ? 4U : 0U));
     timer.TraceEnd(TraceEvent::InputScaleGather, start, meta);
 }
 
+template <class S>
 __aicore__ inline void GatherInputScale(const Arguments& a, const Fragment& f, uint32_t i, Timer& t)
 {
-    if (a.config.hidden == 3584U)
-        GatherInputScaleImpl<112U>(a, f, i, t);
+    if constexpr (S::kHidden == 3584U)
+        GatherInputScaleImpl<S, 112U>(a, f, i, t);
     else
-        GatherInputScaleImpl<0U>(a, f, i, t);
+        GatherInputScaleImpl<S, 0U>(a, f, i, t);
 }
 
+template <class S>
 __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t worker, const Fragment& fragment,
                                               uint32_t fragmentIndex, uint32_t tile, UrmaActivation& epilogue,
                                               Timer& timer, uint32_t workers = 0U)
 {
-    const UrmaMegaMoeImpl::BlockJobContext job{worker, workers ? workers : ActivationWorkers(args.config.world)};
+    const UrmaMegaMoeImpl::BlockJobContext job{worker, workers ? workers : ActivationWorkers<S>()};
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
-    auto addr = Gmm1Addresses(args, fragment);
+    auto addr = Gmm1Addresses<S>(args, fragment, S::kIntermediate);
     addr.activationToGmm2Flag = nullptr;
-    epilogue.UpdateGlobalAddr({static_cast<int64_t>(fragment.rowBegin * args.config.intermediate),
-                               static_cast<int64_t>(fragment.rowBegin * (args.config.intermediate / 32U)), 0, 0, 0, 0});
-    auto config = UrmaRoutedGmmConfig::BuildGmm1ProblemConfig(FragmentShape(args, fragment), job, kComputeTileM);
+    epilogue.UpdateGlobalAddr({static_cast<int64_t>(fragment.rowBegin * S::kIntermediate),
+                               static_cast<int64_t>(fragment.rowBegin * (S::kIntermediate / 32U)), 0, 0, 0, 0});
+    auto config = UrmaRoutedGmmConfig::BuildGmm1ProblemConfig(FragmentShape<S>(args, fragment, S::kIntermediate), job,
+                                                              kComputeTileM);
     const auto layouts = UrmaRoutedGmmConfig::BuildLayouts(config);
     auto gmC = Te::MakeTensor(
         Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ bfloat16_t*>(addr.gmm1OutGlobal)), layouts.c);
@@ -422,13 +439,14 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
 // gather itself costs. Activation keeps tile granularity (one tile per turn),
 // and Pack only fills the bubbles the two stages above leave unused.
 // Reorder is exclusively performed by peer communication owners.
+template <class S>
 __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& timer)
 {
-    const uint32_t activationWorkers = ActivationWorkers(args.config.world);
-    const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
+    const uint32_t activationWorkers = ActivationWorkers<S>();
+    const uint32_t communicationWorkers = CommunicationWorkers<S>();
     uint32_t nextPackRound = kPackStartupRounds;
-    PackBatch earlyPack(args, timer);
-    PrepareActivationRoutes(args, worker, nextPackRound, earlyPack, timer);
+    PackBatch<S> earlyPack(args, timer);
+    PrepareActivationRoutes<S>(args, worker, nextPackRound, earlyPack, timer);
     earlyPack.Close();  // keep the existing blocking steady Pack/scale/activation path
     timer.CoarseBegin(CoarsePhase::Activation);
     UrmaActivation epilogue;
@@ -454,13 +472,13 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
         // waits on once per group before issuing GMM1. Finishing activation
         // tiles ahead of it parks GMM1 behind the activation queue.
         if (nextGather < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextGather);
-            if (AreGroupInputsReady(args, fragment)) {
+            const auto fragment = LoadFragment<S>(args, nextGather);
+            if (AreGroupInputsReady<S>(args, fragment)) {
                 if (idle) {
                     (void)idleStart;
                     idle = false;
                 }
-                GatherInputScale(args, fragment, nextGather, timer);
+                GatherInputScale<S>(args, fragment, nextGather, timer);
                 nextGather += activationWorkers;
                 progress = true;
             }
@@ -471,8 +489,8 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
         // scale gather merely because its owner has no activation in that group.
         if (!progress) {
             while (nextActivation < args.config.fragmentCount) {
-                const auto fragment = LoadFragment(args, nextActivation);
-                const uint32_t tileCount = FragmentGmm1Tiles(args, fragment);
+                const auto fragment = LoadFragment<S>(args, nextActivation);
+                const uint32_t tileCount = FragmentGmm1Tiles<S>(args, fragment);
                 if (!activationPrepared) {
                     activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, activationWorkers);
                     activationPrepared = true;
@@ -487,7 +505,7 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
                         (void)idleStart;
                         idle = false;
                     }
-                    RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
+                    RunReadyActivationTile<S>(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
                     activationTile += activationWorkers;
                     progress = true;
                 }
@@ -501,7 +519,7 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
                 (void)idleStart;
                 idle = false;
             }
-            PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, timer);
+            PackOneRound<S>(args, nextPackRound, worker + communicationWorkers, S::kCubeCores, timer);
             ++nextPackRound;
             progress = true;
         }
@@ -516,7 +534,7 @@ __aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& ti
                 const bool waitingGather = nextGather < args.config.fragmentCount;
                 const uint32_t index = waitingGather ? nextGather : nextActivation;
                 idleEvent = waitingGather ? TraceEvent::WaitDispatch : TraceEvent::WaitGmm1;
-                idleMeta = FragmentTraceMeta(LoadFragment(args, index), index);
+                idleMeta = FragmentTraceMeta(LoadFragment<S>(args, index), index);
             }
             const uint64_t backoff = GetSystemCycle();
             while (GetSystemCycle() - backoff < 64U) {
@@ -549,40 +567,41 @@ class UbRoutedActivation {
 
 public:
     static constexpr uint32_t kColumns = 128U;
+    template <class S>
     __aicore__ inline void Init(const Arguments& a)
     {
-        if (a.config.topkWeightsType) {
+        if (S::kWeightsType) {
             weighted_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
                             .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
                             .clampLimit = a.activationClamp, .ubOffsetBytes = 0U,
                             .topkWeightUbOffsetBytes = 128U * 1024U, .topkWeightIndex = 0U});
-            weighted_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
+            weighted_.UpdateNextProblem({0, S::kIntermediate, 0, 0});
             return;
         }
         op_.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a.activation),
                   .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a.activationScale),
                   .clampLimit = a.activationClamp,
                   .ubOffsetBytes = 0U});
-        op_.UpdateNextProblem({0, a.config.intermediate, 0, 0});
+        op_.UpdateNextProblem({0, S::kIntermediate, 0, 0});
     }
 
-    template <class TimerT>
+    template <class S, class TimerT>
     __aicore__ inline void Run(const Arguments& a, const Fragment& f, uint32_t group, uint32_t tile, TimerT& timer)
     {
-        if (a.config.topkWeightsType) RunImpl<true>(a, f, group, tile, timer, weighted_);
-        else RunImpl<false>(a, f, group, tile, timer, op_);
+        if (S::kWeightsType) RunImpl<S, true>(a, f, group, tile, timer, weighted_);
+        else RunImpl<S, false>(a, f, group, tile, timer, op_);
     }
 
 private:
-    template <bool Early, class TimerT, class ActivationOp>
+    template <class S, bool Early, class TimerT, class ActivationOp>
     __aicore__ inline void RunImpl(const Arguments& a, const Fragment& f, uint32_t group,
                                     uint32_t tile, TimerT& timer, ActivationOp& op)
     {
         const uint32_t n = tile * kColumns;
         // I is256-aligned, so fused N128 task columns have no partial tail.
         // Only the M tail changes; each UB input row remains256 BF16 elements.
-        op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * a.config.intermediate),
-                              static_cast<int64_t>(f.rowBegin * (a.config.intermediate / 32U)), 0, 0, 0, 0});
+        op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * S::kIntermediate),
+                              static_cast<int64_t>(f.rowBegin * (S::kIntermediate / 32U)), 0, 0, 0, 0});
         auto meta = ComputeTileTraceMeta(FragmentTraceMeta(f, group), 0U, n, f.rows, kColumns);
         timer.Begin(Phase::Activation);
         const auto start = timer.TraceBegin();

@@ -73,14 +73,28 @@ def inspect_wheel(path):
                 "deep_ep_experimental/megamoe/api.py",
                 "deep_ep_experimental/megamoe/benchmark.py",
                 "deep_ep_experimental/megamoe/configs/smoke.json",
-                "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
-                "deep_ep_experimental/megamoe/libmegamoe_urma_kernel.so",
             }
             extensions = [
                 n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_C.") and n.endswith(".so")
             ]
-            if len(extensions) != 1 or not required.issubset(names):
+            # MegaMoE device code is compiled at runtime, so the wheel must carry
+            # its kernel sources and the pinned CATLASS closure instead of
+            # prebuilt device libraries.
+            kernel_required = {
+                "deep_ep/_kernel_src/megamoe/mte/kernels/mega_moe/mega_moe_entry.hpp",
+                "deep_ep/_kernel_src/megamoe/urma/kernels/mega_moe_urma/mega_moe_urma_entry.hpp",
+                "deep_ep/_kernel_src/megamoe/catlass/include/catlass/catlass.hpp",
+            }
+            if len(extensions) != 1 or not required.issubset(names) or not kernel_required.issubset(names):
                 raise RuntimeError("Incomplete MegaMoE Beta wheel")
+            stale = [
+                n
+                for n in names
+                if n.startswith("deep_ep_experimental/megamoe/")
+                and (n.endswith("libmegamoe_kernel.so") or n.endswith("libmegamoe_urma_kernel.so"))
+            ]
+            if stale:
+                raise RuntimeError("Wheel carries a prebuilt MegaMoE device library; rebuild the package")
             if not any(name.endswith("cann.LICENSE") for name in names):
                 raise RuntimeError("Missing CANN license for MegaMoE")
         elif beta_names:
@@ -355,7 +369,9 @@ def main():
         probe_beta = (
             "import pathlib,sys; from deep_ep_experimental.megamoe.api import _extension; "
             "m=_extension(); assert pathlib.Path(m.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()); "
-            "assert callable(m.forward) and callable(m.buffer_size); print('Installed MegaMoE extension loaded; no device call')"
+            "assert callable(m.buffer_size) and callable(m.init_megamoe_jit) and m.api_protocol == 11; "
+            "assert pathlib.Path(m.__file__).parent.parent.parent.joinpath('deep_ep/_kernel_src/megamoe').is_dir(); "
+            "print('Installed MegaMoE extension loaded; no device call')"
         )
         run([python, "-I", "-c", probe_beta], output, env, 120)
     # Copy tests, not the Python package: sys.path cannot select checkout code.

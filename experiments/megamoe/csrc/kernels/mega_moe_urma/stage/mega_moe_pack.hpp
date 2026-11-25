@@ -121,14 +121,14 @@ public:
     {
         return active_;
     }
-    template <class Completion>
+    template <class S, class Completion>
     __aicore__ inline void Submit(const Arguments& args, uint64_t begin, uint64_t count, Completion& completion)
     {
         if (count == 0U) return;
         using namespace AscendC;
-        const uint32_t h = args.config.hidden;
+        const uint32_t h = S::kHidden;
         const uint32_t scales = h / 32U;
-        const uint32_t wireScales = args.config.dispatchScaleStride;
+        const uint32_t wireScales = S::kDispatchScaleStride;
         GlobalTensor<uint8_t> x, xScale, expandedX, expandedScale, selfX, selfScale;
         GlobalTensor<int32_t> routes;
         GlobalTensor<int64_t> inverse;
@@ -151,7 +151,7 @@ public:
             nextSlot_ = 0U;
         }
         const uint64_t retireAfter = count < kPackPipelineSlots - 1U ? count : kPackPipelineSlots - 1U;
-        uint32_t low = 0U, high = args.config.world * args.config.localExperts;
+        uint32_t low = 0U, high = S::kExperts;
         while (low < high) {
             const uint32_t mid = (low + high) / 2U;
             if (info->outgoing[mid + 1U] <= begin)
@@ -182,8 +182,7 @@ public:
             // The MTE2_S wait occurs once per index batch, never once per token.
             SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
             WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-            const uint64_t bucketRow =
-                uint64_t(expert) * args.config.sourceRowCapacity + first - info->outgoing[expert];
+            const uint64_t bucketRow = uint64_t(expert) * S::kSourceRowCapacity + first - info->outgoing[expert];
             DataCopyPad(routeIndices, routes[bucketRow],
                         {1U, static_cast<uint32_t>(batchRows * sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
             asc_vf_call<PackInverseRowsVF>(reinterpret_cast<__ubuf__ uint32_t*>(inverseRows.GetPhyAddr()),
@@ -201,11 +200,11 @@ public:
                 LocalTensor<uint8_t> scale(TPosition::VECCALC, kPackUbBase + slot * kPackSlotBytes + kPackTokenCapacity,
                                            kPackScaleCapacity);
                 const uint32_t flat = static_cast<uint32_t>(routeIndices.GetValue(index));
-                const uint64_t tokenRow = flat / args.config.topk;
+                const uint64_t tokenRow = flat / S::kTopK;
                 WaitFlag<HardEvent::MTE3_MTE2>(event);
                 DataCopyPad(token, x[tokenRow * h], {1U, h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
                 DataCopyPad(scale, xScale[tokenRow * scales], {1U, scales, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-                if (args.config.topkWeightsType) {
+                if (S::kWeightsType) {
                     // Append the selected route's FP32 weight in a padded,
                     // 32B-aligned block of the existing scale PUT payload.
                     auto weight = scale[(scales + 31U) / 32U * 32U].ReinterpretCast<float>();
@@ -269,19 +268,21 @@ struct NoPackCompletion {
 };
 
 // Blocking compatibility entry point, used by standalone full Expand callers.
+template <class S>
 __aicore__ inline void ExpandRows(const Arguments& args, uint64_t begin, uint64_t count)
 {
     PackPipeline pipeline;
     NoPackCompletion completion;
-    pipeline.Submit(args, begin, count, completion);
+    pipeline.template Submit<S>(args, begin, count, completion);
     pipeline.Close();
 }
 
 // Retain the original full-expand entry point for standalone callers.
+template <class S>
 __aicore__ inline void Expand(const Arguments& args, uint32_t worker)
 {
-    const uint64_t rows = static_cast<uint64_t>(args.config.bs) * args.config.topk;
-    ExpandRows(args, LocalRowBegin(rows, worker), LocalOwnedRows(rows, worker));
+    const uint64_t rows = static_cast<uint64_t>(args.config.bs) * S::kTopK;
+    ExpandRows<S>(args, LocalRowBegin(rows, worker), LocalOwnedRows(rows, worker));
 }
 
 }  // namespace MegaMoeUrma
@@ -296,9 +297,10 @@ __aicore__ inline __gm__ int32_t* PackReadyFlag(const Arguments& args, uint32_t 
         args.packReady + (static_cast<uint64_t>(peer) * args.config.maxPeerChunks + cv) * kFlagBytes);
 }
 
+template <class S>
 __aicore__ inline Chunk LoadPackChunk(const Arguments& args, uint32_t round, uint32_t peer)
 {
-    return RuntimeSendChunk(args, peer, round);
+    return RuntimeSendChunk<S>(args, peer, round);
 }
 
 __aicore__ inline uint64_t PackPartitionBegin(uint64_t rows, uint32_t worker, uint32_t workers)
@@ -311,17 +313,18 @@ __aicore__ inline uint64_t PackPartitionBegin(uint64_t rows, uint32_t worker, ui
 // that virtual interval balances rows across 56 startup / 28 steady workers.
 // A CV may cross worker boundaries; its local atomic counter counts completed
 // rows, never claimed rows. Each static row is copied and counted exactly once.
+template <class S>
 __aicore__ inline void PackOneRound(const Arguments& args, uint32_t round, uint32_t worker, uint32_t workers,
                                     Timer& timer)
 {
     if (round >= args.config.packRoundCount) return;
-    const uint64_t rows = RuntimePackRoundRows(args, round);
+    const uint64_t rows = RuntimePackRoundRows<S>(args, round);
     const uint64_t begin = PackPartitionBegin(rows, worker, workers);
     const uint64_t end = PackPartitionBegin(rows, worker + 1U, workers);
     if (begin == end) return;
     uint64_t cursor = 0U;
-    for (uint32_t peer = 0U; peer < args.config.world && cursor < end; ++peer) {
-        const Chunk chunk = LoadPackChunk(args, round, peer);
+    for (uint32_t peer = 0U; peer < S::kEp && cursor < end; ++peer) {
+        const Chunk chunk = LoadPackChunk<S>(args, round, peer);
         const uint64_t next = cursor + chunk.rows;
         if (next > begin && cursor < end) {
             const uint64_t first = begin > cursor ? begin : cursor;
@@ -332,10 +335,10 @@ __aicore__ inline void PackOneRound(const Arguments& args, uint32_t round, uint3
                 meta.cv = round;
                 meta.row = chunk.localRow + first - cursor;
                 meta.rows = last - first;
-                meta.bytes = meta.rows * (args.config.hidden + args.config.hidden / 32U);
+                meta.bytes = meta.rows * (S::kHidden + S::kHidden / 32U);
                 timer.Begin(Phase::Pack);
                 const uint64_t start = timer.TraceBegin();
-                ExpandRows(args, meta.row, meta.rows);
+                ExpandRows<S>(args, meta.row, meta.rows);
                 AscendC::AtomicAdd(PackReadyFlag(args, peer, round), static_cast<int32_t>(meta.rows));
                 timer.TraceEnd(TraceEvent::Pack, start, meta);
                 timer.End(Phase::Pack, meta.bytes);
@@ -351,6 +354,7 @@ __aicore__ inline void MarkPackWorkerComplete(const Arguments& args)
     AscendC::AtomicAdd(done, 1);
 }
 
+template <class S>
 class PackBatch {
 public:
     __aicore__ inline PackBatch(const Arguments& args, Timer& timer) : args_(args), timer_(timer) {}
@@ -366,7 +370,7 @@ public:
         if (rows == 0U) return;
         timer_.Begin(Phase::Pack);
         const uint64_t start = timer_.TraceBegin();
-        pipeline_.Submit(args_, row, rows, *this);
+        pipeline_.template Submit<S>(args_, row, rows, *this);
         // Submit retires an older fence at min(5,rows), so event0 is free here.
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(static_cast<AscendC::TEventID>(0U));
         meta_ = TraceMeta{};
@@ -374,7 +378,7 @@ public:
         meta_.cv = cv;
         meta_.row = row;
         meta_.rows = rows;
-        meta_.bytes = rows * (args_.config.hidden + args_.config.hidden / 32U);
+        meta_.bytes = rows * (S::kHidden + S::kHidden / 32U);
         pending_ = true;
         // Non-nested trace: this bar contains submission and the previous
         // quota's retirement. Its own ready may be published in a later bar.
@@ -413,17 +417,18 @@ private:
 // that virtual interval balances rows across 56 startup / 28 steady workers.
 // A CV may cross worker boundaries; its local atomic counter counts completed
 // rows, never claimed rows. Each static row is copied and counted exactly once.
+template <class S>
 __aicore__ inline void PackOneRound(const Arguments& args, uint32_t round, uint32_t worker, uint32_t workers,
-                                    PackBatch& pack)
+                                    PackBatch<S>& pack)
 {
     if (round >= args.config.packRoundCount) return;
-    const uint64_t rows = RuntimePackRoundRows(args, round);
+    const uint64_t rows = RuntimePackRoundRows<S>(args, round);
     const uint64_t begin = PackPartitionBegin(rows, worker, workers);
     const uint64_t end = PackPartitionBegin(rows, worker + 1U, workers);
     if (begin == end) return;
     uint64_t cursor = 0U;
-    for (uint32_t peer = 0U; peer < args.config.world && cursor < end; ++peer) {
-        const Chunk chunk = LoadPackChunk(args, round, peer);
+    for (uint32_t peer = 0U; peer < S::kEp && cursor < end; ++peer) {
+        const Chunk chunk = LoadPackChunk<S>(args, round, peer);
         const uint64_t next = cursor + chunk.rows;
         if (next > begin && cursor < end) {
             const uint64_t first = begin > cursor ? begin : cursor;

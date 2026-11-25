@@ -314,6 +314,3 @@ static_assert(sizeof(ComputeBatchTask) == 8);
 static_assert(sizeof(Chunk) == 40);
 static_assert(sizeof(PackRound) == kWorld * sizeof(Chunk) + sizeof(uint64_t));
 }  // namespace MegaMoeUrma
-
-extern "C" void mega_moe_urma_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* stream,
-                                        const MegaMoeUrma::Arguments* arguments);

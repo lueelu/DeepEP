@@ -25,8 +25,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void ubx_combine_
     const bool dedup = UbxDispatch::EpServerDedupEnabled(td->numMaxTokensPerRank, td->bs, args->rankSize);
 #define UBX_COMBINE(Group)                                                                                       \
     UbxCombine::CombineMemoryServerDedupKernel<Group> kernel;                                                    \
-    kernel.Init(comm, expert, destination, counts, weights, types, relay, mask, output, td->bs, td->h, td->topK, \
-                td->moeExpertNum, td->dtype, magic, dedup);                                                      \
+    kernel.Init(comm, expert, destination, counts, weights, types, relay, mask, output, td->bs,                 \
+                td->numMaxTokensPerRank, td->h, td->topK, td->moeExpertNum, td->dtype, magic, dedup);           \
     kernel.Process()
     if (td->tilingKey == 4U) {
         UBX_COMBINE(4U);

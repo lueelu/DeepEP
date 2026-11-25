@@ -51,8 +51,9 @@ setup(
     packages=packages,
     package_dir=package_dir,
     package_data={
+        "deep_ep": ["include/**/*.hpp"],
         "deep_ep_experimental.ep_gmm_fused": ["NOTICE.md", "upstream.json"],
-        "deep_ep_experimental.megamoe": ["*.so", "configs/*.json"],
+        "deep_ep_experimental.megamoe": ["configs/*.json"],
     },
     ext_modules=[Extension("deep_ep._C", sources=[])],
     cmdclass=cmdclass,

@@ -6,7 +6,7 @@
 
 #include "kernel_operator.h"
 #include "ep_memory_server_dedup_combine_config.h"
-#include "../../dispatch/low_latency/common/comm_args.h"
+#include <deep_ep/comm/comm_args.hpp>
 
 namespace CombineDedup {
 using namespace AscendC;
@@ -78,7 +78,7 @@ public:
             // complete K*N flags, including mask-inactive slots. This source is
             // independent of the final token's in-flight payload and yOut.
             if (remaining == 1U) ClearFlags();
-            if (dtype_ == DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP16)
+            if (dtype_ == kEpServerDedupDtypeFp16)
                 Aggregate<half>(token, mask, completed);
             else
                 Aggregate<bfloat16_t>(token, mask, completed);

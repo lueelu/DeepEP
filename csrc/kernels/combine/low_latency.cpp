@@ -12,23 +12,24 @@
 #include "low_latency/combine_server_dedup_kernel.h"
 #include "low_latency/ep_memory_server_dedup_combine_tiling.h"
 #include "low_latency/ll_transport_tensor_compat.h"
-#include "../dispatch/low_latency/device/dispatch_server_dedup_magic.h"
+#include <deep_ep/impls/ep/dispatch.hpp>
 #include "low_latency/launch.hpp"
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_server_dedup_kernel(
     GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR destinationIndex, GM_ADDR sendCounts, GM_ADDR expertScales,
     GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask, GM_ADDR yOut, GM_ADDR tilingData)
 {
-    const auto* args = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
+    const auto* args = reinterpret_cast<const __gm__ deep_ep::CommArgs*>(commArgs);
     util_set_ffts_config(args->fftsVal);
     // Raw C API: the magic rotates through one local 512B slot per core and
     // no longer borrows a TPipe scratch buffer.
-    const uint32_t magic = DispatchDedup::RotateDispatchServerDedupMagic(args, AscendC::GetBlockIdx());
+    const uint32_t magic = deep_ep::RotateDispatchServerDedupMagic(deep_ep::comm::MakeTransportView(args), AscendC::GetBlockIdx());
     const auto* td = reinterpret_cast<const volatile __gm__ CombineDedup::EpServerDedupCombineTilingData*>(tilingData);
-    const bool enableDedup = DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank);
+    const bool enableDedup = deep_ep::EpServerDedupEnabled(td->numMaxTokensPerRank);
     CombineDedup::CombineMemoryServerDedupKernel kernel;
     kernel.Init(commArgs, expertOut, destinationIndex, sendCounts, expertScales, tokenType, relayReadIndex, sourceMask,
-                yOut, td->bs, td->h, td->topK, td->moeExpertNum, td->dtype, 0, magic, enableDedup);
+                yOut, td->bs, td->numMaxTokensPerRank, td->h, td->topK, td->moeExpertNum, td->dtype, 0, magic,
+                enableDedup);
     kernel.Process();
 }
 extern "C" DEEPEP_EXPORT void combine_server_dedup_kernel_do(void* stream,

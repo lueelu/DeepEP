@@ -86,7 +86,7 @@ LL 按容量上限 M 选择传输路径：M≤32 不执行 server 级去重，32
 | --- | --- |
 | EP、token | P=16/32/64/128，`0 < B ≤ M ≤ 256` |
 | 容量 | 构造时显式 `num_bytes=8 << 30`，各 rank 相同 |
-| 输入 | BF16/FP16 `[B,H]`，或 FP8 E4M3FN payload 与 scales 元组 |
+| 输入 | BF16 `[B,H]`，或 FP8 E4M3FN payload 与 scales 元组 |
 | 路由 | int64 `topk_idx [B,K]`；必须传入 FP32 `topk_weights [B,K]` |
 | Shape | H>0，1≤K≤32，P≤E≤1024，E 可被 P 整除；组合还须满足 Host 布局、UB 和工作区校验 |
 | 调度 | 默认固定调度，`num_sms=0`、`num_qps=0` |
