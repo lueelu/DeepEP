@@ -3,7 +3,9 @@
 #include "runtime/instance_endpoint.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -18,14 +20,30 @@
 #include "shmem.h"
 #include "common/udma_schedule.h"
 #include "common/check.h"
+#include "common/types.h"
 
 namespace {
 
 constexpr uint64_t kDeviceLargePageBytes = 2ULL * 1024ULL * 1024ULL;
 constexpr uint64_t kDeviceHugePage1gBytes = 1ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr uint32_t kUdmaQpCount = 2;
+constexpr uint64_t kMicrosecondsPerSecond = 1000000;
 aclshmemx_uniqueid_t g_default_flag_uid{};
 std::map<uint32_t, std::string> bootstrap_keys;
+
+uint32_t ReadTimeoutSeconds(const char* name, uint32_t default_seconds,
+                            uint32_t max_seconds = std::numeric_limits<uint32_t>::max())
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr) return default_seconds;
+
+    uint32_t seconds = 0;
+    const char* end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, seconds);
+    TORCH_CHECK(result.ec == std::errc{} && result.ptr == end && seconds > 0 && seconds <= max_seconds, name,
+                " must be a positive integer number of seconds in [1, ", max_seconds, "]");
+    return seconds;
+}
 
 void FillInitAttributes(int rank, int world_size, uint64_t local_mem_size, const std::string& ip_port,
                         int64_t data_op_engine_type, aclshmemx_init_attr_t* attributes)
@@ -33,19 +51,15 @@ void FillInitAttributes(int rank, int world_size, uint64_t local_mem_size, const
     if (attributes == nullptr) {
         throw std::invalid_argument("attributes must not be null");
     }
-    std::memset(attributes, 0, sizeof(*attributes));
-
     const std::size_t ip_len = std::min(ip_port.size(), static_cast<std::size_t>(ACLSHMEM_MAX_IP_PORT_LEN - 1));
     std::copy_n(ip_port.data(), ip_len, attributes->ip_port);
     attributes->ip_port[ip_len] = '\0';
 
-    const int attr_version = (1 << 16) + static_cast<int>(sizeof(aclshmemx_init_attr_t));
-
     attributes->my_pe = rank;
     attributes->n_pes = world_size;
     attributes->local_mem_size = local_mem_size;
-    attributes->option_attr = {attr_version, static_cast<data_op_engine_type_t>(data_op_engine_type), DEFAULT_TIMEOUT,
-                               DEFAULT_TIMEOUT, DEFAULT_TIMEOUT};
+    // Preserve the SDK's layout version so it reads runtime_config.
+    attributes->option_attr.data_op_engine_type = static_cast<data_op_engine_type_t>(data_op_engine_type);
     attributes->comm_args = reinterpret_cast<void*>(&g_default_flag_uid);
 }
 
@@ -257,6 +271,16 @@ void ShmemInstance::Init()
         throw std::runtime_error("ShmemInstance local_mem_size is not configured; call init(local_mem_size)");
     }
 
+    if ((data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0) {
+        constexpr uint32_t kMaxSyncTimeoutSeconds = ACLSHMEM_SYNC_TIMEOUT_MAX_US / kMicrosecondsPerSecond;
+        const uint32_t seconds = ReadTimeoutSeconds("DEEPEP_NPU_TIMEOUT_SECONDS", 0, kMaxSyncTimeoutSeconds);
+        // Zero is the SDK's inherit/default sentinel and is never a device-polling deadline.
+        shmem_sync_timeout_us_ = static_cast<uint32_t>(seconds * kMicrosecondsPerSecond);
+        npu_timeout_cycles_ = (seconds == 0 ? ascend_deepep::kDefaultNpuTimeoutSeconds : seconds) *
+                              ascend_deepep::kNpuSystemCyclesPerSecond;
+        notify_host_timeout_seconds_ = ReadTimeoutSeconds("DEEPEP_CPU_TIMEOUT_SECONDS", 120);
+    }
+
     deepep::InstanceLock lock(deepep::instance_mutex());
     try {
         InitRuntime();
@@ -460,6 +484,7 @@ void ShmemInstance::InitRuntime()
             init_flags = ACLSHMEMX_INIT_WITH_UNIQUEID;
         }
 
+        attributes.runtime_config.sync_timeout_us = shmem_sync_timeout_us_;
         attributes.instance_id = instance_id_;
         deepep::InstanceEndpoint endpoint(attributes);
         {
@@ -648,13 +673,25 @@ void* ShmemInstance::PrepareNotifyHostCounts(std::size_t count)
 std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
 {
     TORCH_CHECK(notify_host_pending_ && count <= notify_count_capacity_, "Notify host counts were not prepared");
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    const auto start = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::seconds(notify_host_timeout_seconds_);
     const auto* slots = static_cast<const uint32_t*>(notify_host_counts_);
     std::vector<int32_t> counts(count);
     for (std::size_t i = 0; i < count; ++i) {
         uint32_t value;
         while ((value = __atomic_load_n(slots + i, __ATOMIC_ACQUIRE)) == 0) {
-            TORCH_CHECK(std::chrono::steady_clock::now() < deadline, "timed out waiting for Notify host counts");
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            if (elapsed >= timeout) {
+                const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+                std::fprintf(stderr,
+                             "[DEEPEP_CPU_TIMEOUT] op=notify_dispatch stage=host_counts rank=%d instance_id=%u "
+                             "count_slot=%zu count_slots=%zu observed=%u elapsed_us=%lld timeout_s=%u\n",
+                             rank_, instance_id_, i, count, value, static_cast<long long>(elapsed_us),
+                             notify_host_timeout_seconds_);
+                std::fflush(stderr);
+                TORCH_CHECK(false, "timed out waiting for Notify host counts on rank ", rank_, " at slot ", i,
+                            " after ", notify_host_timeout_seconds_, " seconds");
+            }
         }
         TORCH_CHECK(value - 1U <= uint32_t(std::numeric_limits<int32_t>::max()), "invalid Notify host count");
         counts[i] = static_cast<int32_t>(value - 1U);

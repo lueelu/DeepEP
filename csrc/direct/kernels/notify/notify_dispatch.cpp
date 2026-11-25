@@ -163,7 +163,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     // still be read by a slower rank's previous combine reduction. Skip this
     // only for the Buffer's first workspace use.
     if (tiling.needs_notify_entry_barrier != 0) {
-        aclshmemi_sync_npu_v4<true>(0);
+        aclshmemx_sync_vec_all();
     }
 
     // One AIV owns one logical channel and accumulates complete rank vectors.
@@ -339,7 +339,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         expert_current += len;
         expert_remaining -= len;
     }
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 
     // Source owners gather complete rank rows once. rank_prefix_matrix holds
     // raw counts until each column tile is snapshotted before overwriting it.
@@ -591,7 +591,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
 {
     aclshmemx_instance_ctx_set(instance_id);
     util_set_ffts_config(ffts_addr);
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(

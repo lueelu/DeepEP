@@ -387,7 +387,7 @@ __aicore__ inline void V1DispatchMteKernelImpl(
         }
     }
 
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 
     const int32_t actual_recv_tokens = rank_prefix_gm.GetValue((world_size - 1) * world_size + rank);
     const int32_t recv_tokens_to_copy = DispatchMin(actual_recv_tokens, num_output_tokens);

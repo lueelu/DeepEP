@@ -54,7 +54,7 @@ def source_patches(source):
     return [{"kind": "local-worktree", "sha256": digest.hexdigest()}]
 
 
-def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=False):
+def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=False, enable_device_symbol=False):
     if platform.system() != "Linux":
         raise RuntimeError("SHMEM compilation requires Linux and the pinned CANN SDK")
     root = Path(root).resolve()
@@ -98,6 +98,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
             "source_patches": patches,
+            "metadata_mode": "dynamic" if enable_device_symbol else "fixed",
         }
         if identity.get("revision") != revision or identity.get("build") != expected_build:
             raise RuntimeError(
@@ -136,7 +137,8 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
         build_env["PATH"] = git_dir + os.pathsep + build_env.get("PATH", os.defpath)
         # -e 防止上游中间命令失败后继续打包，随后误登记旧库为成功产物。
         subprocess.run(
-            ["bash", "-e", "scripts/build.sh", "-soc_type", lock["target"]],
+            ["bash", "-e", "scripts/build.sh", "-soc_type", lock["target"]]
+            + (["-enable_device_symbol"] if enable_device_symbol else []),
             cwd=source,
             env=build_env,
             check=True,
@@ -152,6 +154,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
             "source_patches": patches,
+            "metadata_mode": "dynamic" if enable_device_symbol else "fixed",
         },
     )
     print(f"[SHMEM] SDK identity: {manifest}", flush=True)
@@ -168,5 +171,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Build local edits on the pinned commit and record their source fingerprint",
     )
+    parser.add_argument("--enable-device-symbol", action="store_true", help="Build dynamic SHMEM metadata")
     args = parser.parse_args()
-    prepare(rebuild=args.rebuild, if_needed=args.if_needed, allow_local_changes=args.allow_local_changes)
+    prepare(
+        rebuild=args.rebuild,
+        if_needed=args.if_needed,
+        allow_local_changes=args.allow_local_changes,
+        enable_device_symbol=args.enable_device_symbol,
+    )

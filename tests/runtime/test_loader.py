@@ -12,6 +12,43 @@ import pytest
 from deep_ep import _native
 
 
+def test_dynamic_preload_reuses_handles_after_partial_failure(monkeypatch, tmp_path):
+    import ctypes
+
+    names = ("libdeepep_kernels.so", "libdeepep_clos_kernels.so")
+    for name in names:
+        (tmp_path / name).write_bytes(b"device")
+    calls = []
+    fail = True
+
+    def load(path, mode):
+        calls.append(path)
+        if path.endswith(names[1]) and fail:
+            raise OSError("load failed")
+        return object()
+
+    monkeypatch.setattr(ctypes, "CDLL", load)
+    monkeypatch.setattr(_native, "_device_handles", {})
+    _native._preload_dynamic_device_libraries(tmp_path, {"shmem": {"metadata_mode": "fixed"}})
+    assert not calls
+    info = {"shmem": {"metadata_mode": "dynamic"}}
+    with pytest.raises(ImportError, match="Cannot preload"):
+        _native._preload_dynamic_device_libraries(tmp_path, info)
+    fail = False
+    _native._preload_dynamic_device_libraries(tmp_path, info)
+    _native._preload_dynamic_device_libraries(tmp_path, info)
+    assert calls == [str(tmp_path / names[0]), str(tmp_path / names[1]), str(tmp_path / names[1])]
+
+
+def test_dynamic_preload_checks_all_files_before_loading(monkeypatch, tmp_path):
+    import ctypes
+
+    (tmp_path / "libdeepep_kernels.so").write_bytes(b"device")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: pytest.fail("must preflight both libraries"))
+    with pytest.raises(ImportError, match="Missing dynamic"):
+        _native._preload_dynamic_device_libraries(tmp_path, {"shmem": {"metadata_mode": "dynamic"}})
+
+
 def test_require_native_reuses_success_across_operations(monkeypatch):
     from pathlib import Path
     from unittest.mock import Mock
@@ -31,11 +68,24 @@ def test_require_native_reuses_success_across_operations(monkeypatch):
 
 
 @pytest.mark.parametrize("fault", [None, "origin", "protocol", "external", "missing", "source_link"])
-def test_native_loader_identity(monkeypatch, tmp_path, fault):
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_native_loader_identity(monkeypatch, tmp_path, fault, dynamic):
     library = tmp_path / "libshmem.so"
     library.write_bytes(b"test SDK identity")
     expected = hashlib.sha256(library.read_bytes()).hexdigest()
-    (tmp_path / "_build_info.json").write_text(json.dumps({"shmem": {"sha256": {"lib/libshmem.so": expected}}}))
+    (tmp_path / "_build_info.json").write_text(
+        json.dumps(
+            {"shmem": {"metadata_mode": "dynamic" if dynamic else "fixed", "sha256": {"lib/libshmem.so": expected}}}
+        )
+    )
+    loaded = []
+    if dynamic:
+        import ctypes
+
+        for name in ("libdeepep_kernels.so", "libdeepep_clos_kernels.so"):
+            (tmp_path / name).write_bytes(b"device")
+        monkeypatch.setattr(_native, "_device_handles", {})
+        monkeypatch.setattr(ctypes, "CDLL", lambda path, **kwargs: loaded.append(path) or object())
     module = SimpleNamespace(
         runtime_protocol=2 if fault == "protocol" else 1,
         shmem_library_path=lambda: str(library if fault != "external" else tmp_path.parent / "libshmem.so"),
@@ -57,7 +107,12 @@ def test_native_loader_identity(monkeypatch, tmp_path, fault):
         "find_spec",
         lambda name: None if fault == "missing" else spec,
     )
-    monkeypatch.setattr(_native.importlib, "import_module", lambda name: module)
+
+    def import_native(name):
+        assert len(loaded) == (2 if dynamic else 0)
+        return module
+
+    monkeypatch.setattr(_native.importlib, "import_module", import_native)
     monkeypatch.setattr(_native, "_load_bundled_shmem", lambda directory, info: tmp_path)
     _native._load_native.cache_clear()
     try:

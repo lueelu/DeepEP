@@ -178,17 +178,59 @@ def checked_run(argv, **kwargs):
     subprocess.run([str(arg) for arg in argv], check=True, timeout=1800, **kwargs)
 
 
+def shmem_metadata_mode(root):
+    header = Path(root) / "include/host_device/shmem_common_macros.h"
+    if not header.is_file():
+        return "fixed"
+    definitions = re.findall(r"^\s*#define\s+ACLSHMEM_DYNAMIC_META\s+([^\r\n]+)", header.read_text(), re.M)
+    if not definitions:
+        return "fixed"
+    if len(definitions) != 1 or definitions[0].strip() not in ("0", "1"):
+        raise RuntimeError("Invalid SHMEM metadata mode in installed header")
+    return "dynamic" if definitions[0].strip() == "1" else "fixed"
+
+
+def shmem_sdk_inputs(root):
+    root = Path(root)
+    files = sorted(path for path in (root / "include").rglob("*") if path.suffix in {".h", ".hpp"})
+    files.append(root / "lib/libshmem.so")
+    if shmem_metadata_mode(root) == "dynamic":
+        files += sorted(path for path in (root / "src").rglob("*") if path.suffix in {".h", ".hpp"})
+        files += [root / "lib/libshmem_device.a", root / "src/host_device/shmem_device_symbol.h"]
+    return sorted(set(files))
+
+
+def validate_shmem_headers(root, expected):
+    mode = shmem_metadata_mode(root)
+    headers = dict(expected["header_sha256_lf"])
+    if mode == "dynamic":
+        overrides = expected.get("dynamic_header_sha256_lf")
+        if not overrides:
+            raise RuntimeError("Pinned SHMEM SDK does not support dynamic metadata")
+        headers.update(overrides)
+    for relative, digest in headers.items():
+        data = (Path(root) / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise RuntimeError(f"SHMEM public API differs from the pinned SDK: {relative}")
+    return mode
+
+
 def validate_shmem_sdk(root, expected):
     manifest = Path(root) / "deepep-sdk.json"
     if not manifest.is_file():
         raise RuntimeError("SHMEM SDK needs deepep-sdk.json; see scripts/record_shmem_sdk.py")
     sdk = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(sdk, dict) or not isinstance(sdk.get("sha256"), dict):
+        raise ValueError("Invalid SHMEM SDK manifest")
     if sdk.get("revision") != expected["revision"]:
         raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
-    for relative, digest in expected["header_sha256_lf"].items():
-        data = (manifest.parent / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
-        if hashlib.sha256(data).hexdigest() != digest:
-            raise RuntimeError(f"SHMEM public API differs from the pinned SDK: {relative}")
+    mode = validate_shmem_headers(root, expected)
+    if sdk.get("metadata_mode", "fixed") != mode:
+        raise RuntimeError("SHMEM metadata mode differs from SDK identity")
+    if mode == "dynamic":
+        required = {path.relative_to(Path(root)).as_posix() for path in shmem_sdk_inputs(root)}
+        if not required.issubset(sdk.get("sha256", {})):
+            raise RuntimeError("Dynamic SHMEM SDK manifest must cover device archive and headers")
     for relative, digest in sdk["sha256"].items():
         path = (manifest.parent / relative).resolve()
         if not path.is_relative_to(manifest.parent.resolve()) or not path.is_file():
@@ -271,38 +313,18 @@ def build_configuration(environment=None):
         if not manifest.is_file():
             raise RuntimeError("SHMEM SDK has no deepep-sdk.json")
         sdk = json.loads(manifest.read_text(encoding="utf-8"))
-        if not isinstance(sdk, dict):
-            raise ValueError("Invalid SHMEM SDK manifest")
-        if sdk.get("revision") != lock["shmem"]["revision"]:
-            raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
-        for relative, expected in lock["shmem"]["header_sha256_lf"].items():
-            data = (manifest.parent / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
-            if hashlib.sha256(data).hexdigest() != expected:
-                raise RuntimeError(f"SHMEM public API differs from the pinned SDK: {relative}")
-        hashes = sdk.get("sha256")
-        if not isinstance(hashes, dict):
-            raise ValueError("Invalid SHMEM SDK manifest checksums")
-        for relative, expected in hashes.items():
-            path = (manifest.parent / relative).resolve()
-            if not path.is_relative_to(manifest.parent.resolve()) or not path.is_file():
-                raise RuntimeError("Invalid SHMEM SDK manifest path")
-            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-                raise RuntimeError(f"SHMEM SDK checksum mismatch: {relative}")
-        if "lib/libshmem.so" not in hashes or not any(key.startswith("include/") for key in hashes):
-            raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
+        validate_shmem_sdk(manifest.parent, lock["shmem"])
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
-        if beta == "ON":
+        if beta == "ON" or shmem_metadata_mode(manifest.parent) == "dynamic":
             raise
         warnings.warn(f"{exc}; continuing with SHMEM_ROOT={manifest.parent}", RuntimeWarning, stacklevel=2)
     library = manifest.parent / "lib/libshmem.so"
     if not library.is_file():
         raise RuntimeError(f"SHMEM SDK is missing {library}")
-    files = sorted(
-        path for path in (manifest.parent / "include").rglob("*") if path.suffix in {".h", ".hpp"} and path.is_file()
-    )
-    files.append(library)
+    files = shmem_sdk_inputs(manifest.parent)
     # Record actual inputs so replacing an unpinned SDK invalidates the build cache.
     result["shmem"] = {
+        "metadata_mode": shmem_metadata_mode(manifest.parent),
         "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
         "sha256": {
             path.relative_to(manifest.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()

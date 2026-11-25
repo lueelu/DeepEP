@@ -214,7 +214,7 @@ __aicore__ inline void V1CombineMteImpl(
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-        aclshmemi_sync_npu_v4<true>(0);
+        aclshmemx_sync_vec_all();
 
     }
 

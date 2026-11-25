@@ -149,7 +149,7 @@ __aicore__ inline void CombineSelfPipelineImpl(
     // Independent QPs require all markers; one writer's SO cannot cover others.
     sender.Publish(workspace, td.udma_completion_signal_offset, td.rank, core);
     sender.Quiet();
-    WaitIncoming<false>(workspace, td.udma_completion_signal_offset, td.rank, td.world_size, core, cores, cores);
+    WaitIncoming<false>(workspace, td, core, cores, cores);
 }
 
 template <typename T>

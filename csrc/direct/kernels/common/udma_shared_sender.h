@@ -49,7 +49,7 @@ __aicore__ inline void Begin(
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID4);
     }
-    aclshmemi_sync_npu_v4<true>(0);
+    aclshmemx_sync_vec_all();
 }
 
 struct PeerQueue {
@@ -225,24 +225,18 @@ protected:
 
 using Sender = SenderT<>;
 
-// Ascend950's system counter is 1 GHz (1000 cycles/us), not the AIV core clock.
-inline constexpr uint64_t kIncomingCyclesPerUs = 1000ULL;
-inline constexpr uint64_t kIncomingTimeoutCycles = 10ULL * 1000 * 1000 * kIncomingCyclesPerUs;
-
-template <bool IsDispatch>
+template <bool IsDispatch, class Tiling>
 __aicore__ inline void WaitIncoming(
-    GM_ADDR base, uint64_t offset, uint32_t rank, uint32_t world, uint32_t core, uint32_t cores,
-    uint32_t marker_count = 1)
+    GM_ADDR base, const Tiling& td, uint32_t core, uint32_t cores, uint32_t marker_count)
 {
-    // One deadline for this core's entire incoming-marker phase, not 10 s per
-    // source. Poll the same cache-invalidated EQ marker as SHMEM's unbounded wait.
+    // One deadline for this AIV's entire incoming-marker phase.
     const uint64_t start = static_cast<uint64_t>(AscendC::GetSystemCycle());
-    for (uint32_t item = core; item < world * marker_count; item += cores) {
+    for (uint32_t item = core; item < td.world_size * marker_count; item += cores) {
         const uint32_t source = item / marker_count;
         const uint32_t worker = item % marker_count;
-        if (source == rank)
+        if (source == td.rank)
             continue;
-        auto* address = Signal(base, offset, source) + worker;
+        auto* address = Signal(base, td.udma_completion_signal_offset, source) + worker;
         AscendC::GlobalTensor<uint64_t> signal;
         signal.SetGlobalBuffer(address);
         while (true) {
@@ -251,21 +245,25 @@ __aicore__ inline void WaitIncoming(
             if (value == 1U)
                 break;
             const uint64_t elapsed = static_cast<uint64_t>(AscendC::GetSystemCycle()) - start;
-            if (elapsed >= kIncomingTimeoutCycles) {
+            if (elapsed >= td.npu_timeout_cycles) {
+                const auto elapsed_us = static_cast<unsigned long long>(elapsed / kNpuSystemCyclesPerUs);
+                const auto timeout_s = static_cast<uint32_t>(td.npu_timeout_cycles / kNpuSystemCyclesPerSecond);
                 if constexpr (IsDispatch) {
                     AscendC::printf(
-                        "[V1_UDMA_TIMEOUT] op=dispatch stage=wait_incoming rank=%u core=%u source=%u worker=%u "
-                        "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_us=10000000\n",
-                        rank, core, source, worker, reinterpret_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(value),
-                        static_cast<unsigned long long>(elapsed / kIncomingCyclesPerUs));
+                        "[V1_UDMA_TIMEOUT] op=dispatch stage=wait_incoming rank=%u aiv_core_idx=%u "
+                        "peer_rank=%u worker_idx=%u instance_id=%u cached=%u "
+                        "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_s=%u\n",
+                        td.rank, core, source, worker, td.instance_id, td.cached_mode,
+                        reinterpret_cast<unsigned long long>(address), static_cast<unsigned long long>(value),
+                        elapsed_us, timeout_s);
                 } else {
                     AscendC::printf(
-                        "[V1_UDMA_TIMEOUT] op=combine stage=wait_incoming rank=%u core=%u source=%u worker=%u "
-                        "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_us=10000000\n",
-                        rank, core, source, worker, reinterpret_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(value),
-                        static_cast<unsigned long long>(elapsed / kIncomingCyclesPerUs));
+                        "[V1_UDMA_TIMEOUT] op=combine stage=wait_incoming rank=%u aiv_core_idx=%u "
+                        "peer_rank=%u worker_idx=%u instance_id=%u "
+                        "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_s=%u\n",
+                        td.rank, core, source, worker, td.instance_id,
+                        reinterpret_cast<unsigned long long>(address), static_cast<unsigned long long>(value),
+                        elapsed_us, timeout_s);
                 }
                 // Fail the device task. Returning normally would strand other
                 // AIVs at SyncAll or expose incomplete payload as valid output.
