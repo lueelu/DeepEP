@@ -34,6 +34,14 @@ def normalize_machine_type(value):
 # Only the migrated implementation takes an engine argument internally. Mesh+Clos
 # retains its own initialization contract and mixed-engine configuration.
 _TRANSPORT_BY_MACHINE = {"global_clos": "udma", "mesh_pcie": "mte"}
+# Missing-file fallback only; Clos boards match the pinned SHMEM product rules.
+_MACHINE_BY_BOARD = {
+    0x03: "mesh_clos",
+    0x07: "mesh_clos",
+    0x46: "global_clos",
+    0x48: "global_clos",
+    0x6C: "mesh_pcie",
+}
 
 
 def read_json(path):
@@ -198,10 +206,11 @@ def detect_physical(physical, rootinfo_path=None):
     if rootinfo_path is not None:
         raise ValueError(f"explicit rootinfo is missing: {path}")
     board = board_id(physical)
-    if board not in (3, 7, 0x6C):
+    kind = _MACHINE_BY_BOARD.get(board)
+    if kind is None:
         raise ValueError(f"no rootinfo and no validated rule for board 0x{board:02x}; specify machine_type")
     return {
-        "machine_type": "mesh_pcie" if board == 0x6C else "mesh_clos",
+        "machine_type": kind,
         "source": "dcmi_board_rule",
         "physical_device": physical,
         "board": board,

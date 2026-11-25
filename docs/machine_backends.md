@@ -100,13 +100,16 @@ print(buffer.machine_type, buffer.machine_selection)
 `TOPO_FILE_DESC` 按 topo 边声明解释；有 Clos 且无 NPU Mesh 的设备选择 `global_clos`。
 Mesh+Clos 还需已核对的 Mesh+Clos board 规则（0x03/0x07）。完整四卡 Mesh 域与 board `0x6c`
 共同选择 `mesh_pcie`；主机 NIC 的 `d2h` 声明不算 NPU Clos。
-缺省文件缺失时可回退到 Mesh+Clos 及 `0x6c` 的
-DCMI board 规则；DCMI 查询超时为 5 秒，不重试。未知 board、缺失端点、文件矛盾或
+缺省文件缺失时按 DCMI board 自动选择：`0x03/0x07` 为 `mesh_clos`，
+`0x46/0x48` 为 `global_clos`，`0x6c` 为 `mesh_pcie`。已有文件仍优先按拓扑判断。
+板号只决定 DeepEP 后端；后续 SHMEM 根据硬件信息自动生成 RootInfo 并建链，
+无需创建 `/etc/hccl_rootinfo.json`，但仍需驱动提供的 topo 文件及相应硬件查询可用。
+DCMI 查询超时为 5 秒，不重试。未知 board、缺失端点、文件矛盾或
 不完整拓扑报错，要求显式指定，不能仅凭“16 卡”或某一 EID 位推断机型。
 `rootinfo_path="/path/to/rootinfo.json"` 可指定文件；显式文件错误不会悄悄回退。
 这些信息是拓扑声明，不证明物理连接健康或带宽利用率。
 
-现场没有可靠 rootinfo 时使用 `machine_type="global_clos"` 或 `"mesh_clos"`。显式选择跳过
+现场无法自动识别且已确认机型时，可显式设置 `machine_type`。显式选择跳过
 自动探测，但不修改 SHMEM 自身的拓扑初始化；依赖的驱动/SDK 仍须支持该环境。
 传入 EP ProcessGroup/MPI communicator 时，构造阶段先核对全组的后端选择和探测错误，
 再进入 SHMEM 初始化。保留 Mesh+Clos 的显式 rank/world_size/MPI 启动方式；没有 EP group 时
