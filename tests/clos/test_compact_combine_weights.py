@@ -12,6 +12,53 @@ from tests.utils.cpp import cpp_functions
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("corrupt_local_row", [False, True])
+def test_direct_self_production_reduction(tmp_path, corrupt_local_row):
+    source = ROOT / "csrc/direct"
+    kernel = (source / "kernels/combine/combine_udma.cpp").read_text()
+    constants = kernel[kernel.index("constexpr uint32_t kCombineUbBytes") : kernel.index("__aicore__")]
+    functions = cpp_functions(
+        kernel,
+        "CombineMin",
+        "CombineAlignUpElements",
+        "ContributorSlot",
+        "CompactWeightSlot",
+        "CombineLocalInputRow",
+        "V1CombineUdmaImpl",
+    )
+    if corrupt_local_row:
+        functions = functions.replace(
+            "return self_input_base + channel_starts", "return 1U + self_input_base + channel_starts"
+        )
+    host = (source / "ops/combine.cpp").read_text()
+    begin = host.index("    tiling.combine_direct_self =")
+    gate = host[begin : host.index(";", begin) + 1]
+    harness = Path(__file__).with_name("combine_direct_self_oracle.cpp").read_text()
+    harness = harness.replace("// PRODUCTION_CONSTANTS", constants).replace("// PRODUCTION_REDUCTION", functions)
+    harness = harness.replace("// PRODUCTION_GATE", gate)
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required for production-body CPU oracle")
+    path = tmp_path / "direct_self.cpp"
+    path.write_text(harness)
+    executable = tmp_path / ("direct_self.exe" if os.name == "nt" else "direct_self")
+    subprocess.run(
+        [compiler, "-std=c++17", "-O2", "-UNDEBUG", "-I", str(source), str(path), "-o", str(executable)],
+        check=True,
+        timeout=180,
+    )
+    try:
+        result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=120)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
+    if corrupt_local_row:
+        assert result.returncode != 0 and "output[i].bits" in result.stderr, result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("corrupt_prefix", [False, True])
 def test_compact_weight_production_mapping(tmp_path, corrupt_prefix):
     source = ROOT / "csrc/direct"

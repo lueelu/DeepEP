@@ -185,6 +185,9 @@ struct alignas(8) CombineTilingData {
     // capacity-sized partition. Payload addressing remains unchanged.
     uint32_t combine_compact_weights = 0;
     uint64_t combine_send_channel_prefix = 0;
+    // Ordinary V2 reduction reads this rank's contribution from the input.
+    // Internal eligibility, not a user-selectable scheduling policy.
+    uint32_t combine_direct_self = 0;
 };
 
 struct alignas(8) ExpandTilingData {

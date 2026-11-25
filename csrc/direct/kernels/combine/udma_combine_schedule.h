@@ -144,9 +144,11 @@ __aicore__ inline void CombineRemoteImpl(
             // payload nor weight self stores collide with incoming writes.
             // The SQ now owns the WQEs. Finish MTE3's reads of the reused
             // UB before self-copy loads use it, while UDMA reads GM payload.
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
-            CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
+            if (!td.combine_direct_self) {
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                CombineSelfCopy(resource, x, weights, src_idx, rank_prefix, channel_prefix, workspace, td, core);
+            }
             trace.SelfDone(self_started);
         }
         trace.Mark(Trace::IncomingBegin);

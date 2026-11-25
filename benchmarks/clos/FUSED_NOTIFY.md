@@ -99,7 +99,7 @@ as before. The following options remain available on the shared entry point:
 | `--metadata-output-modes off pack direct omit pack_direct all` | Independent cached-pack/direct/omit combinations |
 | `--dispatch-plans auto zeng` | Retained constrained EP8 policy experiment |
 | `--trace-samples 5 --combine-diagnostics --reduce-cores 48` | Separate dispatch/combine diagnostic passes |
-| `--compact-self-modes 0 1` | Compare scatter/compact combine local copies |
+| `--compact-self-modes 0 1` | Legacy local-copy comparison; ordinary V2 UDMA combine now reads self input directly |
 
 These presets are ablations, not an assertion that every production default is
 active. Use `--help` for constraints and defaults. `combine_queue_diagnostics.py`
@@ -107,12 +107,24 @@ is the shared script's combine helper, not a separate launch entry point.
 
 ### Combine preparation and copy A/B
 
+Ordinary V2 peer-schedule UDMA combine now always reads local payload and weight
+directly from its input tensors during reduction (`combine_direct_self=1`).
+It does not stage either local field in SHMEM. Reduce cores remain independent
+of dispatch/combine cores. There is no opt-out switch; compare revisions for
+this change. Early-single, aggregate pipeline, token scheduling and legacy
+monolithic paths retain their existing behavior. Ordinary expanded combine is
+eligible only after aggregation has fully materialized its input.
+
+On the direct-self path, `COMPACT_SELF` and `SELF_DOUBLE_BUFFER` settings do not
+restore local copies; effective `compact_self_rows` and
+`combine_self_double_buffer` are zero. Rebuild Host and kernel together.
+
 Two independent switches default to `0` and are read on each combine call:
 
 | Environment variable | When set to `1` |
 | --- | --- |
 | `DEEPEP_CLOS_COMBINE_WQE_FAST` | Specialize ordinary contiguous-row WQE construction; single-span batches skip lookup, multi-span batches use binary search |
-| `DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER` | Pipeline compact local copies through two 64 KiB UB slots |
+| `DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER` | Pipeline legacy compact local copies through two 64 KiB UB slots; inactive with direct self reads |
 
 Compare `(0,0)`, `(1,0)`, `(0,1)`, `(1,1)` in forward and reverse order with
 one Buffer per rank. Rebuild both Host and kernel because the tiling grows.

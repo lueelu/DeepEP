@@ -519,8 +519,8 @@ def main(argv=None):
         type=int,
         nargs="+",
         choices=[0, 1],
-        default=[0, 1],
-        help="combine diagnostics: compare scatter/compact local copies with one Buffer",
+        default=[1],
+        help="legacy local-copy modes; ordinary V2 UDMA now reads self input directly in both modes",
     )
     parser.add_argument("--flush-l2", action="store_true")
     parser.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)

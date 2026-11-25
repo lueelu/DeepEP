@@ -353,8 +353,9 @@ void CheckCombineOrdering()
     for (unsigned rows : {0U, 3U, 65U, 513U})
         for (bool weighted : {false, true})
             for (unsigned visit : {8U, 64U, 128U}) for (bool legacy_after : {false, true})
-            for (bool compact : {false, true}) {
+            for (bool compact : {false, true}) for (bool direct_self : {false, true}) {
                 if (compact && Phase != 0) continue;
+                if (direct_self && Phase != 0) continue;
                 CombineTilingData td{};
                 td.world_size = 2;
                 td.block_dim = 8;
@@ -363,6 +364,7 @@ void CheckCombineOrdering()
                 td.pipeline_chunk_tokens = 32;
                 td.has_topk_weights = weighted;
                 td.combine_compact_weights = compact && weighted;
+                td.combine_direct_self = direct_self;
                 td.udma_self_copy_after_submit = legacy_after;
                 std::vector<int32_t> indices(rows + 8), prefix{0, 0, int32_t(rows), 0};
                 Resource resource;
@@ -371,7 +373,7 @@ void CheckCombineOrdering()
                 combine_rows = combine_copies = 0;
                 compact_weight_rows = 0;
                 expected_payload_rows = rows;
-                combine_expects_copy = Phase == 0 || Phase == 2;
+                combine_expects_copy = !direct_self && (Phase == 0 || Phase == 2);
                 CombineRemoteImpl<64, Phase, 2>(resource, nullptr, nullptr,
                     reinterpret_cast<GM_ADDR>(indices.data()), reinterpret_cast<GM_ADDR>(prefix.data()),
                     nullptr, nullptr, td, 0, trace);
@@ -571,8 +573,9 @@ constexpr int kBFloat16 = 1;
 void CheckHostGate()
 {
     // Flip every exclusion separately; independent reduce core count is not a gate.
-    for (unsigned exclusion = 0; exclusion <= 14; ++exclusion) {
+    for (unsigned exclusion = 0; exclusion <= 14; ++exclusion) for (bool direct_self : {false, true}) {
         CombineTilingData tiling{};
+        tiling.combine_direct_self = direct_self;
         bool use_udma = exclusion != 1, epilogue = exclusion != 2, aggregate = exclusion == 4;
         tiling.udma_token_schedule = exclusion == 3;
         unsigned pipeline_chunk_tokens = exclusion == 5 ? 64 : 0;
@@ -599,8 +602,8 @@ void CheckHostGate()
             workspace.topk_weights_row_stride += 32;
         }
         // PRODUCTION_GATE
-        assert(tiling.compact_self_rows == (exclusion == 0 || exclusion == 7 || exclusion == 8 ||
-                                          exclusion == 9 || exclusion == 13));
+        assert(tiling.compact_self_rows == (!direct_self && (exclusion == 0 || exclusion == 7 || exclusion == 8 ||
+                                          exclusion == 9 || exclusion == 13)));
         for (const char* wqe_fast : {static_cast<const char*>(nullptr), "0", "1"})
             for (const char* self_db : {static_cast<const char*>(nullptr), "0", "1"}) {
                 // PRODUCTION_OPT_GATES

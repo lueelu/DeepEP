@@ -372,13 +372,18 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.token_capacity = static_cast<uint32_t>(workspace.token_capacity);
     tiling.x_row_stride = static_cast<uint32_t>(workspace.x_row_stride);
     tiling.topk_weights_row_stride = static_cast<uint32_t>(workspace.topk_weights_row_stride);
-    // Keep this rank's contribution in dispatch order. Only the local reader
-    // uses this layout; remote senders retain their original token addressing.
+    // The ordinary split path owns a fully materialized, contiguous input
+    // through its reduction epilogue. Local rows need no SHMEM staging.
+    // Early single-source, pipeline and token schedules retain their copies.
+    tiling.combine_direct_self = use_udma && epilogue && !tiling.udma_token_schedule &&
+        !aggregate && !pipeline_chunk_tokens && !expanded_x.has_value();
+    // Legacy staging controls never re-enable a copy on the direct-self path.
+    // For staging, only the local reader uses compact dispatch row order.
     const char* compact_self = std::getenv("DEEPEP_CLOS_COMBINE_COMPACT_SELF");
     TORCH_CHECK(!compact_self || std::strcmp(compact_self, "0") == 0 || std::strcmp(compact_self, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_COMPACT_SELF must be 0 or 1");
     const bool compact_self_enabled = !compact_self || std::strcmp(compact_self, "1") == 0;
-    tiling.compact_self_rows = compact_self_enabled &&
+    tiling.compact_self_rows = compact_self_enabled && !tiling.combine_direct_self &&
         use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens &&
         !expanded_x.has_value() &&
         x.scalar_type() == torch::kBFloat16 && workspace.x_row_stride == hidden_bytes &&
