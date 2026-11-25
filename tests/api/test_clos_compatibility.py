@@ -585,7 +585,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 args = (cores, 2048 if bucket == 'small' else 5632, op)
                 plan = base.for_launch(*args, bf16=True)
                 assert plan is base.for_launch(*args, bf16=True)
-                expected_order = 0 if cores == 8 and ep in (8,16,32) else order
+                expected_order = 0 if (cores == 8 and ep in (8,16,32)) or (cores == 32 and ep in (4,8,16)) else order
                 assert plan.native_plan()[:7] == [1, expected_order, group, p, w, q, visit]
                 assert plan.self_copy == (copy or 2)
                 assert plan.send_workers <= cores and plan.send_workers * q <= 32
@@ -652,8 +652,8 @@ def test_ep16_weight_row_limit_preserves_payload_plan_across_core_budgets():
                         assert replace(plan,weight_mode=1) == reference
         # Reproduce the compared payload configuration, without a 48-core rule.
         policy = replace(base,ranks_per_group=8,topology_known=True)
-        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,2,2]
-        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,2,1]
+        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,4,2,2]
+        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,4,2,1]
     """)
 
 
@@ -754,7 +754,7 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                                ranks_per_group=group, topology_known=True)
                 for cores in (range(8,16,2) if tier == 8 else range(32,64,2)):
                     plan = base.for_launch(cores,2048 if bucket == 'small' else 5632,op,bf16=True)
-                    expected_order = 0 if tier == 8 and ep in (8,16,32) else order
+                    expected_order = 0 if (tier == 8 and ep in (8,16,32)) or (tier == 32 and ep in (4,8,16)) else order
                     assert plan.native_plan()[:7] == [1,expected_order,group,p,w,q,visit]
                     assert base.config(cores).num_aiv == cores
                     if op == 'combine':
@@ -819,7 +819,52 @@ def test_low_core_rank_defaults_match_measured_plans():
     """)
 
 
-def test_reported_300_operator_plans_remain_unchanged():
+def test_32_core_rank_defaults_preserve_payload_and_weight_plans():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+
+        # EP8/16 anchors match the rank-only machine5 comparison. EP4's
+        # 32-core anchors preserve its pre-existing rank configuration.
+        # P/W/Q, visit, sender count, self-copy, H2816/H6144 weight mode.
+        expected = {
+            (4,'dispatch'): (1,2,1,32,6,2,0,0),
+            (4,'combine'): (1,2,1,32,6,1,0,0),
+            (4,'weighted'): (1,2,1,32,6,2,2,1),
+            (8,'dispatch'): (1,1,1,16,7,2,0,0),
+            (8,'combine'): (1,1,1,16,7,1,0,0),
+            (8,'weighted'): (2,2,1,8,8,2,2,1),
+            (16,'dispatch'): (4,2,1,16,8,2,0,0),
+            (16,'combine'): (2,1,1,8,8,1,0,0),
+            (16,'weighted'): (2,1,1,4,8,2,2,1),
+        }
+        for (ep,op),(p,w,q,visit,senders,copy,small_mode,large_mode) in expected.items():
+            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=ep,topology_known=True)
+            for cores in (0,32,34,48,62):
+                for hidden,mode in ((2816,small_mode),(6144,large_mode)):
+                    plan = base.for_launch(cores,hidden*2,op,bf16=True)
+                    assert plan.native_plan() == [1,0,ep,p,w,q,visit,copy,mode]
+                    assert plan.send_workers == senders
+                    assert plan.send_workers*q <= 32
+        # Rank is also selected outside fitted topologies/row widths, without
+        # manufacturing physical groups or changing the user's actual budget.
+        for ep in (4,8,16):
+            for group in (1,2,4,ep):
+                for known in (False,True):
+                    base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                   ranks_per_group=group,topology_known=known)
+                    for cores in (0,32,34,48,62):
+                        for size in (2046,2048,4096,4098,5632,8192,12288,12290,14336):
+                            for op in ('dispatch','combine','weighted'):
+                                plan = base.for_launch(cores,size,op,bf16=True)
+                                assert plan.peer_order == 0
+                                assert plan.ranks_per_group == group
+                                assert plan.send_workers <= (cores or 32)
+    """)
+
+
+def test_reported_300_operator_plans_preserve_fields_except_rank_order_and_copy_first():
     # Frozen native plans from the November 16 EP8-128 reports, not generated
     # from the selector. Keep all five operators for each of the 60 shapes.
     run_host("""
@@ -844,11 +889,15 @@ def test_reported_300_operator_plans_remain_unchanged():
                            ranks_per_group=group, topology_known=True)
             plan = base.for_launch(cores,hidden*2,op,bf16=True)
             historical = json.loads(row['native_plan'])
-            # This change intentionally removes copy-first; all send/weight
-            # strategy fields in the 300-case historical fixture stay intact.
+            # Preserve the historical fixture; normalize only explicitly
+            # changed order/copy fields, never regenerate expected plans.
             historical[7] = historical[7] or 2
+            senders = int(row['send_aivs'])
+            if ep in (4,8,16) and cores == 32:
+                historical[1] = 0
+                senders = ((ep-2)//historical[3]+1)*historical[4]
             assert plan.native_plan() == historical, (key, op, plan)
-            assert plan.send_workers == int(row['send_aivs']), (key, op, plan)
+            assert plan.send_workers == senders, (key, op, plan)
         assert len(cases) == 60
         assert all(len(ops) == 5 and set(ops) == operations for ops in cases.values())
     """)

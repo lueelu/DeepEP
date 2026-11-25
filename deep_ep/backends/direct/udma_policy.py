@@ -311,10 +311,14 @@ class UdmaPolicy:
                 # SIMT needs an AIV outside the payload sending plan.
                 use_simt_weights = _simt_weight_row_fits(self.world_size, row_bytes) and plan.send_workers < cores
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
-            if 8 <= cores < 16 and self.world_size in (8, 16, 32):
-                # Low-core rank ordering keeps the selected P/W/Q, visit and
-                # copy/weight modes. In particular, EP8 RR -> rank frees one
-                # worker slot but must not implicitly switch UDMA to SIMT.
+            if (8 <= cores < 16 and self.world_size in (8, 16, 32)) or (
+                32 <= cores < 64 and self.world_size in (4, 8, 16)
+            ):
+                # Normalize order after selecting P/W/Q, visit and copy/weight
+                # modes. The 32-core tier keeps the rank-only comparison plans;
+                # EP32+ and the 64-core tier retain their existing schedules.
+                # RR -> rank can free a self-only owner slot; do not implicitly
+                # switch UDMA weights to SIMT when that exposes another helper.
                 plan = replace(plan, peer_order=0)
         plan.validate_num_aiv(num_aiv)
         if not plan.valid_group_capacity():
