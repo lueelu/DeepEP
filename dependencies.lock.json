@@ -2,16 +2,16 @@
   "schema_version": 1,
   "cann_version": "9.2.0",
   "shmem": {
-    "repository": "https://gitcode.com/lishaoxun/shmem",
-    "ref": "refs/heads/rootinfo-dev-backport",
-    "revision": "661921b18b9d2ae114a59e26cc2d05c87d6e29ed",
+    "repository": "https://gitcode.com/cann/shmem",
+    "ref": "refs/heads/dev",
+    "revision": "c485ee7b67d2d660d347edc651a735ff86068d71",
     "distribution": "pinned third-party/shmem submodule or external SDK; headers and library recorded by record_shmem_sdk.py",
     "header_sha256_lf": {
-      "host/shmem_host_def.h": "3a4110a09669a859fd42075279fd9b9c2ae77d93ea464dd8d3d80b3f000687e2",
-      "host/init/shmem_host_init.h": "7a5f5d7851ee13a4b6f00e99149321cd28ef786779aeec22bdf6ecf32e6eaac2",
+      "host/shmem_host_def.h": "e2e36c3b246b36b71f33e279c0286ef5f3d343f5144dc5a2ec82a83ffa6e46eb",
+      "host/init/shmem_host_init.h": "f88ebce13b7671c4756dfa3c3bb04688dda5f90a1590c32931875ed3eed7863b",
       "host/mem/shmem_host_heap.h": "5ef864fd9c6c812169de6e1dfbbb6b55481cd9cb67e543a681c3e19d5ce627b4",
       "host/data_plane/shmem_host_cc.h": "dc8704f0d3fe00abe99ad5c9fa0bb74a79f7cda8c2af9242dc717cdd9f45ceb6",
-      "host_device/shmem_common_types.h": "7a481a1eff556dd9c5484bbcce98af2f3abaa5247efbe228f680144bc18e071e",
+      "host_device/shmem_common_types.h": "ac3f6d3a897e4ff680db84f480f378341cbfb11e87a41830fecddf1a61e6ab47",
       "host_device/shmem_common_macros.h": "62b6cd714837724200d5696708da60e138aab95236ae1c8297e84f979a41be50"
     },
     "dynamic_header_sha256_lf": {
