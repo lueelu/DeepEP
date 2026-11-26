@@ -444,6 +444,8 @@ def _contiguous_group_size(hosts):
 # 2 KiB / 5.5 KiB / 12 KiB rows, random routing. Group sizes are
 # eligibility constraints, NOT an assumed physical rank-to-server mapping.
 # key: EP, communication AIVs, row-byte bucket, operation.
+# The large-row EP8/16 rank candidates share parameters across the measured
+# H2816/4096/6144 interval; no token-count or exact-hidden exceptions.
 # value: measured G, order (rank/group/staggered/RR), P, W, Q, visit, self-copy.
 _PROFILES = {
     (4, 8, "large", "dispatch"): ((4,), 2, 1, 1, 2, 32, 0),
@@ -455,31 +457,31 @@ _PROFILES = {
     (4, 32, "small", "dispatch"): ((4,), 0, 1, 2, 1, 32, 0),
     (4, 32, "small", "combine"): ((4,), 3, 1, 2, 1, 32, 1),
     (4, 32, "small", "weighted"): ((4,), 3, 1, 2, 1, 32, 2),
-    (8, 8, "large", "dispatch"): ((8,), 0, 2, 1, 2, 32, 0),
-    (8, 8, "large", "combine"): ((8,), 1, 1, 1, 2, 32, 2),
+    (8, 8, "large", "dispatch"): ((8,), 0, 2, 2, 1, 32, 0),
+    (8, 8, "large", "combine"): ((8,), 0, 1, 1, 1, 32, 2),
     (8, 8, "large", "weighted"): ((8,), 3, 1, 1, 1, 32, 2),
     (8, 8, "small", "dispatch"): ((8,), 3, 1, 1, 2, 32, 0),
     (8, 8, "small", "combine"): ((8,), 2, 1, 1, 2, 32, 2),
     (8, 8, "small", "weighted"): ((8,), 3, 1, 1, 2, 32, 2),
     (8, 32, "large", "dispatch"): ((8,), 2, 1, 1, 1, 16, 0),
-    (8, 32, "large", "combine"): ((8,), 3, 1, 1, 1, 16, 1),
-    (8, 32, "large", "weighted"): ((8,), 2, 2, 2, 1, 8, 0),
+    (8, 32, "large", "combine"): ((8,), 0, 1, 1, 1, 32, 1),
+    (8, 32, "large", "weighted"): ((8,), 0, 1, 1, 1, 32, 0),
     (8, 32, "small", "dispatch"): ((8,), 3, 1, 2, 1, 16, 0),
     (8, 32, "small", "combine"): ((8,), 2, 1, 2, 1, 8, 1),
     (8, 32, "small", "weighted"): ((8,), 3, 1, 1, 1, 16, 2),
     (16, 8, "large", "dispatch"): ((8, 16), 2, 2, 1, 1, 16, 0),
-    (16, 8, "large", "combine"): ((8, 16), 0, 2, 1, 1, 16, 2),
-    (16, 8, "large", "weighted"): ((8, 16), 2, 2, 1, 1, 32, 2),
+    (16, 8, "large", "combine"): ((8, 16), 0, 2, 1, 1, 8, 2),
+    (16, 8, "large", "weighted"): ((8, 16), 0, 2, 1, 1, 8, 2),
     (16, 8, "small", "dispatch"): ((8, 16), 1, 2, 1, 2, 32, 0),
     (16, 8, "small", "combine"): ((8, 16), 0, 2, 1, 2, 32, 2),
     (16, 8, "small", "weighted"): ((8, 16), 2, 4, 2, 1, 32, 2),
     (16, 32, "large", "dispatch"): ((8, 16), 2, 4, 2, 1, 16, 0),
     (16, 32, "large", "combine"): ((8, 16), 2, 2, 1, 1, 8, 1),
-    (16, 32, "large", "weighted"): ((8, 16), 2, 2, 1, 1, 4, 0),
+    (16, 32, "large", "weighted"): ((8, 16), 0, 2, 1, 1, 8, 0),
     (16, 32, "small", "dispatch"): ((8, 16), 0, 2, 2, 1, 8, 0),
     (16, 32, "small", "combine"): ((8, 16), 0, 2, 1, 1, 32, 1),
     (16, 32, "small", "weighted"): ((8, 16), 1, 2, 2, 1, 4, 0),
     (32, 32, "large", "dispatch"): ((8,), 1, 4, 1, 1, 32, 0),
-    (32, 32, "large", "combine"): ((8,), 3, 1, 1, 1, 8, 1),
+    (32, 32, "large", "combine"): ((8, 16), 0, 4, 1, 1, 8, 1),
     (32, 32, "large", "weighted"): ((8,), 2, 4, 1, 1, 4, 0),
 }

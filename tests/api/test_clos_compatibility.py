@@ -653,10 +653,10 @@ def test_ep16_weight_row_limit_preserves_payload_plan_across_core_budgets():
                         expected = 2 if size <= 8192 and plan.send_workers < cores else 1
                         assert plan.weight_mode == expected, (group,known,cores,size,plan)
                         assert replace(plan,weight_mode=1) == reference
-        # Reproduce the compared payload configuration, without a 48-core rule.
+        # The updated visit applies throughout the existing 32-core tier.
         policy = replace(base,ranks_per_group=8,topology_known=True)
-        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,4,2,2]
-        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,4,2,1]
+        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,8,2,2]
+        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,8,2,1]
     """)
 
 
@@ -796,19 +796,17 @@ def test_low_core_rank_defaults_match_measured_plans():
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
 
-        # Frozen rank arm of the T8192/H2816,H6144 device comparison.
-        # P/W/Q, visit, copy and UDMA weight mode are preserved, including
-        # EP8 weighted combine's newly available helper slot.
+        # Rank candidates keep sender capacity valid across the whole row interval.
         expected = {
             (4,'dispatch'): (1,1,2,32,3,0),
             (4,'combine'): (1,2,1,32,6,0),
             (4,'weighted'): (1,2,1,32,6,1),
-            (8,'dispatch'): (2,1,2,32,4,0),
-            (8,'combine'): (1,1,2,32,7,0),
+            (8,'dispatch'): (2,2,1,32,8,0),
+            (8,'combine'): (1,1,1,32,7,0),
             (8,'weighted'): (1,1,1,32,7,1),
             (16,'dispatch'): (2,1,1,16,8,0),
-            (16,'combine'): (2,1,1,16,8,0),
-            (16,'weighted'): (2,1,1,32,8,1),
+            (16,'combine'): (2,1,1,8,8,0),
+            (16,'weighted'): (2,1,1,8,8,1),
             (32,'dispatch'): (4,1,1,32,8,0),
             (32,'combine'): (4,1,1,32,8,0),
             (32,'weighted'): (4,1,1,32,8,1),
@@ -818,7 +816,7 @@ def test_low_core_rank_defaults_match_measured_plans():
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                            ranks_per_group=group,topology_known=True)
             original = base.native_plan()
-            for hidden in (2816,4096,6144):
+            for hidden in (2816,3072,4096,5120,6144):
                 plan = base.for_launch(8,hidden*2,op,bf16=True)
                 assert plan.native_plan() == [1,0,group,p,w,q,visit,2,mode]
                 assert plan.send_workers == senders
@@ -832,21 +830,21 @@ def test_32_core_rank_defaults_preserve_payload_and_weight_plans():
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
 
-        # EP8/16 anchors match the rank-only machine5 comparison. EP4's
-        # 32-core anchors preserve its pre-existing rank configuration.
+        # EP8/16 rank candidates and EP32 visit8 retain the actual core budget.
+        # EP4 preserves its pre-existing rank configuration.
         # P/W/Q, visit, sender count, self-copy, H2816/H6144 weight mode.
         expected = {
             (4,'dispatch'): (1,2,1,32,6,2,0,0),
             (4,'combine'): (1,2,1,32,6,1,0,0),
             (4,'weighted'): (1,2,1,32,6,2,2,1),
             (8,'dispatch'): (1,1,1,16,7,2,0,0),
-            (8,'combine'): (1,1,1,16,7,1,0,0),
-            (8,'weighted'): (2,2,1,8,8,2,2,1),
+            (8,'combine'): (1,1,1,32,7,1,0,0),
+            (8,'weighted'): (1,1,1,32,7,2,2,1),
             (16,'dispatch'): (4,2,1,16,8,2,0,0),
             (16,'combine'): (2,1,1,8,8,1,0,0),
-            (16,'weighted'): (2,1,1,4,8,2,2,1),
+            (16,'weighted'): (2,1,1,8,8,2,2,1),
             (32,'dispatch'): (4,1,1,32,8,2,0,0),
-            (32,'combine'): (4,1,1,32,8,1,0,0),
+            (32,'combine'): (4,1,1,8,8,1,0,0),
             (32,'weighted'): (4,1,1,32,8,2,2,1),
         }
         for (ep,op),(p,w,q,visit,senders,copy,small_mode,large_mode) in expected.items():
@@ -1119,7 +1117,8 @@ def test_benchmark_reports_separate_launch_plans():
             udma_peers_per_group_per_worker=None,udma_workers_per_peer=2,udma_qps_per_worker=1)
         result = effective_udma_config(b,num_aiv=8,row_bytes=5632,bf16=True)
         plans = result['operation_plans']
-        assert plans['dispatch']['qps_per_worker'] == 2
+        assert plans['dispatch']['qps_per_worker'] == 1
+        assert plans['dispatch']['workers_per_peer'] == 2
         assert plans['weighted']['qps_per_worker'] == 1
         assert plans['weighted']['weight_mode'] == 1
         assert plans['combine']['self_copy'] == 2
