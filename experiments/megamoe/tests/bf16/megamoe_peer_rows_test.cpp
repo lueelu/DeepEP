@@ -182,8 +182,33 @@ static void CheckTokenCountExchange()
                   compact.tokenCountsBytes == dense.tokenCountsBytes);
 }
 
+static void CheckForwardPeerTopology()
+{
+    constexpr uint32_t peers = 16;
+    std::vector<uint32_t> countsPrefix(peers), sourcePrefix(peers, 0);
+    for (uint32_t peer = 0; peer < peers; ++peer) countsPrefix[peer] = 2 * (peer + 1);
+    for (uint32_t ranksPerNode : {0U, 8U}) {
+        const PeerRowLayout<Prefix> layout{Prefix{countsPrefix}, Prefix{sourcePrefix}, peers, 1, 0, ranksPerNode};
+        MegaMoeImpl::PeerRowLimitsCache cache{};
+        for (uint32_t wave = 0; wave < 2; ++wave) {
+            const Slice slice{0, wave * peers, peers, wave, 2 * peers, wave * peers};
+            uint32_t visited = 0;
+            layout.ForEachSpan(
+                slice, slice.packed, slice.packed + peers, cache, [&](const auto& transfer, uint64_t packed) {
+                    const uint32_t peer = ranksPerNode == 0 ? visited : visited / 2 + (visited % 2 == 0 ? 8 : 0);
+                    assert(packed == slice.packed + visited && transfer.rowCount == 1 && transfer.sourceRank == peer);
+                    assert(layout.SourceRow(slice, transfer) == wave &&
+                           layout.SavedRow(slice, transfer) == 2 * peer + wave);
+                    ++visited;
+                });
+            assert(visited == peers);
+        }
+    }
+}
+
 int main()
 {
+    CheckForwardPeerTopology();
     CheckTokenCountExchange();
     CheckBackwardWaveRows();
     CheckDhpWaveOwnership();

@@ -76,7 +76,8 @@ struct BackwardResult {
 // Borrows the root Session window; Python controls its collective lifetime.
 class BF16Plan {
 public:
-    BF16Plan(uintptr_t address, int64_t bytes, int rank, int world_size, torch::Tensor like, bool weight_before_gmm2);
+    BF16Plan(uintptr_t address, int64_t bytes, int rank, int world_size, torch::Tensor like, bool weight_before_gmm2,
+             int ranks_per_node = 0);
 
     void close();
     void prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t local_experts, int64_t max_recv, double limit,
@@ -139,6 +140,7 @@ private:
     c10::optional<c10::Stream> context_stream_;
     c10::optional<c10::Stream> workspace_stream_;
     bool weight_before_gmm2_;
+    int ranks_per_node_;
 
     int context_rank_ = -1;
     int context_world_size_ = -1;

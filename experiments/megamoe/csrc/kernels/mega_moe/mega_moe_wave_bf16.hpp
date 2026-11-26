@@ -933,8 +933,9 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::DispatchWave(const WaveR
         if (begin < end) {
             MegaMoeTrainTimerPassiveScope dispatch(timer_, MegaMoeTrainTimer::AIV_DISPATCH, slice.expert,
                                                    static_cast<uint32_t>(begin - expertBase), end - begin);
-            const PeerRowLayout<UbPeerPrefix> layout{
-                {waveCumsum_}, {waveSourcePrefix_}, worldSize_, expertPerRank_, rankId_};
+            const PeerRowLayout<UbPeerPrefix> layout{{waveCumsum_}, {waveSourcePrefix_},
+                                                     worldSize_,    expertPerRank_,
+                                                     rankId_,       params_.tilingData->dispatchRanksPerNode};
             layout.ForEachSpan(
                 slice, begin, end, dispatchPeerLimits_, [&](const PeerTransfer& t, uint64_t packed) __aicore__ {
                     CopyWavePayload(t.sourceRank, layout.SourceRow(slice, t),
@@ -1005,7 +1006,9 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::SwigluWave(const WaveRan
                     MegaMoeTrainTimerPassiveScope save(timer_, MegaMoeTrainTimer::AIV_SAVE_GATE_UP, slice.expert,
                                                        slice.row + m, shape.m(), n, kGmm1Rows, kPairedColumns, k_, f);
 #endif
-                    const PeerRowLayout<UbPeerPrefix> layout{{waveCumsum_}, {}, worldSize_, expertPerRank_, rankId_};
+                    const PeerRowLayout<UbPeerPrefix> layout{{waveCumsum_}, {},
+                                                             worldSize_,    expertPerRank_,
+                                                             rankId_,       params_.tilingData->dispatchRanksPerNode};
                     const uint64_t first = slice.packed + m;
                     layout.ForEachSpan(slice, first, first + shape.m(), savePeerLimits_,
                                        [&](const PeerTransfer& t, uint64_t packed) __aicore__ {
@@ -1094,7 +1097,9 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::CombineSlice(const WaveS
     LocalTensor<bfloat16_t> buffers[2] = {{TPosition::VECIN, 0, rowElements},
                                           {TPosition::VECIN, rowElements * uint32_t(sizeof(bfloat16_t)), rowElements}};
     using namespace MegaMoeBF16Impl::Wave;
-    const PeerRowLayout<UbPeerPrefix> layout{{waveCumsum_}, {waveSourcePrefix_}, worldSize_, expertPerRank_, rankId_};
+    const PeerRowLayout<UbPeerPrefix> layout{{waveCumsum_}, {waveSourcePrefix_},
+                                             worldSize_,    expertPerRank_,
+                                             rankId_,       params_.tilingData->dispatchRanksPerNode};
     auto* sliceOutput = reinterpret_cast<__gm__ bfloat16_t*>(SliceOutput(scratchRow));
     layout.ForEachSpan(
         slice, begin, end, combinePeerLimits_, [&](const PeerTransfer& t, uint64_t packedRow) __aicore__ {
@@ -1340,7 +1345,8 @@ __aicore__ inline void MegaMoeBF16Forward<TopkWeightT>::SaveDispatchWeights()
     GlobalTensor<TopkWeightT> src, dst;
     src.SetGlobalBuffer(reinterpret_cast<__gm__ TopkWeightT*>(waveWeights_));
     dst.SetGlobalBuffer(reinterpret_cast<__gm__ TopkWeightT*>(params_.workspaceInfo.ptrDispatchedTopkWeights));
-    const PeerRowLayout<UbPeerPrefix> layout{{waveCumsum_}, {}, worldSize_, expertPerRank_, rankId_};
+    const PeerRowLayout<UbPeerPrefix> layout{{waveCumsum_},  {},      worldSize_,
+                                             expertPerRank_, rankId_, params_.tilingData->dispatchRanksPerNode};
     const WaveCounts counts{waveExpertRows_};
     Cursor cursor{};
     WaveSlice slice{};

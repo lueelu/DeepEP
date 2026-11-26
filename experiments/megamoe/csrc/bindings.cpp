@@ -42,7 +42,9 @@ PYBIND11_MODULE(_C, module)
         .def_readonly("dw2", &BackwardResult::dw2)
         .def_readonly("timer", &BackwardResult::timer);
     py::class_<BF16Plan>(module, "BF16Plan")
-        .def(py::init<uintptr_t, int64_t, int, int, torch::Tensor, bool>())
+        .def(py::init<uintptr_t, int64_t, int, int, torch::Tensor, bool, int>(), py::arg("address"), py::arg("bytes"),
+             py::arg("rank"), py::arg("world_size"), py::arg("like"), py::arg("weight_before_gmm2"),
+             py::arg("ranks_per_node") = 0)
         .def("prepare", &BF16Plan::prepare)
         .def_property_readonly("workspace_bytes", &BF16Plan::workspace_bytes)
         .def("forward", &BF16Plan::forward, py::arg("out"), py::arg("x"), py::arg("topk_ids"), py::arg("topk_weights"),

@@ -51,5 +51,6 @@ struct MegaMoeBf16TilingData {
     // Training multiplies p before GMM2; inference weights each route during Unpermute.
     uint32_t routeWeightBeforeGmm2{1};
     uint32_t backwardSplitExperts{0};
+    uint32_t dispatchRanksPerNode{0};
 };
 #endif

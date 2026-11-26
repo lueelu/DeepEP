@@ -59,6 +59,7 @@ def prepare_plan(b, bs, limit, save_type):
         b.max_recv_tokens,
         b.topk_weights.dtype,
         b.need_grad,
+        b.ranks_per_node,
         mode,
         limit,
     )
@@ -66,7 +67,13 @@ def prepare_plan(b, bs, limit, save_type):
         native = require_native("BF16 MegaMoE")
         address = native.megamoe_workspace_address(b._runtime.native)
         plan = _extension().BF16Plan(
-            address, b._runtime.native.capacity, b._runtime.rank, b._runtime.world_size, b.x[:bs], b.need_grad
+            address,
+            b._runtime.native.capacity,
+            b._runtime.rank,
+            b._runtime.world_size,
+            b.x[:bs],
+            b.need_grad,
+            b.ranks_per_node,
         )
         plan.prepare(
             bs,

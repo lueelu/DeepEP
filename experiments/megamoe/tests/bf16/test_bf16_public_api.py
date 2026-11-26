@@ -23,8 +23,9 @@ def buffer(monkeypatch):
     monkeypatch.setattr(api, "npu_api", lambda: SimpleNamespace(current_stream=lambda device: stream))
 
     class Plan:
-        def __init__(self, *args):
-            self.before = args[-1]
+        def __init__(self, address, capacity, rank, world_size, like, weight_before_gmm2, ranks_per_node):
+            self.before = weight_before_gmm2
+            self.ranks_per_node = ranks_per_node
             plans.append(self)
 
         def prepare(self, *args):
@@ -66,6 +67,7 @@ def buffer(monkeypatch):
     b.save_dispatched_x = True
     b.dispatch_rebuilder = None
     b.need_grad = True
+    b.ranks_per_node = 0
     b.gmm1_save_type = "bf16"
     b.mma_type = "bf16xbf16"
     b._plan = b._plan_key = b._plan_bs = None
@@ -222,6 +224,18 @@ def test_forward_and_prepare_validate_routing_inputs_once(buffer, monkeypatch):
     with pytest.raises(ValueError, match="topk_weights"):
         b.prepare(3)
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("need_grad", [False, True])
+def test_bf16_plan_uses_buffer_peer_topology(buffer, need_grad):
+    b, _, plans = buffer
+    b.need_grad = need_grad
+    _, _, w1, w2 = inputs(b, grad=need_grad)
+    call(b, w1, w2)
+    b.ranks_per_node = 1
+    call(b, w1, w2)
+    call(b, w1, w2)
+    assert [plan.ranks_per_node for plan in plans] == [0, 1]
 
 
 def test_prepared_plan_is_reused_and_no_grad_keeps_preweight_semantics(buffer):

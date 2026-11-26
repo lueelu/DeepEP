@@ -23,6 +23,7 @@ template <class Prefix>
 struct PeerRowLayout {
     Prefix countsPrefix, sourcePrefix;
     uint32_t peers, experts, rank;
+    uint32_t ranksPerNode = 0;
 
     MEGA_MOE_PEER_HOST_DEVICE inline uint32_t SourceRow(const Slice& s, const MegaMoeImpl::PeerTransfer& t) const
     {
@@ -44,7 +45,7 @@ struct PeerRowLayout {
         const auto& limits = MegaMoeImpl::GetCachedPeerRowLimits(cache, counts, slice.expert, peers);
         MegaMoeImpl::PeerTransferCursor<PeerCounts<Prefix>> cursor(
             counts, limits, slice.row, slice.row + slice.rows, static_cast<uint32_t>(begin - expertBase),
-            static_cast<uint32_t>(end - expertBase), peers, rank);
+            static_cast<uint32_t>(end - expertBase), peers, rank, ranksPerNode);
         MegaMoeImpl::PeerTransfer transfer{};
         while (cursor.Next(transfer)) {
             visit(transfer, expertBase + transfer.destinationRow);

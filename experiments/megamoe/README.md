@@ -231,6 +231,8 @@ python -m pip install --force-reinstall --no-deps dist/*.whl
 
 ## 3. 多机测试
 
+`SymmBuffer` 的 `ranks_per_node` 默认为 `0`。同一 EP 组内，各机的 rank 数相同且按机器连续编号时，可填每机参与该组的 rank 数，例如 `8`。
+
 各节点使用同一 wheel，并加载相同的 CANN 和 SHMEM 环境。W4A8 的批量脚本从控制机启动；BF16 的推理和训练使用同一测试脚本，在每个节点运行 `torchrun`。W8A8 可通过量化接口调用，当前批量脚本固定生成 FP4 权重，没有权重 dtype 开关。`--input bf16` 只切换 W4A8 的激活输入。
 
 ### W4A8 批量测试

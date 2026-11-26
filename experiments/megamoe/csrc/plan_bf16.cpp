@@ -303,11 +303,19 @@ torch::Tensor BF16Plan::AllocateTimer(const torch::Tensor& like, const torch::Te
 }
 
 BF16Plan::BF16Plan(uintptr_t address, int64_t bytes, int rank, int world_size, torch::Tensor like,
-                   bool weight_before_gmm2)
-    : address_(address), bytes_(bytes), rank_(rank), world_size_(world_size), weight_before_gmm2_(weight_before_gmm2)
+                   bool weight_before_gmm2, int ranks_per_node)
+    : address_(address),
+      bytes_(bytes),
+      rank_(rank),
+      world_size_(world_size),
+      weight_before_gmm2_(weight_before_gmm2),
+      ranks_per_node_(ranks_per_node)
 {
     TORCH_CHECK(address != 0 && bytes > 0 && bytes % kDeviceLargePageBytes == 0, "invalid borrowed training window");
     TORCH_CHECK(rank >= 0 && rank < world_size && world_size <= 1024, "invalid training rank/world size");
+    TORCH_CHECK(
+        ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world_size && world_size % ranks_per_node == 0),
+        "BF16Plan ranks_per_node must divide EP");
     TORCH_CHECK(aclshmem_my_pe() == rank && aclshmem_n_pes() == world_size,
                 "training identity disagrees with the root Session");
     ffts_addr_ = shmemx_get_ffts_config();
@@ -336,6 +344,7 @@ void BF16Plan::prepare(int64_t m, int64_t h, int64_t f, int64_t topk, int64_t lo
     static_assert(DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE == 0 || DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE == 1,
                   "BF16 training forward schedule must be 0 (interleaved) or 1 (staged)");
     tiling.routeWeightBeforeGmm2 = weight_before_gmm2_ ? 1U : 0U;
+    tiling.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node_);
     tiling.forwardSchedule = weight_before_gmm2_ ? DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE : 0U;
     const auto host =
         MakeBf16Tiling(tiling, m, h, f, topk, world_size_, local_experts, max_recv, rank_, limit,
