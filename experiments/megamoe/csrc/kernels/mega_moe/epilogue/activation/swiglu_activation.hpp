@@ -11,6 +11,7 @@
 
 #if defined(__DAV_C310__)
 #include "activation_common.hpp"
+#include "swiglu_math.hpp"
 
 namespace MegaMoeImpl {
 namespace Activation {
@@ -23,8 +24,6 @@ struct SwiGluParams {
 template <typename InputType, bool FuseTopkWeight, bool IsStep>
 __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& context, const SwiGluParams& params)
 {
-    const float scalarOne = 1.0F;
-    const float negScalarOne = -1.0F;
     bfloat16_t zeroValue = 0;
     const uint16_t rowLoopCount = context.rowLoopCount;
     const uint16_t fullVectorLoopCount = context.fullVectorLoopCount;
@@ -75,14 +74,8 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
                 AscendC::Reg::Mins(upFp32Reg, upFp32Reg, params.clampLimit, fullMask);
                 AscendC::Reg::Maxs(upFp32Reg, upFp32Reg, -params.clampLimit, fullMask);
 
-                AscendC::Reg::Muls(negReg, gateFp32Reg, negScalarOne, fullMask);
-                AscendC::Reg::Exp(expReg, negReg, fullMask);
-                AscendC::Reg::Adds(denominatorReg, expReg, scalarOne, fullMask);
-                AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, fullMask);
-                if constexpr (IsStep) {
-                    AscendC::Reg::Mins(sigmoidReg, sigmoidReg, params.clampLimit, fullMask);
-                }
-                AscendC::Reg::Mul(outputFp32Reg, sigmoidReg, upFp32Reg, fullMask);
+                SwiGluFp32<false, IsStep>(outputFp32Reg, gateFp32Reg, upFp32Reg, negReg, expReg, denominatorReg,
+                                          sigmoidReg, fullMask, params.clampLimit);
                 if constexpr (FuseTopkWeight) {
                     AscendC::Reg::Mul(outputFp32Reg, outputFp32Reg, weightReg, fullMask);
                 }
@@ -112,14 +105,8 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
                 AscendC::Reg::Mins(upFp32Reg, upFp32Reg, params.clampLimit, tailComputeMask);
                 AscendC::Reg::Maxs(upFp32Reg, upFp32Reg, -params.clampLimit, tailComputeMask);
 
-                AscendC::Reg::Muls(negReg, gateFp32Reg, negScalarOne, tailComputeMask);
-                AscendC::Reg::Exp(expReg, negReg, tailComputeMask);
-                AscendC::Reg::Adds(denominatorReg, expReg, scalarOne, tailComputeMask);
-                AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, tailComputeMask);
-                if constexpr (IsStep) {
-                    AscendC::Reg::Mins(sigmoidReg, sigmoidReg, params.clampLimit, tailComputeMask);
-                }
-                AscendC::Reg::Mul(outputFp32Reg, sigmoidReg, upFp32Reg, tailComputeMask);
+                SwiGluFp32<false, IsStep>(outputFp32Reg, gateFp32Reg, upFp32Reg, negReg, expReg, denominatorReg,
+                                          sigmoidReg, tailComputeMask, params.clampLimit);
                 if constexpr (FuseTopkWeight) {
                     AscendC::Reg::Mul(outputFp32Reg, outputFp32Reg, weightReg, tailComputeMask);
                 }

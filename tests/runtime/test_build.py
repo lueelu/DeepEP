@@ -385,7 +385,10 @@ def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing
         "deep_ep/_C.fake.so",
         "deep_ep/libdeepep_kernels.so",
         "deep_ep/deepseek-deepep.LICENSE",
+        "deep_ep_experimental/megamoe/__init__.py",
         "deep_ep_experimental/megamoe/api.py",
+        "deep_ep_experimental/megamoe/_bf16.py",
+        "deep_ep_experimental/megamoe/_autograd.py",
         "deep_ep_experimental/megamoe/benchmark.py",
         "deep_ep_experimental/megamoe/configs/smoke.json",
         "deep_ep_experimental/megamoe/_C.fake.so",
@@ -410,6 +413,7 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         "source_sha256": "before",
         "source_version": "1",
         "build_type": "Release",
+        "megamoe": {"enabled": True, "timer": False, "bf16_forward_schedule": "0"},
         "ASCEND_HOME_PATH": "/sdk/cann",
         "SHMEM_ROOT": "/sdk/shmem",
         "arch": "Ascend950",
@@ -422,6 +426,7 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
     key = build.build_cache_key(configuration)
     assert build.build_cache_key({**configuration, "source_sha256": "after", "source_version": "2"}) == key
     for name, value in (
+        ("megamoe", {**configuration["megamoe"], "bf16_forward_schedule": "1"}),
         ("build_type", "RelWithDebInfo"),
         ("ASCEND_HOME_PATH", "/sdk/new-cann"),
         ("SHMEM_ROOT", "/sdk/new-shmem"),
@@ -587,9 +592,12 @@ def test_source_native_recovers_after_build_directory_removed(build, source_nati
 
 
 @pytest.mark.parametrize(
-    "beta,timer,inplace", [(False, False, False), (True, False, False), (True, True, False), (False, False, True)]
+    "beta,timer,inplace,schedule",
+    [(False, False, False, "0"), (True, False, False, "0"), (True, True, False, "1"), (False, False, True, "0")],
 )
-def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer, inplace):
+def test_packaging_uses_cmake_capabilities_and_removes_old_library(
+    build, monkeypatch, tmp_path, beta, timer, inplace, schedule
+):
     from setuptools import Distribution, Extension
 
     # This CPU-only test mocks the build tools, including their discovery paths.
@@ -599,7 +607,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     monkeypatch.setitem(sys.modules, "pybind11", pybind11)
 
     configuration = {
-        "megamoe": {"enabled": beta, "timer": timer},
+        "megamoe": {"enabled": beta, "timer": timer, "bf16_forward_schedule": schedule},
         "CATLASS_ROOT": "/private/catlass" if beta else "",
         "source_sha256": "current",
         "source_version": "1",
@@ -656,6 +664,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
     assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
+    assert f"-DDEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE={schedule}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert calls[1][-2:] == ["--parallel", "6"]
     assert not (destination / "libdeepep_notify.so").exists()
@@ -663,7 +672,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     info = json.loads((destination / "_build_info.json").read_text())
     assert info["capabilities"] == capabilities["capabilities"]
     assert info["source_sha256"] == "current"
-    assert info["megamoe"] == {"enabled": beta, "timer": timer}
+    assert info["megamoe"] == configuration["megamoe"]
     assert "CATLASS_ROOT" not in info
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
 

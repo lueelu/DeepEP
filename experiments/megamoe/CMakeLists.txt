@@ -16,7 +16,17 @@ find_package(Torch REQUIRED)
 find_library(TORCH_NPU_LIBRARY torch_npu PATHS "${torch_npu_root}/lib" NO_DEFAULT_PATH REQUIRED)
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH REQUIRED)
 
-set(beta_include
+set(DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE "0" CACHE STRING "BF16 training forward: 0=interleaved, 1=staged")
+if(NOT DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE MATCHES "^[01]$")
+    message(FATAL_ERROR "DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE must be 0 or 1")
+endif()
+
+set(megamoe_definitions CATLASS_ARCH=3510)
+if(DEEPEP_MEGAMOE_TIMER)
+    list(APPEND megamoe_definitions DEEPEP_MEGAMOE_TIMER=1)
+endif()
+set(quantized_include_dirs
+    "${PROJECT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe"
     "${CATLASS_ROOT}/include" "${CATLASS_ROOT}/examples/common"
@@ -31,53 +41,83 @@ set(beta_include
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}"
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api"
     "${ASCEND_DEEPEP_MEGA_MOE_COMMON_INCLUDE_DIR}/tensor_api/include")
-set(kernel_flags
-    -O2 -std=c++17 -xasc --npu-arch=dav-3510 --cce-auto-infer-kernel-type=false
-    --cce-auto-sync=off --cce-fatobj-link -shared -fPIC -Wl,-soname,libmegamoe_kernel.so
-    -DCATLASS_ARCH=3510 -DASCEND_DEEPEP_DIRECT_TENSOR_INPUT=1
+set(bf16_include_dirs "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe/common"
+    "${CATLASS_ROOT}/include" "${CATLASS_ROOT}/examples/common"
+    "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src" "${SHMEM_ROOT}/src/device"
+    "${ASCEND_HOME_PATH}/include" "${ASCEND_HOME_PATH}/pkg_inc"
+    "${ASCEND_HOME_PATH}/include/experiment/runtime"
+    "${ASCEND_HOME_PATH}/pkg_inc/runtime" "${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime"
+    "${ASCEND_HOME_PATH}/aarch64-linux/include" "${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc"
+    "${ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/runtime"
+    "${ASCEND_HOME_PATH}/aarch64-linux/asc/include"
+    "${ASCEND_HOME_PATH}/compiler/tikcpp" "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw"
+    "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/interface" "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/impl"
+    "${PROJECT_SOURCE_DIR}")
+# BF16 Host and device share the schedule and workspace definitions.
+set(bf16_definitions DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE=${DEEPEP_MEGAMOE_BF16_FORWARD_SCHEDULE})
+
+# One compile configuration for every entry: the training kernels align to
+# the quantized regime (auto-sync off, static compile, tensor API), keeping
+# only the BF16 schedule macros the code consumes.
+set(megamoe_device_flags -O2 -std=c++17 -fPIC -xasc --npu-arch=dav-3510
+    --cce-auto-infer-kernel-type=false --cce-auto-sync=off -DL2_CACHE_HINT
+    -DASCEND_DEEPEP_DIRECT_TENSOR_INPUT=1
     -DASCEND_DEEPEP_DISABLE_MEGA_MOE_EXCEPTION_DUMP=1 -DENABLE_TENSOR_API
-    -DNOT_DYNAMIC_COMPILE -DHIGH_PERFORMANCE=1 -DDETERMINISTIC_MODE=0 -DL2_CACHE_HINT)
-if(DEEPEP_MEGAMOE_TIMER)
-    list(APPEND kernel_flags -DDEEPEP_MEGAMOE_TIMER=1)
-endif()
-foreach(path IN LISTS beta_include)
-    list(APPEND kernel_flags "-I${path}")
+    -DNOT_DYNAMIC_COMPILE -DHIGH_PERFORMANCE=1 -DDETERMINISTIC_MODE=0)
+foreach(definition IN LISTS megamoe_definitions bf16_definitions)
+    list(APPEND megamoe_device_flags "-D${definition}")
+endforeach()
+foreach(path IN LISTS quantized_include_dirs bf16_include_dirs)
+    list(APPEND megamoe_device_flags "-I${path}")
 endforeach()
 find_file(api_header ascendc_api_version.h
     PATHS "${ASCEND_HOME_PATH}/compiler/tikcpp/tikcfw/lib"
-          "${ASCEND_HOME_PATH}/aarch64-linux/tikcpp/tikcfw/lib" NO_DEFAULT_PATH)
+    "${ASCEND_HOME_PATH}/aarch64-linux/tikcpp/tikcfw/lib" NO_DEFAULT_PATH)
 if(api_header)
     file(STRINGS "${api_header}" api_version REGEX "^#define ASCENDC_API_VERSION [0-9]+")
     string(REGEX REPLACE ".*ASCENDC_API_VERSION ([0-9]+).*" "\\1" api_version "${api_version}")
-    list(APPEND kernel_flags "-DASCENDC_API_VERSION=${api_version}")
+    list(APPEND megamoe_device_flags "-DASCENDC_API_VERSION=${api_version}")
 endif()
+
+file(GLOB_RECURSE megamoe_headers CONFIGURE_DEPENDS "csrc/*.hpp" "${PROJECT_SOURCE_DIR}/csrc/kernels/common/*.hpp")
+set(megamoe_objects)
+set(entry_source "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe/mega_moe.cpp")
+set(object "${CMAKE_CURRENT_BINARY_DIR}/mega_moe.o")
+add_custom_command(OUTPUT "${object}"
+    COMMAND "${BISHENG}" ${megamoe_device_flags} -c "${entry_source}" -o "${object}"
+    DEPENDS "${entry_source}" ${megamoe_headers} VERBATIM)
+list(APPEND megamoe_objects "${object}")
+
 set(kernel_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_kernel.so")
-file(GLOB_RECURSE kernel_headers CONFIGURE_DEPENDS "csrc/kernels/*.hpp")
 add_custom_command(OUTPUT "${kernel_library}"
-    COMMAND "${BISHENG}" ${kernel_flags} csrc/kernels/mega_moe/mega_moe.cpp
-        "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
-        -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
-        -o "${kernel_library}"
-    DEPENDS csrc/kernels/mega_moe/mega_moe.cpp csrc/kernel_launch.hpp ${kernel_headers}
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
+    COMMAND "${BISHENG}" -shared --cce-fatobj-link ${megamoe_objects}
+    "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
+    -Wl,--no-as-needed -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl
+    -Wl,--as-needed -lstdc++ -lm "-Wl,-rpath,$ORIGIN"
+    -Wl,-soname,libmegamoe_kernel.so -o "${kernel_library}"
+    DEPENDS ${megamoe_objects} VERBATIM)
 add_custom_target(megamoe_device DEPENDS "${kernel_library}")
-pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp)
-set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
-    INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
-target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include")
-separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
-target_compile_options(megamoe_ext PRIVATE ${torch_flags} -O2 -fstack-protector-strong)
-target_compile_definitions(megamoe_ext PRIVATE CATLASS_ARCH=3510)
-if(DEEPEP_MEGAMOE_TIMER)
-    target_compile_definitions(megamoe_ext PRIVATE DEEPEP_MEGAMOE_TIMER=1)
-endif()
 add_library(megamoe_kernel SHARED IMPORTED)
 set_target_properties(megamoe_kernel PROPERTIES IMPORTED_LOCATION "${kernel_library}")
-add_dependencies(megamoe_ext megamoe_device)
+
+pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/plan_quantized.cpp csrc/plan_bf16.cpp
+    csrc/forward.cpp csrc/backward.cpp)
+set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
+    INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
+target_include_directories(megamoe_ext PRIVATE ${quantized_include_dirs} ${bf16_include_dirs}
+    ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include" "${torch_npu_root}/..")
+separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+target_compile_options(megamoe_ext PRIVATE ${torch_flags} -O2 -fstack-protector-strong)
+target_compile_definitions(megamoe_ext PRIVATE ${megamoe_definitions} ${bf16_definitions})
 target_link_libraries(megamoe_ext PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIBRARY}"
-    "${TORCH_NPU_LIBRARY}" megamoe_kernel shmem ascendcl)
+    "${TORCH_NPU_LIBRARY}" megamoe_kernel shmem ascendcl ascend_runtime)
 target_link_directories(megamoe_ext PRIVATE "${ASCEND_HOME_PATH}/lib64")
 target_link_libraries(megamoe_ext PRIVATE platform tiling_api)
 target_link_options(megamoe_ext PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
+add_dependencies(megamoe_ext megamoe_device)
+
 install(TARGETS megamoe_ext LIBRARY DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)

@@ -75,8 +75,8 @@ __aicore__ inline void CombineTokens(uint32_t nLoc, uint32_t n, LocalTensor<int3
     ub2GmParams.blockLen = Get<N_VALUE>(actualBlockShape) * sizeof(ElementMMadOut2);
     for (int32_t tileIdx = 0; tileIdx < lenTile; ++tileIdx) {
         CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, static_cast<uint32_t>(tileIdx));
-        gmRemoteD.SetGlobalBuffer(
-            reinterpret_cast<__gm__ ElementMMadOut2*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
+        gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ ElementMMadOut2*>(
+            GetRankWinAddrWithOffset(g_winRankAddr_, route.dstRankId, gmRemoteBaseOffset)));
         uint64_t gmDstOffset = GetCombineDstRowIndex(route, params) * n + nLoc;
         AscendC::DataCopyPad(gmRemoteD[gmDstOffset], l0cOutUbGMM2[tileIdx * ubTileN], ub2GmParams);
     }
@@ -91,8 +91,8 @@ __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemo
     CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, 0U);
 
     GlobalTensor<Element> gmRemoteD;
-    gmRemoteD.SetGlobalBuffer(
-        reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
+    gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(
+        GetRankWinAddrWithOffset(g_winRankAddr_, route.dstRankId, gmRemoteBaseOffset)));
     uint64_t gmDstRowOffset = GetCombineDstRowIndex(route, params) * rowElements;
 
     DataCopyExtParams ub2GmParams{1U, static_cast<uint32_t>(rowElements * sizeof(Element)), 0U, 0U, 0U};
@@ -118,7 +118,7 @@ __aicore__ inline void CombineSendTokenToRemote(uint32_t batchStart, uint32_t cu
     GM_ADDR srcAddr = localSrcPtr;
 
     if (toRankId == rankId) {
-        srcAddr = GetRankWinAddrWithOffset(toRankId, gmRemoteOffset);
+        srcAddr = GetRankWinAddrWithOffset(g_winRankAddr_, toRankId, gmRemoteOffset);
     }
 
     gmLocalD.SetGlobalBuffer(reinterpret_cast<__gm__ DataType*>(srcAddr));
@@ -144,7 +144,8 @@ __aicore__ inline void CombineSendTokenToRemote(uint32_t batchStart, uint32_t cu
 
     if (toRankId != rankId) {
         uint64_t channelHandle = GetUrmaCommHandle(params.combineCommParams.mc2Context, toRankId, rankId);
-        GM_ADDR remoteAddr = GetRankWinAddrWithOffset(toRankId, gmRemoteOffset) + dstBaseOffset * sizeof(DataType);
+        GM_ADDR remoteAddr =
+            GetRankWinAddrWithOffset(g_winRankAddr_, toRankId, gmRemoteOffset) + dstBaseOffset * sizeof(DataType);
         params.combineCommParams.hcomm->WriteNbi(channelHandle, remoteAddr, srcAddr, quantTokenSize * sizeof(DataType));
     }
 #endif
@@ -162,7 +163,7 @@ __aicore__ inline void CombineQuantizedTokens(uint32_t batchStart, uint32_t curR
     AscendC::GlobalTensor<QuantOutType> gmRemoteD;
     uint64_t gmRemoteOffset =
         static_cast<uint64_t>(params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr);
-    __gm__ void* dstPeermemPtr = GetRankWinAddrWithOffset(route.dstRankId, gmRemoteOffset);
+    __gm__ void* dstPeermemPtr = GetRankWinAddrWithOffset(g_winRankAddr_, route.dstRankId, gmRemoteOffset);
     gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ QuantOutType*>(dstPeermemPtr));
 
     uint64_t dstBaseOffset = GetCombineDstRowIndex(route, params) * quantTokenSizeBytes;
@@ -674,13 +675,14 @@ __aicore__ inline void Gmm2AicMmadA8W4(BlockMmad& blockMmad, Scheduler& schedule
         }
 
         blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape));
-        if constexpr ((NotifyCombineTileReady || TokenCombine) && !IsShared) {
-            // 保留 tile 基线的 FIX 完成边界；token 路径改在 slice 结束后发布行前缀，
-            // 不再推进 GMM1/SwiGLU 复用的配对序号。
+        if constexpr (NotifyCombineTileReady && !IsShared) {
             AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
-            if constexpr (NotifyCombineTileReady) {
-                AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag, ++(*gmTileSequence));
+            AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag, ++(*gmTileSequence));
+        } else if constexpr (TokenCombine) {
+            if (gmmAddrInfo.routedA8W4Pipeline == nullptr) {
+                AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
+                AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
             }
         } else if constexpr (IsLayered && !IsShared) {
             NotifyCombineConsumersOfTileCompletion(rowOffsetInExpert + mLoc, groupSyncSlotLayout,
@@ -775,6 +777,24 @@ __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmm
                                     uint32_t rowOffsetInExpert, const Params* params = nullptr,
                                     int32_t* gmTileSequence = nullptr)
 {
+    if constexpr (TokenCombine) {
+        if (gmmAddrInfo.routedA8W4Pipeline != nullptr) {
+            // The routed GMM1 and GMM2 launchers instantiate the same Config.
+            auto& kernel = *static_cast<CatlassGmm1<Config>*>(gmmAddrInfo.routedA8W4Pipeline);
+            if constexpr (g_coreType == AscendC::AIC) {
+                kernel.UpdateDownProblem(config, gmmAddrInfo);
+                kernel.Begin();
+                Gmm2AicMmadA8W4<IsShared, IsLayered, NotifyCombineTileReady, TokenCombine>(
+                    kernel, scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, expertTokenCount, rowOffsetInExpert,
+                    gmTileSequence);
+            } else if (GetSubBlockIdx() == 0U) {
+                kernel.UpdateDownProblem(config, gmmAddrInfo);
+                kernel.Begin();
+                Gmm2Aiv0PrologueA8W4(kernel, scheduler, config, startLoopIdx, tileNum);
+            }
+            return;
+        }
+    }
     using KernelConfig = typename Config::KernelConfig;
     using ElementA = typename KernelConfig::ElementAType;
     using ElementB = typename KernelConfig::ElementBType;
@@ -848,12 +868,11 @@ __aicore__ inline void RunGmm2Generic(const AscendC::Shape<int64_t, int64_t, int
     uint32_t tileNum = scheduler.GetTileNum();
 
     if constexpr (CombineQuantMode == COMBINE_NO_QUANT && g_coreType == AscendC::AIV && !NotifyCombineTileReady) {
-        startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+        startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
         return;
     }
 
-    uint32_t startLoopIdx =
-        (config.blockIdx < startBlockIdx ? config.blockIdx + config.blockNum : config.blockIdx) - startBlockIdx;
+    uint32_t startLoopIdx = GetGmmFirstOwnedTile(config.blockIdx, config.blockNum, startBlockIdx);
     using BlockMmad = typename GmmConfig::BlockMmad;
     using MmadContext = GmmKernel::BlockMmadContext<BlockMmad>;
     auto* typedBlockMmadContext = reinterpret_cast<MmadContext*>(blockMmadContext);
@@ -861,7 +880,7 @@ __aicore__ inline void RunGmm2Generic(const AscendC::Shape<int64_t, int64_t, int
         scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, typedBlockMmadContext, allowWeightL2Bypass,
         rowOffsetInExpert, params, gmTileSequence);
 
-    startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+    startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
 }
 
 template <uint8_t CombineQuantMode, typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA,
@@ -913,7 +932,7 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
     uint32_t tileNum = scheduler.GetTileNum();
     uint32_t startLoopIdx = GetGmmFirstOwnedTile(config.blockIdx, config.blockNum, startBlockIdx, reverseBlocks);
     if (startLoopIdx >= tileNum) {
-        startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+        startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
         return;
     }
 
@@ -922,7 +941,7 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
                                                                          tileNum, expertTokenCount, rowOffsetInExpert,
                                                                          params, gmTileSequence);
 
-    startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+    startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
 }
 
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,
@@ -953,14 +972,15 @@ __aicore__ inline void UpdateMoeExpertGmm2GlobalBuffer(const GmmExecutionConfig&
     constexpr uint32_t activationOutputElementsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
     uint64_t gmm1OutputDim = static_cast<uint64_t>(Get<N_VALUE>(state.problemShape));
     uint64_t tokenHiddenDim = static_cast<uint64_t>(Get<K_VALUE>(state.problemShape));
-    uint64_t globalTokenStartIndex = static_cast<uint64_t>(state.globalTokenStartIndex) + rowOffsetInExpert;
+    uint64_t logicalRow = static_cast<uint64_t>(state.globalTokenStartIndex) + rowOffsetInExpert;
+    uint64_t globalTokenStartIndex = logicalRow + workspace.waveRowDelta;
     uint32_t expertMGroupOffset = rowOffsetInExpert / L1_TILE_M_256;
     uint64_t activationOutputWidth = gmm1OutputDim / ACTIVATION_N_HALF;
     uint64_t activationScaleWidth =
         Ops::Base::CeilDiv(activationOutputWidth, static_cast<uint64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
 
     gmmAddrInfo.gmm2OutGlobal = workspace.gmm2MmadResPtr + globalTokenStartIndex * tokenHiddenDim * sizeof(bfloat16_t);
-    gmmAddrInfo.metaInfoGlobal = workspace.metaInfoPtr + globalTokenStartIndex * META_INFO_SIZE * sizeof(int32_t);
+    gmmAddrInfo.metaInfoGlobal = workspace.metaInfoPtr + logicalRow * META_INFO_SIZE * sizeof(int32_t);
     gmmAddrInfo.aGlobal = workspace.activationQuantDataPtr + globalTokenStartIndex * activationOutputWidth /
                                                                  activationOutputElementsPerByte *
                                                                  sizeof(ActivationOutType);
@@ -1165,9 +1185,8 @@ __aicore__ inline __gm__ int32_t* GetTokenCombineReadyCounter(const Params& para
 __aicore__ inline uint32_t GetTokenCombineProducerCount(const MoeStageCommonConfig& common, const AivJobContext& job,
                                                         uint32_t rowCount)
 {
-    uint32_t tiles = GetMGroupCountForRows(rowCount, L1_TILE_M_256) *
-                     Ops::Base::CeilDiv(common.tokenHiddenDim, static_cast<uint32_t>(L1_TILE_N));
-    return tiles < job.totalJobs ? tiles : job.totalJobs;
+    const uint32_t tiles = GetGmm2SliceTiles<L1_TILE_M_256, L1_TILE_N>(rowCount, common.tokenHiddenDim);
+    return GetGmm2ProducerCount(tiles, job.totalJobs);
 }
 
 // 由调用方保证仅实际生产核、每 slice 调用一次。先完成 FIX 写出，再发布完成计数。
@@ -1204,8 +1223,8 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
                        ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
                        : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
-    GM_ADDR sliceOutput =
-        params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
+    GM_ADDR sliceOutput = params.workspaceInfo.gmm2MmadResPtr + (globalRowStart + params.workspaceInfo.waveRowDelta) *
+                                                                    common.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t rowSequence = 0U;
     timer.SetSlice(state.expertIdx, rowStart, rowCount);
     for (uint32_t done = 0U; done < owned.count;) {

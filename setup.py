@@ -21,8 +21,8 @@ from build_support import (  # noqa: E402
     enabled,
 )
 
-BETA = "experiments/megamoe/python"
-beta_enabled = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
+MEGAMOE = "experiments/megamoe/python"
+megamoe_enabled = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
 ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
 packages = find_packages(include=["deep_ep", "deep_ep.*", "ascend_deepep"])
 package_dir = {}
@@ -32,11 +32,12 @@ if ep_gmm_fused:
     package_dir["deep_ep_experimental"] = "experiments/ep_gmm_fused/python/deep_ep_experimental"
     cmdclass["build"] = ConfiguredBuild
     cmdclass["egg_info"] = BuildEggInfo
-if beta_enabled:
-    packages += [name for name in find_packages(where=BETA) if name not in packages]
-    package_dir.setdefault("deep_ep_experimental", BETA + "/deep_ep_experimental")
-    package_dir["deep_ep_experimental.megamoe"] = BETA + "/deep_ep_experimental/megamoe"
+if megamoe_enabled:
+    packages += [name for name in find_packages(where=MEGAMOE) if name not in packages]
+    package_dir.setdefault("deep_ep_experimental", MEGAMOE + "/deep_ep_experimental")
+    package_dir["deep_ep_experimental.megamoe"] = MEGAMOE + "/deep_ep_experimental/megamoe"
     cmdclass["build"] = VariantBuild
+    cmdclass["egg_info"] = BuildEggInfo
 
 setup(
     name="ascend-deepep",
