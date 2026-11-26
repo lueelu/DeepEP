@@ -755,7 +755,7 @@ __aicore__ inline void Gmm1Aiv1EpilogueA8W4(WorkSet& workSet, const GMMAddrInfo&
     }
 }
 
-// Kernel lifetime is independent of scratch ownership: each slice begins and drains events.
+// A routed Wave can retain scratch ownership across GMM1 and GMM2.
 template <bool IsShared, bool TopkWeightsPrefetch, typename Config, typename WorkSet>
 __aicore__ inline void RunGmm1CatlassTiles(CatlassGmm1<Config>& kernel, WorkSet& workSet, const Params& params,
                                            const GMMAddrInfo& addr, const Config& config, uint32_t startLoopIdx,
@@ -766,10 +766,10 @@ __aicore__ inline void RunGmm1CatlassTiles(CatlassGmm1<Config>& kernel, WorkSet&
     if constexpr (g_coreType == AscendC::AIC) {
         Gmm1AicMmadA8W4<CatlassGmm1<Config>, IsShared, TopkWeightsPrefetch>(
             kernel, workSet, params, addr, config, startLoopIdx, tileNum, readySequence, expertIdx);
-        kernel.End(true);  // Tile readiness publication already drained FIX.
+        if (addr.routedA8W4Pipeline == nullptr) kernel.End(true);
     } else {
         Gmm1Aiv0PrologueA8W4(kernel, workSet.scheduler, config, startLoopIdx, tileNum);
-        kernel.End();
+        if (addr.routedA8W4Pipeline == nullptr) kernel.End();
     }
 }
 
@@ -789,8 +789,9 @@ __aicore__ inline void Gmm1ExecA8W4(Scheduler& scheduler, const Params& params, 
     using BiasType = typename KernelConfig::BiasType;
 
     auto layouts = KernelConfig::BuildLayouts(config);
-    auto gmC = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementC*>(gmmAddrInfo.gmm1OutGlobal)), layouts.c);
+    auto gmC =
+        Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementC*>(gmmAddrInfo.gmm1OutGlobal)),
+                       MakeLayoutC{}(config.m, gmmAddrInfo.gmm1OutRowStride));
     auto gmA = Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementA*>(gmmAddrInfo.aGlobal)),
                               layouts.a);
     auto gmB = Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementB*>(gmmAddrInfo.bGlobal)),
@@ -868,21 +869,20 @@ __aicore__ inline void RunGmm1Generic(
     uint32_t tileNum = scheduler.GetTileNum();
 
     if (GetSubBlockIdx() != 0) {
-        startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+        startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
         return;
     }
     if constexpr (g_coreType == AIV) {
         epilogueOp.UpdateNextProblem({config.m, config.outputN, config.k, 0});
     }
 
-    uint32_t startLoopIdx =
-        (config.blockIdx < startBlockIdx ? config.blockIdx + config.blockNum : config.blockIdx) - startBlockIdx;
+    uint32_t startLoopIdx = GetGmmFirstOwnedTile(config.blockIdx, config.blockNum, startBlockIdx);
     // Sparse/small-M experts can expose fewer tiles than logical AIC groups.
     // Idle groups must only advance the shared cursor; constructing a large-K
     // BlockMmad without a matching sibling AIV task can leave the MIX group in
     // an unmatched synchronization state.
     if (startLoopIdx >= tileNum) {
-        startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+        startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
         return;
     }
     using BlockMmad = typename GmmConfig::BlockMmad;
@@ -894,7 +894,7 @@ __aicore__ inline void RunGmm1Generic(
                                                   epilogueOp, vecSetSyncCom, expertBeforeCnt, expertIdx, pingpongIdx,
                                                   typedBlockMmadContext, allowWeightL2Bypass);
 
-    startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+    startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
 }
 
 template <typename ElementA, typename EpilogueElementA, typename ElementB, typename ElementC, typename ElementMxScaleA,
@@ -929,9 +929,10 @@ __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
     using GmmConfig = GmmKernel::Config<true, 0, ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, false,
                                         TopkWeightsPrefetch, false, false, false, true, FuseGateUp>;
     auto config = GmmConfig::BuildGmm1ProblemConfig(problemShape, blockJob, Gmm1TileM);
-    auto layouts = GmmConfig::BuildLayouts(config);
-    auto gmC = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementC*>(gmmAddrInfo.gmm1OutGlobal)), layouts.c);
+    using MakeLayoutC = typename GmmConfig::MakeLayoutC;
+    auto gmC =
+        Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementC*>(gmmAddrInfo.gmm1OutGlobal)),
+                       MakeLayoutC{}(config.m, gmmAddrInfo.gmm1OutRowStride));
     GmmKernel::BlockScheduler scheduler(
         {config.m, config.outputN, config.k},
         GmmKernel::BlockScheduler::Params{
@@ -982,10 +983,9 @@ __aicore__ inline void RunGmm1A8W4(BlockEpilogueActivationMxQuant<ElementA, Elem
                                         GmmKernel::BlockScheduler::Params{Te::MakeCoord(
                                             static_cast<int64_t>(config.tileM), static_cast<int64_t>(config.tileN))});
     uint32_t tileNum = scheduler.GetTileNum();
-    uint32_t startLoopIdx =
-        (config.blockIdx < startBlockIdx ? config.blockIdx + config.blockNum : config.blockIdx) - startBlockIdx;
+    uint32_t startLoopIdx = GetGmmFirstOwnedTile(config.blockIdx, config.blockNum, startBlockIdx);
     if (startLoopIdx >= tileNum) {
-        startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+        startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
         return;
     }
 
@@ -994,7 +994,7 @@ __aicore__ inline void RunGmm1A8W4(BlockEpilogueActivationMxQuant<ElementA, Elem
         scheduler, params, gmmAddrInfo, config, startLoopIdx, tileNum, gmm1TileReadySequence, activationQuantOp,
         expertBeforeCnt, expertIdx, reinterpret_cast<GmmKernel::CatlassGmm1<decltype(config)>*>(persistentKernel));
 
-    startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
+    startBlockIdx = GetGmmNextStartBlock(startBlockIdx, tileNum, config.blockNum);
 }
 
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,
@@ -1033,12 +1033,14 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
     int64_t n = Get<N_VALUE>(state.problemShape);
     int64_t k = Get<K_VALUE>(state.problemShape);
     int64_t expertOffset = state.expertIdx;
-    int64_t globalTokenStartIndex = state.globalTokenStartIndex + rowOffsetInExpert;
+    int64_t globalTokenStartIndex = state.globalTokenStartIndex + rowOffsetInExpert + workspace.waveRowDelta;
     uint32_t expertMGroupOffset = rowOffsetInExpert / L1_TILE_M_256;
     int64_t scaleK = Ops::Base::CeilDiv(k, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
 
     if constexpr (EnableA8W4 || TopkWeightsPrefetch) {
-        gmmAddrInfo.gmm1OutGlobal = workspace.gmm1MmadResPtr + globalTokenStartIndex * n * sizeof(bfloat16_t);
+        gmmAddrInfo.gmm1OutRowStride = workspace.gmm1OutRowStride;
+        gmmAddrInfo.gmm1OutGlobal =
+            workspace.gmm1MmadResPtr + globalTokenStartIndex * gmmAddrInfo.gmm1OutRowStride * sizeof(bfloat16_t);
     }
     if constexpr (TopkWeightsPrefetch) {
         gmmAddrInfo.gmm1TileStatus = reinterpret_cast<__gm__ int32_t*>(workspace.gmm1TileStatusPtr) +
@@ -1140,6 +1142,7 @@ __aicore__ inline void UpdateSharedExpertGmm1GlobalBuffer(const MoeStageCommonCo
     gmmAddrInfo.aGlobal = workspace.sharedExpertInputDataPtr;
     gmmAddrInfo.aScaleGlobal = workspace.sharedExpertInputScalePtr;
     if constexpr (EnableA8W4) {
+        gmmAddrInfo.gmm1OutRowStride = n;
         gmmAddrInfo.gmm1OutGlobal = workspace.sharedExpertGmm1OutPtr + expertIdx * m * n * sizeof(bfloat16_t);
     }
     gmmAddrInfo.bGlobal = GetExpertWeightAddr<ActivationType>(weights.weight1, gmmConfig.isPerExpertWeightTensor,

@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Thin inference-only API; all algorithm selection remains in the native layer."""
+"""MegaMoE public inputs, collective resources and native execution plans."""
 
 from __future__ import annotations
 
@@ -26,18 +26,32 @@ if TYPE_CHECKING:
 def _extension():
     core = require_native("MegaMoE")
     if not hasattr(core, "create_megamoe_runtime"):
-        raise RuntimeError("Install a wheel built with DEEPEP_BUILD_MEGAMOE=ON")
+        raise RuntimeError("Install a wheel with the MegaMoE inference or BF16 component enabled")
     try:
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 4:
+    if getattr(extension, "api_protocol", None) != 5:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
 
 class _MegaRuntime(Runtime):
     _megamoe = True
+
+    def __init__(self, group, capacity, timeout=120, *, bf16=False, debug_collectives=False, **kwargs):
+        self._megamoe = not bf16
+        self._megamoe_train = bf16
+        super().__init__(group, capacity, timeout, debug_collectives=debug_collectives, **kwargs)
+
+    def use_bf16_caller_stream(self):
+        # The buffer lock orders submissions on the host. Order the shared SHMEM window
+        # on the device as well when successive BF16 calls use different streams.
+        caller = npu_api().current_stream(self.device)
+        if caller != self.stream:
+            caller.wait_stream(self.stream)
+            self.stream = caller
+        return caller
 
 
 def _pair(value, name):
@@ -64,7 +78,8 @@ class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
     num_experts is global; intermediate_hidden is the post-SwiGLU width.
-    This Beta supports nonempty, same-BS calls and one in-flight operation per buffer.
+    This Beta supports nonempty, same-BS calls and one device operation at a time per buffer.
+    Differentiable BF16 forwards retain independent states for their backwards.
     """
 
     def __init__(
@@ -81,6 +96,11 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
+        need_grad: bool = False,
+        gmm1_save_type: str = "bf16",
+        max_recv_tokens: int | None = None,
+        debug_collectives: bool = False,
+        save_dispatched_x: bool = True,
     ):
         import torch
         import torch.distributed as dist
@@ -88,28 +108,46 @@ class SymmBuffer:
         if not isinstance(group, (StoreGroup, dist.ProcessGroup)):
             raise TypeError("Pass a StoreGroup or an initialized ProcessGroup explicitly")
         size = group.size() if isinstance(group, StoreGroup) else dist.get_world_size(group)
+        bf16 = mma_type == "bf16xbf16"
         error = None
         try:
-            integer("num_experts", num_experts, 1, 16384)
-            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 65536)
+            integer("num_experts", num_experts, 1, 2048 if bf16 else 16384)
+            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384 if bf16 else 65536)
             integer("num_topk", num_topk, 1, min(32, num_experts))
-            integer("hidden", hidden, 1024, 8192)
-            integer("intermediate_hidden", intermediate_hidden, 256, 4096)
+            integer("hidden", hidden, 256 if bf16 else 1024, 131072 if bf16 else 8192)
+            integer("intermediate_hidden", intermediate_hidden, 256, 131072 if bf16 else 4096)
             integer("num_shared_experts", num_shared_experts, 0, 8)
-            integer("world_size", size, 2, 128)
+            integer("world_size", size, 2, 1024 if bf16 else 128)
             integer("ranks_per_node", ranks_per_node, 0, size)
-            integer("timeout", timeout, 1, 300)
-            if hidden % 64 or intermediate_hidden % 128:
-                raise ValueError("hidden must be divisible by 64; intermediate_hidden by 128")
-            if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
-                raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8 is implemented; no BF16xBF16")
+            integer("timeout", timeout, 1, 3600 if bf16 else 300)
+            if hidden % (256 if bf16 else 64) or intermediate_hidden % (256 if bf16 else 128):
+                divisors = (256, 256) if bf16 else (64, 128)
+                raise ValueError(f"hidden must be divisible by {divisors[0]}; intermediate_hidden by {divisors[1]}")
+            if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8", "bf16xbf16"}:
+                raise ValueError("Only SwiGLU with fp8xfp4, fp8xfp8 or bf16xbf16 is supported")
             if mma_type != "fp8xfp4" and num_shared_experts:
                 raise ValueError("Shared experts currently require FP8xFP4 weights")
-            if num_experts % size or num_experts // size > 128:
-                raise ValueError("Experts must divide EP, with at most 128 local experts")
+            if num_experts % size or num_experts // size > (32 if bf16 else 128):
+                raise ValueError(f"Experts must divide EP, with at most {32 if bf16 else 128} local experts")
+            if (
+                type(need_grad) is not bool
+                or type(debug_collectives) is not bool
+                or type(save_dispatched_x) is not bool
+            ):
+                raise TypeError("need_grad, debug_collectives and save_dispatched_x must be bool")
+            if gmm1_save_type not in {"bf16", "none", "mxfp8"}:
+                raise ValueError("gmm1_save_type must be bf16, none or mxfp8")
+            if bf16:
+                if max_recv_tokens is None and not need_grad:
+                    max_recv_tokens = _extension()._inference_max_recv_tokens(
+                        num_max_tokens_per_rank, size, num_topk, num_experts // size
+                    )
+                integer("max_recv_tokens", max_recv_tokens, 1, (1 << 31) - 1)
+            elif not save_dispatched_x or need_grad or max_recv_tokens is not None or gmm1_save_type != "bf16":
+                raise ValueError("Training and receive-capacity settings require bf16xbf16")
             if ranks_per_node and size % ranks_per_node:
                 raise ValueError("ranks_per_node must divide EP (contiguous node-major ranks)")
-        except (TypeError, ValueError) as failure:
+        except (TypeError, ValueError, ImportError, RuntimeError) as failure:
             error = str(failure)
         # 在进入 SHMEM 之前共同校验布局，不能各 rank 各自选择通信偏移。
         config = (
@@ -123,10 +161,33 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            need_grad,
+            gmm1_save_type,
+            max_recv_tokens,
+            debug_collectives,
+            save_dispatched_x,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
-        capacity = int(ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden))
+        if bf16:
+            if not getattr(ext, "bf16_enabled", False):
+                raise RuntimeError("Install a wheel built with DEEPEP_BUILD_MEGAMOE=ON")
+            capacity = int(
+                ext.bf16_buffer_size(
+                    num_max_tokens_per_rank,
+                    hidden,
+                    intermediate_hidden,
+                    num_topk,
+                    size,
+                    num_experts // size,
+                    max_recv_tokens,
+                    need_grad,
+                )
+            )
+        else:
+            if not getattr(ext, "quantized_enabled", True):
+                raise RuntimeError("Install a wheel built with DEEPEP_BUILD_MEGAMOE=ON")
+            capacity = int(ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden))
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._plan = self._plan_bs = None
@@ -135,6 +196,11 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self.save_dispatched_x = save_dispatched_x
+        self.dispatch_rebuilder = None
+        self.need_grad, self.gmm1_save_type = need_grad, gmm1_save_type
+        self.max_recv_tokens = max_recv_tokens
+        self._plan_key = None
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -143,7 +209,9 @@ class SymmBuffer:
             error = str(failure)
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
-        self._runtime = _MegaRuntime(group, capacity, timeout)
+        self._runtime = _MegaRuntime(group, capacity, timeout, bf16=bf16, debug_collectives=debug_collectives)
+        if bf16:
+            self._runtime.barrier()
 
     def allocate_inputs(self):
         """Legacy idempotent helper. Inputs are already allocated by the constructor."""
@@ -154,10 +222,16 @@ class SymmBuffer:
         if self.x is not None:
             return self
         self.x = torch.empty(
-            (self.num_max_tokens_per_rank, self.hidden), dtype=torch.float8_e4m3fn, device=self._device
+            (self.num_max_tokens_per_rank, self.hidden),
+            dtype=torch.bfloat16 if self.mma_type == "bf16xbf16" else torch.float8_e4m3fn,
+            device=self._device,
         )
-        self.x_sf = torch.empty(
-            (self.num_max_tokens_per_rank, self.hidden // 32), dtype=torch.float8_e8m0fnu, device=self._device
+        self.x_sf = (
+            None
+            if self.mma_type == "bf16xbf16"
+            else torch.empty(
+                (self.num_max_tokens_per_rank, self.hidden // 32), dtype=torch.float8_e8m0fnu, device=self._device
+            )
         )
         self.topk_idx = torch.empty(
             (self.num_max_tokens_per_rank, self.num_topk), dtype=torch.int32, device=self._device
@@ -165,8 +239,13 @@ class SymmBuffer:
         self.topk_weights = torch.empty_like(self.topk_idx, dtype=torch.float32)
         return self
 
-    def _prepare(self, bs):
+    def _prepare(self, bs, limit=0.0, save_type=None):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
+        if self.mma_type == "bf16xbf16":
+            from ._bf16 import prepare_plan, validate_buffer_inputs
+
+            validate_buffer_inputs(self, bs)
+            return prepare_plan(self, bs, limit, save_type)
         if self._plan_bs == bs:
             return
         # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
@@ -202,9 +281,13 @@ class SymmBuffer:
             collective_check(self.group, "prepare", error, bs)
             try:
                 runtime = self._runtime
-                runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
-                with npu_api().stream(runtime.stream):
+                if self.mma_type == "bf16xbf16":
+                    runtime.use_bf16_caller_stream()
                     self._prepare(bs)
+                else:
+                    runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
+                    with npu_api().stream(runtime.stream):
+                        self._prepare(bs)
             except Exception as failure:
                 error = str(failure)
             collective_check(self.group, f"prepare BS={bs}", error)
@@ -234,6 +317,26 @@ class SymmBuffer:
 
     def validate_inputs(self, bs: int, *, x: Tensor | None = None) -> None:
         """Collective, synchronizing routing scan. Run after filling inputs, outside timing."""
+        if self.mma_type == "bf16xbf16":
+            error = None
+            try:
+                from ._bf16 import validate_buffer_inputs
+
+                self._runtime.ensure_alive()
+                integer("BS", bs, 1, self.num_max_tokens_per_rank)
+                if x is not None:
+                    raise ValueError("Assign the original BF16 input to sym_buffer.x")
+                validate_buffer_inputs(self, bs)
+                check_routing(
+                    self.topk_idx[:bs].cpu().tolist(),
+                    self.topk_weights[:bs].cpu().tolist(),
+                    self.num_experts,
+                    self.num_topk,
+                )
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, "input preflight", error, bs)
+            return
         error = None
         try:
             import torch
@@ -272,10 +375,13 @@ class SymmBuffer:
             error = str(failure)
         collective_check(self.group, "input preflight", error, (bs, x is not None))
 
+    def _check_ready(self):
+        self._runtime.ensure_alive()
+
     def destroy(self):
         with self._lock:
             self._runtime.close()
-            self._plan = self._plan_bs = None
+            self._plan = self._plan_bs = self._plan_key = None
             self.x = self.x_sf = self.topk_idx = self.topk_weights = None
 
     def __del__(self):
@@ -564,4 +670,33 @@ def fp8_fp4_mega_moe(
         out=y,
         timer=timer,
         cumulative_stats=cumulative_local_expert_recv_stats,
+    )
+
+
+def bf16_mega_moe(
+    y,
+    l1_weights,
+    l2_weights,
+    sym_buffer,
+    shared_l1_weights=None,
+    shared_l2_weights=None,
+    cumulative_local_expert_recv_stats=None,
+    activation="swiglu",
+    activation_clamp=None,
+    fast_math=True,
+) -> None:
+    """Write BF16 y in place; inputs and save configuration belong to sym_buffer."""
+    from ._bf16 import run
+
+    run(
+        y,
+        l1_weights,
+        l2_weights,
+        sym_buffer,
+        shared_l1_weights,
+        shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        activation,
+        activation_clamp,
+        fast_math,
     )

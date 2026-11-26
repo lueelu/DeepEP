@@ -59,6 +59,7 @@ def lifecycle_binary(tmp_path_factory):
         "instance-limit",
         "udma",
         "megamoe",
+        "megamoe-train",
         "low-latency",
         "ll-rank-bias-16",
         "ll-rank-bias-32",

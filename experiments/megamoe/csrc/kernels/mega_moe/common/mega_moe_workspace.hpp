@@ -32,9 +32,13 @@ struct WorkspaceInfo {
     GM_ADDR flagSendCntCalToUpdParamsPtr;
     GM_ADDR flagGmmToEpiloguePtr{nullptr};
     GM_ADDR gmm2ReadyPtr{nullptr};
+    GM_ADDR gmm2SubmittedPtr{nullptr};
     GM_ADDR gmm2CombineSyncCounterPtr{nullptr};
     GM_ADDR cumsumInfoPtr{nullptr};
+    GM_ADDR scratchReleased{nullptr};
+    int64_t waveRowDelta{0};
     GM_ADDR gmm1MmadResPtr{nullptr};
+    uint32_t gmm1OutRowStride{};
     GM_ADDR gmm2MmadResPtr{nullptr};
     GM_ADDR sharedExpertResultPtr{nullptr};
     GM_ADDR sharedExpertGmm1OutPtr{nullptr};
@@ -71,16 +75,18 @@ struct WorkspaceInfo {
 private:
     HOST_DEVICE void InitializeWorkspaceLayout(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t serverNum)
     {
+        const int64_t payloadRows = tilingData->scratchWaveSlots ? int64_t(tilingData->scratchWaveSlots) *
+                                                                       tilingData->mGroupsPerWave * L1_TILE_M_256
+                                                                 : tilingData->maxOutputSize;
         workspaceSize = 0;
         dispatchRevDataPtr = base;
-        workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->maxOutputSize * tilingData->h, ALIGN_512);
+        workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * payloadRows * tilingData->h, ALIGN_512);
         dispatchRevScalePtr = base + workspaceSize;
 
         int64_t dispatchScaleElementsPerToken =
             Ops::Base::CeilDiv(static_cast<int64_t>(tilingData->h), static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
             MXFP_MULTI_BASE_SIZE;
-        workspaceSize +=
-            Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->maxOutputSize * dispatchScaleElementsPerToken, ALIGN_512);
+        workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * payloadRows * dispatchScaleElementsPerToken, ALIGN_512);
 
         if (tilingData->topkWeightsPrefetch == 1 && tilingData->topoType == TOPO_TYPE_URMA) {
             dispatchRevWeightsPtr = base + workspaceSize;
@@ -91,13 +97,12 @@ private:
         }
 
         activationQuantDataPtr = base + workspaceSize;
-        workspaceSize += Ops::Base::CeilAlign(
-            SIZE_INT_8 * tilingData->maxOutputSize * tilingData->hiddenDim / ACTIVATION_N_HALF, ALIGN_512);
+        workspaceSize +=
+            Ops::Base::CeilAlign(SIZE_INT_8 * payloadRows * tilingData->hiddenDim / ACTIVATION_N_HALF, ALIGN_512);
 
         activationQuantScalePtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(
-            SIZE_INT_8 * tilingData->maxOutputSize * tilingData->hiddenDim / ACTIVATION_N_HALF / MXFP_SCALE_GROUP_NUM,
-            ALIGN_512);
+            SIZE_INT_8 * payloadRows * tilingData->hiddenDim / ACTIVATION_N_HALF / MXFP_SCALE_GROUP_NUM, ALIGN_512);
 
         expertRevTokenNumsPtr = base + workspaceSize;
         int64_t expertMajorPaddedCountBytes =
@@ -158,6 +163,13 @@ private:
             workspaceSize += SIZE_INT_32 * moeExpertCount * readySlotsPerExpert;
         }
 
+        if (useMteWaveCombine && tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 &&
+            tilingData->combineQuantMode == COMBINE_NO_QUANT && tilingData->sharedExpertNum == 0U) {
+            // Per-AIC slice sequence. Reset together with the existing ready counters.
+            gmm2SubmittedPtr = base + workspaceSize;
+            workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
+        }
+
         if (tilingData->topoType == TOPO_TYPE_URMA) {
             gmm2CombineSyncCounterPtr = base + workspaceSize;
             workspaceSize += static_cast<int64_t>(tilingData->combineSyncSlotCountPerExpert) * moeExpertCount *
@@ -187,6 +199,10 @@ private:
             flagSharedGmm1DonePtr = base + workspaceSize;
             workspaceSize += coreFlagBytes;
         }
+        if (tilingData->scratchWaveSlots) {
+            scratchReleased = base + workspaceSize;
+            workspaceSize += uint64_t(tilingData->scratchWaveSlots) * INT_CACHELINE * sizeof(int32_t);
+        }
         flagResetElementCount = (workspaceSize - flagRegionBeginOffset) / SIZE_INT_32;
 
         // A8W4 / Combine 量化路径的条件 workspace 分配。
@@ -209,10 +225,16 @@ private:
                                                   ALIGN_32) *
                              tilingData->aicNum;
         }
-        if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 || tilingData->topkWeightsPrefetch == 1) {
-            // gmm1MmadRes：GMM1 matmul 输出，布局为 maxOutputSize × hiddenDim 个 BF16。
+        // Once all SwiGLU tiles for a row group signal ready, GMM2 can overwrite its Gate/Up rows.
+        const bool reuseRoutedOutput = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 && useMteWaveCombine &&
+                                       tilingData->sharedExpertNum == 0U &&
+                                       tilingData->combineQuantMode == COMBINE_NO_QUANT &&
+                                       tilingData->topkWeightsPrefetch == 0 && tilingData->h >= tilingData->hiddenDim;
+        gmm1OutRowStride = reuseRoutedOutput ? tilingData->h : tilingData->hiddenDim;
+        if (!reuseRoutedOutput &&
+            (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 || tilingData->topkWeightsPrefetch == 1)) {
             gmm1MmadResPtr = base + workspaceSize;
-            workspaceSize += SIZE_BF_16 * tilingData->maxOutputSize * tilingData->hiddenDim;
+            workspaceSize += SIZE_BF_16 * payloadRows * tilingData->hiddenDim;
         }
         // gmm2MmadRes：GMM2 matmul 输出，布局为 maxOutputSize × h 个 BF16；
         // A8W4 GMM1、A4W4 混合路径、A4W4_NZ 和 Combine 量化路径需要该区域。
@@ -225,11 +247,11 @@ private:
                 workspaceSize = Ops::Base::CeilAlign(workspaceSize, static_cast<int64_t>(ALIGN_512));
             }
             gmm2MmadResPtr = base + workspaceSize;
-            // MTE wave 路径为每个 MoE token 行分配独立的 [H] BF16
-            // 区域，生命周期覆盖整个 kernel。它不是 batch 或 ring slot，
-            // 因此 AIC 推进游标前不需要等待 consumer ACK。
-            int64_t gmm2OutputBytes = static_cast<int64_t>(SIZE_BF_16) *
-                                      static_cast<int64_t>(tilingData->maxOutputSize) *
+            if (reuseRoutedOutput) {
+                gmm1MmadResPtr = gmm2MmadResPtr;
+            }
+            // Routed output stays live until every Combine sender releases its Wave.
+            int64_t gmm2OutputBytes = static_cast<int64_t>(SIZE_BF_16) * static_cast<int64_t>(payloadRows) *
                                       static_cast<int64_t>(tilingData->h);
             workspaceSize += useMteWaveCombine ? Ops::Base::CeilAlign(gmm2OutputBytes, static_cast<int64_t>(ALIGN_512))
                                                : gmm2OutputBytes;

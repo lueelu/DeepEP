@@ -36,7 +36,7 @@ Python Runtime → C++ Session → SHMEM / CANN
 | `csrc/ops/` | Notify、HT 和 LL 的 Host 封装 |
 | `csrc/kernels/` | Device 实现、启动声明和共用布局 |
 | `cmake/`、`build_support.py` | 依赖校验、Host/Device 编译和安装 |
-| `experiments/megamoe/` | MegaMoE Python API、融合 kernel、构建/多机启动脚本和计时工具 |
+| `experiments/megamoe/` | MegaMoE 量化推理、BF16 推理与训练的 Python 接口、融合算子及构建和测试工具 |
 | `experiments/ep_gmm_fused/` | 两类通信计算融合算子、UDMA 运行时封装及独立测试 |
 | `tests/`、`benchmarks/` | 正确性验证、测试参考及测量工具 |
 
@@ -62,9 +62,9 @@ LL 通过同一组 dispatch/combine 方法进入独立 kernel。fresh dispatch �
 
 ## MegaMoE 融合流程
 
-MegaMoE 将 token 分发、专家矩阵乘、激活与量化、第二次矩阵乘和加权归并组合为融合前向流程。其模型权重、计算配置和完整 MoE 性能口径与单独 EP 通信不同，说明集中在 [MegaMoE 文档](../experiments/megamoe/README.md)。
+MegaMoE 将 Dispatch、GMM1、SwiGLU、GMM2 和 Combine 融合到一次前向调用中。量化推理使用 `fp8_fp4_mega_moe()`，BF16 推理与训练使用 `bf16_mega_moe()`。两者共用 `SymmBuffer`、Host 扩展和 SHMEM 运行时。MegaMoE 的缓冲容量与初始化约束见[模块 README](../experiments/megamoe/README.md)。
 
-MegaMoE 的 `python/deep_ep_experimental/megamoe/api.py` 提供公开接口，经 `csrc/bindings.cpp`、`forward.cpp` 调用 `csrc/kernels/mega_moe/`；`scripts/` 提供构建和多机入口，`tests/` 检查接口、参考和主机协议。其 `SymmBuffer` 与 ElasticBuffer 分开管理，不能套用 HT/LL 的容量和初始化约束。
+BF16 推理在源 rank 归并时乘路由权重。训练在 GMM2 前乘权，并通过 PyTorch autograd 计算输入、路由权重和专家权重的梯度。每次训练前向独立持有反向所需状态，Plan 可跨调用复用临时 workspace。两种乘权方式和保存配置见 [BF16 接口](../experiments/megamoe/README.md#bf16-接口)。
 
 ## 通信计算融合算子
 

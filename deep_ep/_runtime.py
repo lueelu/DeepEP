@@ -8,6 +8,7 @@ import os
 import threading
 import warnings
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -68,6 +69,7 @@ class Runtime:
     """One explicit collective lifetime per Buffer; live owners are retained."""
 
     _megamoe = False
+    _megamoe_train = False
 
     def __init__(
         self,
@@ -118,21 +120,29 @@ class Runtime:
         if dense_qps not in ("0", "1"):
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap
-        store_group = self._megamoe and isinstance(group, StoreGroup)
+        megamoe = self._megamoe or self._megamoe_train
+        store_group = megamoe and isinstance(group, StoreGroup)
         if self._megamoe and (group is None or udma):
             raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
+        if self._megamoe_train and (udma or bootstrap != "default"):
+            raise ValueError("MegaMoE training requires the MTE/default runtime")
         if store_group:
             if rank is not None or world_size is not None:
                 raise ValueError("Pass either group or rank/world_size, not both")
             rank, size = group.rank(), group.size()
+        elif self._megamoe_train and group is None:
+            size = integer("world_size", world_size, 2, 1024)
+            rank = integer("rank", rank, 0, size - 1)
         else:
             rank, size = rank_and_world(group, rank, world_size)
         factory = native.Runtime
-        if self._megamoe:
-            integer("world_size", size, 2, 128)
+        if megamoe:
+            integer("world_size", size, 2, 1024 if self._megamoe_train else 128)
             factory = getattr(native, "create_megamoe_runtime", None)
             if factory is None:
                 raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE=ON")
+            if self._megamoe_train:
+                factory = partial(factory, bf16=True)
         else:
             from .buffers._elastic_layout import WORLD_SIZES
 
@@ -154,8 +164,9 @@ class Runtime:
             busy = native.runtime_busy() or any(
                 owner.group is not group
                 or owner.device != self.device
-                or self._megamoe
+                or megamoe
                 or owner._megamoe
+                or owner._megamoe_train
                 or bootstrap == "mpi"
                 or owner.bootstrap == "mpi"
                 for owner in _OWNERS
@@ -171,7 +182,7 @@ class Runtime:
                     return int.from_bytes(hashlib.sha256(value.encode()).digest()[:7], "little")
 
                 local_values = [capacity, timeout, digest(address), int(busy)]
-                if self._megamoe:
+                if megamoe:
                     host_id = _host_boot_id()
                     local_values.extend(
                         [
@@ -187,6 +198,7 @@ class Runtime:
                     + 4 * int(dense_qps)
                     + 8 * int(use_1g_huge_pages)
                     + 16 * int(debug_collectives)
+                    + 32 * int(self._megamoe_train)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -206,7 +218,7 @@ class Runtime:
                     raise ValueError(
                         "Ranks disagree on MTE/URMA runtime engines, QP configuration, page size or debug_collectives"
                     )
-                if self._megamoe:
+                if megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
                         raise RuntimeError(
@@ -228,7 +240,7 @@ class Runtime:
                             )
                         devices[key] = peer_rank
             uid = []
-            if group is not None and not self._megamoe:
+            if group is not None and not megamoe:
                 result = None
                 if rank == 0:
                     try:
@@ -245,7 +257,7 @@ class Runtime:
             self.notify_lock = threading.RLock()
             self.notify_failed = False
             self.notify_inflight = None
-            self.stream = npu.Stream(device=self.device)
+            self.stream = npu.current_stream(self.device) if self._megamoe_train else npu.Stream(device=self.device)
             self.native = (
                 native.create_combine_runtime(
                     rank, size, capacity, address, timeout, bootstrap == "mpi", use_1g_huge_pages, uid
@@ -255,7 +267,7 @@ class Runtime:
                 if bootstrap == "mpi"
                 else (
                     native.Runtime(rank, size, capacity, address, timeout, udma, use_1g_huge_pages, uid)
-                    if not self._megamoe
+                    if not megamoe
                     else factory(rank, size, capacity, address, timeout)
                 )
             )

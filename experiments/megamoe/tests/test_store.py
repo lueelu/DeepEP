@@ -69,6 +69,16 @@ def groups(size, store=None, prefix="test"):
     return [StoreGroup(store, rank, size, prefix=prefix, timeout=2) for rank in range(size)]
 
 
+def test_bf16_store_group_rank_limit():
+    store = MemoryStore()
+    assert StoreGroup(store, 127, 128, prefix="quantized").size() == 128
+    with pytest.raises(ValueError, match="size<=128"):
+        StoreGroup(store, 128, 129, prefix="quantized")
+    assert StoreGroup(store, 1023, 1024, prefix="bf16", bf16=True).size() == 1024
+    with pytest.raises(ValueError, match="size<=1024"):
+        StoreGroup(store, 1024, 1025, prefix="bf16", bf16=True)
+
+
 @pytest.mark.parametrize("size", [2, 8, 64, 128])
 def test_gather_barrier_cleanup_and_close(size):
     peers = groups(size)

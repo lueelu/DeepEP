@@ -212,7 +212,7 @@ def test_incomplete_atomic_save_is_not_published(config, tmp_path, monkeypatch):
 def test_cpu_only_cli_cache_is_readable_by_benchmark(config, tmp_path):
     case = tmp_path / "case.json"
     case.write_text(json.dumps(config), encoding="utf-8")
-    root = Path(__file__).resolve().parents[3]
+    root = Path(__file__).resolve().parents[4]
     # 新解释器验证 -m 入口及线程环境，不依赖 pytest 已加载的 NumPy/Torch。
     program = (
         "import runpy, sys; "

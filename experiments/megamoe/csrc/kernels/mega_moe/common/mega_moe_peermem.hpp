@@ -31,7 +31,7 @@
 // host 侧自洽：Ops::Base::CeilAlign/CeilDiv 的提供方，不再依赖包含方的 include 顺序。
 #include "op_common/op_host/util/math_util.h"
 #endif
-#include "../mega_moe_tiling.hpp"
+#include "mega_moe_quantized_tiling.hpp"
 #include "mega_moe_constants.hpp"
 
 namespace MegaMoeImpl {

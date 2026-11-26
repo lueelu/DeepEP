@@ -24,6 +24,7 @@
 #include "common/mega_moe_types.hpp"
 #include "common/mega_moe_workspace.hpp"
 #include "common/mega_moe_utils.hpp"
+#include "common/gmm2_aiv_completion.hpp"
 #include "common/ascend_timer_v2_device.hpp"
 #include "common/mega_moe_exception_dump_policy.hpp"
 #include "epilogue/block_epilogue_activation_mx_quant.hpp"
@@ -97,7 +98,8 @@ protected:
                                                    uint32_t sliceTokenCount,
                                                    WaveCombineBufferConfig& combineBufferConfig,
                                                    uint32_t& combineRowSequence, int32_t& pairwiseTileSequence,
-                                                   bool isFinalCombine, bool reverseBlocks = false);
+                                                   bool isFinalCombine, bool reverseBlocks = false,
+                                                   int32_t* submittedSequence = nullptr);
     template <bool WaitForTokenCountReady>
     __aicore__ inline void PrepareGmmExpertState(ExpertLoopState& state, uint32_t expertIdx);
     __aicore__ inline void ProcessSharedExpertGmm1(int32_t& gmm1TileReadySequence);
@@ -718,13 +720,13 @@ template <bool SourceGmm1Fused>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert(
     ExpertLoopState& state, GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t tokenStartIndexInExpert,
     uint32_t sliceTokenCount, WaveCombineBufferConfig& combineBufferConfig, uint32_t& combineRowSequence,
-    int32_t& pairwiseTileSequence, bool isFinalCombine, bool reverseBlocks)
+    int32_t& pairwiseTileSequence, bool isFinalCombine, bool reverseBlocks, int32_t* submittedSequence)
 {
     constexpr bool tokenCombine = ENABLE_A8W4 && CombineQuantMode == COMBINE_NO_QUANT;
     constexpr bool pairwiseCombine = !tokenCombine && CombineQuantMode == COMBINE_NO_QUANT;
     uint32_t expertTokenCount = static_cast<uint32_t>(Get<M_VALUE>(state.problemShape));
-    uint32_t gmm2NTileCount = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim, static_cast<uint32_t>(L1_TILE_N));
-    uint32_t problemTileCount = GetMGroupCountForRows(sliceTokenCount, GMM1_TILE_M) * gmm2NTileCount;
+    const uint32_t problemTileCount =
+        GetGmm2SliceTiles<GMM1_TILE_M, L1_TILE_N>(sliceTokenCount, commonConfig_.tokenHiddenDim);
     if (!HandleWaveProblemWithoutWork(problemTileCount, gmmExecutionConfig_.blockJob, startBlockIdx, reverseBlocks)) {
         UpdateMoeExpertGmm2GlobalBuffer<Weight1Type, ActivationQuantOutType, QuantScaleOutType>(
             gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, gmmAddrInfo,
@@ -743,7 +745,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
             gmm2TileSequence = &pairwiseTileSequence;
         }
         timer_.SetSlice(state.expertIdx, tokenStartIndexInExpert, sliceTokenCount);
-        // 非量化路径保留逐 tile FIX 完成边界；其他路径保留原有 slice 完成边界。
+        // 非量化路径记录逐 tile 时间，量化路径记录整个 slice 的时间。
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.StartSpan(AscendTimer::AIC_GMM2);
         }
@@ -766,10 +768,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         }
         timer_.ClearSlice();
         if constexpr (tokenCombine && g_coreType == AIC) {
-            // 只在“有 GEMM2 tile”的分支通知：一个实际生产核完成本 slice 的全部
-            // tile 后加一。空核不通知；同一核有多个 tile 也只通知一次。
-            // helper 等待 FIX 写出后再发布，避免 AIV1 读取尚未完成的 GEMM2 输出。
-            NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
+            if (submittedSequence != nullptr) {
+                auto* submitted = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.gmm2SubmittedPtr) +
+                                  static_cast<uint64_t>(gmmExecutionConfig_.blockJob.jobIndex) * INT_CACHELINE;
+                Gmm2AivCompletion::Submit(submitted, ++(*submittedSequence));
+            } else {
+                NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
+            }
         }
     }
 

@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 
-from .timer.__main__ import parse_ranks
+from .timer.w4a8.__main__ import parse_ranks
 from .performance import alignment_config, collect_profile, enqueue_batch, summarize_rounds
 
 
@@ -374,7 +374,7 @@ def run(args, config, group):
             timer_dir = args.output_dir / f"bs_{bs}" / "timer"
             breakdown = None
             if timer is not None:
-                from .timer.breakdown import compact_events, rank_breakdown
+                from .timer.w4a8.breakdown import compact_events, rank_breakdown
 
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 raw_timer = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
@@ -384,7 +384,7 @@ def run(args, config, group):
                 print(f"[TIMER] rank={rank} BS={bs} raw saved; offline parse required", flush=True)
             records = group.all_gather(breakdown, f"timer breakdown BS={bs}")
             if rank == 0:
-                from .timer.breakdown import write_breakdown
+                from .timer.w4a8.breakdown import write_breakdown
 
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 write_breakdown([r for r in records if r is not None], timer_dir, f"BS={bs}")

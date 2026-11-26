@@ -39,7 +39,7 @@ def test_build_variants_have_disjoint_python_and_native_outputs(monkeypatch):
     assert len({row[1] for row in outputs}) == 3
 
 
-def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
+def wheel(tmp_path, enabled, payload, ep_gmm_fused=False, *, omit=None, extra=None):
     entries = {
         "deep_ep/_C.fake.so": b"not-an-executable",
         "deep_ep/_build_info.json": json.dumps(
@@ -53,9 +53,17 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         "test.dist-info/licenses/deepseek-deepep.LICENSE": b"fixture",
     }
     if payload:
-        for name in ("api.py", "benchmark.py", "configs/smoke.json", "libmegamoe_kernel.so", "_C.fake.so"):
+        for name in (
+            "__init__.py",
+            "api.py",
+            "_bf16.py",
+            "_autograd.py",
+            "benchmark.py",
+            "configs/smoke.json",
+            "libmegamoe_kernel.so",
+            "_C.fake.so",
+        ):
             entries["deep_ep_experimental/megamoe/" + name] = b"fixture"
-        entries["test.dist-info/licenses/cann.LICENSE"] = b"fixture"
     if ep_gmm_fused:
         prefix = "deep_ep_experimental/ep_gmm_fused/"
         for name in (
@@ -69,6 +77,19 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         ):
             entries[prefix + name] = b"fixture"
         entries[prefix + "_build_info.json"] = json.dumps({"shmem_revision": "test-sdk"}).encode()
+    runtime = {}
+    for name in ("libshmem.so", "libshmem_utils.so", "aclshmem_bootstrap_config_store.so", "aclshmem_bootstrap_uid.so"):
+        data = name.encode()
+        entries["deep_ep/.libs/" + name] = data
+        runtime[name] = hashlib.sha256(data).hexdigest()
+    info = json.loads(entries["deep_ep/_build_info.json"])
+    info["shmem_runtime"] = runtime
+    entries["deep_ep/_build_info.json"] = json.dumps(info).encode()
+    entries["test.dist-info/licenses/cann.LICENSE"] = b"fixture"
+    if omit is not None:
+        del entries["deep_ep_experimental/megamoe/" + omit]
+    if extra is not None:
+        entries[extra] = b"fixture"
     path = tmp_path / "synthetic.whl"
     with zipfile.ZipFile(path, "w") as archive:
         for name, content in entries.items():
@@ -80,6 +101,27 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
 def test_wheel_expected_payload(tmp_path, enabled, payload):
     validate = load(ROOT / "scripts/validate_package.py")
     assert validate.inspect_wheel(wheel(tmp_path, enabled, payload))["megamoe"]["enabled"] == enabled
+
+
+@pytest.mark.parametrize("missing", ["_C.fake.so", "_bf16.py", "_autograd.py", "benchmark.py", "libmegamoe_kernel.so"])
+def test_wheel_rejects_missing_megamoe_member(tmp_path, missing):
+    validate = load(ROOT / "scripts/validate_package.py")
+    with pytest.raises(RuntimeError, match="Incomplete MegaMoE"):
+        validate.inspect_wheel(wheel(tmp_path, True, True, omit=missing))
+
+
+@pytest.mark.parametrize(
+    "extra,error",
+    [
+        ("build/stale/deep_ep_experimental/megamoe/_C.old.so", "nested MegaMoE"),
+        ("deep_ep_experimental/megamoe/_C.old.so", "Incomplete MegaMoE"),
+        ("deep_ep_experimental/megamoe/libextra_kernel.so", "one device library"),
+    ],
+)
+def test_wheel_rejects_extra_megamoe_library(tmp_path, extra, error):
+    validate = load(ROOT / "scripts/validate_package.py")
+    with pytest.raises(RuntimeError, match=error):
+        validate.inspect_wheel(wheel(tmp_path, True, True, extra=extra))
 
 
 @pytest.mark.parametrize("megamoe,ep_gmm_fused", [(False, False), (False, True), (True, False), (True, True)])
@@ -127,6 +169,9 @@ def test_component_switches_preserve_python_packages(tmp_path):
         with zipfile.ZipFile(archive_path) as archive:
             names = archive.namelist()
             assert names.count("deep_ep_experimental/__init__.py") == int(megamoe or ep_gmm_fused)
+            for family in ("w4a8", "bf16"):
+                timer_parser = f"deep_ep_experimental/megamoe/timer/{family}/trace_parser.py"
+                assert (timer_parser in names) is megamoe
             for component, present, module in (
                 ("megamoe", megamoe, "api.py"),
                 ("ep_gmm_fused", ep_gmm_fused, "ops.py"),
@@ -141,13 +186,14 @@ def test_component_switches_preserve_python_packages(tmp_path):
 @pytest.mark.parametrize("enabled,payload", [(False, True), (True, False)])
 def test_stale_or_missing_beta_rejected(tmp_path, enabled, payload):
     validate = load(ROOT / "scripts/validate_package.py")
-    with pytest.raises(RuntimeError, match="Beta"):
+    with pytest.raises(RuntimeError, match="MegaMoE"):
         validate.inspect_wheel(wheel(tmp_path, enabled, payload))
 
 
 @pytest.mark.parametrize("fault", ["missing", "json", "list", "revision", "header", "checksum"])
-def test_megamoe_build_keeps_strict_sdk_validation(tmp_path, fault):
+def test_megamoe_build_keeps_strict_sdk_validation(tmp_path, fault, monkeypatch):
     build = load(ROOT / "build_support.py")
+    monkeypatch.setattr(build.platform, "system", lambda: "Linux")
     lock = json.loads((ROOT / "dependencies.lock.json").read_text())["shmem"]
     cann, sdk = tmp_path / "cann", tmp_path / "sdk"
     (cann / "include/acl").mkdir(parents=True)

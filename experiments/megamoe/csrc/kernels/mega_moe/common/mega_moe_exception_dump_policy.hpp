@@ -14,7 +14,7 @@
 
 #include "../mc2_common/mc2_exception_dump.hpp"
 #include "mega_moe_workspace.hpp"
-#include "../mega_moe_tiling.hpp"
+#include "mega_moe_quantized_tiling.hpp"
 
 namespace MegaMoeImpl {
 

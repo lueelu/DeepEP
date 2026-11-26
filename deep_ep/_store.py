@@ -20,16 +20,17 @@ class StoreGroup:
     The caller owns the Store server; close this group after collective SHMEM teardown.
     """
 
-    def __init__(self, store, rank, size, *, prefix, timeout=300):
-        if not 0 <= rank < size <= 128 or not prefix or timeout <= 0:
-            raise ValueError("StoreGroup requires rank in [0,size), size<=128, prefix and positive timeout")
+    def __init__(self, store, rank, size, *, prefix, timeout=300, bf16: bool = False):
+        max_ranks = 1024 if bf16 is True else 128
+        if not 0 <= rank < size <= max_ranks or not prefix or timeout <= 0:
+            raise ValueError(f"StoreGroup requires rank in [0,size), size<={max_ranks}, prefix and positive timeout")
         self._store, self._rank, self._size = store, rank, size
         self._prefix, self._timeout = prefix.rstrip("/") + "/", timedelta(seconds=timeout)
         self._sequence = 0
 
     @classmethod
-    def from_env(cls, timeout=300):
-        """Connect to torchrun's existing TCPStore, without initializing a ProcessGroup."""
+    def from_env(cls, timeout=300, *, bf16: bool = False):
+        """Connect to torchrun's TCPStore. Pass bf16=True for BF16 groups larger than 128."""
         from torch.distributed import TCPStore
 
         rank, size = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
@@ -46,7 +47,7 @@ class StoreGroup:
         if rank == 0:
             store.set(key, uuid.uuid4().hex)
         session = store.get(key).decode("ascii")
-        group = cls(store, rank, size, prefix=f"megamoe/{session}", timeout=timeout)
+        group = cls(store, rank, size, prefix=f"megamoe/{session}", timeout=timeout, bf16=bf16)
         group.barrier("connect")
         print(f"[HOST_STORE] rank={rank}/{size} ready (no ProcessGroup)", flush=True)
         return group

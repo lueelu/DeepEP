@@ -6,10 +6,10 @@ import json
 import numpy as np
 import pytest
 
-from deep_ep_experimental.megamoe.timer import protocol as p
-from deep_ep_experimental.megamoe.timer.breakdown import compact_events, rank_breakdown, write_breakdown
-from deep_ep_experimental.megamoe.timer.parse_timer_csv import decode
-from deep_ep_experimental.megamoe.timer.trace_parser import raw_events_for_rank
+from deep_ep_experimental.megamoe.timer.w4a8 import protocol as p
+from deep_ep_experimental.megamoe.timer.w4a8.breakdown import compact_events, rank_breakdown, write_breakdown
+from deep_ep_experimental.megamoe.timer.w4a8.parse_timer_csv import decode
+from deep_ep_experimental.megamoe.timer.w4a8.trace_parser import raw_events_for_rank
 
 
 def event(name, begin, end, group=0):

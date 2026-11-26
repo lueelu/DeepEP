@@ -10,12 +10,12 @@
 // Modified by SimpleBright_Man 2026
 
 /*!
- * \file mega_moe_tiling.h
- * \brief
+ * \file mega_moe_quantized_tiling.hpp
+ * \brief Host and device tiling parameters for W4A8 and W8A8 MegaMoE.
  */
 
-#ifndef ASCENDC_MEGA_MOE_TILING
-#define ASCENDC_MEGA_MOE_TILING
+#ifndef ASCENDC_MEGA_MOE_QUANTIZED_TILING_HPP
+#define ASCENDC_MEGA_MOE_QUANTIZED_TILING_HPP
 
 #include <cstdint>
 #include "kernel_tiling/kernel_tiling.h"
@@ -196,9 +196,10 @@ struct MegaMoeTilingData {
     uint32_t maxTilesPerExpert;  // GMM1 tile 状态位区每 expert 的容量，按交织调度的完整 N 上界预留
     uint8_t actMode;             // MegaMoeImpl::MegaMoeActMode 的底层协议值
     uint8_t actSubMode;          // MegaMoeImpl::MegaMoeActSubMode 的底层协议值
-    float activationAlpha;       // situ: linear_beta; swigluoai: alpha(默认1.702); swiglu/swiglustep: 占位
-    float activationBeta;        // situ/swigluoai: beta(默认1.0); swiglu/swiglustep: 占位
-    uint32_t mGroupsPerWave;     // 每个 routed expert Wave 消费的 256-row M 分组数
+    uint8_t scratchWaveSlots{0};
+    float activationAlpha;    // situ: linear_beta; swigluoai: alpha(默认1.702); swiglu/swiglustep: 占位
+    float activationBeta;     // situ/swigluoai: beta(默认1.0); swiglu/swiglustep: 占位
+    uint32_t mGroupsPerWave;  // 每个 routed expert Wave 消费的 256-row M 分组数
     // MoE 和共享专家使用相同布局：true 表示每个专家一个二维 tensor，false 表示单个三维堆叠 tensor。
     bool isPerExpertWeightTensor;
     // 全卡一致的单卡 token 数上界（attr num_max_tokens_per_rank；attr=0 时 host 置为 bs）。

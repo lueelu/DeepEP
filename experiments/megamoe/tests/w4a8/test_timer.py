@@ -7,16 +7,16 @@ import struct
 
 import pytest
 
-from deep_ep_experimental.megamoe.timer import protocol as p
-from deep_ep_experimental.megamoe.timer.parse_timer_csv import decode, load_raw
-from deep_ep_experimental.megamoe.timer.trace_parser import (
+from deep_ep_experimental.megamoe.timer.w4a8 import protocol as p
+from deep_ep_experimental.megamoe.timer.w4a8.parse_timer_csv import decode, load_raw
+from deep_ep_experimental.megamoe.timer.w4a8.trace_parser import (
     first_start_cycle,
     raw_events_for_rank,
     synchronized_rank_bases,
     trace_events,
 )
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[4]
 
 
 def test_device_schema_and_extended_size():

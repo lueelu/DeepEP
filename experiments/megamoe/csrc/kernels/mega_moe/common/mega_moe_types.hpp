@@ -14,15 +14,20 @@
 
 #include "lib/std/tuple.h"
 #include "tensor_api/tensor.h"
-#include "../mega_moe_tiling.hpp"
+#include "mega_moe_quantized_tiling.hpp"
 #include "mega_moe_constants.hpp"
 #include "mega_moe_workspace.hpp"
+#include "mega_moe_bf16_workspace_view.hpp"
+#include "timer/ascend_timer_device.hpp"
 #if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
 #include "adv_api/hcomm/hcomm.h"
 #endif
 #include "../mc2_common/mc2_moe_context.hpp"
 
-class AscendTimerDevice;
+template <class Schema>
+class BasicAscendTimerDevice;
+struct MegaMoeTimerSchema;
+using AscendTimerDevice = BasicAscendTimerDevice<MegaMoeTimerSchema>;
 
 namespace MegaMoeImpl {
 
@@ -62,6 +67,40 @@ struct ExpertTokenRange {
 
 using Mc2MoeContext = Mc2Aclnn::Mc2MoeContext;
 
+struct Bf16GMMAddrInfo {
+    MegaMoeTrainTimerDevice* timer = nullptr;
+    GM_ADDR aGlobal;
+    GM_ADDR bGlobal;
+    GM_ADDR aScaleGlobal;
+    GM_ADDR bScaleGlobal;
+    GM_ADDR cGlobal;
+    __gm__ int32_t* groupFlagList;
+    __gm__ int32_t* groupFlagList2;
+};
+
+struct Bf16Params {
+    MegaMoeTrainTimerDevice* timer = nullptr;
+    GM_ADDR aGmAddr;
+    GM_ADDR expertIdxGmAddr;
+    GM_ADDR bGmAddr;
+    GM_ADDR bScaleGmAddr;
+    GM_ADDR b2GmAddr;
+    GM_ADDR b2ScaleGmAddr;
+    GM_ADDR probsGmAddr;
+    GM_ADDR y2GmAddr;
+    GM_ADDR expertTokenNumsOutGmAddr;
+    GM_ADDR permutedInputOutGmAddr;
+    GM_ADDR actualRecvTokensOutGmAddr;
+    GM_ADDR savedMetaOutGmAddr;
+    ForwardWorkspaceInfo workspaceInfo;
+    Bf16PeermemInfo peermemInfo;
+    MegaMoeBf16TilingData* tilingData;
+    // Rebuilt from the matching launch policy; zero retains source-major rows.
+    GM_ADDR forwardRawGate{nullptr};
+    GM_ADDR forwardRawUp{nullptr};
+    uint32_t peerRowsGroups{0};
+};
+
 struct GMMAddrInfo {
     GM_ADDR aGlobal;
     GM_ADDR bGlobal;
@@ -76,6 +115,8 @@ struct GMMAddrInfo {
     __gm__ int32_t* gmmToEpilogueFlag;
     __gm__ int32_t* gmm1TileStatus;
     __gm__ int32_t* sharedExpertGmm2TileCounter;
+    uint32_t gmm1OutRowStride = 0;
+    void* routedA8W4Pipeline = nullptr;
     // 仅 Wave 调试采集设置；其他调用保持空指针。
     AscendTimerDevice* timer = nullptr;
 };
