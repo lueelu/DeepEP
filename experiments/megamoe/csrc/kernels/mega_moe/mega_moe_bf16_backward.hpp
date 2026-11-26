@@ -1325,6 +1325,7 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad(
     }
     int64_t previousGroupEnd = 0;
     int64_t expertBase = 0;
+    int32_t logicalCore = static_cast<int32_t>(aivCoreIdx_);
     for (uint32_t expert = 0; expert < expertPerRank_; ++expert) {
         const int64_t groupEnd = static_cast<int32_t>(groupList_.GetValue(expert));
         int64_t expertRows = groupListType_ == 0 ? groupEnd - previousGroupEnd : groupEnd;
@@ -1350,10 +1351,9 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad(
                 Ops::Base::CeilDiv(static_cast<uint32_t>(rankRows), static_cast<uint32_t>(rowsPerBlock)));
             const int32_t blocksPerCore = ownershipBlocks / static_cast<int32_t>(blockAivNum_);
             const int32_t extraBlocks = ownershipBlocks % static_cast<int32_t>(blockAivNum_);
-            const int32_t coreBlocks = blocksPerCore + (static_cast<int32_t>(aivCoreIdx_) < extraBlocks ? 1 : 0);
-            const int64_t coreBlockBegin =
-                static_cast<int64_t>(aivCoreIdx_) * blocksPerCore +
-                (static_cast<int32_t>(aivCoreIdx_) < extraBlocks ? static_cast<int32_t>(aivCoreIdx_) : extraBlocks);
+            const int32_t coreBlocks = blocksPerCore + (logicalCore < extraBlocks ? 1 : 0);
+            const int64_t coreBlockBegin = static_cast<int64_t>(logicalCore) * blocksPerCore +
+                                           (logicalCore < extraBlocks ? logicalCore : extraBlocks);
             const int64_t coreRowBegin = coreBlockBegin * rowsPerBlock;
             int64_t coreRows = static_cast<int64_t>(coreBlocks) * rowsPerBlock;
             if (coreRowBegin + coreRows > rankRows) {
@@ -1371,6 +1371,11 @@ __aicore__ inline void MegaMoeBF16Backward<TopkWeightT>::ReduceAndRouteTopkGrad(
                                       partialTiles, partialStride, expert,
                                       static_cast<uint32_t>(packedRow - expertBase));
                 }
+            }
+            // Continue distributing remainder blocks across peer and expert boundaries.
+            logicalCore -= extraBlocks;
+            if (logicalCore < 0) {
+                logicalCore += static_cast<int32_t>(blockAivNum_);
             }
             rankRowBegin += rankRows;
         }

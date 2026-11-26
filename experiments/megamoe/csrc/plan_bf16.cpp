@@ -267,7 +267,7 @@ torch::Tensor BF16Plan::AllocateTimer(const torch::Tensor& like, const torch::Te
     const int64_t dwTiles = e * std::max(CeilDiv(2 * f, int64_t{128}) * CeilDiv(h, int64_t{256}),
                                          CeilDiv(h, int64_t{128}) * CeilDiv(f, int64_t{256}));
     const int64_t gemmTasks = CeilDiv(std::max(tiles, phase == 0 ? int64_t(0) : dwTiles), groups);
-    // Short dP sends from every peer/expert pair can all be owned by the first AIV.
+    // Budget dP send events across all peer/expert pairs, independently of their AIV assignment.
     const int64_t sendTasks = phase == 0 ? 0 : int64_t(world_size_) * e;
     const int64_t bound = std::max(gemmTasks, sendTasks) + 4 * e + 32;
     const int capacity = static_cast<int>(CeilDiv(std::max(bound, int64_t(128)), int64_t{64}) * 64);
