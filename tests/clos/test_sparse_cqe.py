@@ -5,6 +5,7 @@ constexpr runs the checks even on hosts that cannot execute compiled binaries.
 """
 
 from pathlib import Path
+import json
 import shutil
 import subprocess
 
@@ -14,6 +15,162 @@ from tests.utils.cpp import cpp_functions
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_payload_merge_option_validation(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("C++17 compiler required")
+    host = (ROOT / "csrc/direct/ops/combine.cpp").read_text()
+    parser = cpp_functions(host, "ParseCombinePayloadMaxRows").replace(
+        "uint32_t ParseCombinePayloadMaxRows", "constexpr uint32_t ParseCombinePayloadMaxRows"
+    )
+    prefix = '#include <cstdint>\n#define TORCH_CHECK(ok, ...) if (!(ok)) throw "invalid";\n' + parser
+    valid = (
+        "static_assert(ParseCombinePayloadMaxRows(nullptr)==1);\n"
+        'static_assert(ParseCombinePayloadMaxRows("1")==1);\n'
+        'static_assert(ParseCombinePayloadMaxRows("0004")==4);\n'
+        'static_assert(ParseCombinePayloadMaxRows("32")==32);\n'
+    )
+    for value in (None, "", "0", "33", "-1", "2x", " 4", "1.5", "9999999999999999999999999"):
+        body = valid if value is None else f"constexpr auto result=ParseCombinePayloadMaxRows({json.dumps(value)});"
+        path = tmp_path / "option.cpp"
+        path.write_text(prefix + body)
+        result = subprocess.run(
+            [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "option.o")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert (result.returncode == 0) == (value is None), result.stderr
+
+
+@pytest.mark.parametrize(
+    "limit,corrupt", [(1, False), (2, False), (4, False), (8, False), (16, False), (32, False), (4, True)]
+)
+def test_coalesced_combine_payload_mapping(tmp_path, limit, corrupt):
+    """Expand actual production WQEs back into rows and compare every address.
+
+    Compile-time checks include tails, span boundaries, multiple headers/QPs,
+    continuous/fragmented/duplicate destinations and the conservative byte cap.
+    """
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("C++17 compiler required")
+    text = (ROOT / "csrc/direct/kernels/combine/udma_combine_sender.h").read_text()
+    body = cpp_functions(text, "BuildCombineWqesCoalesced")
+    end = body.rfind(")", 0, body.index("{"))
+    body = (body[:end] + ", uint32_t tid" + body[end:]).replace("threadIdx.x", "tid")
+    body = (
+        body.replace("auto* indices = reinterpret_cast<__ubuf__ int32_t*>(span[0]);", "const uint64_t seed = span[0];")
+        .replace("indices[pos + rows]", "index_at(seed, pos + rows)")
+        .replace("indices[pos]", "index_at(seed, pos)")
+    )
+    program = r"""
+#include <cstdint>
+#define __simt_vf__ constexpr
+#define __launch_bounds__(n)
+#define __ubuf__
+namespace __asc_simt_vf { void __trap(); }
+constexpr int32_t index_at(uint64_t seed, unsigned pos) {
+    unsigned pattern=seed%3, base=unsigned(seed/3)*128;
+    return int32_t(base+(pattern==0 ? pos : pattern==1 ? pos*2 : pos/2));
+}
+// PRODUCTION
+constexpr bool check(unsigned count,unsigned width,unsigned bytes,unsigned pattern) {
+    uint64_t wqes[256]{}, spans[128]{}, headers[16*32]{}, bases[32]{};
+    for(unsigned p=0;p<32;++p) {
+        bases[p]=0x100000000ULL+uint64_t(p)*10000000;
+        for(unsigned h=0;h<16;++h)headers[p*16+h]=p*100+h;
+    }
+    unsigned n=0, output=999;
+    for(unsigned start=0;start<count;start+=width,++n) {
+        unsigned len=count-start<width ? count-start : width;
+        spans[n*4]=n*3+pattern;
+        spans[n*4+1]=(uint64_t(len)<<32)|(17+start);
+        spans[n*4+2]=n;
+        spans[n*4+3]=start;
+    }
+    // Reverse lane order proves that no lane relies on another lane's writes.
+    for(unsigned t=32;t>0;--t)
+        BuildCombineWqesCoalesced(wqes,spans,headers,bases,&output,0x200000000ULL,
+                                 512,bytes,8192,n,count,LIMIT,t-1);
+    if(output>count || (count && !output))return false;
+    unsigned cursor=0, expected_count=0;
+    for(unsigned s=0;s<n;++s) {
+        unsigned len=unsigned(spans[s*4+1]>>32), pos=0;
+        while(pos<len) {
+            unsigned cap=bytes<=65536 ? 65536/bytes : 1;
+            if(cap>LIMIT)cap=LIMIT;
+            unsigned expected_rows=1;
+            while(expected_rows<cap && pos+expected_rows<len &&
+                  index_at(spans[s*4],pos+expected_rows)==index_at(spans[s*4],pos)+int(expected_rows))
+                ++expected_rows;
+            auto* w=wqes+cursor*8;
+            if(w[6]!=uint64_t(expected_rows)*bytes)return false;
+            for(unsigned h=0;h<5;++h)if(w[h]!=headers[s*16+h])return false;
+            for(unsigned r=0;r<expected_rows;++r) {
+                if(w[5]+uint64_t(r)*bytes!=bases[s]+512+uint64_t(index_at(spans[s*4],pos+r))*bytes)return false;
+                if(w[7]+uint64_t(r)*bytes!=0x200000000ULL+
+                   (uint64_t(uint32_t(spans[s*4+1]))+pos+r)*bytes)return false;
+            }
+            pos+=expected_rows; ++cursor; ++expected_count;
+        }
+    }
+    if(output!=expected_count)return false;
+    for(unsigned i=output*8;i<256;++i)if(wqes[i])return false;
+    return true;
+}
+constexpr bool matrix(unsigned bytes) {
+    for(unsigned count : {0U,1U,15U,31U,32U})
+        for(unsigned width : {1U,5U,32U})
+            for(unsigned pattern=0;pattern<3;++pattern)
+                if(!check(count,width,bytes,pattern))return false;
+    return true;
+}
+static_assert(matrix(5632));
+static_assert(matrix(8192));
+static_assert(matrix(12288));
+static_assert(matrix(65568));
+"""
+    program = "#include <initializer_list>\n" + program.replace("// PRODUCTION", body).replace("LIMIT", str(limit))
+    if corrupt:
+        program = program.replace("wqe[6] = uint64_t(rows) * x_bytes;", "wqe[6] = x_bytes;")
+    path = tmp_path / "coalesce.cpp"
+    path.write_text(program)
+    budget = "-fconstexpr-steps=100000000" if "clang" in Path(compiler).name else "-fconstexpr-ops-limit=100000000"
+    result = subprocess.run(
+        [compiler, "-std=c++17", budget, "-c", str(path), "-o", str(tmp_path / "coalesce.o")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if corrupt:
+        assert result.returncode != 0 and "static assertion" in result.stderr, result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+
+
+def test_coalescing_gates_and_count_lifetime():
+    host = (ROOT / "csrc/direct/ops/combine.cpp").read_text()
+    start = host.index("    tiling.combine_payload_max_rows =")
+    gate = host[start : host.index(";", start)]
+    for condition in (
+        "use_udma",
+        "epilogue",
+        "!tiling.udma_token_schedule",
+        "!aggregate",
+        "!pipeline_chunk_tokens",
+        "!expanded_x.has_value()",
+        "workspace.x_row_stride == hidden_bytes",
+    ):
+        assert condition in gate
+    sender = (ROOT / "csrc/direct/kernels/combine/udma_combine_sender.h").read_text()
+    assert "td_.combine_payload_max_rows > 1U && fields_ == 1U" in sender
+    assert sender.index("HardEvent::V_S") < sender.index("submitted = *actual_count")
+    assert "Base::SubmitBatch(submitted, spans_, false)" in sender
+    schedule = (ROOT / "csrc/direct/kernels/combine/udma_combine_schedule.h").read_text()
+    assert "sender_base_bytes + (td.combine_payload_max_rows > 1U ? 32U : 0U)" in schedule
 
 
 @pytest.mark.parametrize("corrupt_sink", [False, True])

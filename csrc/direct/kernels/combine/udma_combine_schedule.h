@@ -14,8 +14,10 @@ __aicore__ inline void CombineRemoteImpl(
     Resource& resource, GM_ADDR x, GM_ADDR weights, GM_ADDR src_idx, GM_ADDR rank_prefix, GM_ADDR channel_prefix,
     GM_ADDR workspace, const CombineTilingData& td, uint32_t core, Trace& trace)
 {
-    constexpr uint32_t sender_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
-    static_assert(sender_bytes + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
+    // Separate VF-produced count from descriptors, indices and pressure scratch.
+    constexpr uint32_t sender_base_bytes = kHeadersOffset + Capacity * Qps * (2U * kWqeBytes + sizeof(uint64_t));
+    const uint32_t sender_bytes = sender_base_bytes + (td.combine_payload_max_rows > 1U ? 32U : 0U);
+    static_assert(sender_base_bytes + 32U + Capacity * kTileTokens * sizeof(int32_t) <= platform::kKernelUbBytes);
     auto wq = resource.template GetBufferByByte<uint8_t>(0);
     auto indices = resource.template GetBufferByByte<int32_t>(sender_bytes);
     const bool compact_weights = Phase == 0 && td.combine_compact_weights;

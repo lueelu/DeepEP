@@ -18,6 +18,21 @@
 
 namespace {
 
+uint32_t ParseCombinePayloadMaxRows(const char* value)
+{
+    if (!value) return 1;
+    uint32_t rows = 0;
+    TORCH_CHECK(*value, "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be an integer in [1, 32]");
+    for (const char* p = value; *p; ++p) {
+        TORCH_CHECK(*p >= '0' && *p <= '9',
+                    "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be an integer in [1, 32]");
+        rows = rows * 10U + uint32_t(*p - '0');
+        TORCH_CHECK(rows <= 32U, "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be in [1, 32]");
+    }
+    TORCH_CHECK(rows >= 1U, "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be in [1, 32]");
+    return rows;
+}
+
 constexpr int64_t kMaxCombineAiv = ascend_deepep::platform::kMaxNumAiv;
 constexpr int64_t kMaxCombineTopk = 128;
 constexpr int64_t kCombineUbBytes = ascend_deepep::platform::kKernelUbBytes;
@@ -394,6 +409,12 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.combine_wqe_fast = wqe_fast && std::strcmp(wqe_fast, "1") == 0 &&
         use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
         !pipeline_chunk_tokens && !expanded_x.has_value();
+    const uint32_t payload_max_rows = ParseCombinePayloadMaxRows(
+        std::getenv("DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"));
+    tiling.combine_payload_max_rows =
+        use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
+        !pipeline_chunk_tokens && !expanded_x.has_value() && workspace.x_row_stride == hidden_bytes
+            ? payload_max_rows : 1U;
     const char* self_db = std::getenv("DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER");
     TORCH_CHECK(!self_db || std::strcmp(self_db, "0") == 0 || std::strcmp(self_db, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER must be 0 or 1");

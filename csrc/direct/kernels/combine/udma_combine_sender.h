@@ -112,6 +112,59 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesFast(
     wqe[7] = (weight ? weights : x) + row * (weight ? weight_bytes : x_bytes);
 }
 
+// Each lane scans at most one original 32-row batch in UB, and owns one
+// compacted WQE. No cross-lane scratch or GM index reads are needed. Keeping
+// spans separate preserves visit/peer/QP/window boundaries and row ownership.
+__simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesCoalesced(
+    __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers,
+    __ubuf__ uint64_t* remote_bases, __ubuf__ uint32_t* actual_count,
+    uint64_t x, uint64_t x_offset, uint32_t x_bytes, uint32_t token_capacity,
+    uint32_t span_count, uint32_t count, uint32_t max_rows)
+{
+    const uint32_t lane = threadIdx.x;
+    if (!x_bytes || !max_rows || max_rows > 32U || count > 32U) {
+        __asc_simt_vf::__trap(); return;
+    }
+    // Conservative cap, matching compact-weight chunking; this is not a
+    // claim about the hardware's maximum transfer length. Never split a row.
+    const uint32_t byte_cap = x_bytes <= 65536U ? 65536U / x_bytes : 1U;
+    const uint32_t limit = max_rows < byte_cap ? max_rows : byte_cap;
+    uint32_t output = 0, consumed = 0;
+    for (uint32_t s = 0; s < span_count; ++s) {
+        auto* span = spans + s * 4U;
+        const uint32_t length = static_cast<uint32_t>(span[1] >> 32U);
+        const uint32_t row = static_cast<uint32_t>(span[1]);
+        const uint32_t peer = static_cast<uint32_t>(span[2]);
+        auto* indices = reinterpret_cast<__ubuf__ int32_t*>(span[0]);
+        if (span[2] >> 32U || span[3] != consumed || length > count - consumed) {
+            __asc_simt_vf::__trap(); return;
+        }
+        for (uint32_t pos = 0; pos < length;) {
+            const int32_t token = indices[pos];
+            if (token < 0 || static_cast<uint32_t>(token) >= token_capacity) {
+                __asc_simt_vf::__trap(); return;
+            }
+            uint32_t rows = 1;
+            while (rows < limit && rows < length - pos &&
+                   uint64_t(token) + rows < token_capacity &&
+                   int64_t(indices[pos + rows]) == int64_t(token) + rows) ++rows;
+            if (lane == output) {
+                auto* header = headers + peer * 2U * 8U;
+                auto* wqe = wqes + output * 8U;
+                for (uint32_t h = 0; h < 5U; ++h) wqe[h] = header[h];
+                wqe[5] = remote_bases[peer] + x_offset + uint64_t(token) * x_bytes;
+                wqe[6] = uint64_t(rows) * x_bytes;
+                wqe[7] = x + (uint64_t(row) + pos) * x_bytes;
+            }
+            ++output;
+            pos += rows;
+        }
+        consumed += length;
+    }
+    if (consumed != count) { __asc_simt_vf::__trap(); return; }
+    if (lane == 0) *actual_count = output;
+}
+
 template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, class Trace = DisabledDispatchDeviceTrace>
 class CombineSenderT : public SenderT<Capacity, Qps, Trace> {
     using Base = SenderT<Capacity, Qps, Trace>;
@@ -210,7 +263,27 @@ public:
         const uint64_t rank_slot = uint64_t(td_.rank) * td_.token_capacity;
         AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID5);
-        if (td_.combine_wqe_fast && row_step_ == 1U && index_step_ == 1U && !td_.single_source_slots) {
+        uint32_t submitted = rows_pending_;
+        const bool coalesce = td_.combine_payload_max_rows > 1U && fields_ == 1U &&
+            row_step_ == 1U && index_step_ == 1U && !td_.single_source_slots &&
+            td_.x_row_stride == uint64_t(td_.hidden) * td_.x_element_bytes;
+        if (coalesce) {
+            auto* actual_count = reinterpret_cast<__ubuf__ uint32_t*>(
+                scratch_ + kCombineBasesOffset + Capacity * Qps * sizeof(uint64_t));
+            asc_vf_call<BuildCombineWqesCoalesced>(
+                dim3(32), reinterpret_cast<__ubuf__ uint64_t*>(scratch_),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kHeadersOffset),
+                reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kCombineBasesOffset), actual_count,
+                x_, td_.x_buffer_offset + rank_slot * td_.x_row_stride,
+                td_.hidden * td_.x_element_bytes, td_.token_capacity, spans_, rows_pending_,
+                td_.combine_payload_max_rows);
+            // VF count is consumed by scalar SQ bookkeeping, not just MTE3.
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID5);
+            submitted = *actual_count;
+            if (!submitted || submitted > rows_pending_) { trap(); return; }
+        } else if (td_.combine_wqe_fast && row_step_ == 1U && index_step_ == 1U && !td_.single_source_slots) {
             if (fields_ == 2U) BuildFast<true>(rank_slot);
             else BuildFast<false>(rank_slot);
         } else {
@@ -228,7 +301,9 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
         Base::FinishWqeBuild(built);
-        Base::SubmitBatch(rows_pending_, spans_, false);
+        // Logical rows/visit accounting above is unchanged. SQ head/credits
+        // and trace WQE counts must use the physical descriptor count.
+        Base::SubmitBatch(submitted, spans_, false);
         rows_pending_ = 0;
         spans_ = 0;
     }

@@ -141,6 +141,33 @@ performance; both still require device validation.
 
 ## Interpreting results
 
+### Combine payload coalescing
+
+`DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS` is read on each combine call. It defaults
+to `1` (the existing builder) and accepts integers from `1` through `32`.
+Values above one enable a separate SIMT builder for ordinary non-expanded
+peer-scheduled combine with dense payload strides. It reads AIV-loaded UB
+indices and merges only consecutive source **and** destination rows. Each WQE
+is capped at 64 KiB, or one unchanged row if a row itself exceeds that size.
+It never merges across descriptor spans, visits, peers/QPs, worker partitions,
+index windows or the original 32-request submission batch. Unsupported paths
+retain individual-row WQEs, including interleaved legacy payload/weight WQEs.
+The default compact-weight path is supported; weight transfers are unchanged.
+
+With coalescing enabled this builder takes precedence over `COMBINE_WQE_FAST`.
+P/W/Q, peer order and logical visit budgets are unchanged. SQ occupancy, head
+updates and diagnostic WQE counts use the reduced physical count. Final flags,
+quiet, local copies/direct self reads and reduce addressing are unchanged.
+The count has a separate 32-byte UB reservation; payload is never staged in UB.
+Rebuild Host and kernel together for the added tiling field.
+
+Compare `1/2/4/8/16/32` using the same Buffer, routes and other settings; setting
+the environment before each call is sufficient outside graph capture. Validate
+zero-tolerance output first, then measure communication and full API separately.
+Use an independent diagnostic pass to compare physical WQE counts and build
+time. Discontinuous routes may save no WQEs and can become slower due to scanning;
+this experiment does not establish a performance gain or change the default.
+
 The scripts run precision checks and forward/reverse comparisons with one Buffer
 per rank. Both weight modes use the same routing across variants. L2 eviction
 finishes before each sample's all-rank barrier on the existing Buffer stream;
