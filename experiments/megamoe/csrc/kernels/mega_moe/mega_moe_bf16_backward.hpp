@@ -135,7 +135,8 @@ private:
                 expert % blockAivNum_ == aivCoreIdx_ && UseStagedWave(ordinal)) {
                 const WavePlan plan(rows, n_ / 2, blockNum_, 0, 0);
                 AtomicAdd(WaveChunkSlot(expert),
-                          static_cast<int32_t>(plan.SelectChunkTiles(prefix, worldSize_, expertPerRank_, expert)));
+                          static_cast<int32_t>(plan.SelectChunkTiles(prefix, worldSize_, expertPerRank_, expert,
+                                                                     params_.tilingData->dispatchRanksPerNode)));
             }
         }
     }

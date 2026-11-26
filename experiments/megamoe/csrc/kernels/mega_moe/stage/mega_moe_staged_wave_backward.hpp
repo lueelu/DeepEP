@@ -82,12 +82,17 @@ struct BackwardWavePlan {
     // across sources. A unit chunk keeps sequential visits.
     template <class Prefix>
     MEGAMOE_BWD_WAVE_HD inline uint32_t SelectChunkTiles(const Prefix& prefix, uint32_t sources, uint32_t experts,
-                                                         uint32_t expert) const
+                                                         uint32_t expert, uint32_t ranksPerNode = 0) const
     {
         if (rows <= groups * tileM) return 1U;
         uint32_t begin = 0, maxRows = 0;
-        for (uint32_t peer = 0; peer < sources && begin < rows; ++peer) {
-            const uint32_t rawEnd = prefix.Get(peer * experts + expert);
+        // Use node-sized source ranges only for a multi-node EP group. The
+        // canonical 128-row tiles and their addresses are independent of visit order.
+        const uint32_t stride =
+            ranksPerNode > 0 && ranksPerNode < sources && sources % ranksPerNode == 0 ? ranksPerNode : 1U;
+        for (uint32_t first = 0; first < sources && begin < rows; first += stride) {
+            const uint32_t last = first + stride - 1;
+            const uint32_t rawEnd = prefix.Get(last * experts + expert);
             const uint32_t end = rawEnd < rows ? rawEnd : rows;
             const uint32_t count = end - begin;
             if (count > maxRows) maxRows = count;
