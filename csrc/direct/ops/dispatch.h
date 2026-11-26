@@ -13,8 +13,7 @@ namespace ascend_deepep::ops {
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> GetDispatchLayout(
     torch::Tensor topk_idx, int64_t num_experts, int rank, int world_size, int num_device_aiv, uint64_t ffts_addr,
-    c10::optional<int64_t> allocation_stream_id = c10::nullopt, bool allocate_only = false,
-    int64_t simt_num_aiv = 0);
+    c10::optional<int64_t> allocation_stream_id = c10::nullopt, bool allocate_only = false, int64_t simt_num_aiv = 0);
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
            std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -33,6 +32,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
            int64_t udma_wqes_per_visit = 8, c10::optional<torch::Tensor> cached_dispatch_plan = c10::nullopt,
            std::vector<torch::Tensor>* public_handle = nullptr, bool defer_public_expert_prefix = false,
            void* dispatch_output_control = nullptr, const std::vector<int64_t>& launch_plan = {},
-           c10::optional<torch::Tensor> cached_send_head = c10::nullopt, bool allow_omit_topk_output = false);
+           c10::optional<torch::Tensor> cached_send_head = c10::nullopt, bool allow_omit_topk_output = false,
+           bool layout_inputs_prepared = false);
 
 }  // namespace ascend_deepep::ops

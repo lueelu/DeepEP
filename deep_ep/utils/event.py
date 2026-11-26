@@ -58,6 +58,7 @@ class EventOverlap:
         self._retained_objects = None
         self._stream_tensors = ()
         self._consumer_tensors = None
+        self._consumer_streams = None
         if isinstance(event, EventHandle) and extra_tensors is not None:
             self._track_tensors(extra_tensors)
 
@@ -86,6 +87,7 @@ class EventOverlap:
         *,
         consumer_tensors: Optional[Tuple[Any, ...]] = None,
         producer_tensors: Optional[Tuple[Any, ...]] = None,
+        consumer_streams: Optional[Tuple[Any, ...]] = None,
     ) -> "EventOverlap":
         """Own backend resources without changing public extra_tensors semantics."""
         overlap = cls(event)
@@ -93,6 +95,8 @@ class EventOverlap:
         overlap._track_tensors(resources, producer_tensors)
         if consumer_tensors is not None:
             overlap._consumer_tensors = overlap._filter_tensors(consumer_tensors)
+        if consumer_streams is not None:
+            overlap._consumer_streams = list(consumer_streams)
         return overlap
 
     def current_stream_wait(self, release_handle: bool = False) -> Any:
@@ -103,8 +107,14 @@ class EventOverlap:
         tensors = self._stream_tensors if self._consumer_tensors is None else self._consumer_tensors
         if tensors:
             stream = npu_api().current_stream(self.event._device)
-            for tensor in tensors:
-                tensor.record_stream(stream)
+            # Dispatch already registers returned outputs before returning.
+            # Compare stream values: current_stream() can return a new wrapper.
+            if self._consumer_streams is None or stream not in self._consumer_streams:
+                for tensor in tensors:
+                    tensor.record_stream(stream)
+                # A failed registration must remain retryable with all owners.
+                if self._consumer_streams is not None:
+                    self._consumer_streams.append(stream)
         result = None
         if self.hook_after_wait is not None:
             result = self.hook_after_wait()
@@ -114,6 +124,7 @@ class EventOverlap:
             self._retained_objects = None
             self._stream_tensors = ()
             self._consumer_tensors = None
+            self._consumer_streams = None
         # Upstream keeps extra_tensors until the wrapper itself is released.
         return result
 

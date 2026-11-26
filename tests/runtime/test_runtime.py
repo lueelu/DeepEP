@@ -284,6 +284,88 @@ def test_selected_consumers_preserve_producer_protection_and_ownership(
     assert all(ref() is None for ref in refs)
 
 
+def test_dispatch_wait_reuses_registered_stream_and_protects_new_consumers(event_backend, monkeypatch):
+    import gc
+    import weakref
+
+    from deep_ep.backends.direct import elastic
+
+    log, npu = event_backend
+
+    class Stream:
+        # Framework stream wrappers can differ in identity while naming the same stream.
+        def __init__(self, number):
+            self.number = number
+
+        def __eq__(self, other):
+            return isinstance(other, Stream) and self.number == other.number
+
+    class Tensor:
+        device = SimpleNamespace(type="npu", index=0)
+
+        def __init__(self, name):
+            self.name = name
+            self.fail = False
+
+        def record_stream(self, stream):
+            log.append((self.name, stream.number))
+            if self.fail:
+                raise RuntimeError("registration failed")
+
+    class Owner:
+        pass
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(Tensor=Tensor))
+    instance = elastic.ElasticBuffer.__new__(elastic.ElasticBuffer)
+    instance._communication_stream = SimpleNamespace(device=0)
+    first, second, source, owner = Tensor("first"), Tensor("second"), Tensor("source"), Owner()
+    refs = [weakref.ref(t) for t in (first, second, source, owner)]
+    overlap = instance._finish_comm_event(
+        True,
+        (first, second, source, owner),
+        consumer_tensors=(first, second),
+        producer_tensors=(),  # Native already protects all producer use.
+        consumer_streams=(Stream(1),),  # Outputs were registered before dispatch returned.
+    )
+    assert len(log) == 1 and log[0][0] == "record"
+    npu.current_stream = lambda device: Stream(1)
+    overlap.wait()
+    overlap.wait()
+    assert [item[0] for item in log] == ["record", "wait", "wait"]
+    npu.current_stream = lambda device: Stream(2)
+    second.fail = True
+    with pytest.raises(RuntimeError, match="registration failed"):
+        overlap.current_stream_wait(True)
+    assert overlap.event is not None and len(overlap._consumer_streams) == 1
+    second.fail = False
+    begin = len(log)
+    overlap.wait()
+    assert log[begin + 1 :] == [("first", 2), ("second", 2)]
+    begin = len(log)
+    overlap.wait()
+    assert [item[0] for item in log[begin:]] == ["wait"]
+    del first, second, source, owner
+    gc.collect()
+    assert all(ref() is not None for ref in refs)
+    original_wait = overlap.event._event.wait
+
+    def fail_wait(stream):
+        raise RuntimeError("wait failed")
+
+    overlap.event._event.wait = fail_wait
+    with pytest.raises(RuntimeError, match="wait failed"):
+        overlap.current_stream_wait(True)
+    assert all(ref() is not None for ref in refs)
+    overlap.event._event.wait = original_wait
+    npu.current_stream = lambda device: Stream(3)
+    begin = len(log)
+    overlap.current_stream_wait(True)
+    assert log[begin + 1 :] == [("first", 3), ("second", 3)]
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+    assert overlap._consumer_streams is None
+
+
 @pytest.mark.parametrize("value", [None, -1, 0, True, 1.5, 2**63])
 def test_capacity_rejection(value):
     with pytest.raises(ValueError):

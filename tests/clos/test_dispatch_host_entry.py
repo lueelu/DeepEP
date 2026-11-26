@@ -91,6 +91,9 @@ def test_combined_entry_preserves_layout_handle_outputs_and_allocation(entry, si
         assert handle.num_recv_tokens_per_expert_list == [1]*32
         assert handle.psum_num_recv_tokens_per_scaleup_rank is public[0]
         assert out[4]=='done' and finish[0][0][1][-1] is handle
+        assert finish[0][1]['producer_tensors'] == ()
+        assert finish[0][1]['consumer_tensors'] == (recv,None,recv_idx,recv_weight if {weights} else None)
+        assert finish[0][1]['consumer_streams'] == ()  # Mock output registration above.
     """)
 
 
@@ -102,11 +105,15 @@ def test_native_composed_entry_order_forwarding_and_core_rejection(tmp_path):
     production = (root / "csrc/direct/runtime/buffer_runtime.cpp").read_text(encoding="utf-8")
     start = production.index("BufferRuntime::FreshDispatchHostResult BufferRuntime::IntranodeDispatchFromTopk(")
     body = production[start : production.index("\n}\n", start) + 3]
+    dispatch = (root / "csrc/direct/ops/dispatch.cpp").read_text(encoding="utf-8")
+    start = dispatch.index("    allocator.Record({x, x_scales, topk_weights,")
+    input_records = dispatch[start : dispatch.index('    CheckNpuContiguous(x, "x");', start)]
     source = tmp_path / "host_entry.cpp"
     source.write_text(
         r"""
 #include <cassert>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
@@ -114,12 +121,40 @@ def test_native_composed_entry_order_forwarding_and_core_rejection(tmp_path):
 #define TORCH_CHECK(test, ...) if (!(test)) throw std::runtime_error("invalid cores")
 namespace torch { struct Tensor { int id; }; }
 namespace c10 { template<class T> using optional = std::optional<T>; constexpr auto nullopt = std::nullopt; }
+constexpr int kCommMetaBytes=128, ACLSHMEM_DATA_OP_UDMA=2;
+std::vector<int> order;
+c10::optional<int64_t> expected_allocation;
+namespace ascend_deepep::ops {
+    template<class... Args> auto V1Dispatch(Args... args) {
+        assert(order == std::vector<int>{1});
+        order.push_back(2);
+        auto a=std::make_tuple(args...);
+        assert(std::get<0>(a).id==1 && std::get<1>(a)->id==2 && std::get<2>(a).id==3 && std::get<3>(a)->id==4);
+        assert(std::get<4>(a).id==11 && std::get<5>(a).id==13 && std::get<6>(a).id==12);
+        assert(std::get<7>(a)==0 && std::get<10>(a)==2 && std::get<11>(a)==100);
+        assert(std::get<12>(a)==32 && std::get<13>(a)==6 && std::get<14>(a)==256 && !std::get<15>(a));
+        assert(std::get<16>(a)==0 && std::get<17>(a)==8 && std::get<18>(a)==128);
+        assert(std::get<19>(a)==99 && !std::get<20>(a) && std::get<21>(a));
+        assert(std::get<22>(a)==123 && std::get<23>(a)==nullptr);
+        assert(std::get<24>(a)==expected_allocation && std::get<25>(a)==129);
+        assert(std::get<26>(a)==2 && std::get<27>(a)==8);
+        *std::get<29>(a)={{22}};
+        assert(std::get<30>(a) && std::get<31>(a)==nullptr);
+        assert(std::get<32>(a)==std::vector<int64_t>({1,2,3}));
+        assert(!std::get<34>(a) && std::get<35>(a));
+        return std::make_tuple(torch::Tensor{21});
+    }
+}
 struct BufferRuntime {
     int num_device_aiv_ = 64;
+    int rank_=0, num_ranks_=8, num_bytes_=0, data_op_engine_type_=2;
+    std::size_t notify_workspace_bytes_=99;
+    bool symmetric_workspace_active_=false;
+    void* dispatch_output_control_=nullptr;
+    int RequireShmem() { return 123; }
+    void* KernelWorkspace() { return nullptr; }
     bool expected_simt;
     bool used_simt = false;
-    c10::optional<int64_t> expected_allocation;
-    std::vector<int> order;
     using Layout = std::tuple<torch::Tensor,c10::optional<torch::Tensor>,torch::Tensor,torch::Tensor>;
     using FreshDispatchHostResult = std::tuple<std::tuple<torch::Tensor>,std::vector<torch::Tensor>,torch::Tensor>;
     Layout GetDispatchLayout(torch::Tensor idx,int64_t experts,c10::optional<int64_t> allocation) {
@@ -132,43 +167,52 @@ struct BufferRuntime {
         used_simt = true;
         return GetDispatchLayout(idx,experts,allocation);
     }
-    template<class... Args> auto IntranodeDispatchWithHandle(Args... args) {
-        assert(order == std::vector<int>{1});
-        order.push_back(2);
-        auto a=std::make_tuple(args...);
-        assert(std::get<0>(a).id==1 && std::get<1>(a)->id==2 && std::get<2>(a).id==3 && std::get<3>(a)->id==4);
-        assert(std::get<4>(a).id==11 && std::get<5>(a).id==13 && std::get<6>(a).id==12);
-        assert(std::get<7>(a)==0 && std::get<10>(a)==2 && std::get<11>(a)==100);
-        assert(std::get<12>(a)==32 && std::get<13>(a)==6 && std::get<14>(a)==256 && !std::get<15>(a));
-        assert(std::get<16>(a)==expected_allocation && std::get<17>(a)==129);
-        assert(std::get<18>(a)==2 && std::get<19>(a)==8 && std::get<21>(a));
-        assert(std::get<22>(a)==std::vector<int64_t>({1,2,3}));
-        return std::make_tuple(std::make_tuple(torch::Tensor{21}),std::vector<torch::Tensor>{{22}});
-    }
     FreshDispatchHostResult IntranodeDispatchFromTopk(
         torch::Tensor,c10::optional<torch::Tensor>,torch::Tensor,c10::optional<torch::Tensor>,
         int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,c10::optional<int64_t>,
         c10::optional<int64_t>,int64_t,int64_t,bool,const std::vector<int64_t>&,bool);
 };
 """
+        + r"""
+void CheckInputProtection(bool prepared) {
+    struct Allocator {
+        std::vector<int> ids;
+        void Record(std::initializer_list<c10::optional<torch::Tensor>> inputs) {
+            for (const auto& input : inputs) if (input) ids.push_back(input->id);
+        }
+    } allocator;
+    torch::Tensor x{1}, is_token_in_rank{6};
+    c10::optional<torch::Tensor> x_scales{{2}}, topk_idx{{3}}, topk_weights{{4}},
+        num_tokens_per_rank{{5}}, num_tokens_per_expert{{7}}, cached_rank_prefix_matrix{{8}},
+        cached_channel_prefix_matrix{{9}}, cached_dispatch_plan{{10}}, cached_send_head{{11}};
+    bool layout_inputs_prepared=prepared;
+"""
+        + input_records
+        + r"""
+    assert(allocator.ids == (prepared ? std::vector<int>{1,2,4,8,9,10,11}
+                                     : std::vector<int>{1,2,4,8,9,10,11,3,5,6,7}));
+}
+"""
         + body
         + r"""
 int main() {
+    CheckInputProtection(false); // Arbitrary/cached input provenance is unknown.
+    CheckInputProtection(true);  // Fresh layout protection was already installed.
     for (bool simt : {false,true}) for (bool comm : {false,true}) {
         BufferRuntime runtime;
         runtime.expected_simt=simt;
-        runtime.expected_allocation=comm ? c10::nullopt : c10::optional<int64_t>{7};
+        expected_allocation=comm ? c10::nullopt : c10::optional<int64_t>{7};
         auto result=runtime.IntranodeDispatchFromTopk({1},torch::Tensor{2},{3},torch::Tensor{4},
-            256,2,100,32,6,256,runtime.expected_allocation,129,2,8,true,{1,2,3},simt);
+            256,2,100,32,6,256,expected_allocation,129,2,8,true,{1,2,3},simt);
         assert(std::get<0>(std::get<0>(result)).id==21 && std::get<1>(result)[0].id==22 && std::get<2>(result).id==13);
-        assert(runtime.order==std::vector<int>({1,2}));
+        assert(order==std::vector<int>({1,2}) && runtime.symmetric_workspace_active_);
         assert(runtime.used_simt==simt);
-        runtime.order.clear();
+        order.clear();
         try {
             runtime.IntranodeDispatchFromTopk({1},torch::Tensor{2},{3},torch::Tensor{4},
-                256,2,100,65,6,256,runtime.expected_allocation,129,2,8,true,{1,2,3},simt);
+                256,2,100,65,6,256,expected_allocation,129,2,8,true,{1,2,3},simt);
             assert(false);
-        } catch (const std::runtime_error&) { assert(runtime.order.empty()); }
+        } catch (const std::runtime_error&) { assert(order.empty()); }
     }
 }
 """,

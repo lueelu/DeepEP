@@ -1076,7 +1076,8 @@ class ElasticBuffer:
         # Handle metadata remains owned and protected for communication-stream use.
         # Expert counts are a Python list; FP8 scales are part of returned recv_x.
         consumer_tensors = (recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights)
-        _record_recv_outputs_on_current_stream(*consumer_tensors)
+        consumer_streams = {}
+        _record_recv_outputs_on_current_stream(*consumer_tensors, streams=consumer_streams)
 
         if x_scales is not None:
             recv_x = (recv_x, recv_x_scales)
@@ -1094,11 +1095,11 @@ class ElasticBuffer:
                 handle,
             ),
             consumer_tensors=consumer_tensors,
-            # Returned outputs and a newly built plan were allocated on this
-            # communication stream. Retain their owners, but only inputs need
-            # producer registration here. A cached plan is protected by native
-            # dispatch's input Record(), independently of this call's setting.
-            producer_tensors=(x_tensor, x_scales, topk_weights) if allocate_on_comm_stream else None,
+            # Native input Record() and StreamAllocator.Empty() already protect
+            # communication use, including cached and cross-stream allocations.
+            # Keep the same owners without registering them again in Python.
+            producer_tensors=(),
+            consumer_streams=tuple(consumer_streams.values()),
         )
         if host_timing is not None:
             host_timing.end_dispatch_host_timing()
@@ -1287,6 +1288,7 @@ class ElasticBuffer:
         *,
         consumer_tensors: Optional[Tuple[Any, ...]] = None,
         producer_tensors: Optional[Tuple[Any, ...]] = None,
+        consumer_streams: Optional[Tuple[Any, ...]] = None,
     ) -> EventOverlap:
         event = _try_record_event(self._communication_stream)
         if async_with_compute_stream:
@@ -1295,6 +1297,7 @@ class ElasticBuffer:
                 _compact_extra_tensors(extra_tensors),
                 consumer_tensors=consumer_tensors,
                 producer_tensors=producer_tensors,
+                consumer_streams=consumer_streams,
             )
         event.current_stream_wait()
         return EventOverlap()

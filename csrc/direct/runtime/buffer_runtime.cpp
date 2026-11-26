@@ -347,12 +347,18 @@ BufferRuntime::FreshDispatchHostResult BufferRuntime::IntranodeDispatchFromTopk(
     // round trip. This is Host entry composition, not device-kernel fusion.
     auto layout = simt_layout ? GetDispatchLayoutV2Simt(topk_idx, num_experts, num_aiv, allocation_stream_id)
                               : GetDispatchLayout(topk_idx, num_experts, allocation_stream_id);
-    auto result = IntranodeDispatchWithHandle(
+    std::vector<torch::Tensor> public_handle;
+    auto result = ascend_deepep::ops::V1Dispatch(
         x, x_scales, topk_idx, topk_weights, std::get<0>(layout), std::get<3>(layout), std::get<2>(layout), 0,
         c10::nullopt, c10::nullopt, expert_alignment, num_worst_tokens, num_aiv, num_max_nvl_chunked_send_tokens,
-        num_max_nvl_chunked_recv_tokens, false, allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker,
-        udma_wqes_per_visit, c10::nullopt, defer_public_expert_prefix, launch_plan);
-    return {std::get<0>(result), std::get<1>(result), std::get<3>(layout)};
+        num_max_nvl_chunked_recv_tokens, false, static_cast<int>(rank_), static_cast<int>(num_ranks_),
+        static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes), notify_workspace_bytes_,
+        symmetric_workspace_active_, (data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0, RequireShmem(),
+        KernelWorkspace(), allocation_stream_id, num_max_tokens_per_rank, udma_peers_per_worker, udma_wqes_per_visit,
+        c10::nullopt, &public_handle, defer_public_expert_prefix, dispatch_output_control_, launch_plan, c10::nullopt,
+        false, true);
+    symmetric_workspace_active_ = true;
+    return {result, public_handle, std::get<3>(layout)};
 }
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
