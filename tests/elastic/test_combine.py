@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import runpy
 import pytest
+import torch
 import importlib.util
 import shutil
 import subprocess
@@ -107,7 +108,6 @@ def test_reuse_profile_does_not_require_the_normal_prepare_kernel(tmp_path):
 @pytest.mark.parametrize("world", [8, 16, 32])
 @pytest.mark.parametrize("mode", ["random", "hotspot", "rotating_hotspot", "duplicates", "invalid", "empty"])
 def test_reuse_periods_preserve_every_contribution(world, mode):
-    torch = pytest.importorskip("torch")
     from deep_ep.buffers._combine_reuse import build_plan
 
     tokens, topk = 17, 6
@@ -200,8 +200,6 @@ def test_without_replacement_golden_and_local_priority(world, experts):
 
 def profile_combine(args, rank, scenario, buffer, expert, invoke, validate, info, log):
     """Clean profiler capture, then one separately validated instrumented call."""
-    import torch
-
     api_events = []
     if getattr(args, "profile_api_time", False):
         call = invoke
@@ -417,8 +415,6 @@ def build_reference(routes, experts, rank, chunk_tokens=256, *, server_dedup=Tru
 
 def install_rank_return_plan(handle, reference):
     """Test-only replacement after real Notify validation, before the first Combine."""
-    import torch
-
     if any(reference["backward_counts"]) or any(reference["gather_rows"]) or any(reference["chunk_masks"]):
         raise ValueError("Rank return plans must not contain remote gather tasks")
     for name in ("forward_counts", "backward_counts", "server_mask", "chunk_ranges", "chunk_masks", "gather_rows"):
@@ -498,25 +494,9 @@ def check_handle(handle, reference, rank):
 
 
 def payload(source, tokens, generation, hidden=7168):
-    import torch
-
     return ((torch.arange(tokens)[:, None] + torch.arange(hidden)[None, :] + source + generation) % 7 - 3).to(
         torch.bfloat16
     )
-
-
-def expected_output(routes, experts, rank, generation, hidden=7168):
-    import torch
-
-    base = payload(rank, len(routes[rank]), generation, hidden).float()
-    selected = torch.tensor(routes[rank], dtype=torch.int64)
-    valid = (selected >= 0) & (selected < experts)
-    slots = torch.arange(selected.shape[1])[None, :]
-    count = valid.sum(dim=1, keepdim=True)
-    bias = ((selected % 3 - 1 + slots % 3 - 1) * valid).sum(dim=1, keepdim=True)
-    # Bounded integer fixtures make this factored sum exact in FP32/BF16.
-    out = base * count + bias
-    return out.to(torch.bfloat16)
 
 
 def bf16_expert_rows(entries, world, tokens, topk, hidden, seed, device):
@@ -526,8 +506,6 @@ def bf16_expert_rows(entries, world, tokens, topk, hidden, seed, device):
     Calculate the sine in FP32 on the same device as the golden, then cast to
     BF16. Using CPU sine for one side and NPU sine for the other is not valid.
     """
-    import torch
-
     ids = torch.tensor(entries, dtype=torch.int64, device=device).reshape(-1, 3)
     token_seeds = (ids[:, 0] * tokens + ids[:, 1]) * topk + ids[:, 2]
     max_seed = world * tokens * topk
@@ -538,8 +516,6 @@ def bf16_expert_rows(entries, world, tokens, topk, hidden, seed, device):
 
 def bf16_expert_input(entries, args, generation, device, pool=None):
     """Generate expanded expert output without allocating all FP32 rows at once."""
-    import torch
-
     with torch.npu.memory.use_mem_pool(pool) if pool is not None else nullcontext():
         output = torch.empty((len(entries), args.hidden), dtype=torch.bfloat16, device=device)
     for begin in range(0, len(entries), 256):
@@ -585,8 +561,6 @@ def ordered_bf16_combine(contributions, orders):
     Use the first contribution to initialize each accumulator, like the kernel.
     Do not replace either loop with torch.sum: reduction order is significant.
     """
-    import torch
-
     batch, _, hidden = contributions.shape
     result = torch.zeros((batch, hidden), dtype=torch.float32, device=contributions.device)
     rows = torch.arange(batch, device=contributions.device)
@@ -613,8 +587,6 @@ def bf16_combine_golden(
     routes, experts, rank, generation, hidden, seed, device="npu", batch_tokens=32, rank_dedup=False
 ):
     """One independent golden: no tested handle, metadata or output is read."""
-    import torch
-
     if batch_tokens < 1:
         raise ValueError("batch_tokens must be positive")
     world, tokens, topk = len(routes), len(routes[rank]), len(routes[rank][0])
@@ -632,8 +604,6 @@ def bf16_combine_golden(
 
 def assert_combine_equal(actual, expected, label, progress=None):
     """Check BF16 payload or FP32 weights with numeric torch.equal, no tolerance."""
-    import torch
-
     if actual.shape != expected.shape or actual.dtype != expected.dtype:
         raise AssertionError(f"{label}: shape/dtype {actual.shape}/{actual.dtype} != {expected.shape}/{expected.dtype}")
     if progress:
@@ -664,7 +634,6 @@ def assert_combine_equal(actual, expected, label, progress=None):
 @pytest.mark.parametrize("rank_dedup", [False, True])
 @pytest.mark.parametrize("mode", ["random", "duplicates", "invalid", "empty", "local_experts"])
 def test_bf16_golden_against_independent_forward_plan(world, rank_dedup, mode):
-    torch = pytest.importorskip("torch")
     args = SimpleNamespace(topk=6, experts=512, seed=1701, tokens=3, hidden=16, ep_size=world)
     routes = make_combine_routes(world, args.tokens, args, mode)
     source, generation = world - 1, 2
@@ -713,7 +682,6 @@ def test_bf16_golden_against_independent_forward_plan(world, rank_dedup, mode):
 
 
 def test_bf16_golden_detects_intermediate_rounding_and_fp32_order():
-    torch = pytest.importorskip("torch")
     values = torch.tensor([[[256.0], [1.0], [-256.0]]], dtype=torch.bfloat16)
     assert ordered_bf16_combine(values, [[[0, 1], [2]]]).item() == 0
     assert ordered_bf16_combine(values, [[[0, 1, 2]]]).item() == 1
@@ -727,7 +695,6 @@ def test_bf16_golden_detects_intermediate_rounding_and_fp32_order():
 
 @pytest.mark.parametrize("dtype_name", ["bfloat16", "float32"])
 def test_combine_equal_contract(dtype_name):
-    torch = pytest.importorskip("torch")
     golden = torch.tensor([0.0, 0.5, -1.0], dtype=getattr(torch, dtype_name))
     assert_combine_equal(golden.clone(), golden, "same")
     corrupt = golden.clone()
@@ -744,15 +711,11 @@ def test_combine_equal_contract(dtype_name):
 
 
 def weight_payload(ids, generation):
-    import torch
-
     bits = 0x3E800000 + ((ids + generation * 104729) % (1 << 25))
     return bits.to(torch.int32).view(torch.float32)
 
 
 def expected_weights(routes, experts, rank, generation):
-    import torch
-
     selected = torch.tensor(routes[rank], dtype=torch.int64)
     tokens, topk = selected.shape
     ids = torch.arange(tokens * topk).reshape(tokens, topk) + rank * tokens * topk
@@ -779,8 +742,6 @@ def check_dispatch_inputs(
     """Optional payload Dispatch oracle; Notify is checked independently."""
     if not enabled:
         return
-    import torch
-
     log(f"{context} dispatch_golden.begin (CPU)")
     sources = torch.tensor([s + t for s, t, _ in entries], dtype=torch.int32)[:, None]
     expected_recv = ((sources + torch.arange(hidden)[None, :] + generation) % 7 - 3).to(torch.bfloat16)
@@ -813,7 +774,6 @@ def check_dispatch_inputs(
 
 def golden_combine_handle(buffer, args, indices, reference, routes):
     """Build a test-only Combine handle without launching Notify or Dispatch."""
-    import torch
     from deep_ep._native import require_native
     from deep_ep.backends.mesh_clos.elastic import EPHandle, _PERSISTENT
 
@@ -936,41 +896,9 @@ def prepare_routing(buffer, args, x, indices, input_weights, handle, reference=N
     return None, None, handle, event
 
 
-def direct_expert_input(entries, generation, device, hidden=7168):
-    """Expanded expert input in expert/source/token/slot order, without transport."""
-    import torch
-
-    sources = torch.tensor(
-        [source + token + generation for source, token, _ in entries], dtype=torch.int32, device=device
-    )
-    columns = torch.arange(hidden, dtype=torch.int32, device=device)
-    return ((sources[:, None] + columns[None, :]) % 7 - 3).float()
-
-
-def hotspot_expert_output(entries, bias, generation, device, hidden, pool=None):
-    import torch
-
-    with torch.npu.memory.use_mem_pool(pool) if pool is not None else nullcontext():
-        output = torch.empty((len(entries), hidden), dtype=torch.bfloat16, device=device)
-    for start in range(0, len(entries), 4096):
-        end = min(start + 4096, len(entries))
-        values = direct_expert_input(entries[start:end], generation, device, hidden)
-        output[start:end].copy_((values + bias[start:end]).to(torch.bfloat16))
-    return output
-
-
-def test_hotspot_input_tiling_preserves_values():
-    torch = pytest.importorskip("torch")
-    entries = [(i % 8, i // 8, i % 6) for i in range(4103)]
-    bias = torch.tensor([i % 5 - 2 for i in range(len(entries))], dtype=torch.float32)[:, None]
-    expected = (direct_expert_input(entries, 2, "cpu", 128) + bias).to(torch.bfloat16)
-    assert torch.equal(hotspot_expert_output(entries, bias, 2, "cpu", 128), expected)
-
-
 def worker(local_rank, args):
     if args.dense_channels:
         os.environ["DEEPEP_SHMEM_DENSE_QPS"] = "1"
-    import torch
     import torch_npu  # noqa: F401
 
     deep_ep = _notify["_import_installed_deep_ep"]()
@@ -1134,8 +1062,6 @@ def worker(local_rank, args):
 
 
 def run_case(buffer, args, rank, world, info, log, references):
-    import torch
-
     if buffer is not None:
         buffer._combine_reuse_tokens = getattr(args, "reuse_window_tokens", 0)
     if getattr(args, "combine_capacity_mib", 0):
@@ -1649,8 +1575,6 @@ def test_rank_return_chunk_boundaries_preserve_original_tokens(world, chunk_toke
 
 
 def test_rank_return_metadata_replacement_refreshes_versions():
-    torch = pytest.importorskip("torch")
-
     routes = _notify["make_routes"](64, 3, 6, 128, 0, "random", seed=1)
     reference = build_reference(routes, 128, 0, server_dedup=False)
     names = ("forward_counts", "backward_counts", "server_mask", "chunk_ranges", "chunk_masks", "gather_rows")
@@ -1936,7 +1860,6 @@ def test_routing_without_dispatch_and_explicit_opt_in(notify_cores, rank_dedup):
 @pytest.mark.parametrize("world", (8, 32, 64))
 @pytest.mark.parametrize("mode", ("random", "duplicates", "empty"))
 def test_golden_routing_skips_device_notify(monkeypatch, world, mode):
-    torch = pytest.importorskip("torch")
     import deep_ep._native as native_module
     import deep_ep.backends.mesh_clos.elastic as elastic
 
@@ -1997,8 +1920,8 @@ def test_notify_checked_without_payload_dispatch(monkeypatch, tmp_path):
     reference, handle = object(), object()
     monkeypatch.setitem(_notify, "make_routes", lambda *a, **k: [[[0]], [[1]]])
     monkeypatch.setitem(_notify, "expert_rows", lambda *a: [])
-    monkeypatch.setitem(
-        sys.modules,
+    monkeypatch.setattr(
+        sys.modules[__name__],
         "torch",
         SimpleNamespace(
             int64="int64",
@@ -2018,30 +1941,6 @@ def test_notify_checked_without_payload_dispatch(monkeypatch, tmp_path):
     monkeypatch.setattr(sys.modules[__name__], "check_handle", reject)
     with pytest.raises(AssertionError, match="Notify metadata corruption"):
         run_case(None, args, 0, 2, None, lambda message: None, {"random": reference})
-
-
-def test_direct_expert_inputs_match_combine_golden():
-    import pytest
-
-    torch = pytest.importorskip("torch")
-    for world in (2, 16):
-        experts, tokens, topk = world * 2, 3, 6
-        for mode in _ROUTES:
-            routes = _notify["make_routes"](world, tokens, topk, experts, 0, mode)
-            for generation in (0, 1):
-                recovered = torch.zeros((world, tokens, 7168), dtype=torch.float32)
-                for rank in range(world):
-                    entries = _notify["expert_rows"](routes, experts, rank)
-                    values = direct_expert_input(entries, generation, "cpu")
-                    assert tuple(values.shape) == (len(entries), 7168)
-                    for row, (source, token, slot) in enumerate(entries):
-                        assert torch.equal(values[row], payload(source, tokens, generation)[token].float())
-                        bias = routes[source][token][slot] % 3 - 1 + slot % 3 - 1
-                        recovered[source, token] += (values[row] + bias).to(torch.bfloat16).float()
-                for source in range(world):
-                    assert torch.equal(
-                        recovered[source].to(torch.bfloat16), expected_output(routes, experts, source, generation)
-                    )
 
 
 def test_ep256_combine_cli(monkeypatch, tmp_path):
@@ -3576,6 +3475,7 @@ def test_summary_profile_capture_excludes_diagnostics_and_restores_hook(tmp_path
         npu=SimpleNamespace(synchronize=lambda: None, stream=lambda _: nullcontext()),
     )
     monkeypatch.setitem(sys.modules, "torch", fake)
+    monkeypatch.setitem(test["profile_combine"].__globals__, "torch", fake)
 
     def decode_chunks(value, **kwargs):
         assert not active and value is chunk_data
@@ -3720,7 +3620,7 @@ def test_session_one_buffer_for_grow_shrink_and_fail_fast(tmp_path, monkeypatch,
         synchronize=lambda: events.append(("sync",)),
         Stream=make_producer,
     )
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(npu=npu))
+    monkeypatch.setattr(test, "torch", SimpleNamespace(npu=npu))
     monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
     layout = ModuleType("deep_ep.buffers._elastic_layout")
     layout.elastic_size_hint = lambda world, tokens, *a, **kw: tokens * 100
