@@ -345,6 +345,10 @@ class UdmaPolicy:
                 if plan.peer_order == 3:
                     rank_peers *= self.world_size // plan.ranks_per_group
                 plan = replace(plan, peer_order=0, peers_per_worker=rank_peers)
+            if self.world_size == 64 and cores == 32 and operation == "dispatch":
+                # Keep eight payload owners and leave 24 AIVs for local work.
+                # Channel count and visit remain launch inputs, unchanged here.
+                plan = replace(plan, peer_order=0, peers_per_worker=8, workers_per_peer=1, qps_per_worker=1)
         plan.validate_num_aiv(num_aiv)
         if not plan.valid_group_capacity():
             raise ValueError("automatic UDMA plan exceeds the per-worker peer table")

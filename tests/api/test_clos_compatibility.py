@@ -916,6 +916,10 @@ def test_reported_300_operator_plans_allow_rank_conversion_and_copy_first_remova
                 senders = ((ep-2)//historical[3]+1)*historical[4]
             if ep == 32 and op == 'combine':
                 historical[6] = 32
+            if ep == 64 and cores == 32 and op == 'dispatch':
+                # Intentional sender-budget change; retain the raw fixture.
+                historical[3:6] = [8,1,1]
+                senders = 8
             if cores == 64 and (op == 'dispatch' and ep in (4,8,16,32)
                                 or op in ('combine','weighted') and ep in (8,16)):
                 # These budgets now deliberately inherit the separately checked
@@ -1168,6 +1172,30 @@ def test_auto_topology_uses_ep_rank_order_and_collects_only_at_construction():
             for op in ('dispatch','combine','weighted'):
                 policy.for_launch(cores,5632,op,bf16=True)
         assert len(calls) == 1
+    """)
+
+
+def test_ep64_dispatch_32_cores_uses_eight_senders_without_changing_other_paths():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        base = resolve_udma_policy(True,64,'udma',None,None,None,None,None)
+        for known in (False,True):
+            for group in (8,16,32,64):
+                policy = replace(base, ranks_per_group=group, topology_known=known)
+                for size in (2048,5632,8192,12288,14336,16384):
+                    for cores in (0,32):
+                        plan = policy.for_launch(cores,size,'dispatch',bf16=True)
+                        assert plan.native_plan()[1:7] == [0,group,8,1,1,32]
+                        assert plan.send_workers == 8 and (cores or 32)-plan.send_workers == 24
+                    for cores in (8,16,30,48,64):
+                        plan = policy.for_launch(cores,size,'dispatch',bf16=True)
+                        assert plan.peers_per_worker == (8 if cores == 8 else 4)
+                    for kwargs in ({'bf16':False}, {'bf16':True,'expanded':True},
+                                   {'bf16':True,'v2':False}):
+                        assert policy.for_launch(32,size,'dispatch',**kwargs).peers_per_worker == 4
+                    assert policy.for_launch(32,size,'combine',bf16=True).send_workers == 16
+                    assert policy.for_launch(32,size,'weighted',bf16=True).send_workers == 16
     """)
 
 
