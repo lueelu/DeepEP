@@ -19,24 +19,50 @@ namespace llquant {
 
 constexpr float kInt8MaxValue = 127.0f;
 
-// Full-width abs-max reduction for one token row. Mirrors ub::SumPacketFlags:
-// a 256B vector holds 64 FP32 lanes, so the accumulator stays in lane zero.
+// Full-width abs-max reduction for one token row. Complete 64-lane blocks
+// accumulate lane-wise, then a single horizontal reduction runs at the end; a
+// partial tail block keeps its own masked reduction. H3584 (56 complete blocks)
+// therefore performs one horizontal reduction instead of 56.
 __simd_vf__ inline void AbsMaxStore(__ubuf__ float* out, __ubuf__ float* src, uint32_t count)
 {
     const auto all = asc_create_mask_b32(PAT_ALL);
     uint32_t oneWord = 1U;
     const auto one = asc_update_mask_b32(oneWord);
+    const uint32_t fullBlocks = count / 64U;
+    const uint32_t tail = count - fullBlocks * 64U;
     vector_float total;
     asc_duplicate_scalar(total, 0.0f, all);
-    for (uint32_t offset = 0, remaining = count; offset < count; offset += 64U) {
-        vector_float input, absolute, part;
-        const auto mask = asc_update_mask_b32(remaining);
-        asc_loadalign(input, src + offset);
-        asc_abs(absolute, input, mask);
-        asc_reduce_max(part, absolute, mask);
-        asc_max(total, total, part, one);
+    for (uint32_t block = 0; block < fullBlocks; ++block) {
+        vector_float input, absolute;
+        asc_loadalign(input, src + block * 64U);
+        asc_abs(absolute, input, all);
+        asc_max(total, total, absolute, all);
     }
-    asc_storealign(out, total, one);
+    if (fullBlocks != 0U) {
+        vector_float reduced;
+        asc_reduce_max(reduced, total, all);
+        if (tail != 0U) {
+            vector_float tailInput, tailAbsolute, tailReduced;
+            uint32_t remaining = tail;
+            const auto tailMask = asc_update_mask_b32(remaining);
+            asc_loadalign(tailInput, src + fullBlocks * 64U);
+            asc_abs(tailAbsolute, tailInput, tailMask);
+            asc_reduce_max(tailReduced, tailAbsolute, tailMask);
+            asc_max(reduced, reduced, tailReduced, one);
+        }
+        asc_storealign(out, reduced, one);
+    } else if (count != 0U) {
+        // Only a tail block: use its masked reduction directly.
+        vector_float tailInput, tailAbsolute, tailReduced;
+        uint32_t remaining = count;
+        const auto tailMask = asc_update_mask_b32(remaining);
+        asc_loadalign(tailInput, src);
+        asc_abs(tailAbsolute, tailInput, tailMask);
+        asc_reduce_max(tailReduced, tailAbsolute, tailMask);
+        asc_storealign(out, tailReduced, one);
+    } else {
+        asc_storealign(out, total, one);
+    }
 }
 
 // View an existing static UB region as an AscendC tensor. The region is already
