@@ -180,14 +180,11 @@ def backend(monkeypatch):
             capacity,
             backend="mte",
             topk_weights_type=0,
-            shared_workspace=None,
         ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
             self.backend = backend
             self.topk_weights_type = topk_weights_type
             self.local_experts = experts
-            self.shared_workspace = shared_workspace
-            self.workspace = shared_workspace if shared_workspace is not None else Tensor(np.zeros(4096), "uint8")
             events.append(("prepare", self.bs))
             events.append(("plan_backend", backend))
 
@@ -241,7 +238,6 @@ def backend(monkeypatch):
 
     ext = SimpleNamespace(
         buffer_size=buffer_size,
-        workspace_size=lambda *args, **kwargs: 4096,
         Plan=Plan,
         ffts_config=lambda: 123,
         timer_enabled=True,
@@ -314,7 +310,7 @@ def test_output_and_stats_aliases_rejected_before_launch(backend):
     assert not any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
 
 
-def test_symm_buffer_base_reuses_runtime_and_shared_workspace(backend):
+def test_symm_buffer_base_reuses_runtime(backend):
     import inspect
 
     assert "timeout" not in inspect.signature(api.SymmBuffer).parameters
@@ -327,7 +323,7 @@ def test_symm_buffer_base_reuses_runtime_and_shared_workspace(backend):
         assert derived.num_bytes == base.num_bytes
         y_derived = Tensor(np.zeros((8, 1024)), "bfloat16")
         api.fp8_fp4_mega_moe(y_derived, *weights(), derived)
-        assert derived._plan.shared_workspace is base._plan.workspace
+        assert derived._plan is not None
     finally:
         derived.destroy()
     # Destroying derived view must not close base's shared runtime.

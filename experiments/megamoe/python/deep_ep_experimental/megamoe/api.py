@@ -208,37 +208,6 @@ class SymmBuffer:
             raise RuntimeError("Buffer runtime has been destroyed")
         self._runtime.ensure_alive()
 
-    def _shared_workspace_from_base(self):
-        if self._base is None or self._backend_name != "mte":
-            return None
-        base_plan = self._base._plan
-        if base_plan is None:
-            return None
-        workspace = getattr(base_plan, "workspace", None)
-        if workspace is None:
-            return None
-        ext = _extension()
-        ws_size = getattr(ext, "workspace_size", None)
-        if ws_size is not None:
-            required = int(
-                ws_size(
-                    self.hidden,
-                    self.intermediate_hidden,
-                    self.num_topk,
-                    self.num_experts // self._world_size,
-                    self._world_size,
-                    self.num_max_tokens_per_rank,
-                    self.mma_type == "fp8xfp4",
-                    self.num_shared_experts,
-                    self.ranks_per_node,
-                    backend=self._backend_name,
-                    topk_weights_type=self.topk_weights_type,
-                )
-            )
-            if workspace.nbytes < required:
-                return None
-        return workspace
-
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
         if self._plan is not None:
@@ -246,10 +215,6 @@ class SymmBuffer:
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
-        plan_kwargs = dict(backend=self._backend_name, topk_weights_type=self.topk_weights_type)
-        shared_workspace = self._shared_workspace_from_base()
-        if shared_workspace is not None:
-            plan_kwargs["shared_workspace"] = shared_workspace
         self._plan = ext.Plan(
             self.x,
             self.intermediate_hidden,
@@ -263,7 +228,8 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
-            **plan_kwargs,
+            backend=self._backend_name,
+            topk_weights_type=self.topk_weights_type,
         )
         # The plan owns capacity for num_max_tokens_per_rank; each forward
         # supplies its active BS without retiring the device workspace.

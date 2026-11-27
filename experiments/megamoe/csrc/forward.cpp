@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 #include "kernels/mega_moe_urma/common/mega_moe_compute_contract.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_route_plan.hpp"
@@ -349,6 +351,23 @@ uint32_t SelectCv(int64_t world, int64_t bs)
     return world == 16 && bs <= 2560 ? 128U : 256U;
 }
 
+// Local MTE scratch is transient within one serial kernel execution, so all
+// Plans on the same NPU share one backing allocation by default.
+std::shared_ptr<torch::Tensor> AcquireSharedMteWorkspace(const torch::Tensor& example, int64_t bytes)
+{
+    static std::mutex mutex;
+    static std::unordered_map<int, std::weak_ptr<torch::Tensor>> shared_by_device;
+    const int device_index = static_cast<int>(example.device().index());
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& entry = shared_by_device[device_index];
+    if (auto existing = entry.lock(); existing && existing->defined() && existing->nbytes() >= bytes) {
+        return existing;
+    }
+    auto allocated = std::make_shared<torch::Tensor>(torch::empty({bytes}, example.options().dtype(torch::kUInt8)));
+    entry = allocated;
+    return allocated;
+}
+
 }  // namespace
 
 struct UrmaWorkspace {
@@ -555,8 +574,7 @@ struct UrmaWorkspace {
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes, const std::string& backend, int64_t topk_weights_type,
-           c10::optional<torch::Tensor> shared_workspace)
+           uint64_t symmetric_address, int64_t symmetric_bytes, const std::string& backend, int64_t topk_weights_type)
     : backend_(backend == "mte" ? Backend::Mte : Backend::Urma),
       topk_weights_type_(topk_weights_type),
       ffts_(ffts),
@@ -626,16 +644,8 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
         const int64_t bytes =
             info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
         TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
-        if (shared_workspace.has_value()) {
-            CheckTensor(*shared_workspace, 1, "shared_workspace");
-            TORCH_CHECK(shared_workspace->device() == example.device() &&
-                            shared_workspace->scalar_type() == torch::kUInt8 && shared_workspace->nbytes() >= bytes,
-                        "shared_workspace must be contiguous uint8 on the same NPU with at least ", bytes,
-                        " bytes, got ", shared_workspace->nbytes());
-            workspace_ = *shared_workspace;
-        } else {
-            workspace_ = torch::empty({bytes}, example.options().dtype(torch::kUInt8));
-        }
+        workspace_owner_ = AcquireSharedMteWorkspace(example, bytes);
+        workspace_ = *workspace_owner_;
         context_ = torch::empty({static_cast<int64_t>(sizeof(context))}, workspace_.options());
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
@@ -655,12 +665,6 @@ int64_t Plan::workspace_bytes() const
             if (t.defined()) bytes += t.nbytes();
         });
     return bytes;
-}
-
-c10::optional<torch::Tensor> Plan::workspace() const
-{
-    if (backend_ == Backend::Mte && workspace_.defined()) return workspace_;
-    return c10::nullopt;
 }
 
 std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
@@ -927,24 +931,6 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
         tokens, topk, hidden, experts, world, 2, 1, topk_weights_type == 1, false, MegaMoeImpl::TOPO_TYPE_MTE, true};
     return AlignUp<int64_t>(MegaMoeImpl::EXCEPTION_DUMP_REGION_SIZE + MegaMoeImpl::CalcPeermemLeastSize(params),
                             2LL << 20);
-}
-
-int64_t workspace_size(int64_t hidden, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
-                       int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node,
-                       const std::string& backend, int64_t topk_weights_type)
-{
-    TORCH_CHECK(topk_weights_type == 0 || topk_weights_type == 1, "topk_weights_type must be 0 or 1");
-    TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
-    if (backend == "urma") return 0;
-    const PlatformInfo platform = GetPlatformInfo();
-    MegaMoeTilingData tiling = MakeTiling(max_tokens, hidden, intermediate * 2, topk, experts, world, max_tokens, 0,
-                                          is_a8w4, shared_experts, platform, topk_weights_type);
-    tiling.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
-    const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling);
-    const int64_t bytes =
-        info.workspaceSize + static_cast<int64_t>(platform.system_workspace) + kReservedWorkspaceBytes;
-    TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
-    return bytes;
 }
 
 }  // namespace deepep::megamoe

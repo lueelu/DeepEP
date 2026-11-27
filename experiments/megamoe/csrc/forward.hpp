@@ -29,8 +29,7 @@ class Plan {
 public:
     Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world, int64_t max_tokens,
          bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts, uint64_t symmetric_address,
-         int64_t symmetric_bytes, const std::string& backend = "mte", int64_t topk_weights_type = 0,
-         c10::optional<torch::Tensor> shared_workspace = c10::nullopt);
+         int64_t symmetric_bytes, const std::string& backend = "mte", int64_t topk_weights_type = 0);
     ~Plan();
 
     std::tuple<torch::Tensor, torch::Tensor> forward(
@@ -42,7 +41,6 @@ public:
         float activation_clamp = std::numeric_limits<float>::max());
 
     int64_t workspace_bytes() const;
-    c10::optional<torch::Tensor> workspace() const;
 
 private:
     Backend backend_;
@@ -50,6 +48,7 @@ private:
     std::unique_ptr<UrmaWorkspace> urma_;
     PlatformInfo platform_{};
     MegaMoeTilingData tiling_;
+    std::shared_ptr<torch::Tensor> workspace_owner_;
     torch::Tensor workspace_;
     torch::Tensor context_;
     uint64_t ffts_;
@@ -66,9 +65,5 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend =
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
                     const std::string& backend = "mte", int64_t topk_weights_type = 0);
-
-int64_t workspace_size(int64_t hidden, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
-                       int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node = 0,
-                       const std::string& backend = "mte", int64_t topk_weights_type = 0);
 
 }  // namespace deepep::megamoe
