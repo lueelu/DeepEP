@@ -1,4 +1,4 @@
-"""Staged rank search implementation for bench_fast_sweep --small-rank-sweep.
+"""Staged rank search and runtime combine payload sweeps for bench_fast_sweep.
 
 No separate CLI. Candidate generation/statistics remain importable without Torch.
 """
@@ -19,26 +19,62 @@ from types import SimpleNamespace
 OPS = ("fresh", "fresh_weighted", "cached", "cached_weighted", "combine", "combine_weighted")
 VISITS = (4, 8, 16, 32, 64, 128)
 SUPPORTED_EPS = (4, 8, 16, 32)
+PAYLOAD_ROWS_ENV = "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"
 
 
 def validate_args(parser, args, argv):
     argv = sys.argv[1:] if argv is None else argv
+    payload_only = args.combine_payload_max_rows is not None
+    if payload_only and args.small_rank_sweep:
+        parser.error("choose either small-rank-sweep or combine-payload-max-rows")
+    if payload_only:
+        limits = args.combine_payload_max_rows
+        if len(set(limits)) != len(limits) or any(v < 1 or v > 32 for v in limits):
+            parser.error("combine-payload-max-rows requires distinct integers in [1,32]")
+        args.combine_payload_max_rows = [1] + [v for v in limits if v != 1]
     if args.ep_size not in SUPPORTED_EPS:
-        parser.error("small-rank-sweep requires EP4/8/16/32")
-    if args.case or args.strategies or args.replay_report or args.quick or args.smoke:
+        parser.error("rank/payload sweeps require EP4/8/16/32")
+    if (args.case and not payload_only) or args.strategies or args.replay_report or args.quick or args.smoke:
         parser.error("small-rank-sweep owns its case/candidate matrix; do not supply other selectors")
     if args.combine_self_copy_modes or args.combine_parallel_self_copy or args.combine_self_copy_after_submit:
         parser.error("small-rank-sweep preserves production self-copy behavior")
     explicit = {arg.split("=", 1)[0] for arg in argv}
     if "--huge-pages" in explicit or args.flush_l2_cache or "--visits" in explicit or args.experts != 256:
-        parser.error("small-rank-sweep fixes no huge pages/no L2 flush/experts256/all six visit values")
+        parser.error("rank/payload sweeps fix no huge pages/no L2 flush/experts256 and manage visit internally")
     if "--seed" in explicit or "--ranks-per-group" in explicit:
         parser.error("small-rank-sweep uses the independent golden seed and discovers real topology")
     if args.reduce_cores < 2 or args.reduce_cores > 64 or args.reduce_cores % 2:
         parser.error("reduce-cores must be even and in [2,64]")
     args.huge_pages = False
     args.seed = 20261122
-    args.case = cases()
+    args.case = (args.case or cases()) if payload_only else cases()
+    if payload_only and any(c["topk"] != 8 or c["aiv"] not in (8, 32) for c in args.case):
+        parser.error("combine payload sweep currently requires topk8 and communication cores 8/32")
+
+
+def payload_candidates(auto, limits):
+    """Freeze the same scheduling plan for every dynamically read merge limit."""
+    return [
+        auto | {"id": "auto" if value == 1 else f"payload_rows_{value}", "auto": value == 1, "payload_max_rows": value}
+        for value in limits
+    ]
+
+
+def activate_config(policy, config, op):
+    # Called only after the previous launch completes, outside timed intervals.
+    policy.config, policy.operation = config, op_kind(op)
+    if "payload_max_rows" in config and op.startswith("combine"):
+        os.environ[PAYLOAD_ROWS_ENV] = str(config["payload_max_rows"])
+    else:
+        os.environ.pop(PAYLOAD_ROWS_ENV, None)
+
+
+def check_payload_limit(native, config):
+    requested = config["payload_max_rows"]
+    actual = int(native.last_combine_payload_max_rows())
+    if actual != requested:
+        raise RuntimeError(f"combine payload limit mismatch: Host submitted {actual}, requested {requested}")
+    return dict(payload_max_rows_requested=requested, payload_max_rows_submitted=actual)
 
 
 def cases():
@@ -265,6 +301,8 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
             result = s.done(invoke())
             plan = s.policy.for_launch(shape["aiv"], shape["hidden"] * 2, op_kind(op), bf16=True, expanded=False)
             observation = check_launch(s.native, result, plan, op, shape["aiv"], s.args.reduce_cores)
+            if "payload_max_rows" in config:
+                observation.update(check_payload_limit(s.native, config))
             observations.append(observation)
             del result
             for _ in range(s.args.warmup):
@@ -417,7 +455,8 @@ def run_case(s, shape, winners):
     logical_bytes = send_rows * hidden * 2
     representative = shape["tokens"] == 8192 and hidden in (2816, 6144)
     outputs = []
-    for op in OPS:
+    payload_only = s.args.combine_payload_max_rows is not None
+    for op in ("combine", "combine_weighted") if payload_only else OPS:
         weighted = op.endswith("weighted")
 
         def invoke():
@@ -441,7 +480,9 @@ def run_case(s, shape, winners):
             )
 
         auto = policy_config(s.base.for_launch(cores, hidden * 2, op_kind(op), bf16=True), s.group.size(), True)
-        if representative:
+        if payload_only:
+            selected = payload_candidates(auto, s.args.combine_payload_max_rows)
+        elif representative:
             coarse = measure(
                 s, shape, op, shortlist(s.group.size(), cores) + [auto], invoke, logical_bytes, "coarse", s.args.samples
             )
@@ -478,7 +519,7 @@ def run_case(s, shape, winners):
             )
         # Prefer lower worst-round completed API; retain communication winner independently.
         best = min(results, key=lambda r: max(v["metrics"]["api"]["mean"] for v in r["rounds"]))
-        if representative:
+        if representative and not payload_only:
             winners[cores, hidden, op] = transfer_candidate(best["config"], s.group.size())
         outputs.append(
             dict(shape=shape, operator=op, representative=representative, winner=best["config"], results=results)
@@ -504,6 +545,7 @@ def write_summary(s):
                 visit=c["visit"],
                 sender_cores=c["payload_aivs"],
                 reduce_cores=s.args.reduce_cores,
+                payload_max_rows=c.get("payload_max_rows", 1),
                 GBps_per_rank=r["GBps"],
                 precision="zero_tolerance_passed",
                 winner=c["id"] == item["winner"]["id"],
@@ -526,7 +568,11 @@ def write_summary(s):
 def run(args):
     from bench_fast_sweep import StoreGroup, qp_plan_spec, write
 
-    reservation = [dict(operations={"all": shortlist(args.ep_size, a, VISITS)}) for a in (8, 32)]
+    payload_only = args.combine_payload_max_rows is not None
+    operations = ("combine", "combine_weighted") if payload_only else OPS
+    reservation = (
+        [] if payload_only else [dict(operations={"all": shortlist(args.ep_size, a, VISITS)}) for a in (8, 32)]
+    )
     if args.plan_only:
         import json
 
@@ -535,9 +581,10 @@ def run(args):
                 dict(
                     ep=args.ep_size,
                     cases=args.case,
-                    operators=OPS,
+                    operators=operations,
+                    payload_max_rows=args.combine_payload_max_rows,
                     candidates=reservation,
-                    qp_plans=qp_plan_spec(reservation),
+                    qp_plans=None if payload_only else qp_plan_spec(reservation),
                     huge_pages=False,
                     reduce_cores=args.reduce_cores,
                     note="runtime adds actual auto and preparation plans after topology discovery",
@@ -578,13 +625,15 @@ def run(args):
     defaults = [
         policy_config(base.for_launch(c["aiv"], c["hidden"] * 2, op_kind(op), bf16=True), world)
         for c in args.case
-        for op in OPS
+        for op in (("fresh_weighted", *operations) if payload_only else OPS)
     ]
     # Include constructor defaults and all preparation launches in the same reservation union.
     defaults.append(policy_config(base, world))
     reservation.append(dict(operations={"default": defaults}))
     spec = qp_plan_spec(reservation)
-    group.agree([args.case, defaults, spec, args.reduce_cores, args.samples, args.final_samples])
+    group.agree(
+        [args.case, defaults, spec, args.reduce_cores, args.samples, args.final_samples, args.combine_payload_max_rows]
+    )
     native_path = Path(importlib.util.find_spec("deep_ep._clos_C").origin)
     identity_paths = [
         Path(__file__),
@@ -604,6 +653,8 @@ def run(args):
 
     native = load_native_module()
     require_native(native)
+    if payload_only and not callable(getattr(native, "last_combine_payload_max_rows", None)):
+        raise RuntimeError("loaded Host extension lacks runtime payload-limit observation; install the matching build")
     os.environ["DEEPEP_CLOS_TUNING_SESSION"] = "1"
     os.environ["DEEPEP_CLOS_QP_PLANS"] = spec
     capacity = max(c["tokens"] for c in args.case)
@@ -624,6 +675,7 @@ def run(args):
             topology_known=base.topology_known,
             baseline_plans=defaults,
             reduce_cores=args.reduce_cores,
+            payload_max_rows=args.combine_payload_max_rows,
         ),
     )
     if rank == 0:
@@ -658,7 +710,7 @@ def run(args):
 
     def activate(config, op):
         torch.npu.synchronize()
-        policy.config, policy.operation = config, op_kind(op)
+        activate_config(policy, config, op)
 
     session = SimpleNamespace(
         torch=torch,
@@ -687,6 +739,7 @@ def run(args):
         torch.npu.empty_cache()
     group.agree("successful_ready_to_destroy")
     buffer.destroy()
+    os.environ.pop(PAYLOAD_ROWS_ENV, None)
     write(out / "exit.json", dict(code=0, complete=True, buffer_initializations=1, precision_checked=True))
     group.agree("all_exit_files_written")
     if rank == 0:
@@ -694,13 +747,20 @@ def run(args):
             args.output / "report.json",
             dict(
                 ep=world,
+                mode="combine_payload" if payload_only else "small_rank",
+                payload_max_rows=args.combine_payload_max_rows,
                 results=session.completed,
                 buffer_initializations=1,
                 huge_pages=False,
                 precision_checked=True,
                 bandwidth="deduplicated BF16 bytes including self; excludes weights",
                 aggregation="per-sample slowest rank; independent API; nearest-rank P95",
-                limitation="staged candidate best, not exhaustive optimum; H4096 inherits H6144 candidate",
+                limitation=(
+                    "merge-limit-only comparison; default scheduling frozen; Host limit observed, physical merge rate not measured"
+                    if payload_only
+                    else "staged candidate best, not exhaustive optimum; H4096 inherits H6144 candidate"
+                ),
             ),
         )
-        print(f"SMALL_RANK_SWEEP_COMPLETE EP={world} output={args.output}", flush=True)
+        label = "COMBINE_PAYLOAD_SWEEP_COMPLETE" if payload_only else "SMALL_RANK_SWEEP_COMPLETE"
+        print(f"{label} EP={world} output={args.output}", flush=True)

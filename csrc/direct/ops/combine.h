@@ -24,6 +24,12 @@ inline std::array<uint32_t, 9>& LastCombineLaunch()
     return launch;
 }
 
+inline uint32_t& LastCombinePayloadMaxRows()
+{
+    static thread_local uint32_t rows = 1;
+    return rows;
+}
+
 using CombineResult = std::tuple<torch::Tensor, c10::optional<torch::Tensor>>;
 
 // Internal one-shot continuation, consumed before ElasticBuffer.combine returns.

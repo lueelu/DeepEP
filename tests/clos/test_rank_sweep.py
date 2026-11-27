@@ -109,6 +109,38 @@ def test_aggregation_is_max_per_sample_not_max_rank_mean():
         sweep.slowest([{"comm": [1]}, {"comm": [1, 2]}])
 
 
+def test_payload_sweep_cli_and_frozen_plan(monkeypatch, capsys):
+    monkeypatch.syspath_prepend(str(BENCH))
+    import bench_fast_sweep as entry
+
+    argv = ["--ep-size", "16", "--case", "4096,2816,8,8", "--combine-payload-max-rows", "2", "4", "8", "--plan-only"]
+    args = entry.parse_args(argv)
+    assert args.combine_payload_max_rows == [1, 2, 4, 8]
+    assert len(args.case) == 1 and not args.huge_pages
+    sweep.run(args)
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["operators"] == ["combine", "combine_weighted"]
+    assert plan["payload_max_rows"] == [1, 2, 4, 8]
+    assert plan["qp_plans"] is None  # Resolve only actual default plans at runtime.
+    auto = sweep.candidate(2, 1, 1, 8, 16) | {"id": "auto", "auto": True}
+    candidates = sweep.payload_candidates(auto, args.combine_payload_max_rows)
+    policy = SimpleNamespace(config=None, operation=None)
+    monkeypatch.delenv(sweep.PAYLOAD_ROWS_ENV, raising=False)
+    for config in candidates + list(reversed(candidates)):
+        sweep.activate_config(policy, config, "combine_weighted")
+        assert os.environ[sweep.PAYLOAD_ROWS_ENV] == str(config["payload_max_rows"])
+        assert all(config[k] == auto[k] for k in ("order", "peers", "workers", "qps", "visit", "payload_aivs"))
+        native = SimpleNamespace(last_combine_payload_max_rows=lambda: int(os.environ[sweep.PAYLOAD_ROWS_ENV]))
+        assert sweep.check_payload_limit(native, config)["payload_max_rows_submitted"] == config["payload_max_rows"]
+    sweep.activate_config(policy, auto, "fresh_weighted")
+    assert sweep.PAYLOAD_ROWS_ENV not in os.environ
+    with pytest.raises(RuntimeError, match="limit mismatch"):
+        sweep.check_payload_limit(SimpleNamespace(last_combine_payload_max_rows=lambda: 1), candidates[1])
+    for extra in (["0"], ["33"], ["2", "2"], ["2", "--small-rank-sweep"], ["2", "--visits", "32"]):
+        with pytest.raises(SystemExit):
+            entry.parse_args(["--ep-size", "16", "--combine-payload-max-rows", *extra])
+
+
 def test_finalists_keep_api_and_communication_winners():
     rows = [
         dict(config={"id": name, "auto": name == "auto"}, metrics={"api": {"mean": api}, "comm": {"mean": comm}})
@@ -221,13 +253,15 @@ def test_measure_keeps_profiler_notify_outside_full_api(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("ep", [4, 8, 16, 32])
-def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep):
+@pytest.mark.parametrize("payload_only", [False, True])
+def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep, payload_only):
     from tests.api.test_clos_compatibility import run_host
 
     run_host(
         """
         import os, tempfile, json
         ep = TEST_EP
+        payload_only = TEST_PAYLOAD
         from pathlib import Path
         from unittest.mock import patch
         sys.path.insert(0, 'benchmarks/clos')
@@ -250,16 +284,17 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep):
         stage_metrics.prepare_v2_sample = lambda *a:None
         _native.load_native_module = lambda:SimpleNamespace(**{name:lambda:None for name in
             ['last_dispatch_channel_metadata','last_dispatch_metadata_options','last_combine_launch',
-             'last_dispatch_launch','last_dispatch_overlap_options']})
+             'last_dispatch_launch','last_dispatch_overlap_options','last_combine_payload_max_rows']})
         initialized, executed, destroyed = [], [], []
         class Buffer:
             get_buffer_size_hint = staticmethod(lambda g,t,h,k: t*h*k)
             def __init__(self,g,**kw):
                 assert not kw['use_1g_huge_pages'] and kw['num_max_tokens_per_rank']==8192
                 assert os.environ['DEEPEP_CLOS_TUNING_SESSION']=='1'
-                for a in (8,32):
-                    for c in runner.shortlist(ep,a):
-                        assert f"rank:{c['peers']}:{c['workers']}:{c['qps']}" in os.environ['DEEPEP_CLOS_QP_PLANS']
+                if not payload_only:
+                    for a in (8,32):
+                        for c in runner.shortlist(ep,a):
+                            assert f"rank:{c['peers']}:{c['workers']}:{c['qps']}" in os.environ['DEEPEP_CLOS_QP_PLANS']
                 initialized.append(self)
                 self._udma_auto_policy = resolve_udma_policy(True,ep,'udma',None,None,None,None,None).bind_group(g)
                 self.runtime = SimpleNamespace(use_1g_huge_pages=lambda:False)
@@ -269,6 +304,12 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep):
         elastic.ElasticBuffer = Buffer
         def run_case(s,shape,winners):
             assert s.buffer is initialized[0] and len(initialized)==1
+            if payload_only:
+                c = runner.policy_config(s.base.for_launch(shape['aiv'],shape['hidden']*2,'combine',bf16=True),ep,True)
+                for config in runner.payload_candidates(c,s.args.combine_payload_max_rows):
+                    s.activate(config,'combine')
+                    assert os.environ[runner.PAYLOAD_ROWS_ENV]==str(config['payload_max_rows'])
+                    assert s.policy.for_launch(shape['aiv'],shape['hidden']*2,'combine',bf16=True)==s.base.for_launch(shape['aiv'],shape['hidden']*2,'combine',bf16=True)
             executed.append(shape)
             return []
         runner.run_case = run_case
@@ -278,11 +319,13 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep):
             native = root/'_clos_C.so'; native.write_bytes(b'host')
             (root/'libdeepep_clos_kernels.so').write_bytes(b'kernel')
             (root/'.libs').mkdir(); (root/'.libs/libshmem.so').write_bytes(b'shmem')
-            args = entry.parse_args(['--small-rank-sweep','--ep-size',str(ep),'--output',str(root/'result')])
+            mode = ['--combine-payload-max-rows','1','2','4','8'] if payload_only else ['--small-rank-sweep']
+            args = entry.parse_args([*mode,'--ep-size',str(ep),'--output',str(root/'result')])
             with patch.object(runner.importlib.util,'find_spec',return_value=SimpleNamespace(origin=str(native))):
                 runner.run(args)
             report = json.loads((args.output/'report.json').read_text())
             assert report['buffer_initializations']==1 and not report['huge_pages']
         assert len(initialized)==1 and destroyed==initialized and executed==runner.cases()
-    """.replace("TEST_EP", str(ep))
+        assert runner.PAYLOAD_ROWS_ENV not in os.environ
+    """.replace("TEST_EP", str(ep)).replace("TEST_PAYLOAD", str(payload_only))
     )

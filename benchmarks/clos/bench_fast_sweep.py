@@ -1,7 +1,7 @@
 """One SHMEM initialization, existing full-Clos peer schedules and staged tuning.
 
 Launch on each node with torchrun. --plan-only needs no torch/NPU installation.
-Legacy mode is performance-only. --small-rank-sweep checks finalist precision.
+Legacy mode is performance-only. Rank/payload sweep modes also check precision.
 """
 
 import argparse
@@ -158,8 +158,14 @@ def parse_args(argv=None):
         help="staged EP4/8/16/32 rank sweep: six operators, API timing and finalist precision",
     )
     p.add_argument("--reduce-cores", type=int, default=48)
+    p.add_argument(
+        "--combine-payload-max-rows",
+        type=int,
+        nargs="+",
+        help="combine-only runtime sweep of payload merge limits (1..32); freeze default rank/P/W/Q/visit, one Buffer",
+    )
     args = p.parse_args(argv)
-    if args.small_rank_sweep:
+    if args.small_rank_sweep or args.combine_payload_max_rows is not None:
         from rank_sweep import validate_args
 
         validate_args(p, args, argv)
@@ -453,7 +459,7 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
 
 def main():
     args = parse_args()
-    if args.small_rank_sweep:
+    if args.small_rank_sweep or args.combine_payload_max_rows is not None:
         from rank_sweep import run
 
         return run(args)
@@ -808,7 +814,10 @@ if __name__ == "__main__":
                 write(destination, dict(code=1, complete=False, traceback=traceback.format_exc()))
         except OSError:
             traceback.print_exc()
-        if "--small-rank-sweep" in sys.argv and "RANK" in os.environ:
+        if (
+            any(a.split("=", 1)[0] in ("--small-rank-sweep", "--combine-payload-max-rows") for a in sys.argv)
+            and "RANK" in os.environ
+        ):
             # Do not enter native collective destruction after a failed rank.
             traceback.print_exc()
             sys.stdout.flush()

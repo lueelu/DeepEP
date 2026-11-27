@@ -29,6 +29,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("take_combine_device_timing", &ascend_deepep::ops::TakeCombineDeviceTiming);
     m.def("last_dispatch_channel_metadata", [] { return ascend_deepep::ops::LastDispatchChannelMetadata(); });
     m.def("last_combine_launch", [] { return ascend_deepep::ops::LastCombineLaunch(); });
+    m.def("last_combine_payload_max_rows", [] { return ascend_deepep::ops::LastCombinePayloadMaxRows(); });
     m.def("last_dispatch_launch", [] { return ascend_deepep::ops::LastDispatchLaunch(); });
     m.def("last_dispatch_channel_metadata_tile_tokens",
           [] { return ascend_deepep::ops::LastDispatchChannelMetadataTileTokens(); });
