@@ -4,10 +4,10 @@
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_SOURCE_AGGREGATE_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_SOURCE_AGGREGATE_H
 
-#include "kernel_operator.h"
+#include <kernel_operator.h>
 
-#include "ep_memory_server_dedup_combine_config.h"
-#include "dispatch_dedup_types.h"
+#include <ubx/kernels/ep_memory_server_dedup_combine_config.h>
+#include <ubx/kernels/dispatch_dedup_types.h>
 
 namespace UbxCombine {
 using namespace AscendC;
@@ -115,7 +115,7 @@ private:
         masks_ = Allocate<uint32_t>(EpCombineAlign(owned * 4U, 32U));
         pending_ = Allocate<uint32_t>(EpCombineAlign(owned * 4U, 32U));
         weights_ = Allocate<float>(EpCombineAlign(owned * k * 4U, 32U));
-        flags_ = Allocate<float>(EpCombineM5SnapshotBytes(h, k, owned));
+        flags_ = Allocate<float>(EpCombineM5FlagBytes(h, k));
         work_ = Allocate<float>(EpCombineM5WorkBytes(h, k));
         probeSum_ = Allocate<float>(32U);
         cast_ = scratch.ReinterpretCast<float>();

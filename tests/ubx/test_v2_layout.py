@@ -23,7 +23,9 @@ def test_shared_metadata_workspace_and_tiling(tmp_path):
 #include <cassert>
 #include <cstddef>
 #include <vector>
-#include "PREFIX/ep_memory_server_dedup_protocol.h"
+#include <deep_ep/common/compiled.hpp>
+using deep_ep::EpServerDedupReadIndexBlock;
+using deep_ep::EpServerDedupTokenType;
 #include "PREFIX/ep_memory_server_dedup_count_layout.h"
 #include "PREFIX/ll_rdma_layout.h"
 using namespace NS;
@@ -90,6 +92,7 @@ std::vector<uint64_t> dispatch() {
 #include <stdexcept>
 #include <vector>
 #include "ubx/v2.hpp"
+#include "ubx/kernels/combine_layout.h"
 #include "ubx/kernels/ep_memory_server_dedup_combine_tiling.h"
 std::vector<uint64_t> dispatch();
 std::vector<uint64_t> combine();
@@ -109,6 +112,19 @@ int main() {
                     assert(td.dtype == dtype && td.numMaxTokensPerRank == 256 && td.quantMode == 0);
                     assert(td.tilingKey == (world <= 16 ? 4 : 16));
                 }
+    for (unsigned h : {3584U, 3840U, 4096U}) {
+        auto plan = [h](unsigned rows) { return UbxCombine::PlanPutRows(rows, 256, h, 8, 28); };
+        for (unsigned rows : {0U, 256U, 10001U}) {
+            const auto whole = plan(rows);
+            assert(whole.rows == rows && whole.lanes && whole.receive.inputLanes);
+        }
+        unsigned fit = 10001U;
+        while (plan(fit + 1).rows == fit + 1) ++fit;
+        const auto spill = plan(fit + 1);
+        assert(spill.rows == 2048U && spill.lanes && spill.receive.inputLanes);
+        assert(plan(32768).rows == spill.rows);
+        assert(spill.receive.totalBytes <= 240U * 1024U);
+    }
     int rejected = 0;
     try { deepep::ubx::v2_capacity(32, 32, 3584, 8, 384, 56, 4); }
     catch (const std::invalid_argument&) { ++rejected; }

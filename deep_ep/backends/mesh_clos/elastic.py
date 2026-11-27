@@ -549,6 +549,8 @@ class ElasticBuffer:
                     )
                     result.token_type = tensors["token_type"]
                     result.destination_index = tensors["destination_index"]
+                    if runtime.ll_backend == "rdma":
+                        result._put_route_tag = getattr(native, "low_latency_put_route_tag", None)
                     result.relay_read_index = tensors["relay_read_index"]
                     result.source_mask = tensors["source_mask"]
                     result.source_weights = tensors["source_weights"]

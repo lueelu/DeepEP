@@ -206,7 +206,8 @@ def main(argv=None):
                         do_expand=True,
                         do_cpu_sync=False,
                     )
-                    assert dispatched.event is None and handle.is_low_latency
+                    dispatched.current_stream_wait()
+                    assert handle.is_low_latency
                     # LL exposes no public expert-count list. The test reads the
                     # actual device prefix; CPU routing independently checks it.
                     prefix = handle.send_counts.cpu().tolist()

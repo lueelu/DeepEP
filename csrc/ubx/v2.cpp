@@ -6,6 +6,11 @@
 #include "kernels/ep_memory_server_dedup_combine_tiling.h"
 
 namespace deepep::ubx {
+uint32_t combine_ub_bytes()
+{
+    return UbxCombine::kEpServerDedupCombineUbBytes;
+}
+
 uint64_t v2_capacity(int world, int tokens, int hidden, int topk, int experts, uint32_t cores, uint32_t ranks_per_host)
 {
     if (ranks_per_host != UbxDispatch::kLlPhysicalRanksPerHost || world < int(ranks_per_host) ||

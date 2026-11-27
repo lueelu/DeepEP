@@ -4,14 +4,14 @@
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_SELECT_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_SELECT_H
 
-#include "kernel_operator.h"
-#include "ep_server_order.h"
+#include <kernel_operator.h>
+#include <ubx/kernels/ep_server_order.h>
 
 namespace UbxCombine {
 // Dispatch and Combine share the same large-world half ordering.
 using EpServerOrder::ServerDedupHalfOrder;
 
-// Table2 carries source ranks. Two comparisons select one eight-rank server
+// Table2 carries source ranks. Two comparisons select one logical server
 // without scalar division or a per-candidate GetValue loop.
 __aicore__ inline void ServerDedupRankMask(AscendC::LocalTensor<uint8_t> mask, AscendC::LocalTensor<uint8_t> upper,
                                            AscendC::LocalTensor<int32_t> ranks, int32_t first, int32_t end,

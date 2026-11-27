@@ -106,8 +106,8 @@ __aicore__ inline uint32_t BuildServerDedupMetadata(__ubuf__ uint32_t* type, __u
         if (header[6U] == kEpServerDedupPutRouteTag) {
             // Dispatch physical slots are capacity-M partitions while the PUT
             // inbox is B-based and capacity >= B. Decode the row's expert and q
-            // with M, then match the unchanged packed member key. The first
-            // column keeps p so the base Combine still applies its M->B map.
+            // with M, then match the packed member key. Column zero keeps the
+            // physical Dispatch slot independently of the B-based PUT address.
             const uint32_t q = slot % capacity;
             const uint32_t localExpert = (slot / capacity) % localExperts;
             const uint32_t key = (rank * localExperts + localExpert) | (q << 16U);

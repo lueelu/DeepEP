@@ -34,7 +34,7 @@ inline void init_jit(const std::string& root_path)
         kernel_root / "shmem/src/device",
         kernel_root / "shmem/src/device_simt",
     };
-    const deep_jit::Config config(root, "EP", "", include_dirs, {"deep_ep/"});
+    const deep_jit::Config config(root, "EP", "", include_dirs, {"deep_ep/", "ubx/kernels/"});
     jit = deep_jit::LazyInit<deep_jit::Runtime<deep_jit::Ascend>>([config] {
         return std::make_shared<deep_jit::Runtime<deep_jit::Ascend>>(config);
     });

@@ -19,6 +19,7 @@ from ._store import StoreGroup
 from ._backend_lock import LOCK as _LOCK
 
 _OWNER = None
+_PUT_ROUTE_TAG = 0x50555431  # Dispatch FIRST_HOP wire tag PUT1
 
 
 class _MegaMoEProfile(NamedTuple):
@@ -213,6 +214,7 @@ class Runtime:
                     + 16 * int(debug_collectives)
                     + 32 * int(self.ll_backend == "rdma")
                     + 64 * int(profile is not None and profile.peer_access_check)
+                    + 128 * int(self.ll_backend == "rdma" and getattr(native, "low_latency_put_route_tag", None) == _PUT_ROUTE_TAG)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -235,7 +237,7 @@ class Runtime:
                 if any(value[-1] != values[0][-1] for value in values):
                     raise ValueError(
                         "Ranks disagree on MTE/URMA/RDMA runtime engines, QP configuration, page size, "
-                        "debug_collectives or MegaMoE backend profile"
+                        "debug_collectives, RoCE PUT protocol or MegaMoE backend profile"
                     )
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]

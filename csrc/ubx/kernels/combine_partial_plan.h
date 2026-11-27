@@ -1,9 +1,9 @@
 // Copyright (c) 2026, Lu Lu
 #pragma once
 
-#include "ep_memory_server_dedup_combine_config.h"
-#include "combine_server_dedup_select.h"
-#include "combine_return_schedule.h"
+#include <ubx/kernels/ep_memory_server_dedup_combine_config.h>
+#include <ubx/kernels/combine_server_dedup_select.h>
+#include <ubx/kernels/combine_return_schedule.h>
 
 namespace UbxCombine {
 // M4 has not started computing yet. The caller lends either the idle FP32

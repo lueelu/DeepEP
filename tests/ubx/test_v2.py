@@ -98,6 +98,7 @@ def setup(monkeypatch):
     handle = EPHandle.__new__(EPHandle)
     handle.__dict__.update(
         _buffer_token=buffer._handle_token,
+        _put_route_tag=0x50555431,
         is_low_latency=True,
         metadata_only=False,
         do_expand=True,
@@ -222,5 +223,13 @@ def test_pod_path_does_not_enter_rdma_adapter(setup, monkeypatch):
     s.runtime.ll_backend = "mte"
     monkeypatch.setattr(ubx, "combine", lambda *_: pytest.fail("POD entered the RDMA adapter"))
     output, _, event = s.buffer.combine(s.x, s.handle)
-    assert output.shape == (32, 3584) and event.event is None
+    event.current_stream_wait(release_handle=True)
+    assert output.shape == (32, 3584)
     assert next(entry[2] for entry in s.log if entry[0] == "tiling") == {}
+
+
+def test_reject_legacy_dispatch_before_submission(setup):
+    del setup.handle._put_route_tag
+    with pytest.raises(ValueError, match="PUT1"):
+        setup.buffer.combine(setup.x, setup.handle)
+    assert not any(row[0] == "launch" for row in setup.log)

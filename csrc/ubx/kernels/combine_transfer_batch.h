@@ -1,9 +1,9 @@
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
-#include "ll_transport.h"
+#include <ubx/kernels/ll_transport.h>
 
-#include "combine_wqe_prepare.h"
+#include <ubx/kernels/combine_wqe_prepare.h>
 
 namespace UbxCombine {
 // One quiet per used peer before any GM slot is recycled. M5 may overlap
@@ -19,9 +19,9 @@ class TransferBatch {
     {
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(7U);
     }
-    AscendC::LocalTensor<uint8_t> privateUb_;
+    AscendC::LocalTensor<uint8_t> workspace_, quiet_;
     bool partial_ = false;
-    __aicore__ inline void Retire(AscendC::LocalTensor<uint8_t> scratch)
+    __aicore__ inline void Retire()
     {
         if (!count_) return;
         for (uint32_t word = 0U; word < kWords; ++word) {
@@ -31,7 +31,7 @@ class TransferBatch {
                 if (mask & (1U << bit)) {
                     const uint32_t peer = word * 32U + bit;
 
-                    UbxTransport::Quiet(peer, scratch);
+                    UbxTransport::Quiet(peer, quiet_);
                 }
             peers_[word] = 0U;
         }
@@ -42,15 +42,16 @@ class TransferBatch {
         UbxTransport::Check(args_, peer, offset, bytes_);
         return stage_ + uint64_t(count_) * bytes_;
     }
-    __aicore__ inline void Submit(uint32_t peer, uint64_t offset, GM_ADDR src, AscendC::LocalTensor<uint8_t> scratch)
+    __aicore__ inline void Submit(uint32_t peer, uint64_t offset, GM_ADDR src)
     {
         using namespace AscendC;
         SetFlag<HardEvent::MTE3_S>(7U);
 
+        auto scratch = workspace_[count_ * 128U];
         PreparedWrite write;
         bool prepared = false;
         if (partial_) {
-            prepared = write.Prepare(peer, UbxTransport::RemoteAddress(args_, peer, offset), src, bytes_, privateUb_);
+            prepared = write.Prepare(peer, UbxTransport::RemoteAddress(args_, peer, offset), src, bytes_, scratch);
         }
 
         WaitStage();
@@ -61,7 +62,7 @@ class TransferBatch {
             UbxTransport::Put(args_, peer, UbxTransport::RemoteAddress(args_, peer, offset), src, bytes_, scratch);
 
         peers_[peer / 32U] |= 1U << (peer % 32U);
-        if (++count_ == capacity_) Retire(scratch);
+        if (++count_ == capacity_) Retire();
     }
 
 public:
@@ -74,12 +75,16 @@ public:
         args_ = args;
         bytes_ = bytes;
         capacity_ = UbxRdma::kCoreBytes / bytes;
+        quiet_ = workspace_[capacity_ * 128U];
         if (uint32_t(args->rankSize) > UbxDispatch::kLlPhysicalRanksPerHost)
             stage_ = UbxTransport::Stage(args, capacity_ * bytes);
     }
-    __aicore__ inline void SetPartialScratch(AscendC::LocalTensor<uint8_t> scratch)
+    __aicore__ inline void SetWorkspace(AscendC::LocalTensor<uint8_t> scratch)
     {
-        privateUb_ = scratch;
+        workspace_ = scratch;
+    }
+    __aicore__ inline void EnablePrepare()
+    {
         partial_ = true;
     }
     __aicore__ inline bool Pending() const
@@ -92,12 +97,12 @@ public:
 
         AscendC::DataCopy(UbxTransport::Tensor(dst, false), packet, bytes_);
 
-        Submit(peer, offset, dst, packet);
+        Submit(peer, offset, dst);
     }
 
-    __aicore__ inline void Flush(AscendC::LocalTensor<uint8_t> scratch)
+    __aicore__ inline void Flush()
     {
-        Retire(scratch);
+        Retire();
     }
 };
 }  // namespace UbxCombine

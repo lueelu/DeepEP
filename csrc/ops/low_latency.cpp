@@ -15,6 +15,7 @@
 #include "runtime/session.hpp"
 #include "runtime/ll_core_config.hpp"
 #include "ubx/v2.hpp"
+#include "ubx/launch.hpp"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
 #include "host/data_plane/shmem_host_p2p_sync.h"
@@ -157,6 +158,7 @@ void bind_low_latency(py::module_& module)
 {
     if (deepep_ll_core_protocol_version() != deep_ep::kLlCoreProtocolVersion)
         throw std::runtime_error("LL Host/device core protocol mismatch; rebuild and reinstall the complete wheel");
+    module.attr("low_latency_put_route_tag") = deep_ep::kEpServerDedupPutRouteTag;
     module.attr("low_latency_core_protocol") = deep_ep::kLlCoreProtocolVersion;
     module.attr("low_latency_roce_qps_per_peer") = 0; // actual active physical cores
     module.attr("low_latency_implementation") = "ndr-hns1825";
@@ -468,10 +470,10 @@ void bind_low_latency(py::module_& module)
         py::gil_scoped_release release;
         session.invalidate_dispatch_controls();
         if (session.ll_rdma()) {
-            const ubx::CombineArgs rdma_args{args.commArgs,     args.expertOut, args.destinationIndex, args.sendCounts,
-                                             args.expertScales, args.tokenType, args.relayReadIndex,   args.sourceMask,
-                                             args.yOut,         args.tilingData, cores};
-            ubx_combine_launch(reinterpret_cast<void*>(stream_address), &rdma_args);
+            deep_ep::launch_combine_put(
+                reinterpret_cast<void*>(stream_address), cores, deep_ep::LlGroupForWorld(world), h, k, e, args.commArgs,
+                args.expertOut, args.destinationIndex, args.sendCounts, args.expertScales, args.tokenType,
+                args.relayReadIndex, args.sourceMask, args.yOut, args.tilingData);
         } else {
             combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
         }

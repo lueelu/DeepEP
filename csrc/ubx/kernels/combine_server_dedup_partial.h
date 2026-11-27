@@ -4,19 +4,17 @@
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 
-#include "kernel_operator.h"
-#include "combine_ready.h"
-#include "combine_ready_select.h"
+#include <kernel_operator.h>
 
-#include "ll_transport.h"
-#include "combine_rdma_return.h"
-#include "combine_stage_wire.h"
-#include "comm_args.h"
-#include "dispatch_dedup_types.h"
-#include "ep_memory_server_dedup_buffer_layout.h"
-#include "ep_memory_server_dedup_combine_config.h"
-#include "combine_server_dedup_select.h"
-#include "combine_partial_plan.h"
+#include <ubx/kernels/ll_transport.h>
+#include <ubx/kernels/combine_rdma_return.h>
+#include <ubx/kernels/combine_stage_wire.h>
+#include <ubx/kernels/comm_args.h>
+#include <ubx/kernels/dispatch_dedup_types.h>
+#include <ubx/kernels/ep_memory_server_dedup_buffer_layout.h>
+#include <ubx/kernels/ep_memory_server_dedup_combine_config.h>
+#include <ubx/kernels/combine_server_dedup_select.h>
+#include <ubx/kernels/combine_partial_plan.h>
 
 namespace UbxCombine {
 using namespace AscendC;
@@ -29,7 +27,7 @@ class ServerDedupPartial {
 public:
     __aicore__ inline void Init(const __gm__ UbxDispatch::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch,
                                 GM_ADDR expert, GM_ADDR table2, GM_ADDR table3, GM_ADDR types, uint32_t tokens,
-                                uint32_t bs, uint32_t h, uint32_t k, uint32_t experts, uint8_t dtype, uint64_t window,
+                                uint32_t bs, uint32_t h, uint32_t k, uint8_t dtype, uint64_t window,
                                 const EpCombineM45WorkspaceLayout& layout, ReturnBatch* batch)
     {
         args_ = args;
@@ -42,13 +40,11 @@ public:
         bs_ = bs;
         h_ = h;
         k_ = k;
-        localExperts_ = experts / uint32_t(args->rankSize);
         dtype_ = dtype;
         window_ = window;
         blocks_ = (h * 2U + 479U) / 480U;
         packetBytes_ = blocks_ * 512U;
         inputBytes_ = layout.inputBytes;
-        stageStride_ = packetBytes_;
         stageBase_ = window + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET + uint64_t(bs) * k * packetBytes_;
         inputLanes_ = layout.inputLanes;
         outputLanes_ = layout.outputLanes;
@@ -58,10 +54,7 @@ public:
         }
         rows_ = Allocate<int32_t>(EpCombineM4TaskBytes(tokens, recvCores_));
         const uint32_t bytes = EpCombineReadyTaskBytes(tokens, recvCores_);
-        readyDeps_ = Allocate<int32_t>(bytes);
-        readyWork_ = Allocate<int32_t>(bytes);
-        readyTasks_ = Allocate<int32_t>(bytes);
-        readyMask_ = Allocate<uint8_t>(EpCombineAlign((bytes / 4U + 7U) / 8U, 32U));
+        done_ = Allocate<int32_t>(bytes);
         scan_ = scratch_[used_];
         scanRows_ = EpCombineM4ScanRows(h, k);
         table2Ub_ = Allocate<int32_t>(EpCombineAlign(kEpServerDedupCombineM4TableRows * 12U, 32U));
@@ -75,7 +68,11 @@ public:
         planScratch_ = scratch[layout.inputOffset];
         planScratchBytes_ = EpCombineRouteSnapshotBytes(layout);
         low_ = Allocate<uint16_t>(blocks_ * 480U);
-        rdmaBatch_->SetPartialScratch(Allocate<uint8_t>(128U));
+        Allocate<uint8_t>(128U);  // Guard the last vector packing load from low_.
+        flags_ = Allocate<float>(EpCombineM5FlagBytes(h, k));
+        work_ = Allocate<float>(EpCombineM5WorkBytes(h, k));
+        sumFlags_ = Allocate<float>(32U);
+        rdmaBatch_->EnablePrepare();
         inputs_ = scratch[layout.inputOffset].ReinterpretCast<uint16_t>();
         outputs_ = scratch[layout.outputOffset];
         expert_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(expert));
@@ -84,10 +81,6 @@ public:
         types_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(types));
     }
 
-    __aicore__ inline void SetReady(CombineGroupReady<Group>* ready)
-    {
-        ready_ = ready;
-    }
     __aicore__ inline uint32_t Process()
     {
         // Must precede output-flag initialization: the snapshot aliases those
@@ -102,7 +95,6 @@ public:
         SetFlag<HardEvent::V_MTE2>(7U);
         WaitFlag<HardEvent::V_MTE2>(7U);
 
-        if (UbxTransport::Rdma(args_)) rdmaBatch_->Init(args_, packetBytes_);
 
         for (uint32_t lane = 0; lane < inputLanes_; ++lane) SetFlag<HardEvent::V_MTE2>(lane);
         uint64_t flagMask[2] = {0xffU, 0U};
@@ -114,8 +106,7 @@ public:
 
         const uint32_t servers = uint32_t(args_->rankSize) / Group;
         const uint32_t ownServer = uint32_t(args_->rank) / Group;
-        uint32_t completed = 0U;
-        completed = ProcessReadyTasks(servers, ownServer);
+        const uint32_t completed = ProcessReadyTasks(servers, ownServer);
 
         for (uint32_t lane = 0; lane < inputLanes_; ++lane) WaitFlag<HardEvent::V_MTE2>(lane);
 
@@ -164,81 +155,73 @@ private:
             Sync<HardEvent::MTE2_S>();
         }
 
-        Duplicate(readyDeps_, int32_t(kReadyTaskDone), EpCombineAlign(count, 64U));
-        Sync<HardEvent::V_S>();
-
         for (uint32_t task = 0; task < count; ++task) {
             LoadReadyMetadata(task);
-            const uint32_t n = table3Ub_.GetValue(0U);
-            if (n == 0U || n >= k_) {
+            const uint32_t members = table3Ub_.GetValue(0U);
+            if (!members || members >= k_ || uint32_t(table2Ub_.GetValue(0U)) >= uint32_t(args_->rankSize) ||
+                uint32_t(table2Ub_.GetValue(1U)) >= bs_ || uint32_t(table2Ub_.GetValue(2U)) >= k_) {
                 Trap();
                 return 0U;
             }
-            uint32_t mask = 0U;
-            for (uint32_t member = 1; member <= n; ++member) {
-                const uint32_t rank = (table3Ub_.GetValue(member * 2U) & 0xffffU) / localExperts_;
-                if (rank / Group != uint32_t(args_->rank) / Group) {
-                    Trap();
-                    return 0U;
-                }
-                mask |= 1U << (rank % Group);
-            }
-            const uint32_t source = uint32_t(table2Ub_.GetValue(0U));
-            readyDeps_.SetValue(task,
-                                int32_t(mask | (UbxTransport::RemoteWrite(args_, source) ? 0U : kReadyTaskLocal)));
+            done_.SetValue(task, 0);
         }
-
-        uint32_t completed = 0U, blockedMask = 0xffffffffU;
+        uint32_t completed = 0U;
         while (completed < count) {
-            const uint32_t observed = ready_->Poll();
-
-            // Only an EMPTY selection can be cached. After remote work runs,
-            // ready local work must still be selected even with the same mask.
-            if (observed == blockedMask) {
-                continue;
-            }
-
-            const uint32_t missing = ((1U << Group) - 1U) ^ observed;
-            // One known task needs a dependency test, not compaction. Group
-            // flag polling remains Vector; multi-task ordering is unchanged.
-            uint32_t runnable;
-            {
-                runnable =
-                    SelectReadyCombineTasks(readyDeps_, readyWork_, readyTasks_, readyMask_, count, missing, true);
-                if (!runnable)
-                    runnable =
-                        SelectReadyCombineTasks(readyDeps_, readyWork_, readyTasks_, readyMask_, count, missing, false);
-            }
-
-            if (!runnable) {
-                blockedMask = observed;
-
-                continue;
-            }
-            blockedMask = 0xffffffffU;
-
-            for (uint32_t index = 0; index < runnable; ++index) {
-                const uint32_t task = uint32_t(readyTasks_.GetValue(index));
-                const uint32_t row = uint32_t(rows_.GetValue(task));
-
+            for (uint32_t task = 0; task < count; ++task) {
+                if (done_.GetValue(task)) continue;
                 LoadReadyMetadata(task);
-
                 const uint32_t source = uint32_t(table2Ub_.GetValue(0U));
                 const uint32_t token = uint32_t(table2Ub_.GetValue(1U));
-                const uint32_t topk = uint32_t(table2Ub_.GetValue(2U));
-                const uint32_t n = table3Ub_.GetValue(0U);
+                const uint32_t members = table3Ub_.GetValue(0U);
+                if (!MembersArrived(source, token, members)) continue;
+                const uint32_t row = uint32_t(rows_.GetValue(task));
                 if (dtype_ == UbxDispatch::DISPATCH_DEDUP_DATA_TYPE_FP16)
-                    Aggregate<half>(row, source, n + 1U);
+                    Aggregate<half>(row, source, members + 1U);
                 else
-                    Aggregate<bfloat16_t>(row, source, n + 1U);
-
-                Send(completed % outputLanes_, source, token, topk);
-                readyDeps_.SetValue(task, int32_t(kReadyTaskDone));
-                ++completed;
+                    Aggregate<bfloat16_t>(row, source, members + 1U);
+                Send(completed++ % outputLanes_, source, token, uint32_t(table2Ub_.GetValue(2U)));
+                done_.SetValue(task, 1);
             }
         }
-
+        if (count) ClearMemberFlags(count);
         return completed;
+    }
+
+    __aicore__ inline GM_ADDR Inbox(uint32_t source, uint32_t token, uint32_t member) const
+    {
+        const uint64_t slot = (uint64_t(source) * bs_ + token) * k_ + member;
+        return args_->peerMems[args_->rank] + stageBase_ + slot * packetBytes_;
+    }
+
+    __aicore__ inline GlobalTensor<float> MemberFlags(uint32_t source, uint32_t token)
+    {
+        GlobalTensor<float> flags;
+        flags.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(Inbox(source, token, 1U) + 480U));
+        flags.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+        return flags;
+    }
+
+    __aicore__ inline bool MembersArrived(uint32_t source, uint32_t token, uint32_t members)
+    {
+        const uint32_t flags = members * blocks_;
+        UbxTransport::Sync<HardEvent::V_MTE2>(7U);
+        DataCopy(flags_, MemberFlags(source, token), {uint16_t(flags), 1U, 15U, 0U});
+        UbxTransport::Sync<HardEvent::MTE2_V>(7U);
+        ReduceSum<float>(sumFlags_, flags_, work_, 1U, flags, 1U);
+        UbxTransport::Sync<HardEvent::V_S>(7U);
+        return sumFlags_.GetValue(0U) == float(flags);
+    }
+
+    __aicore__ inline void ClearMemberFlags(uint32_t count)
+    {
+        Duplicate(flags_, 0.0f, k_ * blocks_ * 8U);
+        UbxTransport::Sync<HardEvent::V_MTE3>(7U);
+        for (uint32_t task = 0; task < count; ++task) {
+            LoadReadyMetadata(task);
+            auto flags = MemberFlags(uint32_t(table2Ub_.GetValue(0U)), uint32_t(table2Ub_.GetValue(1U)));
+            DataCopyPad(flags, flags_, {uint16_t(table3Ub_.GetValue(0U) * blocks_), 32U, 0U, 480U, 0U});
+        }
+        UbxTransport::Sync<HardEvent::MTE3_S>(7U);
     }
 
     template <class T>
@@ -331,25 +314,14 @@ private:
 
         WaitFlag<HardEvent::V_MTE2>(lane);
 
-        GlobalTensor<uint16_t> data;
         if (member == 0U) {
-            data = expert_[uint64_t(row) * h_];
+            auto data = expert_[uint64_t(row) * h_];
 
             DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U},
                         {false, 0U, 0U, uint16_t(0)});
         } else {
-            const uint32_t packed = table3Ub_.GetValue(member * 2U);
-            const uint32_t expert = packed & 0xffffU, q = packed >> 16U;
-            const uint32_t memberRank = expert / localExperts_, localExpert = expert % localExperts_;
-            const uint64_t slot =
-                (((uint64_t(source) + memberRank) % uint32_t(args_->rankSize)) * localExperts_ + localExpert) * bs_ + q;
-            if (memberRank / Group != uint32_t(args_->rank) / Group) {
-                Trap();
-                return;
-            }
-
-            LoadStageWire(args_, memberRank, stageBase_ + slot * stageStride_, inputs_[lane * inputBytes_ / 2U],
-                          h_ * 2U);
+            const uint32_t token = uint32_t(table2Ub_.GetValue(1U));
+            LoadStageWire(Inbox(source, token, member), inputs_[lane * inputBytes_ / 2U], h_ * 2U);
         }
         SetFlag<HardEvent::MTE2_V>(lane);
     }
@@ -408,8 +380,6 @@ private:
         SetFlag<HardEvent::V_MTE3>(lane);
         WaitFlag<HardEvent::V_MTE3>(lane);
 
-        // This reduced output has one destination; the next use rewrites its
-        // body and never reads the SDK's borrowed first 128 bytes.
         const uint64_t offset =
             window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET + (uint64_t(token) * k_ + topk) * packetBytes_;
 
@@ -418,9 +388,8 @@ private:
         SetFlag<HardEvent::MTE3_V>(lane);
     }
 
-    CombineGroupReady<Group>* ready_ = nullptr;
-    LocalTensor<int32_t> readyDeps_, readyWork_, readyTasks_;
-    LocalTensor<uint8_t> readyMask_;
+    LocalTensor<float> flags_, work_, sumFlags_;
+    LocalTensor<int32_t> done_;
     LocalTensor<int32_t> readyTable2_;
     LocalTensor<uint32_t> readyTable3_;
     uint32_t readyTable3Stride_ = 0U;
@@ -438,10 +407,10 @@ private:
     GlobalTensor<uint16_t> expert_;
     GlobalTensor<int32_t> table2_, types_;
     GlobalTensor<uint32_t> table3_;
-    uint32_t used_ = 0, tokens_ = 0, bs_ = 0, h_ = 0, k_ = 0, localExperts_ = 0, dtype_ = 0;
+    uint32_t used_ = 0, tokens_ = 0, bs_ = 0, h_ = 0, k_ = 0, dtype_ = 0;
     uint32_t blocks_ = 0, packetBytes_ = 0, inputBytes_ = 0, inputLanes_ = 0, outputLanes_ = 0;
     uint32_t inputSequence_ = 0, scanRows_ = 0;
-    uint64_t stageStride_ = 0, stageBase_ = 0, window_ = 0;
+    uint64_t stageBase_ = 0, window_ = 0;
     PartialTaskPlan<Group> plan_;
     LocalTensor<uint8_t> planScratch_;
     uint32_t planScratchBytes_ = 0U;
