@@ -696,3 +696,43 @@ def test_route_weight_mode_reaches_plan(backend, mode):
 def test_invalid_route_weight_mode(backend, mode):
     with pytest.raises((ValueError, TypeError), match="topk_weights_type"):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)
+
+
+@pytest.mark.parametrize("backend_name", ["mte", "urma"])
+def test_continuous_bs_ramp_up_and_down_reuses_single_plan(backend, monkeypatch, backend_name):
+    ramp = (1, 2, 16, 128, 255, 256, 257, 512, 1024, 512, 257, 256, 255, 128, 16, 2, 1)
+    if backend_name == "urma":
+        b, (w1, w2) = urma_buffer(backend, monkeypatch)
+        hidden = 256
+    else:
+        b = api.SymmBuffer(backend.group_type(), 4, 1024, 2, 1024, 256)
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        raw = weights()
+        for weight, _ in raw:
+            weight.npu_format = 2
+        w1, w2 = api.transform_weights_for_mega_moe(*raw)
+        hidden = 1024
+
+    try:
+        stats = Tensor([0, 0], "int32")
+        casts_before = sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
+        plans = []
+        for step, bs in enumerate(ramp, start=1):
+            y = Tensor(np.zeros((bs, hidden)), "bfloat16")
+            assert api.fp8_fp4_mega_moe(y, w1, w2, b, cumulative_local_expert_recv_stats=stats) is None
+            np.testing.assert_array_equal(y.data, 3)
+            launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+            assert launch[0].shape == (bs, hidden)
+            assert launch[1].dtype == "float8_e8m0fnu" and launch[1].shape == (bs, hidden // 32)
+            assert launch[2].dtype == "int64" and launch[2].shape == (bs, 2)
+            expected_fused = backend_name == "urma" or bs <= 256
+            selected = w1.select(expected_fused)
+            assert launch[4] is selected[0] and launch[6] is selected[1]
+            assert launch[-1] == step
+            plans.append(b._plan)
+        assert len({id(p) for p in plans}) == 1
+        assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts_before
+        np.testing.assert_array_equal(stats.data, [2 * len(ramp), 3 * len(ramp)])
+    finally:
+        b.destroy()

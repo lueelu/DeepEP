@@ -41,12 +41,8 @@ def load_config(name, bs_values=None):
     if bs_values is not None:
         config["bs_values"] = [int(part) for part in bs_values.split(",")]
     batches = config["bs_values"]
-    if (
-        not batches
-        or len(set(batches)) != len(batches)
-        or any(type(b) is not int or not 0 < b <= 65536 for b in batches)
-    ):
-        raise ValueError("BS values must be distinct integers in [1,65536]")
+    if not batches or any(type(b) is not int or not 0 < b <= 65536 for b in batches):
+        raise ValueError("BS values must be integers in [1,65536]")
     for name, minimum in (("warmup", 0), ("iters", 1), ("seed", 0)):
         if type(config[name]) is not int or config[name] < minimum:
             raise ValueError(f"Invalid {name}")
@@ -376,8 +372,11 @@ def run(args, config, group):
         guard.prepare_per_call_alignment()
         manifest["alignment"] = guard.describe()
         (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    seen_bs: dict[int, int] = {}
     for bs in config["bs_values"]:
-        case = rank_dir / f"bs_{bs}"
+        repeat_idx = seen_bs.get(bs, 0)
+        seen_bs[bs] = repeat_idx + 1
+        case = rank_dir / (f"bs_{bs}" if repeat_idx == 0 else f"bs_{bs}_repeat{repeat_idx}")
         case.mkdir()
         x, ids, weights = inputs(config, rank, bs, args.routing, world=world)
         if args.input == "bf16":
@@ -477,10 +476,15 @@ def run(args, config, group):
                 )
                 other, other_counts = cascade.forward(
                     activation,
-                    buffer.topk_idx[:bs],
+                    buffer.topk_idx[:bs].to(torch.int32),
                     buffer.topk_weights[:bs],
                     input_kind=args.input,
-                    quantized=(buffer.x[:bs], buffer.x_sf[:bs]) if activation is None else None,
+                    quantized=(
+                        buffer.x[:bs],
+                        buffer.x_sf[:bs].view(torch.uint8).view(torch.float8_e8m0fnu).reshape(bs, model["hidden"] // 32),
+                    )
+                    if activation is None
+                    else None,
                 )
                 dual = compare_outputs(
                     result.float().cpu().numpy(),
