@@ -1199,6 +1199,88 @@ def test_ep64_dispatch_32_cores_uses_eight_senders_without_changing_other_paths(
     """)
 
 
+@pytest.mark.parametrize("ep", [4, 8, 16, 32, 64, 128, 256])
+def test_auto_qp_reservation_covers_dynamic_launches_and_legacy_paths(ep):
+    run_host(f"""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        base = resolve_udma_policy(True,{ep},'udma',None,None,None,None,None)
+        names = ('rank','group','group_staggered','group_round_robin')
+        sizes = (32,2047,2048,2049,4095,4096,4097,5632,7168,8191,8192,8193,12287,12288,12289,14336,32768)
+        for group in (1,2,4,8,16,32,64,128,256):
+            if group > {ep}: continue
+            for known in (False,True):
+                policy = replace(base,ranks_per_group=group,topology_known=known)
+                reserved = set(policy.reservation_spec().split(';'))
+                assert policy.signature()[-1] == policy.reservation_spec()
+                for cores in range(0,65,2):
+                    try: policy.for_num_aiv(cores)
+                    except ValueError: continue
+                    for size in sizes:
+                        for op in ('dispatch','combine','weighted'):
+                            for kwargs in ({{'bf16':True}}, {{'bf16':False}},
+                                           {{'bf16':True,'expanded':True}}, {{'bf16':True,'v2':False}}):
+                                p = policy.for_launch(cores,size,op,**kwargs)
+                                key = f'{{names[p.peer_order]}}:{{p.peers_per_worker}}:{{p.workers_per_peer}}:{{p.qps_per_worker}}'
+                                assert key in reserved, (group,known,cores,size,op,kwargs,key,reserved)
+        if {ep} in (32,64,128):
+            policy = replace(base,ranks_per_group=16,topology_known=True)
+            expected = {{32:'rank:4:1:1;rank:8:1:1',
+                        64:'rank:4:1:1;rank:8:1:1;group_round_robin:4:1:1',
+                        128:'rank:8:1:1;rank:16:1:1;group_round_robin:2:1:1;group_round_robin:4:1:1'}}
+            assert policy.reservation_spec() == expected[{ep}]
+    """)
+
+
+def test_auto_qp_masks_preserve_control_symmetry_and_reduce_tuning_union(tmp_path):
+    import json
+    import shutil
+
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required for automatic QP mask coverage")
+    generated = subprocess.run(
+        [sys.executable, "-c", DTYPES_ONLY + textwrap.dedent("""
+            import json
+            from dataclasses import replace
+            from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+            cases = []
+            for ep in (4,8,16,32,64,128):
+                group = min(ep,16)
+                policy = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                 ranks_per_group=group,topology_known=True)
+                cases.append((ep,group,policy.reservation_spec()))
+            print(json.dumps(cases))
+        """)], cwd=ROOT, capture_output=True, text=True, check=True,
+    )
+    source = ['#include "runtime/udma_qp_reservation.h"', 'using namespace ascend_deepep::udma;']
+    names = ("rank", "group", "group_staggered", "group_round_robin")
+    for ep, group, spec in json.loads(generated.stdout):
+        expressions = []
+        for entry in spec.split(";"):
+            order, p, w, q = entry.split(":")
+            expressions.append(f"QpReservation::Mask(r,p,{ep},{group},{names.index(order)},{p},{int(w)*int(q)})")
+        source.append(f"constexpr uint64_t mask{ep}(unsigned r,unsigned p) {{return " + "|".join(expressions) + ";}")
+        source.append(f"""
+constexpr bool check{ep}() {{
+    unsigned before=0,after=0;
+    for(unsigned p=0;p<{ep};++p) {{
+        auto m=mask{ep}(0,p), old=TuningPeerMask(0,p,{ep},{group});
+        if(m!=mask{ep}(p,0) || (p==0 ? m!=0 : !(m&1)) || (m&~old)) return false;
+        for(unsigned b=0;b<32;++b) {{before+=(old>>b)&1; after+=(m>>b)&1;}}
+    }}
+    return after < before;
+}}
+static_assert(check{ep}(), "automatic mask must retain control and symmetry while reducing reservations");
+""")
+    path = tmp_path / "auto_qp_masks.cpp"
+    path.write_text("\n".join(source))
+    budget = "-fconstexpr-ops-limit=100000000" if Path(compiler).name.startswith("g++") else "-fconstexpr-steps=100000000"
+    result = subprocess.run([compiler,"-std=c++17",budget,"-I"+str(ROOT / "csrc/direct"),"-c",str(path),
+                             "-o",str(tmp_path / "auto_qp_masks.o")], capture_output=True,text=True,timeout=90)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_large_ep_low_core_fallback_and_invalid_launch_inputs():
     run_host("""
         from dataclasses import replace

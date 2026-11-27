@@ -54,7 +54,7 @@ export DEEPEP_CLOS_QP_PLANS='rank:8:1:1'
 # 同一 Buffer 如还要测试 P4，使用 'rank:8:1:1;rank:4:1:1'
 ```
 
-格式为 `order:P:W:Q`，多组用分号分隔；order 支持 `rank/group/group_staggered/group_round_robin`，沿用 Buffer 的固定 G。必须包含 dispatch、cached dispatch、combine 和准备阶段实际会用到的 QP。所有 rank 必须配置一致；初始化后不可扩大范围，超出已建链范围的调用会在提交 kernel 前报错。多 Buffer 复用也会校验配置一致。未设置时保留原有完整候选范围。该选项仅支持全 Clos shared-Jetty UDMA peer 路径，不修改发送策略、QP 编号、visit、权重方式或大页设置。须使用当前 lock 指定的 SHMEM，重编 Host，并在设备上验证初始化和算子精度；连接数量减少不等同于已测得初始化加速。
+格式为 `order:P:W:Q`，多组用分号分隔；order 支持 `rank/group/group_staggered/group_round_robin`，沿用 Buffer 的固定 G。必须包含 dispatch、cached dispatch、combine 和准备阶段实际会用到的 QP。所有 rank 必须配置一致；初始化后不可扩大范围，超出已建链范围的调用会在提交 kernel 前报错。多 Buffer 复用也会校验配置一致。未设置时，自动模式从当前策略选择器生成各合法核数、行宽区间、V1/展开/非BF16回退路径的QP并集；无需为动态通信核数重新初始化。摸测 session 仍预留完整候选范围，手动模式保留原规则，显式设置本变量优先。该选项仅支持全 Clos shared-Jetty UDMA peer 路径，不修改发送策略、QP 编号、visit、权重方式或大页设置。须使用当前 lock 指定的 SHMEM，重编 Host，并在设备上验证初始化和算子精度；连接数量减少不等同于已测得初始化加速。
 
 通用入口提供配置检查、确定性负载规划和 JSON/CSV 结果协议。当前支持无设备 dry-run；native 测量适配器未接入，非 dry-run 返回非零，不以模拟时间代替通信测量。
 

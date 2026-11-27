@@ -123,7 +123,34 @@ class UdmaPolicy:
             self.wqes_per_visit,
             self.ranks_per_group,
             self.topology_known,
+            self.reservation_spec(),
         )
+
+    @lru_cache(maxsize=128)
+    def reservation_spec(self):
+        """Union all automatic ownership mappings for this Buffer's topology.
+
+        Core counts remain dynamic. Baseline plans cover V1, non-BF16 and
+        expanded paths; BF16 V2 plans cover every row-size policy interval.
+        Visit, copy/weight mode and payload coalescing do not change QP masks.
+        """
+        mappings = set()
+        # Representatives of the selector's <=4096 bucket, 2048..12288
+        # profile range and 8192..12288 weighted range, including fallbacks.
+        row_sizes = (1, 2048, 4096, 4097, 8192, 12288, 12289)
+        for cores in range(2, _MAX_NUM_AIV + 1, 2):
+            try:
+                baseline = self.for_num_aiv(cores)
+            except ValueError:
+                continue  # This topology cannot launch at this core budget.
+            plans = [baseline]
+            for size in row_sizes:
+                for operation in ("dispatch", "combine", "weighted"):
+                    plans.append(self.for_launch(cores, size, operation, bf16=True))
+            for plan in plans:
+                mappings.add((plan.peer_order, plan.peers_per_worker, plan.workers_per_peer, plan.qps_per_worker))
+        names = ("rank", "group", "group_staggered", "group_round_robin")
+        return ";".join(f"{names[order]}:{p}:{w}:{q}" for order, p, w, q in sorted(mappings))
 
     def validate_num_aiv(self, num_aiv):
         """Check the supplied count without changing it or the selected schedule."""

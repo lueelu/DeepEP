@@ -32,7 +32,7 @@ public:
                   bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1, bool auto_resources = false);
+                  int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {});
 
     ~BufferRuntime() noexcept;
 

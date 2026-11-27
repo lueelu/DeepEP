@@ -99,7 +99,7 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker, bool auto_resources)
+                             int64_t udma_qps_per_worker, bool auto_resources, std::string auto_qp_plans)
     : rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -200,6 +200,12 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
         throw std::invalid_argument("tuning session requires shared-Jetty peer scheduling and a fixed group size");
     const char* qp_plans = std::getenv("DEEPEP_CLOS_QP_PLANS");
     qp_plan_spec_ = qp_plans ? qp_plans : "";
+    // Python derives this set from the same selector used at launch. Explicit
+    // reservations take precedence; tuning sessions retain their broad union.
+    if (!auto_qp_plans.empty() && !auto_resources_)
+        throw std::invalid_argument("automatic QP plans require automatic launch resources");
+    if (qp_plan_spec_.empty() && auto_resources_ && !tuning_session_)
+        qp_plan_spec_ = auto_qp_plans;
     if (!qp_plan_spec_.empty()) {
         if (!(data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) || !shared_jetty_ || token_schedule_)
             throw std::invalid_argument("QP reservations require shared-Jetty UDMA peer scheduling");
@@ -236,7 +242,7 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
         const auto order = combine ? combine_peer_order_ : dispatch_peer_order_;
         const auto p = order == kGroupRoundRobinOrder ? peers_per_group_per_worker_ : uint32_t(peers);
         if (!qp_reservation_.Allows(order, p, workers_per_peer_, qps_per_worker_))
-            throw std::invalid_argument("UDMA launch uses QPs outside DEEPEP_CLOS_QP_PLANS; reserve all plans before Buffer initialization");
+            throw std::invalid_argument("UDMA launch uses QPs outside the initialization reservation; reserve all plans before Buffer initialization");
         return {order,
                 ranks_per_group_,
                 p,
@@ -267,7 +273,7 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
         (p > 4 || ((group + owners - 1) / owners) * (world_size_ / group) > kGroupPeerCapacity))
         throw std::invalid_argument("UDMA launch plan exceeds the round-robin peer table");
     if (!qp_reservation_.Allows(order, p, w, q))
-        throw std::invalid_argument("UDMA launch uses QPs outside DEEPEP_CLOS_QP_PLANS; reserve all plans before Buffer initialization");
+        throw std::invalid_argument("UDMA launch uses QPs outside the initialization reservation; reserve all plans before Buffer initialization");
     return {uint32_t(order), uint32_t(group), uint32_t(p), uint32_t(w),
             uint32_t(q),     uint32_t(v),     copy,        uint32_t(weight)};
 }

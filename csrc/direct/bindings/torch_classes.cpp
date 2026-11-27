@@ -26,7 +26,7 @@ static auto combine_epilogue_registry =
 static auto buffer_runtime_registry =
     torch::jit::class_<BufferRuntime>("AscendDeepEP", "BufferRuntime")
         .def(torch::jit::init<int64_t, int64_t, int64_t, std::string, bool, std::string, bool, std::vector<int64_t>,
-                              std::string, bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool>(),
+                              std::string, bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, std::string>(),
              "",
              {torch::arg("rank"), torch::arg("num_ranks"), torch::arg("num_bytes"), torch::arg("transport"),
               torch::arg("low_latency_mode"), torch::arg("ip_port"), torch::arg("use_1g_huge_pages"),
@@ -34,7 +34,8 @@ static auto buffer_runtime_registry =
               torch::arg("v1_token_schedule") = false, torch::arg("udma_dispatch_peer_order") = 0,
               torch::arg("udma_combine_peer_order") = 0, torch::arg("udma_ranks_per_group") = 0,
               torch::arg("udma_peers_per_group_per_worker") = 0, torch::arg("udma_workers_per_peer") = 1,
-              torch::arg("udma_qps_per_worker") = 1, torch::arg("auto_resources") = false})
+              torch::arg("udma_qps_per_worker") = 1, torch::arg("auto_resources") = false,
+              torch::arg("auto_qp_plans") = ""})
         .def("is_initialized", &BufferRuntime::IsInitialized)
         .def("_configure_tuning", &BufferRuntime::ConfigureTuning)
         .def("barrier", &BufferRuntime::Barrier)

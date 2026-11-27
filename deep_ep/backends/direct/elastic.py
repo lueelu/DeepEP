@@ -327,6 +327,7 @@ class ElasticBuffer:
                 # Keep the appended flag after all six native peer fields.
                 *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
                 self._udma_auto_policy is not None,
+                self._udma_auto_policy.reservation_spec() if self._udma_auto_policy is not None else "",
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
