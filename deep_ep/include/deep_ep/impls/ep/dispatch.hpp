@@ -2210,7 +2210,6 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
     const uint32_t members = tail.ReadIndex()[0U];
     for (uint32_t i = 0; i < members; ++i) {
         const uint32_t index = tail.Entry(i)[0U], expert = index & 0xffffU, q = index >> 16U;
-        if (expert == globalExpert) continue;  // own row was already emitted above
         const uint32_t destinationRank = expert / localExperts_;
         ReceiverWaitQuantOutput<Layout>(st);
         ReceiverQuantizeWire<Layout>(ctx, ub, wire, expert);

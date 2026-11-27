@@ -616,8 +616,6 @@ class ElasticBuffer:
 
         runtime = runtime_of(self)
         runtime.ensure_alive()
-        if getattr(handle, "smooth_int8", False):
-            raise NotImplementedError("Combine does not consume smooth INT8 dispatch output")
         if runtime.ll_backend == "rdma":
             from ..ubx.elastic import combine
 
