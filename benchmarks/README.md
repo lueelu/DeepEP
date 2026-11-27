@@ -13,6 +13,22 @@ visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变
 
 ### EP4/8/16/32 精简 rank 摸测
 
+仅重测当前自动 combine（不摸测）时，复用同一入口：
+
+```bash
+export DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY=1
+torchrun --nproc_per_node=16 benchmarks/clos/bench_fast_sweep.py \
+  --combine-defaults-only --ep-size 16 --skip-precision --single-pass \
+  --no-huge-pages --reduce-cores 48 --warmup 5 --final-samples 30 \
+  --output combine_defaults_ep16
+```
+
+默认 T8192、H2816/4096/6144、通信8/32核、K8/E256/BF16/expand0，两种权重路径，共12组/EP；也可用重复的 `--case TOKENS,HIDDEN,TOPK,AIV` 缩小范围。每rank仅构造一次 Buffer，所有shape和核数复用；准备 handle 的 dispatch 不计入结果。P/W/Q、visit、payload rows 和 WQE fast 均采用当前自动值，不扫描或覆盖。进程环境须清除其他 `DEEPEP_CLOS_*` 覆盖项，仅允许上述 notify=1；脚本按实际计划并集预留 QP，并保存实际 launch/rows。
+
+该模式始终在 combine profiler 中开启独立 notify；解析器要求每次调用的顺序为 `采样前barrier → notify → 通信 → reduce`，前置barrier不计入notify。只输出notify/通信的逐rank原始样本、均值/P50/P95和通信带宽，不采集API耗时；reduce仍执行。`--skip-precision` 明确将报告标为 `precision=skipped`，不能据此宣称精度通过。`--single-pass` 不跑反序、不追加采样。带宽分子和逐样本最慢rank口径沿用下面的说明，notify不计入带宽分母。
+
+EP4/8在单机分别用4/8进程，EP32用两机各16进程；各EP独立会话，不能跨EP复用同一个Buffer。先用 `--plan-only` 核对用例。失败时保留构造/设备第一条错误和已完成结果，不自动重启或删掉慢样本。若仍出现初始化同步错误，notify测量尚未开始，不能把该轮当作性能结果。
+
 ```bash
 torchrun --nproc_per_node=8 benchmarks/clos/bench_fast_sweep.py \
   --small-rank-sweep --ep-size 8 --no-huge-pages --reduce-cores 48 \

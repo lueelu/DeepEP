@@ -22,12 +22,19 @@ PAYLOAD_ROWS_ENV = "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"
 WQE_FAST_ENV = "DEEPEP_CLOS_COMBINE_WQE_FAST"
 
 
+def combine_only(args):
+    return getattr(args, "combine_defaults_only", False) or args.combine_payload_max_rows is not None
+
+
 def validate_args(parser, args, argv):
     argv = sys.argv[1:] if argv is None else argv
-    payload_only = args.combine_payload_max_rows is not None
+    defaults_only = args.combine_defaults_only
+    if defaults_only and (args.small_rank_sweep or args.combine_payload_max_rows is not None):
+        parser.error("combine-defaults-only cannot be combined with strategy or payload sweeps")
+    payload_only = combine_only(args)
     if payload_only and args.small_rank_sweep:
         parser.error("choose either small-rank-sweep or combine-payload-max-rows")
-    if payload_only:
+    if args.combine_payload_max_rows is not None:
         limits = args.combine_payload_max_rows
         if len(set(limits)) != len(limits) or any(v < 1 or v > 32 for v in limits):
             parser.error("combine-payload-max-rows requires distinct integers in [1,32]")
@@ -53,7 +60,8 @@ def validate_args(parser, args, argv):
         parser.error("reduce-cores must be even and in [2,64]")
     args.huge_pages = False
     args.seed = 20261122
-    args.case = (args.case or cases()) if payload_only else cases()
+    default_cases = [dict(tokens=8192, hidden=h, topk=8, aiv=a) for h in (2816, 4096, 6144) for a in (8, 32)]
+    args.case = (args.case or (default_cases if defaults_only else cases())) if payload_only else cases()
     if payload_only and any(c["topk"] != 8 or c["aiv"] not in (8, 32) for c in args.case):
         parser.error("combine payload sweep currently requires topk8 and communication cores 8/32")
 
@@ -314,7 +322,7 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
     if s.rank == 0:
         print(f"PHASE {tag}/{op}/{phase} candidates={len(configs)}", flush=True)
     observations = []
-    with profile_combine_notify(False):
+    with profile_combine_notify(getattr(s.args, "combine_defaults_only", False) and op.startswith("combine")):
         for config in configs:
             s.activate(config, op)
             s.prepare()
@@ -323,6 +331,11 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
             observation = check_launch(s.native, result, plan, op, shape["aiv"], s.args.reduce_cores)
             if "payload_max_rows" in config:
                 observation.update(check_payload_limit(s.native, config))
+            elif getattr(s.args, "combine_defaults_only", False):
+                observation.update(
+                    payload_max_rows_submitted=int(s.native.last_combine_payload_max_rows()),
+                    combine_wqe_fast_submitted=int(s.native.last_combine_wqe_fast()),
+                )
             observations.append(observation)
             del result
     # Retain device-stage profiling and its existing combine-notify diagnostic.
@@ -357,6 +370,8 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
         for _ in range(2):
             call()
     local = parse_profile(directory, op, configs, s.args.warmup, samples)
+    if getattr(s.args, "combine_defaults_only", False):
+        local = [{k: stages[k] for k in ("notify", "comm")} for stages in local]
     s.write(
         directory / "rank_samples.json", dict(stages=local, launches=observations, logical_payload_bytes=logical_bytes)
     )
@@ -443,16 +458,18 @@ def run_case(s, shape, winners):
             dx, topk_idx=di, topk_weights=inputs["weight"], num_experts=256, num_sms=cores, do_expand=False
         )
     )
-    # Validate the preparation handle independently; never trust it as a golden producer.
-    check_cpu_reference(
-        torch,
-        [v.cpu() for v in fresh[:3]],
-        args,
-        s.rank,
-        s.group.size(),
-        src_idx=fresh[3]._dispatch_layout[3].cpu(),
-        handle=fresh[3],
-    )
+    # Skip both preparation and operator golden checks only when explicitly requested.
+    checked = not getattr(s.args, "skip_precision", False)
+    if checked:
+        check_cpu_reference(
+            torch,
+            [v.cpu() for v in fresh[:3]],
+            args,
+            s.rank,
+            s.group.size(),
+            src_idx=fresh[3]._dispatch_layout[3].cpu(),
+            handle=fresh[3],
+        )
     handle, owned, owned_weights = fresh[3], fresh[0].clone(), fresh[2].clone()
     inputs.update(
         original_combine_weight=owned_weights, combine_weight=owned_weights, invalid_combine_weight=fresh[1] < 0
@@ -463,7 +480,7 @@ def run_case(s, shape, winners):
     logical_bytes = send_rows * hidden * 2
     representative = shape["tokens"] == 8192 and hidden in (2816, 6144)
     outputs = []
-    payload_only = s.args.combine_payload_max_rows is not None
+    payload_only = combine_only(s.args)
     for op in ("combine", "combine_weighted") if payload_only else OPS:
         weighted = op.endswith("weighted")
 
@@ -488,7 +505,9 @@ def run_case(s, shape, winners):
             )
 
         auto = policy_config(s.base.for_launch(cores, hidden * 2, op_kind(op), bf16=True), s.group.size(), True)
-        if payload_only:
+        if getattr(s.args, "combine_defaults_only", False):
+            selected = [auto]
+        elif payload_only:
             selected = payload_candidates(
                 auto, s.args.combine_payload_max_rows, s.args.combine_visits, s.args.combine_wqe_fast
             )
@@ -506,12 +525,14 @@ def run_case(s, shape, winners):
             # H4096 deliberately uses the H6144 winner: a held-out generalization test.
             source_hidden = 2816 if hidden == 2816 else 6144
             selected = unique([winners[cores, source_hidden, op], auto])
-        for config in selected:
-            precision(s, shape, op, config, invoke, cpu, inputs)
-        s.group.agree(["precision_passed", shape, op, selected])
+        if checked:
+            for config in selected:
+                precision(s, shape, op, config, invoke, cpu, inputs)
+        s.group.agree(["precision_passed" if checked else "precision_skipped", shape, op, selected])
+        orders = [selected] if getattr(s.args, "single_pass", False) else [selected, list(reversed(selected))]
         turns = [
             measure(s, shape, op, order, invoke, logical_bytes, f"final{turn}", s.args.final_samples)
-            for turn, order in enumerate((selected, list(reversed(selected))))
+            for turn, order in enumerate(orders)
         ]
         results = []
         for config in selected:
@@ -523,7 +544,7 @@ def run_case(s, shape, winners):
                     config=config,
                     metrics=metrics,
                     rounds=rounds,
-                    precision_checked=True,
+                    precision_checked=checked,
                     GBps=rounds[0]["payload_bytes_per_rank"] / metrics["comm"]["mean"] / 1000,
                 )
             )
@@ -558,7 +579,7 @@ def write_summary(s):
                 payload_max_rows=c.get("payload_max_rows", "auto"),
                 combine_wqe_fast=c.get("combine_wqe_fast", 0),
                 GBps_per_rank=r["GBps"],
-                precision="zero_tolerance_passed",
+                precision="zero_tolerance_passed" if r["precision_checked"] else "skipped",
                 winner=c["id"] == item["winner"]["id"],
             )
             for stage, values in r["metrics"].items():
@@ -585,7 +606,10 @@ def write_summary(s):
 def run(args):
     from bench_fast_sweep import StoreGroup, qp_plan_spec, write
 
-    payload_only = args.combine_payload_max_rows is not None
+    payload_only = combine_only(args)
+    defaults_only = getattr(args, "combine_defaults_only", False)
+    checked = not getattr(args, "skip_precision", False)
+    single_pass = getattr(args, "single_pass", False)
     operations = ("combine", "combine_weighted") if payload_only else OPS
     reservation = (
         [] if payload_only else [dict(operations={"all": shortlist(args.ep_size, a, VISITS)}) for a in (8, 32)]
@@ -606,6 +630,10 @@ def run(args):
                     qp_plans=None if payload_only else qp_plan_spec(reservation),
                     huge_pages=False,
                     reduce_cores=args.reduce_cores,
+                    automatic_combine_only=defaults_only,
+                    pre_combine_notify=True,
+                    precision_checked=checked,
+                    final_passes=1 if single_pass else 2,
                     note="runtime adds actual auto and preparation plans after topology discovery",
                 ),
                 indent=2,
@@ -622,6 +650,8 @@ def run(args):
     from stage_metrics import L2CacheFlush, prepare_v2_sample
 
     unexpected = {k: v for k, v in os.environ.items() if k.startswith("DEEPEP_CLOS_") and v}
+    if defaults_only and unexpected.get("DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY") == "1":
+        unexpected.pop("DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY")
     if unexpected:
         raise RuntimeError(f"clear DEEPEP_CLOS_* overrides for the default comparison: {unexpected}")
     rank, world, device = (int(os.environ[k]) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
@@ -661,6 +691,10 @@ def run(args):
             args.combine_payload_max_rows,
             args.combine_visits,
             args.combine_wqe_fast,
+            defaults_only,
+            checked,
+            single_pass,
+            args.warmup,
         ]
     )
     native_path = Path(importlib.util.find_spec("deep_ep._clos_C").origin)
@@ -709,6 +743,10 @@ def run(args):
             payload_max_rows=args.combine_payload_max_rows,
             combine_visits=args.combine_visits,
             combine_wqe_fast=args.combine_wqe_fast,
+            automatic_combine_only=defaults_only,
+            pre_combine_notify=True,
+            precision_checked=checked,
+            final_passes=1 if single_pass else 2,
         ),
     )
     if rank == 0:
@@ -774,26 +812,30 @@ def run(args):
     buffer.destroy()
     os.environ.pop(PAYLOAD_ROWS_ENV, None)
     os.environ.pop(WQE_FAST_ENV, None)
-    write(out / "exit.json", dict(code=0, complete=True, buffer_initializations=1, precision_checked=True))
+    write(out / "exit.json", dict(code=0, complete=True, buffer_initializations=1, precision_checked=checked))
     group.agree("all_exit_files_written")
     if rank == 0:
         write(
             args.output / "report.json",
             dict(
                 ep=world,
-                mode="combine_payload" if payload_only else "small_rank",
+                mode="combine_defaults" if defaults_only else "combine_payload" if payload_only else "small_rank",
                 payload_max_rows=args.combine_payload_max_rows,
                 combine_visits=args.combine_visits,
                 combine_wqe_fast=args.combine_wqe_fast,
                 results=session.completed,
                 buffer_initializations=1,
                 huge_pages=False,
-                precision_checked=True,
+                precision_checked=checked,
+                pre_combine_notify=True,
+                final_passes=1 if single_pass else 2,
                 bandwidth="deduplicated BF16 bytes including self; excludes weights",
                 aggregation="per-sample slowest rank; device stages only; nearest-rank P95",
                 selection_metric="worst-round mean communication kernel time; API not measured",
                 limitation=(
-                    "runtime payload/visit/fast comparison; rank/P/W/Q frozen; Host options observed, physical merge rate not measured"
+                    "automatic combine only; separate notify enabled; no API timing or strategy search"
+                    if defaults_only
+                    else "runtime payload/visit/fast comparison; rank/P/W/Q frozen; Host options observed, physical merge rate not measured"
                     if payload_only
                     else "staged candidate best, not exhaustive optimum; H4096 inherits H6144 candidate"
                 ),

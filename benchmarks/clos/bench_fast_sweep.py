@@ -162,6 +162,13 @@ def parse_args(argv=None):
     )
     p.add_argument("--reduce-cores", type=int, default=48)
     p.add_argument(
+        "--combine-defaults-only",
+        action="store_true",
+        help="measure only automatic weighted/unweighted combine with separate notify; no strategy search",
+    )
+    p.add_argument("--skip-precision", action="store_true", help="rank/combine modes: explicitly skip golden checks")
+    p.add_argument("--single-pass", action="store_true", help="rank/combine modes: omit the reverse final pass")
+    p.add_argument(
         "--combine-payload-max-rows",
         type=int,
         nargs="+",
@@ -182,10 +189,12 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if (args.combine_visits is not None or args.combine_wqe_fast is not None) and args.combine_payload_max_rows is None:
         p.error("combine-visits/combine-wqe-fast require combine-payload-max-rows")
-    if args.small_rank_sweep or args.combine_payload_max_rows is not None:
+    if args.small_rank_sweep or args.combine_payload_max_rows is not None or args.combine_defaults_only:
         from rank_sweep import validate_args
 
         validate_args(p, args, argv)
+    elif args.skip_precision or args.single_pass:
+        p.error("skip-precision/single-pass require a rank/combine mode")
     if args.replay_report and args.combine_self_copy_modes and len(args.combine_self_copy_modes) != 1:
         p.error("replay accepts only one explicit self-copy mode")
     args.replay_mode_override = (
@@ -476,7 +485,7 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
 
 def main():
     args = parse_args()
-    if args.small_rank_sweep or args.combine_payload_max_rows is not None:
+    if args.small_rank_sweep or args.combine_payload_max_rows is not None or args.combine_defaults_only:
         from rank_sweep import run
 
         return run(args)
