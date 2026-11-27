@@ -20,7 +20,7 @@ namespace {
 
 uint32_t ParseCombinePayloadMaxRows(const char* value, uint64_t payload_row_bytes)
 {
-    if (!value) return payload_row_bytes <= 8192U ? 2U : 1U;
+    if (!value) return payload_row_bytes <= 8192U ? 4U : (payload_row_bytes <= 12288U ? 2U : 1U);
     uint32_t rows = 0;
     TORCH_CHECK(*value, "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be an integer in [1, 32]");
     for (const char* p = value; *p; ++p) {

@@ -27,11 +27,13 @@ def test_payload_merge_option_validation(tmp_path):
     )
     prefix = '#include <cstdint>\n#define TORCH_CHECK(ok, ...) if (!(ok)) throw "invalid";\n' + parser
     valid = (
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 5632)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8191)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8192)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8193)==1);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12288)==1);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 5632)==4);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8191)==4);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8192)==4);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8193)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12288)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12289)==1);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 14336)==1);\n"
         'static_assert(ParseCombinePayloadMaxRows("1", 5632)==1);\n'
         'static_assert(ParseCombinePayloadMaxRows("2", 12288)==2);\n'
         'static_assert(ParseCombinePayloadMaxRows("0004", 8192)==4);\n'

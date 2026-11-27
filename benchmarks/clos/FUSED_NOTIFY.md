@@ -162,9 +162,11 @@ performance; both still require device validation.
 ### Combine dense payload batches
 
 `DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS` is read on each combine call. When unset,
-the maximum is `2` for payload rows of at most 8192 bytes (inclusive), otherwise
-`1`. The byte count is hidden size times payload element size, excluding weights
-and metadata. For BF16 this includes H4096. Explicit integers from `1` through
+the maximum is `4` for payload rows of at most 8192 bytes (inclusive), `2` for
+rows above 8192 and at most 12288 bytes, and `1` for larger rows. The byte count
+is hidden size times payload element size, excluding weights and metadata.
+For BF16 this means H<=4096 uses 4, 4096<H<=6144 uses 2, and H>6144 uses 1.
+Explicit integers from `1` through
 `32` override this default; set `1` to compare with the single-row builder.
 Values above one enable dense remote payload slots for ordinary non-expanded
 V2 peer-scheduled combine with aligned payload strides and original dispatch
@@ -199,9 +201,9 @@ the environment before each call is sufficient outside graph capture. Validate
 zero-tolerance output first, then measure communication and full API separately.
 Use an independent diagnostic pass to compare physical WQE counts and build
 time, plus reduce time and complete API time. Prefix staging and changed reduce
-locality can offset sender savings; no performance gain is assumed. The default
-row-count threshold remains unchanged, so H6144 requires an explicit limit >1
-to exercise dense payloads.
+locality can offset sender savings; no performance gain is assumed. H6144 now
+exercises dense payloads by default with two rows per WQE; set the limit to 1
+for the token-addressed baseline.
 
 The existing `bench_fast_sweep.py` entry point also accepts a runtime-only
 combine sweep (do not combine this with `--small-rank-sweep`):
