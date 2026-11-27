@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import statistics
 import sys
-import time
 from types import SimpleNamespace
 
 OPS = ("fresh", "fresh_weighted", "cached", "cached_weighted", "combine", "combine_weighted")
@@ -202,10 +201,8 @@ def slowest(gathered):
 
 
 def finalists(rows, count):
-    # Include both objectives, rather than pruning an API winner by bandwidth alone.
-    api = sorted(rows, key=lambda r: r["metrics"]["api"]["mean"])
     comm = sorted(rows, key=lambda r: r["metrics"]["comm"]["mean"])
-    selected = unique([r["config"] for pair in zip(api, comm) for r in pair if not r["config"].get("auto")])[:count]
+    selected = unique([r["config"] for r in comm if not r["config"].get("auto")])[:count]
     return selected + [next(r["config"] for r in rows if r["config"].get("auto"))]
 
 
@@ -316,7 +313,7 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
     s.group.agree([tag, op, phase, configs, samples])
     if s.rank == 0:
         print(f"PHASE {tag}/{op}/{phase} candidates={len(configs)}", flush=True)
-    api, observations = [], []
+    observations = []
     with profile_combine_notify(False):
         for config in configs:
             s.activate(config, op)
@@ -328,18 +325,8 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
                 observation.update(check_payload_limit(s.native, config))
             observations.append(observation)
             del result
-            for _ in range(s.args.warmup):
-                s.prepare()
-                s.done(invoke())
-            values = []
-            for _ in range(samples):
-                s.prepare()
-                started = time.perf_counter_ns()
-                result = s.done(invoke())
-                values.append((time.perf_counter_ns() - started) / 1000)
-                del result
-            api.append(values)
-    # Extra combine notify exists only in this independent profiler pass, never in API timing.
+    # Retain device-stage profiling and its existing combine-notify diagnostic.
+    # There is no separate host/API sampling pass.
     with (
         profile_combine_notify(op.startswith("combine")),
         prof.profile(
@@ -370,8 +357,6 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
         for _ in range(2):
             call()
     local = parse_profile(directory, op, configs, s.args.warmup, samples)
-    for i, stages in enumerate(local):
-        stages["api"] = api[i]
     s.write(
         directory / "rank_samples.json", dict(stages=local, launches=observations, logical_payload_bytes=logical_bytes)
     )
@@ -511,7 +496,7 @@ def run_case(s, shape, winners):
             coarse = measure(
                 s, shape, op, shortlist(s.group.size(), cores) + [auto], invoke, logical_bytes, "coarse", s.args.samples
             )
-            best = min((r for r in coarse if not r["config"].get("auto")), key=lambda r: r["metrics"]["api"]["mean"])[
+            best = min((r for r in coarse if not r["config"].get("auto")), key=lambda r: r["metrics"]["comm"]["mean"])[
                 "config"
             ]
             extra = [candidate(best["peers"], best["workers"], best["qps"], v, s.group.size()) for v in (4, 8, 64, 128)]
@@ -542,8 +527,8 @@ def run_case(s, shape, winners):
                     GBps=rounds[0]["payload_bytes_per_rank"] / metrics["comm"]["mean"] / 1000,
                 )
             )
-        # Prefer lower worst-round completed API; retain communication winner independently.
-        best = min(results, key=lambda r: max(v["metrics"]["api"]["mean"] for v in r["rounds"]))
+        # Prefer lower worst-round communication time; this is not an API optimum.
+        best = min(results, key=lambda r: max(v["metrics"]["comm"]["mean"] for v in r["rounds"]))
         if representative and not payload_only:
             winners[cores, hidden, op] = transfer_candidate(best["config"], s.group.size())
         outputs.append(
@@ -578,13 +563,13 @@ def write_summary(s):
             )
             for stage, values in r["metrics"].items():
                 row.update({f"{stage}_{k}_us": v for k, v in values.items()})
-            row["api_change_vs_auto"] = (
-                r["metrics"]["api"]["mean"] / baseline["metrics"]["api"]["mean"] - 1 if baseline else None
+            row["comm_change_vs_auto"] = (
+                r["metrics"]["comm"]["mean"] / baseline["metrics"]["comm"]["mean"] - 1 if baseline else None
             )
             row["bandwidth_change_vs_auto"] = r["GBps"] / baseline["GBps"] - 1 if baseline else None
-            row["api_worse_in_either_round"] = (
+            row["comm_worse_in_either_round"] = (
                 any(
-                    a["metrics"]["api"]["mean"] > b["metrics"]["api"]["mean"]
+                    a["metrics"]["comm"]["mean"] > b["metrics"]["comm"]["mean"]
                     for a, b in zip(r["rounds"], baseline["rounds"])
                 )
                 if baseline
@@ -805,7 +790,8 @@ def run(args):
                 huge_pages=False,
                 precision_checked=True,
                 bandwidth="deduplicated BF16 bytes including self; excludes weights",
-                aggregation="per-sample slowest rank; independent API; nearest-rank P95",
+                aggregation="per-sample slowest rank; device stages only; nearest-rank P95",
+                selection_metric="worst-round mean communication kernel time; API not measured",
                 limitation=(
                     "runtime payload/visit/fast comparison; rank/P/W/Q frozen; Host options observed, physical merge rate not measured"
                     if payload_only

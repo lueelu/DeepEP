@@ -102,8 +102,8 @@ def test_cli_plan_and_rejected_selectors(monkeypatch, capsys, ep):
 
 
 def test_aggregation_is_max_per_sample_not_max_rank_mean():
-    result = sweep.slowest([{"api": [10, 100], "comm": [1, 9]}, {"api": [100, 10], "comm": [9, 1]}])
-    assert sweep.stats(result["api"])["mean"] == 100
+    result = sweep.slowest([{"notify": [10, 100], "comm": [1, 9]}, {"notify": [100, 10], "comm": [9, 1]}])
+    assert sweep.stats(result["notify"])["mean"] == 100
     assert sweep.stats(result["comm"])["p95"] == 9
     with pytest.raises(ValueError):
         sweep.slowest([{"comm": [1]}, {"comm": [1, 2]}])
@@ -202,7 +202,7 @@ def test_payload_summary_without_implicit_baseline(tmp_path):
     auto = sweep.candidate(2, 1, 1, 8, 16) | {"id": "auto", "auto": True}
     configs = sweep.payload_candidates(auto, [2, 4])
     results = [
-        dict(config=c, metrics={"api": {"mean": 100}, "comm": {"mean": 80}}, GBps=300, rounds=[]) for c in configs
+        dict(config=c, metrics={"comm": {"mean": 80}}, GBps=300, rounds=[]) for c in configs
     ]
     state = SimpleNamespace(
         completed=[dict(shape={}, operator="combine", results=results, winner=configs[0])],
@@ -216,8 +216,9 @@ def test_payload_summary_without_implicit_baseline(tmp_path):
     assert all(
         r[k] == ""
         for r in rows
-        for k in ("api_change_vs_auto", "bandwidth_change_vs_auto", "api_worse_in_either_round")
+        for k in ("comm_change_vs_auto", "bandwidth_change_vs_auto", "comm_worse_in_either_round")
     )
+    assert not any("api" in k for k in rows[0])
     # An unset limit is now selected by row bytes; never report it as explicit rows=1.
     for config in configs:
         config.pop("payload_max_rows")
@@ -226,12 +227,12 @@ def test_payload_summary_without_implicit_baseline(tmp_path):
         assert all(row["payload_max_rows"] == "auto" for row in csv.DictReader(f))
 
 
-def test_finalists_keep_api_and_communication_winners():
+def test_finalists_select_communication_winners_without_api():
     rows = [
-        dict(config={"id": name, "auto": name == "auto"}, metrics={"api": {"mean": api}, "comm": {"mean": comm}})
-        for name, api, comm in [("auto", 1, 1), ("api", 2, 4), ("comm", 4, 2), ("middle", 3, 3)]
+        dict(config={"id": name, "auto": name == "auto"}, metrics={"comm": {"mean": comm}})
+        for name, comm in [("auto", 1), ("slow", 4), ("comm", 2), ("middle", 3)]
     ]
-    assert [c["id"] for c in sweep.finalists(rows, 2)] == ["api", "comm", "auto"]
+    assert [c["id"] for c in sweep.finalists(rows, 2)] == ["comm", "middle", "auto"]
 
 
 def test_auto_winner_is_frozen_for_held_out_shapes():
@@ -294,9 +295,9 @@ def test_cached_launch_checks_native_not_creation_handle():
         sweep.check_launch(native, None, plan, "cached_weighted", 8, 48)
 
 
-def test_measure_keeps_profiler_notify_outside_full_api(tmp_path, monkeypatch):
+def test_measure_profiles_device_stages_without_api_sampling(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(BENCH))
-    calls, files = [], {}
+    calls, files, boundaries = [], {}, []
     configs = [{"id": "a"}, {"id": "b"}]
     samples = {stage: [10.0, 20.0] for stage in ("comm", "notify", "reduce", "layout")}
     monkeypatch.setattr(sweep, "parse_profile", lambda *a: [dict(samples), dict(samples)])
@@ -319,21 +320,25 @@ def test_measure_keeps_profiler_notify_outside_full_api(tmp_path, monkeypatch):
         group=SimpleNamespace(agree=lambda x: None, gather=lambda x: [x, x], size=lambda: 2),
         write=lambda p, v: files.__setitem__(p.name, v),
         activate=lambda c, o: None,
-        prepare=lambda: None,
-        done=lambda x: x,
+        prepare=lambda: boundaries.append("prepare"),
+        done=lambda x: boundaries.append("done"),
         policy=SimpleNamespace(for_launch=lambda *a, **kw: None),
     )
 
     def invoke():
+        boundaries.append("invoke")
         calls.append(os.environ["DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY"])
 
     rows = sweep.measure(
         session, {"tokens": 4096, "hidden": 2816, "aiv": 8}, "combine", configs, invoke, 15000, "test", 2
     )
-    assert calls == ["0"] * 8 + ["1"] * 14
+    # One untimed launch audit per config, then profiler guards/warmups/samples only.
+    assert calls == ["0"] * 2 + ["1"] * 14
+    assert boundaries == ["prepare", "invoke", "done"] * 16
     assert "DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY" not in os.environ
     assert rows[0]["GBps"] == 1
-    assert len(files["rank_samples.json"]["stages"][0]["api"]) == 2
+    assert set(files["rank_samples.json"]["stages"][0]) == set(samples)
+    assert "api" not in rows[0]["metrics"]
     assert not rows[0]["precision_checked"]
 
 
