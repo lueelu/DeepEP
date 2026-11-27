@@ -830,7 +830,7 @@ def test_32_core_rank_defaults_preserve_payload_and_weight_plans():
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
 
-        # EP8/16 rank candidates and EP32 visit8 retain the actual core budget.
+        # EP8/16 rank candidates and EP32 visit32 retain the actual core budget.
         # EP4 preserves its pre-existing rank configuration.
         # P/W/Q, visit, sender count, self-copy, H2816/H6144 weight mode.
         expected = {
@@ -844,7 +844,7 @@ def test_32_core_rank_defaults_preserve_payload_and_weight_plans():
             (16,'combine'): (2,1,1,8,8,1,0,0),
             (16,'weighted'): (2,1,1,8,8,2,2,1),
             (32,'dispatch'): (4,1,1,32,8,2,0,0),
-            (32,'combine'): (4,1,1,8,8,1,0,0),
+            (32,'combine'): (4,1,1,32,8,1,0,0),
             (32,'weighted'): (4,1,1,32,8,2,2,1),
         }
         for (ep,op),(p,w,q,visit,senders,copy,small_mode,large_mode) in expected.items():
@@ -899,8 +899,9 @@ def test_reported_300_operator_plans_allow_rank_conversion_and_copy_first_remova
                            ranks_per_group=group, topology_known=True)
             plan = base.for_launch(cores,hidden*2,op,bf16=True)
             historical = json.loads(row['native_plan'])
-            # Preserve the historical fixture; normalize only rank order,
-            # its RR ownership width, and copy-first. Never regenerate it.
+            # Preserve the historical fixture; normalize rank order,
+            # its RR ownership width, copy-first, and the EP32 combine visit.
+            # Never regenerate the recorded measurements.
             historical[7] = historical[7] or 2
             senders = int(row['send_aivs'])
             if ep in (4,8,16,32) and cores == 32:
@@ -908,6 +909,8 @@ def test_reported_300_operator_plans_allow_rank_conversion_and_copy_first_remova
                     historical[3] *= ep//group
                 historical[1] = 0
                 senders = ((ep-2)//historical[3]+1)*historical[4]
+            if ep == 32 and op == 'combine':
+                historical[6] = 32
             assert plan.native_plan() == historical, (key, op, plan)
             assert plan.send_workers == senders, (key, op, plan)
         assert len(cases) == 60
@@ -964,7 +967,27 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
     """)
 
 
-def test_ep32_dispatch_profile_survives_extra_cores_with_separate_combine_tiers():
+def test_ep32_unweighted_combine_preserves_eight_core_sender_plan():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        for group in (8,16):
+            for known in (False,True):
+                base = replace(resolve_udma_policy(True,32,'udma',None,None,None,None,None),
+                               ranks_per_group=group,topology_known=known)
+                for cores in (0,*range(8,65,2)):
+                    for size in (1024,2048,4096,5632,8192,12288,14336):
+                        plan = base.for_launch(cores,size,'combine',bf16=True)
+                        reference = base.for_launch(8,size,'combine',bf16=True)
+                        assert plan.native_plan()[:7] == reference.native_plan()[:7]
+                        assert plan.native_plan()[:7] == [1,0,group,4,1,1,32]
+                        assert plan.send_workers == 8
+                        assert base.config(cores).num_aiv == cores
+                        assert plan.self_copy == (1 if (cores or 32) >= 16 else 2)
+    """)
+
+
+def test_ep32_dispatch_profile_survives_extra_cores():
     run_host("""
         from dataclasses import replace, asdict
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy

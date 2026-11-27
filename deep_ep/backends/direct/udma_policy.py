@@ -242,7 +242,8 @@ class UdmaPolicy:
         if v2 and not expanded and bf16:
             bucket = "small" if row_bytes <= 4096 else "large"
             # Extra auxiliary AIVs must not discard the EP32 dispatch profile.
-            # Combine retains its separate 64-core baseline.
+            # EP32 unweighted combine has no fitted override: every core budget
+            # retains rank/P4/W1/Q1/visit32, with spare cores used independently.
             # Select a measured tier without truncating the actual launch budget.
             # Intermediate budgets retain the baseline; 64+ retains the historic
             # large-budget plans, except for EP32 dispatch's existing inheritance.
@@ -482,6 +483,5 @@ _PROFILES = {
     (16, 32, "small", "combine"): ((8, 16), 0, 2, 1, 1, 32, 1),
     (16, 32, "small", "weighted"): ((8, 16), 1, 2, 2, 1, 4, 0),
     (32, 32, "large", "dispatch"): ((8,), 1, 4, 1, 1, 32, 0),
-    (32, 32, "large", "combine"): ((8, 16), 0, 4, 1, 1, 8, 1),
     (32, 32, "large", "weighted"): ((8,), 2, 4, 1, 1, 4, 0),
 }
