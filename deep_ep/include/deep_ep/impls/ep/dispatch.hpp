@@ -523,26 +523,51 @@ using namespace count_ub;
 // admitted footprint are compile-time facts of this specialization.
 // ---------------------------------------------------------------------------
 // Per-core quantization scratch. Disabled modes keep a one-byte placeholder so
-// their UB lane counts are exactly the previous values.
-template <bool kEnabled, int kSmoothBytes, int kWorkBytes, int kHalfBytes, int kPayloadBytes, int kOutWireBytes>
-struct DispatchQuantScratch {};
-template <int kSmoothBytes, int kWorkBytes, int kHalfBytes, int kPayloadBytes, int kOutWireBytes>
-struct alignas(kNumUbAlignmentBytes) DispatchQuantScratch<true, kSmoothBytes, kWorkBytes, kHalfBytes,
-                                                          kPayloadBytes, kOutWireBytes> {
-    alignas(kNumUbAlignmentBytes) uint8_t smooth[kSmoothBytes];
+// their UB lane counts are exactly the previous values. The FP32 token, FP32
+// work and FP16 scratch are single buffers: one token/group is processed at a
+// time. Only smooth rows and receiver output slots are multi-buffered.
+template <bool kEnabled, int kFp32Bytes, int kWorkBytes, int kHalfBytes, int kSmoothSlotBytes,
+          uint32_t kSmoothSlots, int kPayloadBytes>
+struct DispatchSenderQuantScratch {};
+template <int kFp32Bytes, int kWorkBytes, int kHalfBytes, int kSmoothSlotBytes, uint32_t kSmoothSlots,
+          int kPayloadBytes>
+struct alignas(kNumUbAlignmentBytes) DispatchSenderQuantScratch<true, kFp32Bytes, kWorkBytes, kHalfBytes,
+                                                                kSmoothSlotBytes, kSmoothSlots, kPayloadBytes> {
+    alignas(kNumUbAlignmentBytes) uint8_t fp32[kFp32Bytes];
     alignas(kNumUbAlignmentBytes) uint8_t work[kWorkBytes];
     alignas(kNumUbAlignmentBytes) uint8_t half[kHalfBytes];
-    alignas(kNumUbAlignmentBytes) float scalar[8];
+    alignas(kNumUbAlignmentBytes) uint8_t smooth[kSmoothSlots][kSmoothSlotBytes];
     alignas(kNumUbAlignmentBytes) uint8_t int8_payload[kPayloadBytes];
-    alignas(kNumUbAlignmentBytes) uint8_t out_wire[kOutWireBytes];
+    alignas(kNumUbAlignmentBytes) float scalar[8];
+};
+
+template <bool kEnabled, int kFp32Bytes, int kWorkBytes, int kHalfBytes, int kSmoothSlotBytes,
+          uint32_t kSmoothSlots, int kPayloadBytes, int kWireBytes, uint32_t kOutSlots>
+struct DispatchReceiverQuantScratch {};
+template <int kFp32Bytes, int kWorkBytes, int kHalfBytes, int kSmoothSlotBytes, uint32_t kSmoothSlots,
+          int kPayloadBytes, int kWireBytes, uint32_t kOutSlots>
+struct alignas(kNumUbAlignmentBytes) DispatchReceiverQuantScratch<true, kFp32Bytes, kWorkBytes, kHalfBytes,
+                                                                  kSmoothSlotBytes, kSmoothSlots, kPayloadBytes,
+                                                                  kWireBytes, kOutSlots> {
+    struct alignas(kNumUbAlignmentBytes) OutSlot {
+        uint8_t payload[kPayloadBytes];
+        uint8_t wire[kWireBytes];
+    };
+    alignas(kNumUbAlignmentBytes) uint8_t fp32[kFp32Bytes];
+    alignas(kNumUbAlignmentBytes) uint8_t work[kWorkBytes];
+    alignas(kNumUbAlignmentBytes) uint8_t half[kHalfBytes];
+    alignas(kNumUbAlignmentBytes) uint8_t smooth[kSmoothSlots][kSmoothSlotBytes];
+    OutSlot out[kOutSlots];
+    alignas(kNumUbAlignmentBytes) float scalar[8];
 };
 
 template <uint32_t kNumRanks, uint32_t kNumMaxTokensPerRank, uint32_t kNumHiddenElems, uint32_t kNumTopk,
           uint32_t kNumExperts, uint32_t kNumVecCores, uint32_t kNumRanksPerGroup, bool kDedup, bool kRdma,
-          bool kPrequantized, bool kSmoothInt8>
+          bool kPrequantized, bool kSmoothInt8, uint32_t kQuantSlots>
 struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
     static constexpr bool kDedupMode = kDedup;
     static constexpr bool kSmoothInt8Mode = kSmoothInt8;
+    static constexpr uint32_t kSmoothSlots = kSmoothInt8 ? kQuantSlots : 1U;
     // Shape-derived axes. Only num_tokens stays a runtime argument.
     static constexpr EpServerDedupInputMode kInputMode =
         kSmoothInt8 ? EpServerDedupInputMode::SmoothInt8
@@ -589,16 +614,28 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
     static constexpr int kNumProbeBatch = 16;
     static constexpr int kNumFlagsBytes = kNumProbeBatch * kNumBlocks * 32 + 256;
     static constexpr int kNumSumsBytes = kNumProbeBatch * 32;
+    // Probe overlay bytes, also used by the compile-time quantization-slot
+    // chooser before DispatchUBLayoutWithBuffer is instantiated.
+    static constexpr int kProbeBytes = kNumFlagsBytes + kNumSumsBytes +
+        kNumProbeBatch * int(sizeof(uint32_t))
+#ifdef DEEPEP_LL_REFERENCE_PROFILE
+        + int(profile::kPacketTraceCapacity) * 32
+#endif
+        ;
     // Smooth INT8 scratch sizes. Zero (and compiled out by the holder) for the
-    // other modes, which keeps their admitted footprint identical.
-    static constexpr int kQuantSmoothBytes =
+    // other modes, which keeps their admitted footprint identical. The FP32
+    // token and work/half buffers are single; smooth rows and receiver output
+    // slots follow the admitted slot count.
+    static constexpr int kQuantFp32Bytes =
         kSmoothInt8 ? math::align(int(kNumHiddenElems) * 4, kNumUbAlignmentBytes) : 0;
     static constexpr int kQuantWorkBytes =
         kSmoothInt8 ? math::align(int(kNumHiddenElems) * 4, kNumUbAlignmentBytes) + 256 : 0;
     static constexpr int kQuantHalfBytes =
         kSmoothInt8 ? math::align(int(kNumHiddenElems) * 2, kNumUbAlignmentBytes) + 256 : 0;
+    static constexpr int kQuantSmoothSlotBytes =
+        kSmoothInt8 ? math::align(int(kNumHiddenElems) * 4, kNumUbAlignmentBytes) : 0;
     static constexpr int kQuantPayloadBytes = int(kData.int8PackedPayloadBytes);
-    static constexpr int kQuantOutWireBytes = int(kData.int8Stride);
+    static constexpr int kQuantWireBytes = int(kData.int8Stride);
 
     // Count stage: routes stay shared with the sender's route image. Every
     // sub-buffer starts on a UB alignment boundary so MTE and vector accesses
@@ -626,8 +663,8 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
         alignas(kNumUbAlignmentBytes) uint32_t direct_tasks[kNumPerCoreTokens * int(kNumTopk) * 4];
         alignas(kNumUbAlignmentBytes) uint32_t server_state[kNumServerBytes / 4];
         alignas(kNumUbAlignmentBytes) uint32_t firsthop_masks[kNumFirstHopMasks];
-        DispatchQuantScratch<kSmoothInt8, kQuantSmoothBytes, kQuantWorkBytes, kQuantHalfBytes,
-                             kQuantPayloadBytes, kQuantOutWireBytes> quant;
+        DispatchSenderQuantScratch<kSmoothInt8, kQuantFp32Bytes, kQuantWorkBytes, kQuantHalfBytes,
+                                   kQuantSmoothSlotBytes, kSmoothSlots, kQuantPayloadBytes> quant;
     };
     // Receiver stage. Probe tables live in the receiver buffer overlay so a
     // sender core never reserves them.
@@ -635,8 +672,9 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
         alignas(kNumUbAlignmentBytes) int32_t  prefix[kNumPrefixBytes / 4];
         alignas(kNumUbAlignmentBytes) uint32_t task_pos[kNumTaskBytes / 4];
         alignas(kNumUbAlignmentBytes) uint32_t pending_idx[kNumTaskBytes / 4];
-        DispatchQuantScratch<kSmoothInt8, kQuantSmoothBytes, kQuantWorkBytes, kQuantHalfBytes,
-                             kQuantPayloadBytes, kQuantOutWireBytes> quant;
+        DispatchReceiverQuantScratch<kSmoothInt8, kQuantFp32Bytes, kQuantWorkBytes, kQuantHalfBytes,
+                                     kQuantSmoothSlotBytes, kSmoothSlots, kQuantPayloadBytes,
+                                     kQuantWireBytes, kSmoothSlots> quant;
     };
     struct alignas(kNumUbAlignmentBytes) ReceiverProbe {
         alignas(kNumUbAlignmentBytes) float    flags[kNumFlagsBytes / 4];
@@ -659,7 +697,7 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
 
 template <uint32_t kRanks, uint32_t kTokens, uint32_t kHidden, uint32_t kTopk, uint32_t kExperts,
           uint32_t kVecCores, uint32_t kUbBytes, uint32_t kRanksPerGroup, bool kPrequantized, bool kSmoothInt8,
-          bool kDedup, bool kRdma>
+          uint32_t kQuantSlots, bool kDedup, bool kRdma>
 struct alignas(kNumUbAlignmentBytes) DispatchUBLayoutWithBuffer {
     // Axes re-exported for the phase classes, which template on this map.
     static constexpr uint32_t kNumRanks = kRanks;
@@ -672,10 +710,11 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayoutWithBuffer {
     static constexpr uint32_t kNumRanksPerGroup = kRanksPerGroup;
     static constexpr bool kPrequantizedMode = kPrequantized;
     static constexpr bool kSmoothInt8Mode = kSmoothInt8;
+    static constexpr uint32_t kQuantSlotsMode = kQuantSlots;
     static constexpr bool kDedupMode = kDedup;
     static constexpr bool kRdmaMode = kRdma;
     using layout_t = DispatchUBLayout<kRanks, kTokens, kHidden, kTopk, kExperts, kVecCores, kRanksPerGroup,
-                                      kDedup, kRdma, kPrequantized, kSmoothInt8>;
+                                      kDedup, kRdma, kPrequantized, kSmoothInt8, kQuantSlots>;
     static constexpr int kCountTxBytes = layout_t::kCountTxBytes;
     static constexpr int kPayloadBytes = int(layout_t::kData.packedPayloadBytes);
     static constexpr int kTokenStride = int(layout_t::kData.tokenStride);
@@ -689,19 +728,14 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayoutWithBuffer {
     // Role-exclusive buffer overlays: sender cores own the payload stages and
     // RDMA workspace, receiver cores own the probe tables. Keeping them apart
     // preserves the sender lane count admitted by the previous implementation.
-    static constexpr int kProbeBytes = layout_t::kNumFlagsBytes + layout_t::kNumSumsBytes +
-        layout_t::kNumProbeBatch * int(sizeof(uint32_t))
-#ifdef DEEPEP_LL_REFERENCE_PROFILE
-        + int(profile::kPacketTraceCapacity) * 32
-#endif
-        ;
+    static constexpr int kProbeBytes = layout_t::kProbeBytes;
     static constexpr int kSenderStageBytes = kNumInputStages * kPayloadBytes + kRdmaWorkspaceBytes;
     static constexpr int kSenderFixedBytes = kCountTxBytes + int(sizeof(layout_t)) + kSenderStageBytes;
     static constexpr int kReceiverFixedBytes = kCountTxBytes + int(sizeof(layout_t)) + kProbeBytes;
     static constexpr int kSenderLanes =
         math::min<int>(8, (int(kNumUbBytes) - kSenderFixedBytes) / kTokenStride);
     static constexpr int kReceiverLanes =
-        math::min<int>(kSmoothInt8 ? 6 : 8, (int(kNumUbBytes) - kReceiverFixedBytes) / kLaneStride);
+        math::min<int>(kSmoothInt8 ? 4 : 8, (int(kNumUbBytes) - kReceiverFixedBytes) / kLaneStride);
     EP_STATIC_ASSERT(kSenderLanes > 0, "Insufficient UB for dispatch sender lanes");
     EP_STATIC_ASSERT(kReceiverLanes > 0, "Insufficient UB for dispatch receiver lanes");
     EP_STATIC_ASSERT(!kRdma || kTokenStride <= int(rdma::kCoreBytes), "Packet exceeds RDMA staging core bytes");
@@ -1526,6 +1560,15 @@ struct SenderPhaseState {
     LlSenderInputReuse input_reuse;
     comm::DispatchRdmaBatch rdma_batch;
     uint32_t input_sequence = 0U, cached_tail_entries = 0U;
+    // Smooth INT8: the unsmoothed FP32 token is converted once per token and
+    // reused by every same-host expert of that token. The smooth row of the
+    // next INT8 packet may already be prefetched into the other slot.
+    uint32_t fp32_token = UINT32_MAX;
+    uint32_t smooth_ready_expert = UINT32_MAX, smooth_slot = 0U;
+    bool fp32_valid = false, smooth_ready = false;
+    // A smooth slot may still be read by Vector after the packet that used it;
+    // armed[] records that (V,MTE2) event before the slot is overwritten.
+    bool smooth_armed[2] = {false, false};
     bool has_scratch = false, full_mesh_first_hop = false;
     uint32_t work_count = 0U, start = 0U, count = 0U, packets = 0U, direct_count = 0U;
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
@@ -1651,10 +1694,44 @@ __aicore__ inline uint32_t SenderFirstHop(SenderPhaseState& st, __ubuf__ Layout*
     return mesh.FirstK();
 }
 
+// Load one smooth row into a sender slot. Callers own the MTE2->V notify and
+// the slot lifetime (see SenderAcquire/ReleaseSmoothSlot).
+template <class Layout>
+__aicore__ inline event_t SenderSmoothSlotEvent(uint32_t slot)
+{
+    return slot == 0U ? EVENT_ID6 : EVENT_ID7;
+}
+
+template <class Layout>
+__aicore__ inline void SenderAcquireSmoothSlot(SenderPhaseState& st, uint32_t slot)
+{
+    if (!st.smooth_armed[slot]) return;
+    asc_sync_wait(PIPE_V, PIPE_MTE2, SenderSmoothSlotEvent<Layout>(slot));
+    st.smooth_armed[slot] = false;
+}
+
+template <class Layout>
+__aicore__ inline void SenderReleaseSmoothSlot(SenderPhaseState& st, uint32_t slot)
+{
+    asc_sync_notify(PIPE_V, PIPE_MTE2, SenderSmoothSlotEvent<Layout>(slot));
+    st.smooth_armed[slot] = true;
+}
+
+template <class Layout>
+__aicore__ inline void SenderLoadSmoothRow(DispatchContext& ctx, __ubuf__ uint8_t* slot, uint32_t expert)
+{
+    constexpr uint32_t h_ = Layout::kNumHiddenElems;
+    const uint64_t smooth_offset = uint64_t(expert) * h_ * sizeof(float);
+    asc_copy_gm2ub_align(reinterpret_cast<__ubuf__ uint8_t*>(slot),
+        reinterpret_cast<__gm__ uint8_t*>(ctx.input_scales + smooth_offset), 1U,
+        uint32_t(h_ * sizeof(float)), 0U, 0U, false, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+        uint32_t(h_ * sizeof(float)) + 0U, math::align(uint32_t(h_ * sizeof(float)), 32U) + 0U);
+}
+
 template <class Layout, class XType>
 __aicore__ inline void SenderSendPacket(DispatchContext& ctx, __ubuf__ Layout* ub, SenderPhaseState& st,
                                         uint32_t token, uint32_t firstK, uint32_t expert, uint32_t q,
-                                        uint32_t mask)
+                                        uint32_t mask, uint32_t next_expert = UINT32_MAX)
 {
     using layout_t = typename Layout::layout_t;
     constexpr uint32_t kMaxTokens = Layout::kNumMaxTokensPerRank;
@@ -1684,17 +1761,53 @@ __aicore__ inline void SenderSendPacket(DispatchContext& ctx, __ubuf__ Layout* u
     __ubuf__ uint8_t* payload = st.cached_payload;
     if constexpr (smooth_) {
         if (int8_wire) {
+            constexpr uint32_t kSlots = Layout::kQuantSlotsMode;
             auto& quant = ub->workspace.phases.sender.quant;
-            const uint64_t smooth_offset = uint64_t(expert) * h_ * sizeof(float);
-            asc_copy_gm2ub_align(reinterpret_cast<__ubuf__ uint8_t*>(quant.smooth),
-                reinterpret_cast<__gm__ uint8_t*>(ctx.input_scales + smooth_offset), 1U,
-                uint32_t(h_ * sizeof(float)), 0U, 0U, false, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
-                uint32_t(h_ * sizeof(float)) + 0U, math::align(uint32_t(h_ * sizeof(float)), 32U) + 0U);
-            asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            asc_sync_wait(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            const float scale = llquant::QuantizeToken(
-                quant.int8_payload, st.cached_payload, quant.smooth, quant.work, quant.half, quant.scalar,
+            uint32_t slot = 0U;
+            bool load_current = true;
+            if constexpr (kSlots > 1U) {
+                if (st.smooth_ready) {
+                    // The previous packet prefetched this expert's row. A
+                    // mismatch still has to retire that load before reusing.
+                    asc_sync_wait(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    st.smooth_ready = false;
+                    if (st.smooth_ready_expert == expert) {
+                        slot = st.smooth_slot;
+                        load_current = false;
+                    }
+                }
+            }
+            if (load_current) {
+                slot = 0U;
+                SenderAcquireSmoothSlot<Layout>(st, slot);
+                SenderLoadSmoothRow<Layout>(ctx, quant.smooth[slot], expert);
+                asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                asc_sync_wait(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            }
+            // The FP32 token is converted once per token and reused by every
+            // same-host expert of that token.
+            if (!st.fp32_valid || st.fp32_token != token) {
+                llquant::PrepareToken(quant.fp32, st.cached_payload, h_);
+                st.fp32_token = token;
+                st.fp32_valid = true;
+            }
+            if constexpr (kSlots > 1U) {
+                if (next_expert != UINT32_MAX && !ctx.view.remote_write(next_expert / localExperts_)) {
+                    // Prefetch the next same-host expert's smooth row while the
+                    // current row is still being quantized.
+                    const uint32_t next_slot = slot ^ 1U;
+                    SenderAcquireSmoothSlot<Layout>(st, next_slot);
+                    SenderLoadSmoothRow<Layout>(ctx, quant.smooth[next_slot], next_expert);
+                    asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                    st.smooth_ready = true;
+                    st.smooth_ready_expert = next_expert;
+                    st.smooth_slot = next_slot;
+                }
+            }
+            const float scale = llquant::QuantizeExpert(
+                quant.int8_payload, quant.fp32, quant.smooth[slot], quant.work, quant.half, quant.scalar,
                 h_);
+            SenderReleaseSmoothSlot<Layout>(st, slot);
             llquant::StoreScale(quant.int8_payload, uint32_t(data_.quantCount), scale);
             SenderFillTail<Layout, XType>(ctx, ub, st, quant.int8_payload, token, firstK, mask,
                 uint32_t(data_.headerPayloadOffset), uint32_t(data_.readIndexPayloadOffset));
@@ -1809,8 +1922,17 @@ __aicore__ inline void SenderSendWithDedup(DispatchContext& ctx, __ubuf__ Layout
             const uint32_t mask = firstHopMasks_[scheduled];
             const uint32_t firstK = SenderFirstHop<Layout, XType>(st, ub, (start_ + token) * k_, mask);
             const uint32_t index = (start_ + token) * k_ + firstK, expert = uint32_t(ub->workspace.routes[index]);
+            // Predict the next first-hop expert so its smooth row can prefetch.
+            uint32_t next_expert = UINT32_MAX;
+            if (group + 1U < firstHopCount) {
+                const uint32_t next_scheduled = LlFirstHopOrder(firstHopCount, rankInGroup, sendCore,
+                                                                start_ + token, group + 1U);
+                const uint32_t next_mask = firstHopMasks_[next_scheduled];
+                const uint32_t next_k = SenderFirstHop<Layout, XType>(st, ub, (start_ + token) * k_, next_mask);
+                next_expert = uint32_t(ub->workspace.routes[(start_ + token) * k_ + next_k]);
+            }
             SenderSendPacket<Layout, XType>(ctx, ub, st, start_ + token, firstK, expert,
-                                            SenderCalTokenSendExpertCnt(ub, expert, index), mask);
+                                            SenderCalTokenSendExpertCnt(ub, expert, index), mask, next_expert);
             sourceMask |= 1U << firstK;
             sourceWeights_[token * k_ + firstK] = 1.0f;
             // Relay members travel inside this packet. Publish their real
@@ -1842,8 +1964,11 @@ __aicore__ inline void SenderSendWithDedup(DispatchContext& ctx, __ubuf__ Layout
         for (uint32_t task = serverState_[server]; task != UINT32_MAX; task = directTasks_[task * 4U + 3U]) {
             const uint32_t expert = directTasks_[task * 4U + 2U], token = directTasks_[task * 4U];
             const uint32_t k = directTasks_[task * 4U + 1U];
+            const uint32_t next_task = directTasks_[task * 4U + 3U];
+            const uint32_t next_expert = next_task == UINT32_MAX ? UINT32_MAX : directTasks_[next_task * 4U + 2U];
             SenderSendPacket<Layout, XType>(ctx, ub, st, start_ + token, k, expert,
-                                            SenderCalTokenSendExpertCnt(ub, expert, (start_ + token) * k_ + k), 0U);
+                                            SenderCalTokenSendExpertCnt(ub, expert, (start_ + token) * k_ + k), 0U,
+                                            next_expert);
             sourceWeights_[token * k_ + k] = routeWeights_[token * k_ + k];
         }
     }
@@ -1961,10 +2086,11 @@ __aicore__ inline void SendStage(DispatchContext& ctx, __ubuf__ Layout* ub, Send
 struct ReceiverPhaseState {
     ServerDedupReceiveTasks tasks;
     uint32_t receiver = 0U, lanes = 0U;
-    // SmoothInt8: an MTE3 output copy (from the quantization scratch or the
-    // INT8 forward wire) may still be in flight. EVENT_ID6 retires it before
-    // the same buffer is rewritten. EVENT_ID7 is the matching V/S -> MTE3 gate.
-    bool quant_output_live = false;
+    // SmoothInt8 slot lifetimes. Per-slot flags keep prompt reuse of the smooth
+    // prefetch buffer and the INT8 output ring without a global serialization.
+    bool out_live[2] = {false, false};
+    bool smooth_armed[2] = {false, false};
+    bool smooth_pending[2] = {false, false};
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
     __ubuf__ uint32_t* trace = nullptr;
     bool trace_enabled = false;
@@ -2085,49 +2211,94 @@ __aicore__ inline void ReceiverRecordProcessed(DispatchContext& ctx, __ubuf__ La
 #endif
 
 // SmoothInt8 receiver helpers -------------------------------------------------
-// All quantization output (own row or forwarded INT8 wire) is written by MTE3
-// from a single per-core scratch. Retire that copy before rewriting it.
+// Slots use one event id per slot across three distinct pipe pairs:
+//   (MTE2,V) smooth row ready, (V,MTE2) smooth row free, (MTE3,V) output free.
+// EVENT_ID6 carries the V->MTE3 and S->MTE3 output gates. The smooth receiver
+// admits at most four wire lanes so ids 0..3 stay owned by ReceiverIssueLoad.
 template <class Layout>
-__aicore__ inline void ReceiverWaitQuantOutput(ReceiverPhaseState& st)
+__aicore__ inline event_t QuantSlotEvent(uint32_t slot)
 {
-    if (!st.quant_output_live) return;
-    asc_sync_wait(PIPE_MTE3, PIPE_V, EVENT_ID6);
-    st.quant_output_live = false;
+    return slot == 0U ? EVENT_ID4 : EVENT_ID5;
 }
 
 template <class Layout>
-__aicore__ inline void ReceiverMarkQuantOutput(ReceiverPhaseState& st)
+__aicore__ inline void ReceiverAcquireOutSlot(ReceiverPhaseState& st, uint32_t slot)
 {
-    asc_sync_notify(PIPE_MTE3, PIPE_V, EVENT_ID6);
-    st.quant_output_live = true;
+    if (!st.out_live[slot]) return;
+    asc_sync_wait(PIPE_MTE3, PIPE_V, QuantSlotEvent<Layout>(slot));
+    st.out_live[slot] = false;
 }
 
-// Quantize the compact BF16 wire for one global expert into the shared scratch.
-// The caller must have retired the previous output copy and published the MTE2
-// wire to V.
 template <class Layout>
-__aicore__ inline void ReceiverQuantizeWire(DispatchContext& ctx, __ubuf__ Layout* ub,
-                                            __ubuf__ uint8_t* wire, uint32_t expert)
+__aicore__ inline void ReceiverReleaseOutSlot(ReceiverPhaseState& st, uint32_t slot)
 {
-    using layout_t = typename Layout::layout_t;
+    asc_sync_notify(PIPE_MTE3, PIPE_V, QuantSlotEvent<Layout>(slot));
+    st.out_live[slot] = true;
+}
+
+// The previous Vector reader of this smooth row must finish before MTE2
+// overwrites it. Only the immediately preceding generation is tracked.
+template <class Layout>
+__aicore__ inline void ReceiverAcquireSmoothSlot(ReceiverPhaseState& st, uint32_t slot)
+{
+    if (!st.smooth_armed[slot]) return;
+    asc_sync_wait(PIPE_V, PIPE_MTE2, QuantSlotEvent<Layout>(slot));
+    st.smooth_armed[slot] = false;
+}
+
+template <class Layout>
+__aicore__ inline void ReceiverReleaseSmoothSlot(ReceiverPhaseState& st, uint32_t slot)
+{
+    asc_sync_notify(PIPE_V, PIPE_MTE2, QuantSlotEvent<Layout>(slot));
+    st.smooth_armed[slot] = true;
+}
+
+template <class Layout>
+__aicore__ inline void ReceiverLoadSmooth(DispatchContext& ctx, __ubuf__ Layout* ub, ReceiverPhaseState& st,
+                                          uint32_t expert, uint32_t slot)
+{
     constexpr uint32_t h_ = Layout::kNumHiddenElems;
-    constexpr EpServerDedupDataLayout data_ = layout_t::kData;
-    auto& quant = ub->workspace.phases.receiver.quant;
+    auto* quant = &ub->workspace.phases.receiver.quant;
     const uint64_t smooth_offset = uint64_t(expert) * h_ * sizeof(float);
-    asc_copy_gm2ub_align(reinterpret_cast<__ubuf__ uint8_t*>(quant.smooth),
+    asc_copy_gm2ub_align(reinterpret_cast<__ubuf__ uint8_t*>(quant->smooth[slot]),
         reinterpret_cast<__gm__ uint8_t*>(ctx.input_scales + smooth_offset), 1U,
         uint32_t(h_ * sizeof(float)), 0U, 0U, false, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
         uint32_t(h_ * sizeof(float)) + 0U, math::align(uint32_t(h_ * sizeof(float)), 32U) + 0U);
-    asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    asc_sync_wait(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    const float scale = llquant::QuantizeToken(quant.int8_payload, wire, quant.smooth, quant.work,
-                                               quant.half, quant.scalar, h_);
-    llquant::StoreScale(quant.int8_payload, uint32_t(data_.quantCount), scale);
+    asc_sync_notify(PIPE_MTE2, PIPE_V, QuantSlotEvent<Layout>(slot));
+    st.smooth_pending[slot] = true;
+}
+
+template <class Layout>
+__aicore__ inline void ReceiverWaitSmooth(ReceiverPhaseState& st, uint32_t slot)
+{
+    if (!st.smooth_pending[slot]) return;
+    asc_sync_wait(PIPE_MTE2, PIPE_V, QuantSlotEvent<Layout>(slot));
+    st.smooth_pending[slot] = false;
+}
+
+__aicore__ inline void ReceiverGateVectorToMte3()
+{
+    asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID6);
+    asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID6);
+}
+
+__aicore__ inline void ReceiverGateScalarToMte3()
+{
+    asc_sync_notify(PIPE_S, PIPE_MTE3, EVENT_ID6);
+    asc_sync_wait(PIPE_S, PIPE_MTE3, EVENT_ID6);
+}
+
+__aicore__ inline void ReceiverGateScalarToVector()
+{
+    asc_sync_notify(PIPE_S, PIPE_V, EVENT_ID6);
+    asc_sync_wait(PIPE_S, PIPE_V, EVENT_ID6);
 }
 
 // Entry (BF16) and terminal (INT8) handling for one ready slot. The INT8 wire
-// only needs output assembly; the BF16 wire is quantized per expert here, and
-// a first-hop group is re-packed into one INT8 wire per relay member.
+// only needs output assembly. The BF16 wire is converted to FP32 once, then
+// every expert (the local one plus relay members) is quantized from that
+// unsmoothed token, prefetching the next smooth row and writing into a
+// two-slot output ring when the admitted UB allows it.
 template <class Layout>
 __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layout* ub, ReceiverPhaseState& st,
                                              uint32_t j, uint32_t lane, __ubuf__ uint8_t* wire,
@@ -2137,6 +2308,7 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
     constexpr uint32_t k_ = Layout::kNumTopk;
     constexpr uint32_t h_ = Layout::kNumHiddenElems;
     constexpr bool dedupMode_ = Layout::kDedupMode;
+    constexpr uint32_t kSlots = Layout::kQuantSlotsMode;
     constexpr uint32_t localExperts_ = uint32_t(layout_t::kNumLocalExperts);
     constexpr EpServerDedupDataLayout data_ = layout_t::kData;
     const uint32_t headerOffset = int8_wire ? uint32_t(data_.headerPayloadOffset)
@@ -2173,28 +2345,90 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
             reinterpret_cast<__ubuf__ uint8_t*>(wire + data_.quantCount), 1U, uint32_t(data_.scaleBytes),
             asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, uint32_t(data_.scaleBytes) + 0U,
             math::align(uint32_t(data_.scaleBytes), 32U) + 0U);
-    } else {
-        ReceiverWaitQuantOutput<Layout>(st);
-        asc_sync_notify(PIPE_S, PIPE_V, EVENT_ID7);
-        asc_sync_wait(PIPE_S, PIPE_V, EVENT_ID7);
-        ReceiverQuantizeWire<Layout>(ctx, ub, wire, globalExpert);
-        asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID7);
-        asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID7);
-        asc_sync_notify(PIPE_S, PIPE_MTE3, EVENT_ID7);
-        asc_sync_wait(PIPE_S, PIPE_MTE3, EVENT_ID7);
-        asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(expandX_ + uint64_t(row) * h_),
-            reinterpret_cast<__ubuf__ uint8_t*>(quant->int8_payload), 1U, h_,
-            asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, h_ + 0U, math::align(h_, 32U) + 0U);
-        asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(dynamicScales_ + uint64_t(row) * data_.scaleBytes),
-            reinterpret_cast<__ubuf__ uint8_t*>(quant->int8_payload + data_.quantCount), 1U,
-            uint32_t(data_.scaleBytes), asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
-            uint32_t(data_.scaleBytes) + 0U, math::align(uint32_t(data_.scaleBytes), 32U) + 0U);
-        ReceiverMarkQuantOutput<Layout>(st);
+        ReceiverGateScalarToMte3();
+        if (dedupMode_) asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(tokenType_ + row),
+            reinterpret_cast<__ubuf__ uint8_t*>(type), 1U, 4U, asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
+            4U + 0U, math::align(4U, 32U) + 0U);
+        asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(destinationIndex_ + uint64_t(row) * 3U),
+            reinterpret_cast<__ubuf__ uint8_t*>(destination), 1U, 12U,
+            asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, 12U + 0U, math::align(12U, 32U) + 0U);
+        return;
+    }
+
+    // Publish the lane's MTE2 completion to V, then convert the raw BF16 token
+    // once. Every expert below reuses this unsmoothed FP32 token.
+    ReceiverGateScalarToVector();
+    llquant::PrepareToken(quant->fp32, wire, h_);
+
+    const uint32_t members = firstHop ? tail.ReadIndex()[0U] : 0U;
+    const uint32_t tasks = 1U + members;
+    const uint32_t source = tail.Header()[0U], ranks = uint32_t(ctx.view.num_ranks);
+    for (uint32_t i = 0; i < tasks; ++i) {
+        const bool own = (i == 0U);
+        const uint32_t entry = own ? 0U : tail.Entry(i - 1U)[0U];
+        const uint32_t expert = own ? globalExpert : (entry & 0xffffU);
+        const uint32_t q = own ? 0U : (entry >> 16U);
+        const uint32_t slot = i % kSlots;
+
+        if (i == 0U || kSlots == 1U) {
+            ReceiverAcquireSmoothSlot<Layout>(st, slot);
+            ReceiverLoadSmooth<Layout>(ctx, ub, st, expert, slot);
+        }
+        ReceiverWaitSmooth<Layout>(st, slot);
+        if constexpr (kSlots > 1U) {
+            if (i + 1U < tasks) {
+                const uint32_t next_slot = (i + 1U) % kSlots;
+                const uint32_t next_entry = tail.Entry(i)[0U];
+                ReceiverAcquireSmoothSlot<Layout>(st, next_slot);
+                ReceiverLoadSmooth<Layout>(ctx, ub, st, next_entry & 0xffffU, next_slot);
+            }
+        }
+
+        ReceiverAcquireOutSlot<Layout>(st, slot);
+        const float scale = llquant::QuantizeExpert(quant->out[slot].payload, quant->fp32,
+                                                    quant->smooth[slot], quant->work, quant->half,
+                                                    quant->scalar, h_);
+        ReceiverReleaseSmoothSlot<Layout>(st, slot);
+        llquant::StoreScale(quant->out[slot].payload, uint32_t(data_.quantCount), scale);
+
+        if (own) {
+            ReceiverGateVectorToMte3();
+            ReceiverGateScalarToMte3();
+            asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(expandX_ + uint64_t(row) * h_),
+                reinterpret_cast<__ubuf__ uint8_t*>(quant->out[slot].payload), 1U, h_,
+                asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, h_ + 0U, math::align(h_, 32U) + 0U);
+            asc_copy_ub2gm_align(
+                reinterpret_cast<__gm__ uint8_t*>(dynamicScales_ + uint64_t(row) * data_.scaleBytes),
+                reinterpret_cast<__ubuf__ uint8_t*>(quant->out[slot].payload + data_.quantCount), 1U,
+                uint32_t(data_.scaleBytes), asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                uint32_t(data_.scaleBytes) + 0U, math::align(uint32_t(data_.scaleBytes), 32U) + 0U);
+            ReceiverReleaseOutSlot<Layout>(st, slot);
+            continue;
+        }
+
+        const uint32_t destinationRank = expert / localExperts_;
+        auto* header = reinterpret_cast<__ubuf__ uint32_t*>(quant->out[slot].payload + data_.headerPayloadOffset);
+        auto* readIndex = reinterpret_cast<__ubuf__ uint32_t*>(quant->out[slot].payload +
+                                                               data_.readIndexPayloadOffset);
+        header[0] = source;
+        header[1] = tail.Header()[1U];
+        header[2] = tail.Header()[2U];
+        header[3] = uint32_t(EpServerDedupTokenType::Terminal);
+        readIndex[0] = 0U;
+        ReceiverGateScalarToVector();
+        ub::FillPacketFlags(quant->out[slot].wire, uint32_t(data_.int8BlockCount));
+        ub::PackPayload(quant->out[slot].wire, quant->out[slot].payload, uint32_t(data_.int8BlockCount));
+        ub::SetPacketMarker(quant->out[slot].wire, PacketReceiveLayout::kKeepFlags);
+        ReceiverGateVectorToMte3();
+        comm::Packet(ctx.view, destinationRank,
+            DispatchServerDedupDispatchOffset(data_, source, destinationRank, expert % localExperts_, q, ranks,
+                localExperts_, Layout::kNumMaxTokensPerRank) + ctx.window_offset + data_.int8TailOffset,
+            quant->out[slot].wire, uint32_t(data_.int8BlockCount) * 512U, 7U);
+        ReceiverReleaseOutSlot<Layout>(st, slot);
     }
 
     // Metadata is written by S; publish it before the MTE3 copies below.
-    asc_sync_notify(PIPE_S, PIPE_MTE3, EVENT_ID0);
-    asc_sync_wait(PIPE_S, PIPE_MTE3, EVENT_ID0);
+    ReceiverGateScalarToMte3();
     if (dedupMode_) asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(tokenType_ + row),
         reinterpret_cast<__ubuf__ uint8_t*>(type), 1U, 4U, asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
         4U + 0U, math::align(4U, 32U) + 0U);
@@ -2206,33 +2440,6 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
     asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(relayReadIndex_ + uint64_t(row) * k_ * 2U),
         reinterpret_cast<__ubuf__ uint8_t*>(tail.ReadIndex()), 1U, k_ * 8U,
         asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, k_ * 8U + 0U, math::align(k_ * 8U, 32U) + 0U);
-    const uint32_t source = tail.Header()[0U], ranks = uint32_t(ctx.view.num_ranks);
-    const uint32_t members = tail.ReadIndex()[0U];
-    for (uint32_t i = 0; i < members; ++i) {
-        const uint32_t index = tail.Entry(i)[0U], expert = index & 0xffffU, q = index >> 16U;
-        const uint32_t destinationRank = expert / localExperts_;
-        ReceiverWaitQuantOutput<Layout>(st);
-        ReceiverQuantizeWire<Layout>(ctx, ub, wire, expert);
-        auto* header = reinterpret_cast<__ubuf__ uint32_t*>(quant->int8_payload + data_.headerPayloadOffset);
-        auto* readIndex = reinterpret_cast<__ubuf__ uint32_t*>(quant->int8_payload + data_.readIndexPayloadOffset);
-        header[0] = source;
-        header[1] = tail.Header()[1U];
-        header[2] = tail.Header()[2U];
-        header[3] = uint32_t(EpServerDedupTokenType::Terminal);
-        readIndex[0] = 0U;
-        asc_sync_notify(PIPE_S, PIPE_V, EVENT_ID7);
-        asc_sync_wait(PIPE_S, PIPE_V, EVENT_ID7);
-        ub::FillPacketFlags(quant->out_wire, uint32_t(data_.int8BlockCount));
-        ub::PackPayload(quant->out_wire, quant->int8_payload, uint32_t(data_.int8BlockCount));
-        ub::SetPacketMarker(quant->out_wire, PacketReceiveLayout::kKeepFlags);
-        asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID7);
-        asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID7);
-        comm::Packet(ctx.view, destinationRank,
-            DispatchServerDedupDispatchOffset(data_, source, destinationRank, expert % localExperts_, q, ranks,
-                localExperts_, Layout::kNumMaxTokensPerRank) + ctx.window_offset + data_.int8TailOffset,
-            quant->out_wire, uint32_t(data_.int8BlockCount) * 512U, 7U);
-        ReceiverMarkQuantOutput<Layout>(st);
-    }
 }
 
 template <class Layout>
@@ -2528,6 +2735,33 @@ EP_STATIC_ASSERT(offsetof(DispatchArgs, ffts_val) == 168U, "ffts slot offset");
 // The static UB maps (DispatchUBLayout / DispatchUBLayoutWithBuffer) are
 // defined next to the phase classes above; dispatch_body only instantiates them.
 
+// Pick 1 or 2 smooth quantization slots from the admitted UB budget. Two slots
+// enable the receiver smooth prefetch and the INT8 output ring; large hidden
+// keeps a single-slot correct path instead of failing UB admission.
+template <uint32_t kNumRanks, uint32_t kNumMaxTokensPerRank, uint32_t kNumHiddenBytes, uint32_t kNumTopk,
+          uint32_t kNumExperts, uint32_t kNumVecCores, uint32_t kNumUbBytes, uint32_t kNumRanksPerGroup,
+          bool kPrequantized, bool kSmoothInt8, bool kDedup, bool kRdma>
+constexpr uint32_t DispatchQuantSlots()
+{
+    if constexpr (!kSmoothInt8) {
+        return 1U;
+    } else {
+        constexpr uint32_t hiddenElems = kPrequantized ? kNumHiddenBytes : kNumHiddenBytes / 2U;
+        using layout2 = DispatchUBLayout<kNumRanks, kNumMaxTokensPerRank, hiddenElems, kNumTopk,
+                                         kNumExperts, kNumVecCores, kNumRanksPerGroup, kDedup, kRdma,
+                                         kPrequantized, kSmoothInt8, 2U>;
+        constexpr int stageBytes = 2 * int(layout2::kData.packedPayloadBytes);
+        constexpr int rdmaSlots = kRdma ? int(rdma::kCoreBytes) / int(layout2::kData.tokenStride) : 0;
+        constexpr int rdmaBytes = kRdma
+            ? (rdmaSlots + 1) * int(comm::DispatchRdmaBatch::kWorkspaceBytes) : 0;
+        constexpr int senderFixed = layout2::kCountTxBytes + int(sizeof(layout2)) + stageBytes + rdmaBytes;
+        constexpr int receiverFixed = layout2::kCountTxBytes + int(sizeof(layout2)) + layout2::kProbeBytes;
+        constexpr int laneStride = int(layout2::kData.tokenStride) + 64;
+        return (senderFixed + int(layout2::kData.tokenStride) <= int(kNumUbBytes) &&
+                receiverFixed + laneStride <= int(kNumUbBytes)) ? 2U : 1U;
+    }
+}
+
 template <uint32_t kNumRanks, uint32_t kNumMaxTokensPerRank, uint32_t kNumHiddenBytes, uint32_t kNumTopk,
           uint32_t kNumExperts, uint32_t kNumVecCores, uint32_t kNumUbBytes,
           uint32_t kNumRanksPerGroup,
@@ -2572,9 +2806,12 @@ __aicore__ inline void dispatch_body(
     // carries the byte count, matching DeepEP-Ascend's kNumHiddenBytes.
     constexpr uint32_t kNumHiddenElems = kPrequantized ? kNumHiddenBytes
                                                        : kNumHiddenBytes / sizeof(XType);
+    constexpr uint32_t kQuantSlots = DispatchQuantSlots<
+        kNumRanks, kNumMaxTokensPerRank, kNumHiddenBytes, kNumTopk, kNumExperts, kNumVecCores, kNumUbBytes,
+        kNumRanksPerGroup, kPrequantized, kSmoothInt8, kDedup, kRdma>();
     using ub_layout_t = DispatchUBLayoutWithBuffer<kNumRanks, kNumMaxTokensPerRank, kNumHiddenElems, kNumTopk,
                                                    kNumExperts, kNumVecCores, kNumUbBytes, kNumRanksPerGroup,
-                                                   kPrequantized, kSmoothInt8, kDedup, kRdma>;
+                                                   kPrequantized, kSmoothInt8, kQuantSlots, kDedup, kRdma>;
     EP_STATIC_ASSERT(sizeof(ub_layout_t) <= kNumUbBytes, "Dispatch UB capacity");
     // Lane count is a compile-time fact; the map asserts at least one lane.
     // UB address space starts at zero; the map's member order is the layout.

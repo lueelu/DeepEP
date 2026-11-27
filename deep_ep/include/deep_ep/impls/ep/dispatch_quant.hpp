@@ -9,7 +9,7 @@
 // Smooth per-token dynamic INT8 quantization shared by the source (same-host
 // direct packets) and the destination relay (BF16 entry packets). Both call
 // sites must produce identical bytes, so the numeric order lives in one place:
-//   BF16 -> FP32, FP32 * smooth[e], abs-max over hidden,
+//   BF16 -> FP32 (once per token), FP32 * smooth[e], abs-max over hidden,
 //   alpha = 127 / max, y * alpha, FP32 -> INT32 (RINT), INT32 -> FP16, FP16 -> INT8.
 // The AscendC LocalTensor path is used for the conversions and elementwise
 // math because the UB-pointer asc_* overloads have no linked definition on
@@ -48,25 +48,33 @@ __aicore__ inline AscendC::LocalTensor<T> View(__ubuf__ uint8_t* address, uint32
         AscendC::TPosition::VECCALC, static_cast<uint32_t>(reinterpret_cast<uint64_t>(address)), elements);
 }
 
-// Quantize `hidden` BF16 elements from `in` with `smooth` (FP32, same length)
-// into `out`. `work` holds FP32/INT32 scratch (>= hidden + 64 elements),
-// `half_buf` holds FP16 scratch, and `scalar` is a 32B-aligned FP32 result slot.
-// Returns the FP32 dequant scale d = 1 / (127 / max) (0 when max <= 0).
-__aicore__ inline float QuantizeToken(__ubuf__ uint8_t* out, __ubuf__ uint8_t* in,
-                                      __ubuf__ uint8_t* smooth, __ubuf__ uint8_t* work,
-                                      __ubuf__ uint8_t* half_buf, __ubuf__ float* scalar,
-                                      uint32_t hidden)
+// Convert the raw BF16 token into the unsmoothed FP32 token once. Every expert
+// of the same token/group reuses this buffer, so the Cast is not repeated.
+__aicore__ inline void PrepareToken(__ubuf__ uint8_t* fp32, __ubuf__ uint8_t* bf16, uint32_t hidden)
 {
+    auto dst = View<float>(fp32, hidden);
+    auto src = View<bfloat16_t>(bf16, hidden);
+    AscendC::Cast(dst, src, AscendC::RoundMode::CAST_NONE, hidden);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+// Quantize one expert from the unsmoothed FP32 token. `smooth` holds the FP32
+// row of this expert, `work` holds FP32/INT32 scratch (>= hidden + 64 elements),
+// `half_buf` holds FP16 scratch and `scalar` is a 32B-aligned FP32 result slot.
+// Returns d = 1 / (127 / max), or 0 when max <= 0 (q is then zeroed).
+__aicore__ inline float QuantizeExpert(__ubuf__ uint8_t* out, __ubuf__ uint8_t* fp32,
+                                       __ubuf__ uint8_t* smooth, __ubuf__ uint8_t* work,
+                                       __ubuf__ uint8_t* half_buf, __ubuf__ float* scalar,
+                                       uint32_t hidden)
+{
+    auto src_f = View<float>(fp32, hidden);
     auto work_f = View<float>(work, hidden);
     auto work_i32 = View<int32_t>(work, hidden);
     auto half_t = View<half>(half_buf, hidden);
     auto out_i8 = View<int8_t>(out, hidden);
     auto smooth_f = View<float>(smooth, hidden);
-    auto in_bf = View<bfloat16_t>(in, hidden);
 
-    AscendC::Cast(work_f, in_bf, AscendC::RoundMode::CAST_NONE, hidden);
-    AscendC::PipeBarrier<PIPE_V>();
-    AscendC::Mul(work_f, work_f, smooth_f, static_cast<int32_t>(hidden));
+    AscendC::Mul(work_f, src_f, smooth_f, static_cast<int32_t>(hidden));
     AscendC::PipeBarrier<PIPE_V>();
     AbsMaxStore(scalar, reinterpret_cast<__ubuf__ float*>(work), hidden);
     asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
