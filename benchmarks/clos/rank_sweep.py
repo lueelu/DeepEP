@@ -20,6 +20,7 @@ OPS = ("fresh", "fresh_weighted", "cached", "cached_weighted", "combine", "combi
 VISITS = (4, 8, 16, 32, 64, 128)
 SUPPORTED_EPS = (4, 8, 16, 32)
 PAYLOAD_ROWS_ENV = "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"
+WQE_FAST_ENV = "DEEPEP_CLOS_COMBINE_WQE_FAST"
 
 
 def validate_args(parser, args, argv):
@@ -31,7 +32,13 @@ def validate_args(parser, args, argv):
         limits = args.combine_payload_max_rows
         if len(set(limits)) != len(limits) or any(v < 1 or v > 32 for v in limits):
             parser.error("combine-payload-max-rows requires distinct integers in [1,32]")
-        args.combine_payload_max_rows = [1] + [v for v in limits if v != 1]
+        # Run exactly the requested values, including when no rows=1 baseline is requested.
+        for name, values, allowed in (
+            ("combine-visits", args.combine_visits, VISITS),
+            ("combine-wqe-fast", args.combine_wqe_fast, (0, 1)),
+        ):
+            if values is not None and (len(set(values)) != len(values) or not set(values) <= set(allowed)):
+                parser.error(f"{name} requires distinct values from {allowed}")
     if args.ep_size not in SUPPORTED_EPS:
         parser.error("rank/payload sweeps require EP4/8/16/32")
     if (args.case and not payload_only) or args.strategies or args.replay_report or args.quick or args.smoke:
@@ -52,12 +59,21 @@ def validate_args(parser, args, argv):
         parser.error("combine payload sweep currently requires topk8 and communication cores 8/32")
 
 
-def payload_candidates(auto, limits):
-    """Freeze the same scheduling plan for every dynamically read merge limit."""
-    return [
-        auto | {"id": "auto" if value == 1 else f"payload_rows_{value}", "auto": value == 1, "payload_max_rows": value}
-        for value in limits
-    ]
+def payload_candidates(auto, limits, visits=None, fast_modes=None):
+    """Keep rank/P/W/Q fixed; only explicitly requested axes change at runtime."""
+    configs = []
+    for value in limits:
+        for visit in visits if visits is not None else (auto["visit"],):
+            # Fast is bypassed by the merge builder; do not time duplicate cases.
+            for fast in (fast_modes if fast_modes is not None else (0,)) if value == 1 else (0,):
+                baseline = value == 1 and visit == auto["visit"] and fast == 0
+                name = "auto" if baseline else f"payload_rows_{value}"
+                if not baseline and (visits is not None or fast_modes is not None):
+                    name += f"_v{visit}_fast{fast}"
+                configs.append(
+                    auto | dict(id=name, auto=baseline, payload_max_rows=value, visit=visit, combine_wqe_fast=fast)
+                )
+    return configs
 
 
 def activate_config(policy, config, op):
@@ -65,8 +81,10 @@ def activate_config(policy, config, op):
     policy.config, policy.operation = config, op_kind(op)
     if "payload_max_rows" in config and op.startswith("combine"):
         os.environ[PAYLOAD_ROWS_ENV] = str(config["payload_max_rows"])
+        os.environ[WQE_FAST_ENV] = str(config["combine_wqe_fast"])
     else:
         os.environ.pop(PAYLOAD_ROWS_ENV, None)
+        os.environ.pop(WQE_FAST_ENV, None)
 
 
 def check_payload_limit(native, config):
@@ -74,7 +92,12 @@ def check_payload_limit(native, config):
     actual = int(native.last_combine_payload_max_rows())
     if actual != requested:
         raise RuntimeError(f"combine payload limit mismatch: Host submitted {actual}, requested {requested}")
-    return dict(payload_max_rows_requested=requested, payload_max_rows_submitted=actual)
+    fast = int(native.last_combine_wqe_fast())
+    if fast != config["combine_wqe_fast"]:
+        raise RuntimeError(f"combine WQE fast mismatch: Host submitted {fast}, requested {config['combine_wqe_fast']}")
+    return dict(
+        payload_max_rows_requested=requested, payload_max_rows_submitted=actual, combine_wqe_fast_submitted=fast
+    )
 
 
 def cases():
@@ -481,7 +504,9 @@ def run_case(s, shape, winners):
 
         auto = policy_config(s.base.for_launch(cores, hidden * 2, op_kind(op), bf16=True), s.group.size(), True)
         if payload_only:
-            selected = payload_candidates(auto, s.args.combine_payload_max_rows)
+            selected = payload_candidates(
+                auto, s.args.combine_payload_max_rows, s.args.combine_visits, s.args.combine_wqe_fast
+            )
         elif representative:
             coarse = measure(
                 s, shape, op, shortlist(s.group.size(), cores) + [auto], invoke, logical_bytes, "coarse", s.args.samples
@@ -531,7 +556,7 @@ def run_case(s, shape, winners):
 def write_summary(s):
     rows = []
     for item in s.completed:
-        baseline = next(r for r in item["results"] if r["config"].get("auto"))
+        baseline = next((r for r in item["results"] if r["config"].get("auto")), None)
         for r in item["results"]:
             c = r["config"]
             row = dict(
@@ -546,17 +571,24 @@ def write_summary(s):
                 sender_cores=c["payload_aivs"],
                 reduce_cores=s.args.reduce_cores,
                 payload_max_rows=c.get("payload_max_rows", 1),
+                combine_wqe_fast=c.get("combine_wqe_fast", 0),
                 GBps_per_rank=r["GBps"],
                 precision="zero_tolerance_passed",
                 winner=c["id"] == item["winner"]["id"],
             )
             for stage, values in r["metrics"].items():
                 row.update({f"{stage}_{k}_us": v for k, v in values.items()})
-            row["api_change_vs_auto"] = r["metrics"]["api"]["mean"] / baseline["metrics"]["api"]["mean"] - 1
-            row["bandwidth_change_vs_auto"] = r["GBps"] / baseline["GBps"] - 1
-            row["api_worse_in_either_round"] = any(
-                a["metrics"]["api"]["mean"] > b["metrics"]["api"]["mean"]
-                for a, b in zip(r["rounds"], baseline["rounds"])
+            row["api_change_vs_auto"] = (
+                r["metrics"]["api"]["mean"] / baseline["metrics"]["api"]["mean"] - 1 if baseline else None
+            )
+            row["bandwidth_change_vs_auto"] = r["GBps"] / baseline["GBps"] - 1 if baseline else None
+            row["api_worse_in_either_round"] = (
+                any(
+                    a["metrics"]["api"]["mean"] > b["metrics"]["api"]["mean"]
+                    for a, b in zip(r["rounds"], baseline["rounds"])
+                )
+                if baseline
+                else None
             )
             rows.append(row)
     with (s.args.output / "summary.csv").open("w", encoding="utf-8-sig", newline="") as f:
@@ -583,6 +615,8 @@ def run(args):
                     cases=args.case,
                     operators=operations,
                     payload_max_rows=args.combine_payload_max_rows,
+                    combine_visits=args.combine_visits,
+                    combine_wqe_fast=args.combine_wqe_fast,
                     candidates=reservation,
                     qp_plans=None if payload_only else qp_plan_spec(reservation),
                     huge_pages=False,
@@ -632,7 +666,17 @@ def run(args):
     reservation.append(dict(operations={"default": defaults}))
     spec = qp_plan_spec(reservation)
     group.agree(
-        [args.case, defaults, spec, args.reduce_cores, args.samples, args.final_samples, args.combine_payload_max_rows]
+        [
+            args.case,
+            defaults,
+            spec,
+            args.reduce_cores,
+            args.samples,
+            args.final_samples,
+            args.combine_payload_max_rows,
+            args.combine_visits,
+            args.combine_wqe_fast,
+        ]
     )
     native_path = Path(importlib.util.find_spec("deep_ep._clos_C").origin)
     identity_paths = [
@@ -653,7 +697,9 @@ def run(args):
 
     native = load_native_module()
     require_native(native)
-    if payload_only and not callable(getattr(native, "last_combine_payload_max_rows", None)):
+    if payload_only and any(
+        not callable(getattr(native, name, None)) for name in ("last_combine_payload_max_rows", "last_combine_wqe_fast")
+    ):
         raise RuntimeError("loaded Host extension lacks runtime payload-limit observation; install the matching build")
     os.environ["DEEPEP_CLOS_TUNING_SESSION"] = "1"
     os.environ["DEEPEP_CLOS_QP_PLANS"] = spec
@@ -676,6 +722,8 @@ def run(args):
             baseline_plans=defaults,
             reduce_cores=args.reduce_cores,
             payload_max_rows=args.combine_payload_max_rows,
+            combine_visits=args.combine_visits,
+            combine_wqe_fast=args.combine_wqe_fast,
         ),
     )
     if rank == 0:
@@ -740,6 +788,7 @@ def run(args):
     group.agree("successful_ready_to_destroy")
     buffer.destroy()
     os.environ.pop(PAYLOAD_ROWS_ENV, None)
+    os.environ.pop(WQE_FAST_ENV, None)
     write(out / "exit.json", dict(code=0, complete=True, buffer_initializations=1, precision_checked=True))
     group.agree("all_exit_files_written")
     if rank == 0:
@@ -749,6 +798,8 @@ def run(args):
                 ep=world,
                 mode="combine_payload" if payload_only else "small_rank",
                 payload_max_rows=args.combine_payload_max_rows,
+                combine_visits=args.combine_visits,
+                combine_wqe_fast=args.combine_wqe_fast,
                 results=session.completed,
                 buffer_initializations=1,
                 huge_pages=False,
@@ -756,7 +807,7 @@ def run(args):
                 bandwidth="deduplicated BF16 bytes including self; excludes weights",
                 aggregation="per-sample slowest rank; independent API; nearest-rank P95",
                 limitation=(
-                    "merge-limit-only comparison; default scheduling frozen; Host limit observed, physical merge rate not measured"
+                    "runtime payload/visit/fast comparison; rank/P/W/Q frozen; Host options observed, physical merge rate not measured"
                     if payload_only
                     else "staged candidate best, not exhaustive optimum; H4096 inherits H6144 candidate"
                 ),

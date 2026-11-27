@@ -490,6 +490,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     }
     const auto ffts_addr = shmem.FftsAddr();
     LastCombinePayloadMaxRows() = tiling.combine_payload_max_rows;
+    LastCombineWqeFast() = tiling.combine_wqe_fast;
     LastCombineLaunch() = {tiling.udma_peer_order,
                            tiling.udma_peers_per_worker,
                            tiling.udma_workers_per_peer,

@@ -164,7 +164,21 @@ def parse_args(argv=None):
         nargs="+",
         help="combine-only runtime sweep of payload merge limits (1..32); freeze default rank/P/W/Q/visit, one Buffer",
     )
+    p.add_argument(
+        "--combine-visits",
+        type=int,
+        nargs="+",
+        help="with combine-payload-max-rows: scan visit only, retaining default rank/P/W/Q",
+    )
+    p.add_argument(
+        "--combine-wqe-fast",
+        type=int,
+        nargs="+",
+        help="with combine-payload-max-rows: scan WQE fast 0/1 for rows=1; merged rows use their own builder",
+    )
     args = p.parse_args(argv)
+    if (args.combine_visits is not None or args.combine_wqe_fast is not None) and args.combine_payload_max_rows is None:
+        p.error("combine-visits/combine-wqe-fast require combine-payload-max-rows")
     if args.small_rank_sweep or args.combine_payload_max_rows is not None:
         from rank_sweep import validate_args
 

@@ -112,9 +112,10 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesFast(
     wqe[7] = (weight ? weights : x) + row * (weight ? weight_bytes : x_bytes);
 }
 
-// Each lane scans at most one original 32-row batch in UB, and owns one
-// compacted WQE. No cross-lane scratch or GM index reads are needed. Keeping
-// spans separate preserves visit/peer/QP/window boundaries and row ownership.
+// One lane owns one logical row. Warp exchanges identify contiguous runs and
+// compact their heads into disjoint WQE slots; no lane scans another row's UB
+// indices. All 32 lanes (including tails) participate in every warp operation.
+// Span boundaries retain visit/peer/QP/window and worker ownership.
 __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesCoalesced(
     __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers,
     __ubuf__ uint64_t* remote_bases, __ubuf__ uint32_t* actual_count,
@@ -122,47 +123,89 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesCoalesced(
     uint32_t span_count, uint32_t count, uint32_t max_rows)
 {
     const uint32_t lane = threadIdx.x;
-    if (!x_bytes || !max_rows || max_rows > 32U || count > 32U) {
+    if (!x_bytes || !max_rows || max_rows > 32U || count > 32U || span_count > count ||
+        (count && !span_count)) {
         __asc_simt_vf::__trap(); return;
     }
-    // Conservative cap, matching compact-weight chunking; this is not a
-    // claim about the hardware's maximum transfer length. Never split a row.
+    if (!count) {
+        if (lane == 0) *actual_count = 0;
+        return;
+    }
+    const bool active = lane < count;
+    uint32_t first = 0, peer = 0, token = 0;
+    uint64_t row = 0;
+    bool invalid = false;
+    if (active) {
+        uint32_t last = span_count;
+        while (first + 1U < last) {
+            const uint32_t mid = first + (last - first) / 2U;
+            if (static_cast<uint32_t>(spans[mid * 4U + 3U]) <= lane) first = mid;
+            else last = mid;
+        }
+        auto* span = spans + first * 4U;
+        const uint32_t begin = static_cast<uint32_t>(span[3]);
+        const uint32_t length = static_cast<uint32_t>(span[1] >> 32U);
+        invalid = span[2] >> 32U || begin > lane || length > count - begin || lane - begin >= length;
+        if (!invalid) {
+            const uint32_t pos = lane - begin;
+            const int32_t selected = reinterpret_cast<__ubuf__ int32_t*>(span[0])[pos];
+            invalid = selected < 0 || static_cast<uint32_t>(selected) >= token_capacity;
+            token = static_cast<uint32_t>(selected);
+            row = uint64_t(static_cast<uint32_t>(span[1])) + pos;
+            peer = static_cast<uint32_t>(span[2]);
+        }
+    }
+    // Validate the producer's complete span partition in parallel, including
+    // boundaries that happen to have consecutive token numbers on both sides.
+    if (lane < span_count) {
+        auto* span = spans + lane * 4U;
+        const uint64_t begin = span[3], length = span[1] >> 32U;
+        const uint64_t end = lane + 1U < span_count ? spans[(lane + 1U) * 4U + 3U] : count;
+        invalid |= (!lane && begin != 0) || !length || begin + length != end || end > count;
+    }
+    if (asc_ballot(invalid)) { __asc_simt_vf::__trap(); return; }
+    const uint32_t preceding_token = asc_shfl_up(token, 1, 32);
+    const uint32_t preceding_span = asc_shfl_up(first, 1, 32);
+    const bool run_head = active && (lane == 0 || first != preceding_span ||
+                                    uint64_t(token) != uint64_t(preceding_token) + 1U);
+    const uint32_t run_heads = asc_ballot(run_head);
+    const uint32_t through_lane = 0xffffffffU >> (31U - lane);
+    uint32_t preceding_heads = run_heads & through_lane, run_begin = 0;
+    // Index of the nearest preceding run head, in five bounded register steps.
+    for (uint32_t shift = 16U; shift; shift >>= 1U) {
+        if (preceding_heads >> shift) { preceding_heads >>= shift; run_begin += shift; }
+    }
+    // Conservative 64-KiB cap, not a claim about the hardware's maximum length.
     const uint32_t byte_cap = x_bytes <= 65536U ? 65536U / x_bytes : 1U;
     const uint32_t limit = max_rows < byte_cap ? max_rows : byte_cap;
-    uint32_t output = 0, consumed = 0;
-    for (uint32_t s = 0; s < span_count; ++s) {
-        auto* span = spans + s * 4U;
-        const uint32_t length = static_cast<uint32_t>(span[1] >> 32U);
-        const uint32_t row = static_cast<uint32_t>(span[1]);
-        const uint32_t peer = static_cast<uint32_t>(span[2]);
-        auto* indices = reinterpret_cast<__ubuf__ int32_t*>(span[0]);
-        if (span[2] >> 32U || span[3] != consumed || length > count - consumed) {
-            __asc_simt_vf::__trap(); return;
+    const bool head = active && (lane - run_begin) % limit == 0;
+    const uint32_t heads = asc_ballot(head);
+    // Portable 32-bit population counts; no additional UB workspace or VF.
+    uint32_t total = heads;
+    total -= (total >> 1U) & 0x55555555U;
+    total = (total & 0x33333333U) + ((total >> 2U) & 0x33333333U);
+    total = ((total + (total >> 4U)) & 0x0f0f0f0fU) * 0x01010101U >> 24U;
+    if (lane == 0) *actual_count = total;
+    if (!head) return;  // No warp operations below this point.
+    uint32_t output = heads & (through_lane >> 1U);
+    output -= (output >> 1U) & 0x55555555U;
+    output = (output & 0x33333333U) + ((output >> 2U) & 0x33333333U);
+    output = ((output + (output >> 4U)) & 0x0f0f0f0fU) * 0x01010101U >> 24U;
+    uint32_t following = heads & ~through_lane, end = count;
+    if (following) {
+        following &= 0U - following;  // Lowest following head bit.
+        end = 0;
+        for (uint32_t shift = 16U; shift; shift >>= 1U) {
+            if (following >> shift) { following >>= shift; end += shift; }
         }
-        for (uint32_t pos = 0; pos < length;) {
-            const int32_t token = indices[pos];
-            if (token < 0 || static_cast<uint32_t>(token) >= token_capacity) {
-                __asc_simt_vf::__trap(); return;
-            }
-            uint32_t rows = 1;
-            while (rows < limit && rows < length - pos &&
-                   uint64_t(token) + rows < token_capacity &&
-                   int64_t(indices[pos + rows]) == int64_t(token) + rows) ++rows;
-            if (lane == output) {
-                auto* header = headers + peer * 2U * 8U;
-                auto* wqe = wqes + output * 8U;
-                for (uint32_t h = 0; h < 5U; ++h) wqe[h] = header[h];
-                wqe[5] = remote_bases[peer] + x_offset + uint64_t(token) * x_bytes;
-                wqe[6] = uint64_t(rows) * x_bytes;
-                wqe[7] = x + (uint64_t(row) + pos) * x_bytes;
-            }
-            ++output;
-            pos += rows;
-        }
-        consumed += length;
     }
-    if (consumed != count) { __asc_simt_vf::__trap(); return; }
-    if (lane == 0) *actual_count = output;
+    const uint32_t rows = end - lane;
+    auto* header = headers + peer * 2U * 8U;
+    auto* wqe = wqes + output * 8U;
+    for (uint32_t h = 0; h < 5U; ++h) wqe[h] = header[h];
+    wqe[5] = remote_bases[peer] + x_offset + uint64_t(token) * x_bytes;
+    wqe[6] = uint64_t(rows) * x_bytes;
+    wqe[7] = x + uint64_t(row) * x_bytes;
 }
 
 template <uint32_t Capacity = kMaxPeers, uint32_t Qps = 1, class Trace = DisabledDispatchDeviceTrace>

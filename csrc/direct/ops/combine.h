@@ -24,6 +24,12 @@ inline std::array<uint32_t, 9>& LastCombineLaunch()
     return launch;
 }
 
+inline uint32_t& LastCombineWqeFast()
+{
+    static thread_local uint32_t enabled = 0;
+    return enabled;
+}
+
 inline uint32_t& LastCombinePayloadMaxRows()
 {
     static thread_local uint32_t rows = 1;

@@ -115,12 +115,12 @@ def test_payload_sweep_cli_and_frozen_plan(monkeypatch, capsys):
 
     argv = ["--ep-size", "16", "--case", "4096,2816,8,8", "--combine-payload-max-rows", "2", "4", "8", "--plan-only"]
     args = entry.parse_args(argv)
-    assert args.combine_payload_max_rows == [1, 2, 4, 8]
+    assert args.combine_payload_max_rows == [2, 4, 8]
     assert len(args.case) == 1 and not args.huge_pages
     sweep.run(args)
     plan = json.loads(capsys.readouterr().out)
     assert plan["operators"] == ["combine", "combine_weighted"]
-    assert plan["payload_max_rows"] == [1, 2, 4, 8]
+    assert plan["payload_max_rows"] == [2, 4, 8]
     assert plan["qp_plans"] is None  # Resolve only actual default plans at runtime.
     auto = sweep.candidate(2, 1, 1, 8, 16) | {"id": "auto", "auto": True}
     candidates = sweep.payload_candidates(auto, args.combine_payload_max_rows)
@@ -130,7 +130,10 @@ def test_payload_sweep_cli_and_frozen_plan(monkeypatch, capsys):
         sweep.activate_config(policy, config, "combine_weighted")
         assert os.environ[sweep.PAYLOAD_ROWS_ENV] == str(config["payload_max_rows"])
         assert all(config[k] == auto[k] for k in ("order", "peers", "workers", "qps", "visit", "payload_aivs"))
-        native = SimpleNamespace(last_combine_payload_max_rows=lambda: int(os.environ[sweep.PAYLOAD_ROWS_ENV]))
+        native = SimpleNamespace(
+            last_combine_payload_max_rows=lambda: int(os.environ[sweep.PAYLOAD_ROWS_ENV]),
+            last_combine_wqe_fast=lambda: int(os.environ[sweep.WQE_FAST_ENV]),
+        )
         assert sweep.check_payload_limit(native, config)["payload_max_rows_submitted"] == config["payload_max_rows"]
     sweep.activate_config(policy, auto, "fresh_weighted")
     assert sweep.PAYLOAD_ROWS_ENV not in os.environ
@@ -139,6 +142,82 @@ def test_payload_sweep_cli_and_frozen_plan(monkeypatch, capsys):
     for extra in (["0"], ["33"], ["2", "2"], ["2", "--small-rank-sweep"], ["2", "--visits", "32"]):
         with pytest.raises(SystemExit):
             entry.parse_args(["--ep-size", "16", "--combine-payload-max-rows", *extra])
+
+
+def test_payload_sweep_axes_and_native_audit(monkeypatch):
+    monkeypatch.syspath_prepend(str(BENCH))
+    import bench_fast_sweep as entry
+
+    args = entry.parse_args(
+        [
+            "--ep-size",
+            "32",
+            "--combine-payload-max-rows",
+            "1",
+            "2",
+            "4",
+            "--combine-visits",
+            "4",
+            "8",
+            "32",
+            "--combine-wqe-fast",
+            "0",
+            "1",
+        ]
+    )
+    auto = sweep.candidate(4, 1, 1, 8, 32) | {"id": "auto", "auto": True}
+    configs = sweep.payload_candidates(auto, args.combine_payload_max_rows, args.combine_visits, args.combine_wqe_fast)
+    assert len(configs) == 12 and len({c["id"] for c in configs}) == 12
+    assert sum(c["auto"] for c in configs) == 1
+    assert all(c["combine_wqe_fast"] == 0 for c in configs if c["payload_max_rows"] > 1)
+    assert all((c["order"], c["peers"], c["workers"], c["qps"]) == ("rank", 4, 1, 1) for c in configs)
+    monkeypatch.delenv(sweep.PAYLOAD_ROWS_ENV, raising=False)
+    monkeypatch.delenv(sweep.WQE_FAST_ENV, raising=False)
+    policy = SimpleNamespace(config=None, operation=None)
+    for config in configs + list(reversed(configs)):
+        sweep.activate_config(policy, config, "combine")
+        native = SimpleNamespace(
+            last_combine_payload_max_rows=lambda: int(os.environ[sweep.PAYLOAD_ROWS_ENV]),
+            last_combine_wqe_fast=lambda: int(os.environ[sweep.WQE_FAST_ENV]),
+        )
+        assert sweep.check_payload_limit(native, config)["combine_wqe_fast_submitted"] == config["combine_wqe_fast"]
+    wrong = SimpleNamespace(last_combine_payload_max_rows=lambda: 1, last_combine_wqe_fast=lambda: 0)
+    with pytest.raises(RuntimeError, match="fast mismatch"):
+        sweep.check_payload_limit(wrong, next(c for c in configs if c["combine_wqe_fast"]))
+    sweep.activate_config(policy, auto, "fresh_weighted")
+    assert sweep.WQE_FAST_ENV not in os.environ and sweep.PAYLOAD_ROWS_ENV not in os.environ
+    for extra in (
+        ["--combine-visits", "3"],
+        ["--combine-visits", "8", "8"],
+        ["--combine-wqe-fast", "2"],
+        ["--combine-wqe-fast", "0", "0"],
+    ):
+        with pytest.raises(SystemExit):
+            entry.parse_args(["--ep-size", "16", "--combine-payload-max-rows", "1", *extra])
+    with pytest.raises(SystemExit):
+        entry.parse_args(["--combine-visits", "8"])
+
+
+def test_payload_summary_without_implicit_baseline(tmp_path):
+    auto = sweep.candidate(2, 1, 1, 8, 16) | {"id": "auto", "auto": True}
+    configs = sweep.payload_candidates(auto, [2, 4])
+    results = [
+        dict(config=c, metrics={"api": {"mean": 100}, "comm": {"mean": 80}}, GBps=300, rounds=[]) for c in configs
+    ]
+    state = SimpleNamespace(
+        completed=[dict(shape={}, operator="combine", results=results, winner=configs[0])],
+        args=SimpleNamespace(output=tmp_path, reduce_cores=48),
+        group=SimpleNamespace(size=lambda: 16),
+    )
+    sweep.write_summary(state)
+    with (tmp_path / "summary.csv").open(encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [r["payload_max_rows"] for r in rows] == ["2", "4"]
+    assert all(
+        r[k] == ""
+        for r in rows
+        for k in ("api_change_vs_auto", "bandwidth_change_vs_auto", "api_worse_in_either_round")
+    )
 
 
 def test_finalists_keep_api_and_communication_winners():
@@ -284,7 +363,7 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep, payload_only
         stage_metrics.prepare_v2_sample = lambda *a:None
         _native.load_native_module = lambda:SimpleNamespace(**{name:lambda:None for name in
             ['last_dispatch_channel_metadata','last_dispatch_metadata_options','last_combine_launch',
-             'last_dispatch_launch','last_dispatch_overlap_options','last_combine_payload_max_rows']})
+             'last_dispatch_launch','last_dispatch_overlap_options','last_combine_payload_max_rows','last_combine_wqe_fast']})
         initialized, executed, destroyed = [], [], []
         class Buffer:
             get_buffer_size_hint = staticmethod(lambda g,t,h,k: t*h*k)
@@ -306,10 +385,12 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep, payload_only
             assert s.buffer is initialized[0] and len(initialized)==1
             if payload_only:
                 c = runner.policy_config(s.base.for_launch(shape['aiv'],shape['hidden']*2,'combine',bf16=True),ep,True)
-                for config in runner.payload_candidates(c,s.args.combine_payload_max_rows):
+                for config in runner.payload_candidates(c,s.args.combine_payload_max_rows,s.args.combine_visits,s.args.combine_wqe_fast):
                     s.activate(config,'combine')
                     assert os.environ[runner.PAYLOAD_ROWS_ENV]==str(config['payload_max_rows'])
-                    assert s.policy.for_launch(shape['aiv'],shape['hidden']*2,'combine',bf16=True)==s.base.for_launch(shape['aiv'],shape['hidden']*2,'combine',bf16=True)
+                    plan=s.policy.for_launch(shape['aiv'],shape['hidden']*2,'combine',bf16=True)
+                    assert (plan.peers_per_worker,plan.workers_per_peer,plan.qps_per_worker,plan.wqes_per_visit)==(config['peers'],config['workers'],config['qps'],config['visit'])
+                    assert os.environ[runner.WQE_FAST_ENV]==str(config['combine_wqe_fast'])
             executed.append(shape)
             return []
         runner.run_case = run_case
@@ -319,13 +400,13 @@ def test_session_reserves_once_and_reuses_buffer_for_all_shapes(ep, payload_only
             native = root/'_clos_C.so'; native.write_bytes(b'host')
             (root/'libdeepep_clos_kernels.so').write_bytes(b'kernel')
             (root/'.libs').mkdir(); (root/'.libs/libshmem.so').write_bytes(b'shmem')
-            mode = ['--combine-payload-max-rows','1','2','4','8'] if payload_only else ['--small-rank-sweep']
+            mode = ['--combine-payload-max-rows','1','2','4','8','--combine-visits','8','32','--combine-wqe-fast','0','1'] if payload_only else ['--small-rank-sweep']
             args = entry.parse_args([*mode,'--ep-size',str(ep),'--output',str(root/'result')])
             with patch.object(runner.importlib.util,'find_spec',return_value=SimpleNamespace(origin=str(native))):
                 runner.run(args)
             report = json.loads((args.output/'report.json').read_text())
             assert report['buffer_initializations']==1 and not report['huge_pages']
         assert len(initialized)==1 and destroyed==initialized and executed==runner.cases()
-        assert runner.PAYLOAD_ROWS_ENV not in os.environ
+        assert runner.PAYLOAD_ROWS_ENV not in os.environ and runner.WQE_FAST_ENV not in os.environ
     """.replace("TEST_EP", str(ep)).replace("TEST_PAYLOAD", str(payload_only))
     )

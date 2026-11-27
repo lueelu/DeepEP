@@ -45,9 +45,7 @@ def test_payload_merge_option_validation(tmp_path):
         assert (result.returncode == 0) == (value is None), result.stderr
 
 
-@pytest.mark.parametrize(
-    "limit,corrupt", [(1, False), (2, False), (4, False), (8, False), (16, False), (32, False), (4, True)]
-)
+@pytest.mark.parametrize("limit,corrupt", [(n, False) for n in (1, 2, 3, 4, 5, 8, 16, 31, 32)] + [(4, True)])
 def test_coalesced_combine_payload_mapping(tmp_path, limit, corrupt):
     """Expand actual production WQEs back into rows and compare every address.
 
@@ -60,12 +58,9 @@ def test_coalesced_combine_payload_mapping(tmp_path, limit, corrupt):
     text = (ROOT / "csrc/direct/kernels/combine/udma_combine_sender.h").read_text()
     body = cpp_functions(text, "BuildCombineWqesCoalesced")
     end = body.rfind(")", 0, body.index("{"))
-    body = (body[:end] + ", uint32_t tid" + body[end:]).replace("threadIdx.x", "tid")
-    body = (
-        body.replace("auto* indices = reinterpret_cast<__ubuf__ int32_t*>(span[0]);", "const uint64_t seed = span[0];")
-        .replace("indices[pos + rows]", "index_at(seed, pos + rows)")
-        .replace("indices[pos]", "index_at(seed, pos)")
-    )
+    body = (body[:end] + ", Warp& warp" + body[end:]).replace("threadIdx.x", "warp.lane")
+    body = body.replace("reinterpret_cast<__ubuf__ int32_t*>(span[0])[pos]", "index_at(span[0], pos)")
+    body = body.replace("asc_ballot(", "warp.ballot(").replace("asc_shfl_up(", "warp.up(")
     program = r"""
 #include <cstdint>
 #define __simt_vf__ constexpr
@@ -73,11 +68,32 @@ def test_coalesced_combine_payload_mapping(tmp_path, limit, corrupt):
 #define __ubuf__
 namespace __asc_simt_vf { void __trap(); }
 constexpr int32_t index_at(uint64_t seed, unsigned pos) {
-    unsigned pattern=seed%3, base=unsigned(seed/3)*128;
-    return int32_t(base+(pattern==0 ? pos : pattern==1 ? pos*2 : pos/2));
+    unsigned pattern=seed%5, base=unsigned(seed/5);
+    return int32_t(base+(pattern==0 ? pos : pattern==1 ? pos*2 : pattern==2 ? pos/2 :
+                        pattern==3 ? pos+(pos/3)*2 : pos+(pos/7)*3));
 }
+// Emulate exactly the three ballots and two shuffles. The scalar golden
+// computes masks independently, then every production lane must supply the
+// expected predicate/value; wrong participation/order fails the test too.
+struct Warp {
+    unsigned lane=0, ballots=0, shuffles=0, run_heads=0, heads=0;
+    unsigned tokens[32]{}, owners[32]{};
+    bool valid=true;
+    constexpr unsigned ballot(bool predicate) {
+        unsigned mask=ballots==0 ? 0 : ballots==1 ? run_heads : heads;
+        valid &= ballots<3 && predicate==bool((mask>>lane)&1U);
+        ++ballots;
+        return mask;
+    }
+    constexpr unsigned up(unsigned value,unsigned delta,unsigned width) {
+        const auto* values=shuffles==0 ? tokens : owners;
+        valid &= shuffles<2 && delta==1 && width==32 && value==values[lane];
+        ++shuffles;
+        return values[lane ? lane-1 : 0];
+    }
+};
 // PRODUCTION
-constexpr bool check(unsigned count,unsigned width,unsigned bytes,unsigned pattern) {
+constexpr bool check(unsigned count,unsigned width,unsigned bytes,unsigned pattern, bool adjacent=false) {
     uint64_t wqes[256]{}, spans[128]{}, headers[16*32]{}, bases[32]{};
     for(unsigned p=0;p<32;++p) {
         bases[p]=0x100000000ULL+uint64_t(p)*10000000;
@@ -86,15 +102,38 @@ constexpr bool check(unsigned count,unsigned width,unsigned bytes,unsigned patte
     unsigned n=0, output=999;
     for(unsigned start=0;start<count;start+=width,++n) {
         unsigned len=count-start<width ? count-start : width;
-        spans[n*4]=n*3+pattern;
+        spans[n*4]=(adjacent ? 8192-count+start : n*128)*5+pattern;
         spans[n*4+1]=(uint64_t(len)<<32)|(17+start);
         spans[n*4+2]=n;
         spans[n*4+3]=start;
     }
-    // Reverse lane order proves that no lane relies on another lane's writes.
-    for(unsigned t=32;t>0;--t)
+    Warp warp;
+    unsigned cap=bytes<=65536 ? 65536/bytes : 1;
+    if(cap>LIMIT)cap=LIMIT;
+    for(unsigned s=0;s<n;++s) {
+        unsigned begin=unsigned(spans[s*4+3]), len=unsigned(spans[s*4+1]>>32);
+        for(unsigned pos=0;pos<len;++pos) {
+            unsigned lane=begin+pos;
+            warp.tokens[lane]=unsigned(index_at(spans[s*4],pos));
+            warp.owners[lane]=s;
+            if(pos==0 || index_at(spans[s*4],pos)!=index_at(spans[s*4],pos-1)+1)
+                warp.run_heads |= 1U<<lane;
+        }
+        for(unsigned pos=0;pos<len;) {
+            warp.heads |= 1U<<(begin+pos);
+            unsigned rows=1;
+            while(rows<cap && pos+rows<len &&
+                  index_at(spans[s*4],pos+rows)==index_at(spans[s*4],pos)+int(rows))++rows;
+            pos+=rows;
+        }
+    }
+    // Reverse order also proves no output relies on another lane's UB writes.
+    for(unsigned t=32;t>0;--t) {
+        warp.lane=t-1; warp.ballots=0; warp.shuffles=0;
         BuildCombineWqesCoalesced(wqes,spans,headers,bases,&output,0x200000000ULL,
-                                 512,bytes,8192,n,count,LIMIT,t-1);
+                                 512,bytes,8192,n,count,LIMIT,warp);
+        if(!warp.valid || warp.ballots!=(count?3U:0U) || warp.shuffles!=(count?2U:0U))return false;
+    }
     if(output>count || (count && !output))return false;
     unsigned cursor=0, expected_count=0;
     for(unsigned s=0;s<n;++s) {
@@ -122,10 +161,14 @@ constexpr bool check(unsigned count,unsigned width,unsigned bytes,unsigned patte
     return true;
 }
 constexpr bool matrix(unsigned bytes) {
-    for(unsigned count : {0U,1U,15U,31U,32U})
-        for(unsigned width : {1U,5U,32U})
-            for(unsigned pattern=0;pattern<3;++pattern)
+    for(unsigned count : {0U,1U,2U,15U,16U,17U,31U,32U})
+        for(unsigned width : {1U,3U,5U,16U,32U})
+            for(unsigned pattern=0;pattern<5;++pattern)
                 if(!check(count,width,bytes,pattern))return false;
+    // Consecutive destinations across spans must still produce distinct WQEs;
+    // the final valid token also touches the capacity boundary.
+    for(unsigned width : {1U,3U,5U,16U,32U})
+        if(!check(32,width,bytes,0,true))return false;
     return true;
 }
 static_assert(matrix(5632));

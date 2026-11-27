@@ -147,7 +147,10 @@ performance; both still require device validation.
 to `1` (the existing builder) and accepts integers from `1` through `32`.
 Values above one enable a separate SIMT builder for ordinary non-expanded
 peer-scheduled combine with dense payload strides. It reads AIV-loaded UB
-indices and merges only consecutive source **and** destination rows. Each WQE
+indices and merges only consecutive source **and** destination rows. Each lane
+loads its own index, then warp shuffles/ballots identify run heads and compact
+WQE positions. It does not repeat a full-batch index scan in every lane; inactive
+tail lanes still participate in all warp operations. Each WQE
 is capped at 64 KiB, or one unchanged row if a row itself exceeds that size.
 It never merges across descriptor spans, visits, peers/QPs, worker partitions,
 index windows or the original 32-request submission batch. Unsupported paths
@@ -165,7 +168,7 @@ Compare `1/2/4/8/16/32` using the same Buffer, routes and other settings; settin
 the environment before each call is sufficient outside graph capture. Validate
 zero-tolerance output first, then measure communication and full API separately.
 Use an independent diagnostic pass to compare physical WQE counts and build
-time. Discontinuous routes may save no WQEs and can become slower due to scanning;
+time. Discontinuous routes may save no WQEs and can become slower due to compaction;
 this experiment does not establish a performance gain or change the default.
 
 The existing `bench_fast_sweep.py` entry point also accepts a runtime-only
@@ -183,18 +186,32 @@ Use `--plan-only` to inspect the matrix without a device. EP4/8/16/32 and
 8/32 communication cores are supported; repeat `--case TOKENS,HIDDEN,TOPK,AIV`
 to restrict shapes (topk8, experts256, BF16, expand0). With no `--case`, use
 the existing T4096/8192, H2816/4096/6144, 8/32-core matrix. This mode measures
-only unweighted and weighted combine, freezes default rank/P/W/Q/visit, disables
+only unweighted and weighted combine, freezes default rank/P/W/Q, disables
 1 GiB pages and L2 flushing, and initializes one Buffer per rank for the entire
-EP session. Preparation dispatch is not a measured candidate. Limit `1` is
-always included as the baseline. Each limit gets zero-tolerance checks and
+EP session. Preparation dispatch is not a measured candidate. Only explicitly
+requested limits are measured; include `1` for a single-row baseline. Each
+candidate gets zero-tolerance checks and
 forward/reverse performance rounds; notify/communication/reduce profiler
 samples are separate from full API samples. `summary.csv` records the limit,
-bandwidth, mean/P50/P95 and changes versus limit 1; per-rank observations check
-the requested limit against the Host's actual tiling field.
+bandwidth, mean/P50/P95 and changes versus rows=1/default-visit/fast=0, if that
+candidate is present; otherwise delta columns are blank. Per-rank observations
+check the requested limit, visit and WQE fast against the Host tiling fields.
+
+By default, visit is unchanged and WQE fast is off. To explore single-row
+preparation as well as merging without restarting Buffer, add:
+
+```bash
+--combine-payload-max-rows 1 2 4 --combine-visits 8 32 --combine-wqe-fast 0 1
+```
+
+`--combine-visits` accepts 4/8/16/32/64/128. WQE fast applies only to rows=1;
+merged-row candidates run once per visit with fast=0, because the coalescing
+builder takes precedence. The example measures eight configurations per shape
+and weight mode, retaining the same rank/P/W/Q and all other production settings.
 
 Install the matching Host/kernel build once (including
-`last_combine_payload_max_rows` for audit). Switching limits only updates the
-environment between completed calls, outside timing; it does **not** rebuild
+`last_combine_payload_max_rows` and `last_combine_wqe_fast` for audit). Switching limits only updates the
+environment/policy between completed calls, outside timing; it does **not** rebuild
 the library, restart workers, recreate Buffer or change QP reservations. Graph
 capture is not used. Host observation verifies the submitted limit, not how
 many rows actually merged; use the independent WQE diagnostic pass for that.
