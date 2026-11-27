@@ -700,7 +700,8 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
             for cores in ((8,20,64) if ep == 32 else (8,20)):
                 p = base.for_launch(cores,8192,'weighted',bf16=True)
                 assert p.peer_order == 0
-                assert p.weight_mode == (2 if p.send_workers < cores else 1)
+                weight_cores = (8 if cores < 32 else 32) if ep == 64 else cores
+                assert p.weight_mode == (2 if p.send_workers < weight_cores else 1)
             for other in (replace(base,topology_known=False), replace(base,ranks_per_group=24-group)):
                 p = other.for_launch(32,8192,'weighted',bf16=True)
                 assert p.peer_order == 0 and p.weight_mode == 2
@@ -737,7 +738,7 @@ def test_weight_preference_does_not_return_to_simt_as_rows_grow():
                             # Legacy mode 0 uses SIMT when a helper exists,
                             # under the normal SIMT-enabled peer kernel build.
                             preferred = _simt_weight_row_fits(ep,size)
-                            weight_cores = (8 if cores < 32 else 32) if ep in (8,16) else cores
+                            weight_cores = (8 if cores < 32 else 32) if ep in (8,16,64) else cores
                             simt = plan.weight_mode != 1 and plan.send_workers < weight_cores
                             # The low-core rank override preserves the weight
                             # mode selected before removing the RR self owner.
@@ -920,8 +921,8 @@ def test_reported_300_operator_plans_allow_rank_conversion_and_copy_first_remova
                 # Intentional sender-budget change; retain the raw fixture.
                 historical[3:6] = [8,1,1]
                 senders = 8
-            if cores == 64 and (op == 'dispatch' and ep in (4,8,16,32)
-                                or op in ('combine','weighted') and ep in (8,16)):
+            if cores == 64 and (op == 'dispatch' and ep in (4,8,16,32,64)
+                                or op in ('combine','weighted') and ep in (8,16,64)):
                 # These budgets now deliberately inherit the separately checked
                 # 32-core anchor; the old 64-core fixture remains unmodified.
                 inherited = base.for_launch(32,hidden*2,op,bf16=True)
@@ -976,12 +977,12 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
                     mode = (2 if ep == 4 and size <= 7168 else 1) if op == 'weighted' else 0
                     assert plan.native_plan() == [1,order,group,p,w,1,32,2,mode]
 
-        # No fixed half-core split, and no change to the all-senders fallback.
+        # EP64 dispatch retains eight senders throughout the supported core range.
         base = replace(resolve_udma_policy(True,64,'udma',None,None,None,None,None),
                        ranks_per_group=16,topology_known=True)
-        assert base.for_launch(16,5632,'dispatch',bf16=True).send_workers == 16
+        assert base.for_launch(16,5632,'dispatch',bf16=True).send_workers == 8
         assert base.for_launch(18,5632,'dispatch',bf16=True).send_workers == 8
-        assert base.for_launch(20,5632,'dispatch',bf16=True).send_workers == 16
+        assert base.for_launch(20,5632,'dispatch',bf16=True).send_workers == 8
     """)
 
 
@@ -989,12 +990,12 @@ def test_sender_tiers_inherit_complete_plans_without_changing_launch_budget():
     run_host("""
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
-        for ep in (4,8,16,32):
+        for ep in (4,8,16,32,64):
             for group in sorted({min(ep,8),min(ep,16)}):
                 for known in (False,True):
                     base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                                    ranks_per_group=group,topology_known=known)
-                    for op in (('dispatch','combine','weighted') if ep in (8,16) else ('dispatch',)):
+                    for op in (('dispatch','combine','weighted') if ep in (8,16,64) else ('dispatch',)):
                         for size in (1024,2048,4096,4097,5632,8192,12288,12289,14336):
                             for cores in range(8,65,2):
                                 tier = 8 if cores < 32 else 32
@@ -1029,6 +1030,54 @@ def test_ep32_unweighted_combine_preserves_eight_core_sender_plan():
                         assert plan.send_workers == 8
                         assert base.config(cores).num_aiv == cores
                         assert plan.self_copy == (1 if (cores or 32) >= 16 else 2)
+    """)
+
+
+def test_large_row_extension_is_opt_in_scoped_and_reserved():
+    run_host("""
+        import os
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        def resolve(ep):
+            return replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=min(ep,16), topology_known=True)
+        os.environ.pop('DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY',None)
+        old = resolve(8)
+        assert not old.extend_large_rows
+        old_plan = old.for_launch(32,14336,'combine',bf16=True).native_plan()
+        assert old_plan[3:6] == [1,2,1]
+        os.environ['DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY'] = '1'
+        enabled = resolve(8)
+        assert enabled.extend_large_rows and old.signature() != enabled.signature()
+        # Configuration is immutable per Buffer; changing the environment cannot
+        # leave cached launch plans inconsistent with its original QP reservation.
+        assert old.for_launch(32,14336,'combine',bf16=True).native_plan() == old_plan
+        names = ('rank','group','group_staggered','group_round_robin')
+        for ep in (4,8,16,32,64,128):
+            base = resolve(ep)
+            disabled = replace(base,extend_large_rows=False)
+            reserved = set(base.reservation_spec().split(';'))
+            for cores in range(8,65,2):
+                for op in ('dispatch','combine','weighted'):
+                    for size in (2048,4096,5632,8192,12288,12289,14336,32768):
+                        plan = base.for_launch(cores,size,op,bf16=True)
+                        reference = disabled.for_launch(cores,12288 if ep in (4,8,16) and size>12288 else size,
+                                                       op,bf16=True)
+                        assert plan.native_plan() == reference.native_plan(), (ep,cores,op,size)
+                        key = f'{names[plan.peer_order]}:{plan.peers_per_worker}:{plan.workers_per_peer}:{plan.qps_per_worker}'
+                        assert key in reserved and plan.send_workers <= cores
+                        assert plan.send_workers*plan.qps_per_worker <= 32
+                    for opts in ({'bf16':False},{'bf16':True,'v2':False},{'bf16':True,'expanded':True}):
+                        assert base.for_launch(cores,14336,op,**opts).native_plan() == disabled.for_launch(
+                            cores,14336,op,**opts).native_plan()
+        os.environ['DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY'] = '0'
+        assert not resolve(8).extend_large_rows
+        assert enabled.for_launch(32,14336,'combine',bf16=True).native_plan()[3:6] == [1,1,1]
+        for bad in ('true','2',''):
+            os.environ['DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY'] = bad
+            try: resolve(8)
+            except ValueError: pass
+            else: raise AssertionError('invalid large-row option accepted')
     """)
 
 
@@ -1123,7 +1172,7 @@ def test_ep128_defaults_preserve_fixed_candidate_across_shapes_and_budgets():
     """)
 
 
-def test_ep128_eight_core_rank_p16_preserves_other_core_plans():
+def test_ep128_low_core_rank_p16_preserves_larger_core_plans():
     run_host("""
         from dataclasses import replace
         from deep_ep.backends.direct.config import Config
@@ -1137,14 +1186,15 @@ def test_ep128_eight_core_rank_p16_preserves_other_core_plans():
                 for op in ('dispatch','combine','weighted'):
                     for size in (2048,5632,8192,12288,14336):
                         for opts in ({'bf16':True},{'bf16':False},{'bf16':True,'expanded':True},{'bf16':True,'v2':False}):
-                            plan = base.for_launch(8,size,op,**opts)
-                            mode = 1 if op == 'weighted' and opts == {'bf16':True} else 0
-                            assert plan.native_plan() == [1,0,group,16,1,1,32,2,mode]
-                            assert plan.send_workers == 8
-                            assert plan.valid_group_capacity()
+                            for cores in (8,10,12,14):
+                                plan = base.for_launch(cores,size,op,**opts)
+                                mode = (2 if cores > 8 else 1) if op == 'weighted' and opts == {'bf16':True} else 0
+                                assert plan.native_plan() == [1,0,group,16,1,1,32,2,mode]
+                                assert plan.send_workers == 8
+                                assert plan.valid_group_capacity()
         base = replace(base,ranks_per_group=16,topology_known=True)
         for cores in (10,12,14):
-            assert base.for_launch(cores,5632,'dispatch',bf16=True).native_plan() == [1,3,16,2,1,1,32,2,0]
+            assert base.for_launch(cores,5632,'dispatch',bf16=True).native_plan() == [1,0,16,16,1,1,32,2,0]
         for cores in (0,*range(16,65,2)):
             for op in ('dispatch','combine','weighted'):
                 assert base.for_launch(cores,5632,op,bf16=True).native_plan() == [1,0,16,8,1,1,16,2,0]
@@ -1190,7 +1240,7 @@ def test_ep64_dispatch_32_cores_uses_eight_senders_without_changing_other_paths(
                         assert plan.send_workers == 8 and (cores or 32)-plan.send_workers == 24
                     for cores in (8,16,30,48,64):
                         plan = policy.for_launch(cores,size,'dispatch',bf16=True)
-                        assert plan.peers_per_worker == (8 if cores == 8 else 4)
+                        assert plan.peers_per_worker == 8
                     for kwargs in ({'bf16':False}, {'bf16':True,'expanded':True},
                                    {'bf16':True,'v2':False}):
                         assert policy.for_launch(32,size,'dispatch',**kwargs).peers_per_worker == 4
@@ -1227,7 +1277,7 @@ def test_auto_qp_reservation_covers_dynamic_launches_and_legacy_paths(ep):
             policy = replace(base,ranks_per_group=16,topology_known=True)
             expected = {{32:'rank:4:1:1;rank:8:1:1',
                         64:'rank:4:1:1;rank:8:1:1;group_round_robin:4:1:1',
-                        128:'rank:8:1:1;rank:16:1:1;group_round_robin:2:1:1;group_round_robin:4:1:1'}}
+                        128:'rank:8:1:1;rank:16:1:1;group_round_robin:4:1:1'}}
             assert policy.reservation_spec() == expected[{ep}]
     """)
 
@@ -1240,7 +1290,11 @@ def test_auto_qp_masks_preserve_control_symmetry_and_reduce_tuning_union(tmp_pat
     if compiler is None:
         pytest.skip("C++17 compiler required for automatic QP mask coverage")
     generated = subprocess.run(
-        [sys.executable, "-c", DTYPES_ONLY + textwrap.dedent("""
+        [
+            sys.executable,
+            "-c",
+            DTYPES_ONLY
+            + textwrap.dedent("""
             import json
             from dataclasses import replace
             from deep_ep.backends.direct.udma_policy import resolve_udma_policy
@@ -1251,15 +1305,20 @@ def test_auto_qp_masks_preserve_control_symmetry_and_reduce_tuning_union(tmp_pat
                                  ranks_per_group=group,topology_known=True)
                 cases.append((ep,group,policy.reservation_spec()))
             print(json.dumps(cases))
-        """)], cwd=ROOT, capture_output=True, text=True, check=True,
+        """),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    source = ['#include "runtime/udma_qp_reservation.h"', 'using namespace ascend_deepep::udma;']
+    source = ['#include "runtime/udma_qp_reservation.h"', "using namespace ascend_deepep::udma;"]
     names = ("rank", "group", "group_staggered", "group_round_robin")
     for ep, group, spec in json.loads(generated.stdout):
         expressions = []
         for entry in spec.split(";"):
             order, p, w, q = entry.split(":")
-            expressions.append(f"QpReservation::Mask(r,p,{ep},{group},{names.index(order)},{p},{int(w)*int(q)})")
+            expressions.append(f"QpReservation::Mask(r,p,{ep},{group},{names.index(order)},{p},{int(w) * int(q)})")
         source.append(f"constexpr uint64_t mask{ep}(unsigned r,unsigned p) {{return " + "|".join(expressions) + ";}")
         source.append(f"""
 constexpr bool check{ep}() {{
@@ -1275,9 +1334,24 @@ static_assert(check{ep}(), "automatic mask must retain control and symmetry whil
 """)
     path = tmp_path / "auto_qp_masks.cpp"
     path.write_text("\n".join(source))
-    budget = "-fconstexpr-ops-limit=100000000" if Path(compiler).name.startswith("g++") else "-fconstexpr-steps=100000000"
-    result = subprocess.run([compiler,"-std=c++17",budget,"-I"+str(ROOT / "csrc/direct"),"-c",str(path),
-                             "-o",str(tmp_path / "auto_qp_masks.o")], capture_output=True,text=True,timeout=90)
+    budget = (
+        "-fconstexpr-ops-limit=100000000" if Path(compiler).name.startswith("g++") else "-fconstexpr-steps=100000000"
+    )
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            budget,
+            "-I" + str(ROOT / "csrc/direct"),
+            "-c",
+            str(path),
+            "-o",
+            str(tmp_path / "auto_qp_masks.o"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 

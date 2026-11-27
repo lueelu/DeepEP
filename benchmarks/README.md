@@ -7,6 +7,10 @@ Modified by Joyce_An 2026
 
 ## Clos 单次初始化摸测
 
+普通 V2 BF16 非展开路径中，EP64 dispatch 的8～64核均保留8个payload发送核；combine的8～30核继承8核计划，32～64核继承32核计划。EP128的8～14核使用rank/P16/W1/Q1/v32，16～64核保持rank/P8/W1/Q1/v16。额外核数不再反复改变发送分工。
+
+大行宽发送计划延伸仍默认关闭。设备对照时可在创建 Buffer **之前**，为所有rank设置 `DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY=1`：普通V2 BF16非展开、EP4/8/16、8～64核、payload行宽超过12288字节时，继承12288字节对应的发送计划。设为`0`或不设置保留旧行为。该选项在构造时固定并参与rank配置一致性检查；不会改变实际tensor大小、UB/通信容量检查或payload合并行数。它尚未通过H7168设备性能验证，不能视为新的默认推荐。使用允许环境选项的 `clos/bench_v2_bandwidth.py` 做对照；下面的默认策略摸测入口会拒绝该实验覆盖项。
+
 visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变。visit 是一个 peer 每轮的 WQE 预算，64/128 会拆为多个最多32条的提交，不扩大 WQE 暂存区，也不改变 SQ 信用保护。带权重等多字段路径按 WQE 计数，不等于同等数量的 token。新增取值需同步更新 Python 和 Host 库。
 
 `clos/bench_fast_sweep.py` 在候选策略过滤完成后，自动将本次所有算子（包括准备 handle 的 fresh dispatch）的 QP 映射并集传给 SHMEM，每个进程只初始化一个 Buffer。`--plan-only` 和输出 `plan.json` 中的 `qp_plans` 记录建链范围；`BUFFER_READY` 记录初始化耗时。visit 不改变 QP 映射，固定 P/W/Q 的 visit 扫描不会额外预建其他策略的连接。普通模式**不做精度验证**；下面的精简 rank 模式会检查入围配置。

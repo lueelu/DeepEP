@@ -1,6 +1,7 @@
 """Full-CLOS host scheduling. Core counts remain operation inputs."""
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
@@ -100,6 +101,7 @@ class UdmaPolicy:
     peer_order: int = 0
     self_copy: int = 2  # 1: spare AIVs; 2: after submit; legacy 0 aliases 2.
     weight_mode: int = 0  # 0: legacy; 1: UDMA; 2: SIMT when spare AIVs exist.
+    extend_large_rows: bool = False  # Opt-in H6144 sender-plan extension; captured at Buffer construction.
 
     def __post_init__(self):
         # Historical profiles/manual callers may still supply 0. Never report
@@ -123,6 +125,7 @@ class UdmaPolicy:
             self.wqes_per_visit,
             self.ranks_per_group,
             self.topology_known,
+            self.extend_large_rows,
             self.reservation_spec(),
         )
 
@@ -179,7 +182,7 @@ class UdmaPolicy:
             raise ValueError(f"num_aiv/num_sms must be zero or an even count <= {_MAX_NUM_AIV}")
         budget = min(32 // self.qps_per_worker, 32 if num_aiv == 0 else num_aiv)
         policy = self
-        if self.world_size == 128 and num_aiv == 8 and self.workers_per_peer == self.qps_per_worker == 1:
+        if self.world_size == 128 and 8 <= num_aiv < 16 and self.workers_per_peer == self.qps_per_worker == 1:
             policy = replace(self, peer_order=0, peers_per_worker=16, wqes_per_visit=32)
         while policy.send_workers > budget and policy.peers_per_worker < 8:
             policy = replace(policy, peers_per_worker=policy.peers_per_worker * 2)
@@ -250,10 +253,27 @@ class UdmaPolicy:
             raise ValueError("payload row bytes must be a positive integer")
         base = self.for_num_aiv(num_aiv)
         cores = num_aiv or 32
+        if (
+            self.extend_large_rows
+            and self.world_size in (4, 8, 16)
+            and v2
+            and not expanded
+            and bf16
+            and 8 <= cores <= 64
+            and row_bytes > 12288
+        ):
+            # Only inherit scheduling. Actual tensor sizes, transfer bounds and
+            # payload coalescing remain based on the real row width in the Host/kernel.
+            return self.for_launch(num_aiv, 12288, operation, bf16=True)
         inherit_sender_tier = (
-            v2 and not expanded and bf16 and 8 <= cores <= 64
-            and ((operation == "dispatch" and self.world_size in (4, 8, 16, 32))
-                 or (operation in ("combine", "weighted") and self.world_size in (8, 16)))
+            v2
+            and not expanded
+            and bf16
+            and 8 <= cores <= 64
+            and (
+                (operation == "dispatch" and self.world_size in (4, 8, 16, 32, 64))
+                or (operation in ("combine", "weighted") and self.world_size in (8, 16, 64))
+            )
         )
         if inherit_sender_tier:
             tier = 8 if cores < 32 else 32
@@ -270,8 +290,8 @@ class UdmaPolicy:
         if self.world_size == 128 and cores >= 16:
             # One fixed EP128 schedule for every row size and operation. Match
             # the measured rank/P8/W1/Q1/visit16 candidate and weight path.
-            # Legacy self-copy 0 is normalized to after-submit. Smaller budgets keep the capacity
-            # fallback selected by for_num_aiv().
+            # Legacy self-copy 0 is normalized to after-submit. Budgets 8..14
+            # retain rank/P16/visit32 selected by for_num_aiv().
             plan = replace(
                 base,
                 peer_order=0,
@@ -471,7 +491,10 @@ def resolve_udma_policy(
         ("udma_wqes_per_visit", wqes, visit),
     ):
         _check_override(name, supplied, effective, rank)
-    return UdmaPolicy(world_size, p, w, q, visit)
+    extend = os.environ.get("DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY", "0")
+    if extend not in ("0", "1"):
+        raise ValueError("DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY must be 0 or 1")
+    return UdmaPolicy(world_size, p, w, q, visit, extend_large_rows=extend == "1")
 
 
 def _logical_group(world):
