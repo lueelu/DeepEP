@@ -23,6 +23,7 @@ class Device(str):
 DTYPES = dict(
     uint8=np.uint8,
     int8=np.int8,
+    int16=np.int16,
     int32=np.int32,
     int64=np.int64,
     float32=np.float32,
@@ -47,6 +48,10 @@ class Tensor:
     @property
     def ndim(self):
         return self.data.ndim
+
+    @property
+    def nbytes(self):
+        return self.data.nbytes
 
     def __getitem__(self, index):
         return Tensor(self.data[index], self.dtype, self.device)
@@ -175,11 +180,14 @@ def backend(monkeypatch):
             capacity,
             backend="mte",
             topk_weights_type=0,
+            shared_workspace=None,
         ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
             self.backend = backend
             self.topk_weights_type = topk_weights_type
             self.local_experts = experts
+            self.shared_workspace = shared_workspace
+            self.workspace = shared_workspace if shared_workspace is not None else Tensor(np.zeros(4096), "uint8")
             events.append(("prepare", self.bs))
             events.append(("plan_backend", backend))
 
@@ -233,6 +241,7 @@ def backend(monkeypatch):
 
     ext = SimpleNamespace(
         buffer_size=buffer_size,
+        workspace_size=lambda *args, **kwargs: 4096,
         Plan=Plan,
         ffts_config=lambda: 123,
         timer_enabled=True,
@@ -261,13 +270,17 @@ def weights():
 @pytest.mark.parametrize("bf16", [False, True])
 def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16):
     b = backend.buffer
-    assert b.x.shape == (17, 1024) and b.x_sf.shape == (17, 32)
-    original = b.x
-    assert b.allocate_inputs() is b and b.x is original
+    assert b.x.shape == (17, 1024) and b.x.dtype == "float8_e4m3fn"
+    assert b.x_sf.shape == (17, 16) and b.x_sf.dtype == "int16"
+    assert b.topk_idx.shape == (17, 2) and b.topk_idx.dtype == "int64"
+    assert b.topk_weights.shape == (17, 2) and b.topk_weights.dtype == "float32"
+    assert not hasattr(b, "allocate_inputs")
+    assert not hasattr(b, "prepare")
+    assert not hasattr(b, "validate_inputs")
+    assert not hasattr(b, "workspace_bytes")
+    assert not hasattr(b, "symmetric_buffer_bytes")
+    assert b.num_bytes == 2 << 20
     x = Tensor(np.ones((17, 1024)), "bfloat16") if bf16 else None
-    b.validate_inputs(17, x=x)
-    b.prepare(17)
-    b.prepare(17)
     y, stats = Tensor(np.zeros((17, 1024)), "bfloat16"), Tensor([7, 11], "int32")
     assert api.fp8_fp4_mega_moe(y, *weights(), b, cumulative_local_expert_recv_stats=stats, x=x) is None
     np.testing.assert_array_equal(y.data, 3)
@@ -279,32 +292,47 @@ def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16)
     launches = [event[1] for event in backend.events if isinstance(event, tuple) and event[0] == "launch"]
     assert launches[0][8] is None and launches[1][8] is timer
     assert (launches[0][1] is None) == bf16
+    if not bf16:
+        assert launches[0][1].dtype == "float8_e8m0fnu" and launches[0][1].shape == (17, 32)
     assert launches[0][-2] is y and launches[1][-2] is y
     assert (
         sum(event == ("prepare", 17) for event in backend.events if isinstance(event, tuple) and event[0] == "prepare")
         == 1
     )
     assert stats.streams == [b._runtime.stream, b._runtime.stream]
-    assert b.workspace_bytes == 4096 and b.symmetric_buffer_bytes == 2 << 20
-    b.prepare(1)
     assert b._plan.bs == 17 and b._plan_bs == 17
 
 
 def test_output_and_stats_aliases_rejected_before_launch(backend):
     b = backend.buffer
     y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    aliased_stats = b.topk_weights[0].view("int32")
     with pytest.raises(ValueError, match="alias"):
-        api.fp8_fp4_mega_moe(y, *weights(), b, cumulative_local_expert_recv_stats=b.topk_idx[0])
+        api.fp8_fp4_mega_moe(y, *weights(), b, cumulative_local_expert_recv_stats=aliased_stats)
     with pytest.raises(ValueError, match="overlap"):
         api.fp8_fp4_mega_moe(y, *weights(), b, x=y)
     assert not any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
 
 
-@pytest.mark.parametrize("bad", [-1, 4, 0])
-def test_collective_routing_preflight_rejects_bad_ids(backend, bad):
-    backend.buffer.topk_idx.data[0, 1] = bad
-    with pytest.raises(ValueError, match="rank=0.*token=0"):
-        backend.buffer.validate_inputs(17)
+def test_symm_buffer_base_reuses_runtime_and_shared_workspace(backend):
+    import inspect
+
+    assert "timeout" not in inspect.signature(api.SymmBuffer).parameters
+    base = backend.buffer
+    y_base = Tensor(np.zeros((17, 1024)), "bfloat16")
+    api.fp8_fp4_mega_moe(y_base, *weights(), base)
+    derived = api.SymmBuffer(base.group, 4, 8, 2, 1024, 256, base=base)
+    try:
+        assert derived._runtime is base._runtime
+        assert derived.num_bytes == base.num_bytes
+        y_derived = Tensor(np.zeros((8, 1024)), "bfloat16")
+        api.fp8_fp4_mega_moe(y_derived, *weights(), derived)
+        assert derived._plan.shared_workspace is base._plan.workspace
+    finally:
+        derived.destroy()
+    # Destroying derived view must not close base's shared runtime.
+    assert not base._runtime.closed
+    api.fp8_fp4_mega_moe(y_base, *weights(), base)
 
 
 def test_collective_remote_error_and_bs_mismatch(backend):
@@ -358,13 +386,24 @@ def test_fp4_and_packed_e8m0_are_reinterpreted_without_numeric_cast(backend, dty
     np.testing.assert_array_equal(planar_scale.data, sf.reshape(1, 512, 2, 2))
 
 
-def test_shared_fp4_preparation_retains_planar_weights_and_scales(backend):
-    raw = np.arange(512 * 64, dtype=np.uint8).reshape(1, 512, 64)
-    sf = np.arange(512 * 4, dtype=np.uint8).reshape(1, 512, 2, 2)
-    pair = Tensor(raw, "uint8"), Tensor(sf, "float8_e8m0fnu")
-    for weight, scale in api.transform_weights_for_mega_moe(pair, pair, shared=True):
-        np.testing.assert_array_equal(weight.data, raw)
-        np.testing.assert_array_equal(scale.data, sf)
+def test_shared_2d_preparation_retains_planar_weights_and_int16_scales(backend):
+    import inspect
+
+    assert "shared" not in inspect.signature(api.transform_weights_for_mega_moe).parameters
+    raw_fp4 = np.arange(512 * 64, dtype=np.uint8).reshape(512, 64)
+    sf_bytes = np.arange(512 * 4, dtype=np.uint8).reshape(512, 4)
+    sf_i16 = sf_bytes.view(np.int16)
+    pair_fp4 = Tensor(raw_fp4.view(np.int8), "int8"), Tensor(sf_i16, "int16")
+    for weight, scale in api.transform_weights_for_mega_moe(pair_fp4, pair_fp4):
+        np.testing.assert_array_equal(weight.data, raw_fp4)
+        np.testing.assert_array_equal(scale.data, sf_bytes.reshape(512, 2, 2))
+        assert weight.dtype == "uint8" and scale.dtype == "float8_e8m0fnu"
+
+    raw_fp8 = np.arange(512 * 128, dtype=np.uint8).reshape(512, 128)
+    pair_fp8 = Tensor(raw_fp8, "float8_e4m3fn"), Tensor(sf_i16, "int16")
+    for weight, scale in api.transform_weights_for_mega_moe(pair_fp8, pair_fp8):
+        assert weight is pair_fp8[0]
+        np.testing.assert_array_equal(scale.data, sf_bytes.reshape(512, 2, 2))
 
 
 @pytest.mark.parametrize("bf16", [False, True])
@@ -372,8 +411,8 @@ def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf
     b = backend.buffer
     b.num_max_tokens_per_rank = 4096
     b.x = Tensor(np.zeros((4096, 1024)), "float8_e4m3fn")
-    b.x_sf = Tensor(np.zeros((4096, 32)), "float8_e8m0fnu")
-    b.topk_idx = Tensor(np.tile([0, 1], (4096, 1)), "int32")
+    b.x_sf = Tensor(np.zeros((4096, 16)), "int16")
+    b.topk_idx = Tensor(np.tile([0, 1], (4096, 1)), "int64")
     b.topk_weights = Tensor(np.ones((4096, 2)), "float32")
     raw = weights()
     for weight, _ in raw:
@@ -478,40 +517,33 @@ def test_store_group_public_configuration_and_prepare_without_process_group(back
     buffer = api.SymmBuffer(group, 4, 17, 2, 1024, 256)
     buffer.topk_idx.data[:] = [0, 1]
     buffer.topk_weights.data[:] = [0.4, 0.6]
-    buffer.validate_inputs(17)
-    buffer.prepare(17)
     buffer.destroy()
     assert stages == [
         "check:MegaMoE product selection",
         "check:configuration",
         "check:input allocation",
-        "check:input preflight",
-        "check:prepare",
-        "check:prepare BS=17",
     ]
 
 
-def test_non_finite_route_weights_and_bad_capacity_fail_before_launch(backend):
-    backend.buffer.topk_weights.data[2, 0] = np.nan
-    with pytest.raises(ValueError, match="token=2.*finite"):
-        backend.buffer.validate_inputs(17)
-    with pytest.raises(ValueError, match="prepare.*BS"):
-        backend.buffer.prepare(18)
+def test_bad_capacity_fails_before_launch(backend):
+    with pytest.raises(ValueError, match="within the buffer capacity"):
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((18, 1024)), "bfloat16"), *weights(), backend.buffer)
     assert not any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
 
 
-def test_plan_allocation_failure_is_collective_and_retryable(backend):
+def test_plan_allocation_failure_is_retryable(backend):
     plan_type = backend.ext.Plan
 
     def fail(*args, **kwargs):
         raise RuntimeError("workspace allocation failed")
 
     backend.ext.Plan = fail
-    with pytest.raises(ValueError, match="rank=0: workspace allocation failed"):
-        backend.buffer.prepare(17)
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    with pytest.raises(RuntimeError, match="workspace allocation failed"):
+        api.fp8_fp4_mega_moe(y, *weights(), backend.buffer)
     assert backend.buffer._plan is None and backend.buffer._plan_bs is None
     backend.ext.Plan = plan_type
-    backend.buffer.prepare(17)
+    api.fp8_fp4_mega_moe(y, *weights(), backend.buffer)
     assert backend.buffer._plan_bs == backend.buffer.num_max_tokens_per_rank
 
 
@@ -595,7 +627,7 @@ def test_urma_shared_shapes_reach_same_forward_without_extra_host_interface(back
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
         assert launch[9:13] == (sw1, sw2, ss1, ss2)
         assert b._plan.backend == "urma"
-        assert b._plan.workspace_bytes == b.workspace_bytes
+        assert b.num_bytes == 2 << 20
     finally:
         b.destroy()
 
@@ -657,7 +689,8 @@ def test_activation_clamp_reaches_native_forward(backend):
 def test_route_weight_mode_reaches_plan(backend, mode):
     b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)
     try:
-        b.prepare(17)
+        y = Tensor(np.zeros((17, 1024)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, *weights(), b)
         assert b._plan.topk_weights_type == mode
     finally:
         b.destroy()

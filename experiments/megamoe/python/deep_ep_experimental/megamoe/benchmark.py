@@ -346,13 +346,19 @@ def run(args, config, group):
 
         def shared_pair(pair):
             if not urma:
-                return device_pair(pair)
+                data, scale = device_pair(pair)
+                if model["num_shared_experts"] == 1:
+                    return data.squeeze(0), scale.squeeze(0)
+                return data, scale
             from .reference import expand_fp4_to_fp8
 
             data, scale = device_pair(expand_fp4_to_fp8(pair))
-            return data.view(torch.float8_e4m3fn), scale
+            data = data.view(torch.float8_e4m3fn)
+            if model["num_shared_experts"] == 1:
+                return data.squeeze(0), scale.squeeze(0)
+            return data, scale
 
-        shared = transform_weights_for_mega_moe(*map(shared_pair, shared_raw), shared=True)
+        shared = transform_weights_for_mega_moe(*map(shared_pair, shared_raw))
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
     cascade = None
     cascade_owned = False
@@ -379,13 +385,10 @@ def run(args, config, group):
         else:
             data, scale = quantize_input(x)
             buffer.x[:bs].copy_(torch.from_numpy(data).npu().view(torch.float8_e4m3fn))
-            buffer.x_sf[:bs].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+            buffer.x_sf[:bs].copy_(torch.from_numpy(scale).npu().view(torch.int16).reshape(bs, model["hidden"] // 64))
             activation = None
-        buffer.topk_idx[:bs].copy_(torch.from_numpy(ids))
+        buffer.topk_idx[:bs].copy_(torch.from_numpy(ids).to(torch.int64))
         buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
-        if not urma:
-            buffer.validate_inputs(bs, x=activation)
-        buffer.prepare(bs)
         result = torch.empty((bs, model["hidden"]), device="npu", dtype=torch.bfloat16)
 
         def call(timer=None, stats=None):
@@ -408,8 +411,8 @@ def run(args, config, group):
             call()
             torch.npu.synchronize()
         resources = dict(
-            workspace_bytes=buffer.workspace_bytes,
-            symmetric_buffer_bytes=buffer.symmetric_buffer_bytes,
+            workspace_bytes=buffer._plan.workspace_bytes if buffer._plan is not None else 0,
+            symmetric_buffer_bytes=buffer.num_bytes,
             prepared_bs=bs,
             max_tokens=buffer.num_max_tokens_per_rank,
         )
