@@ -2093,6 +2093,11 @@ struct ReceiverPhaseState {
     bool out_live[2] = {false, false};
     bool smooth_armed[2] = {false, false};
     bool smooth_pending[2] = {false, false};
+    // Cross-packet prefetch binding. A non-UINT32_MAX position means the next
+    // BF16 task's first smooth row is already loaded into prefetched_smooth_slot
+    // and is waiting for the next BF16 consume to take it over.
+    uint32_t prefetched_position = UINT32_MAX;
+    uint32_t prefetched_smooth_slot = 0U;
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
     __ubuf__ uint32_t* trace = nullptr;
     bool trace_enabled = false;
@@ -2304,7 +2309,9 @@ __aicore__ inline void ReceiverGateScalarToVector()
 template <class Layout>
 __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layout* ub, ReceiverPhaseState& st,
                                              uint32_t j, uint32_t lane, __ubuf__ uint8_t* wire,
-                                             uint32_t row, bool int8_wire)
+                                             uint32_t row, bool int8_wire,
+                                             uint32_t next_bf16_position = UINT32_MAX,
+                                             uint32_t next_bf16_expert = UINT32_MAX)
 {
     using layout_t = typename Layout::layout_t;
     constexpr uint32_t k_ = Layout::kNumTopk;
@@ -2362,6 +2369,21 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
     ReceiverGateScalarToVector();
     llquant::PrepareToken(quant->fp32, wire, h_);
 
+    // Cross-packet prefetch binding. The physical slot must match exactly; a
+    // mismatch is an internal scheduling error (do not silently read the wrong
+    // expert row). Only the binding is cleared here: the MTE2->V readiness is
+    // still consumed by the first ReceiverWaitSmooth below.
+    uint32_t smooth_start = 0U;
+    bool first_prefetched = false;
+    if constexpr (kSlots > 1U) {
+        if (st.prefetched_position != UINT32_MAX) {
+            if (st.prefetched_position != st.tasks.Position(j)) trap();
+            smooth_start = st.prefetched_smooth_slot % kSlots;
+            first_prefetched = true;
+            st.prefetched_position = UINT32_MAX;
+        }
+    }
+
     const uint32_t members = firstHop ? tail.ReadIndex()[0U] : 0U;
     const uint32_t tasks = 1U + members;
     const uint32_t source = tail.Header()[0U], ranks = uint32_t(ctx.view.num_ranks);
@@ -2370,47 +2392,64 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
         const uint32_t entry = own ? 0U : tail.Entry(i - 1U)[0U];
         const uint32_t expert = own ? globalExpert : (entry & 0xffffU);
         const uint32_t q = own ? 0U : (entry >> 16U);
-        const uint32_t slot = i % kSlots;
+        // Smooth and output slots rotate independently: a cross-packet hit may
+        // start smooth at slot 1 while outputs always start at slot 0.
+        const uint32_t out_slot = i % kSlots;
+        const uint32_t smooth_slot = (smooth_start + i) % kSlots;
 
-        if (i == 0U || kSlots == 1U) {
-            ReceiverAcquireSmoothSlot<Layout>(st, slot);
-            ReceiverLoadSmooth<Layout>(ctx, ub, st, expert, slot);
+        if (i == 0U) {
+            if (!first_prefetched) {
+                ReceiverAcquireSmoothSlot<Layout>(st, smooth_slot);
+                ReceiverLoadSmooth<Layout>(ctx, ub, st, expert, smooth_slot);
+            }
+        } else if (kSlots == 1U) {
+            ReceiverAcquireSmoothSlot<Layout>(st, smooth_slot);
+            ReceiverLoadSmooth<Layout>(ctx, ub, st, expert, smooth_slot);
         }
-        ReceiverWaitSmooth<Layout>(st, slot);
+        ReceiverWaitSmooth<Layout>(st, smooth_slot);
         if constexpr (kSlots > 1U) {
             if (i + 1U < tasks) {
-                const uint32_t next_slot = (i + 1U) % kSlots;
+                const uint32_t next_smooth = (smooth_slot + 1U) % kSlots;
                 const uint32_t next_entry = tail.Entry(i)[0U];
-                ReceiverAcquireSmoothSlot<Layout>(st, next_slot);
-                ReceiverLoadSmooth<Layout>(ctx, ub, st, next_entry & 0xffffU, next_slot);
+                ReceiverAcquireSmoothSlot<Layout>(st, next_smooth);
+                ReceiverLoadSmooth<Layout>(ctx, ub, st, next_entry & 0xffffU, next_smooth);
+            } else if (next_bf16_position != UINT32_MAX) {
+                // Last expert of this packet: load the next ready BF16 task's
+                // first row into the slot the current Vector pass does not use.
+                const uint32_t prefetch_slot = smooth_slot ^ 1U;
+                ReceiverAcquireSmoothSlot<Layout>(st, prefetch_slot);
+                ReceiverLoadSmooth<Layout>(ctx, ub, st, next_bf16_expert, prefetch_slot);
+                st.prefetched_position = next_bf16_position;
+                st.prefetched_smooth_slot = prefetch_slot;
             }
         }
 
-        ReceiverAcquireOutSlot<Layout>(st, slot);
-        const float scale = llquant::QuantizeExpert(quant->out[slot].payload, quant->fp32,
-                                                    quant->smooth[slot], quant->work, quant->half,
+        ReceiverAcquireOutSlot<Layout>(st, out_slot);
+        const float scale = llquant::QuantizeExpert(quant->out[out_slot].payload, quant->fp32,
+                                                    quant->smooth[smooth_slot], quant->work, quant->half,
                                                     quant->scalar, h_);
-        ReceiverReleaseSmoothSlot<Layout>(st, slot);
-        llquant::StoreScale(quant->out[slot].payload, uint32_t(data_.quantCount), scale);
+        ReceiverReleaseSmoothSlot<Layout>(st, smooth_slot);
+        llquant::StoreScale(quant->out[out_slot].payload, uint32_t(data_.quantCount), scale);
 
         if (own) {
             ReceiverGateVectorToMte3();
             ReceiverGateScalarToMte3();
             asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(expandX_ + uint64_t(row) * h_),
-                reinterpret_cast<__ubuf__ uint8_t*>(quant->out[slot].payload), 1U, h_,
+                reinterpret_cast<__ubuf__ uint8_t*>(quant->out[out_slot].payload), 1U, h_,
                 asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, h_ + 0U, math::align(h_, 32U) + 0U);
             asc_copy_ub2gm_align(
                 reinterpret_cast<__gm__ uint8_t*>(dynamicScales_ + uint64_t(row) * data_.scaleBytes),
-                reinterpret_cast<__ubuf__ uint8_t*>(quant->out[slot].payload + data_.quantCount), 1U,
+                reinterpret_cast<__ubuf__ uint8_t*>(quant->out[out_slot].payload + data_.quantCount), 1U,
                 uint32_t(data_.scaleBytes), asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
                 uint32_t(data_.scaleBytes) + 0U, math::align(uint32_t(data_.scaleBytes), 32U) + 0U);
-            ReceiverReleaseOutSlot<Layout>(st, slot);
+            ReceiverReleaseOutSlot<Layout>(st, out_slot);
             continue;
         }
 
         const uint32_t destinationRank = expert / localExperts_;
-        auto* header = reinterpret_cast<__ubuf__ uint32_t*>(quant->out[slot].payload + data_.headerPayloadOffset);
-        auto* readIndex = reinterpret_cast<__ubuf__ uint32_t*>(quant->out[slot].payload +
+        auto* header = reinterpret_cast<__ubuf__ uint32_t*>(quant->out[out_slot].payload +
+                                                            data_.headerPayloadOffset);
+        auto* readIndex = reinterpret_cast<__ubuf__ uint32_t*>(quant->out[out_slot].payload +
                                                                data_.readIndexPayloadOffset);
         header[0] = source;
         header[1] = tail.Header()[1U];
@@ -2418,15 +2457,16 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
         header[3] = uint32_t(EpServerDedupTokenType::Terminal);
         readIndex[0] = 0U;
         ReceiverGateScalarToVector();
-        ub::FillPacketFlags(quant->out[slot].wire, uint32_t(data_.int8BlockCount));
-        ub::PackPayload(quant->out[slot].wire, quant->out[slot].payload, uint32_t(data_.int8BlockCount));
-        ub::SetPacketMarker(quant->out[slot].wire, PacketReceiveLayout::kKeepFlags);
+        ub::FillPacketFlags(quant->out[out_slot].wire, uint32_t(data_.int8BlockCount));
+        ub::PackPayload(quant->out[out_slot].wire, quant->out[out_slot].payload,
+                        uint32_t(data_.int8BlockCount));
+        ub::SetPacketMarker(quant->out[out_slot].wire, PacketReceiveLayout::kKeepFlags);
         ReceiverGateVectorToMte3();
         comm::Packet(ctx.view, destinationRank,
             DispatchServerDedupDispatchOffset(data_, source, destinationRank, expert % localExperts_, q, ranks,
                 localExperts_, Layout::kNumMaxTokensPerRank) + ctx.window_offset + data_.int8TailOffset,
-            quant->out[slot].wire, uint32_t(data_.int8BlockCount) * 512U, 7U);
-        ReceiverReleaseOutSlot<Layout>(st, slot);
+            quant->out[out_slot].wire, uint32_t(data_.int8BlockCount) * 512U, 7U);
+        ReceiverReleaseOutSlot<Layout>(st, out_slot);
     }
 
     // Metadata is written by S; publish it before the MTE3 copies below.
@@ -2446,7 +2486,9 @@ __aicore__ inline void ReceiverConsumeSmooth(DispatchContext& ctx, __ubuf__ Layo
 
 template <class Layout>
 __aicore__ inline void ReceiverConsumeLoaded(DispatchContext& ctx, __ubuf__ Layout* ub, ReceiverPhaseState& st,
-                                             uint32_t j, uint32_t lane, bool keepFlags)
+                                             uint32_t j, uint32_t lane, bool keepFlags,
+                                             uint32_t next_bf16_position = UINT32_MAX,
+                                             uint32_t next_bf16_expert = UINT32_MAX)
 {
     using layout_t = typename Layout::layout_t;
     constexpr uint32_t k_ = Layout::kNumTopk;
@@ -2466,7 +2508,8 @@ __aicore__ inline void ReceiverConsumeLoaded(DispatchContext& ctx, __ubuf__ Layo
     auto* wire = laneBytes_ + lane * laneStride_;
     const uint32_t row = st.tasks.Begin() + j * st.tasks.Stride();
     if constexpr (Layout::kSmoothInt8Mode) {
-        ReceiverConsumeSmooth<Layout>(ctx, ub, st, j, lane, wire, row, keepFlags);
+        ReceiverConsumeSmooth<Layout>(ctx, ub, st, j, lane, wire, row, keepFlags, next_bf16_position,
+                                      next_bf16_expert);
         asc_sync_notify(PIPE_MTE3, PIPE_MTE2, event_t(lane));
         return;
     }
@@ -2669,10 +2712,40 @@ __aicore__ inline void RecvStage(DispatchContext& ctx, __ubuf__ Layout* ub, Rece
                                   (probe.keepFlagsMask & (1U << nextLoad)) != 0U);
                 ++issued;
             }
+            // The consumption order descends through the ready bits. The next
+            // consumed task is the highest set ready bit below this index; only
+            // a BF16 neighbour can take a cross-packet smooth prefetch, and an
+            // adjacent INT8 task stops the lookahead instead of searching past it.
+            uint32_t next_bf16_position = UINT32_MAX, next_bf16_expert = UINT32_MAX;
+            if constexpr (Layout::kSmoothInt8Mode) {
+                if constexpr (Layout::kQuantSlotsMode > 1U) {
+                    if constexpr (Layout::kDedupMode) {
+                        if (!(probe.keepFlagsMask & (1U << index))) {
+                            for (uint32_t j = index; j > 0U; --j) {
+                                const uint32_t cand = j - 1U;
+                                if (!(probe.readyMask & (1U << cand))) continue;
+                                if (probe.keepFlagsMask & (1U << cand)) break;
+                                constexpr uint32_t localExperts = Layout::kNumExperts / Layout::kNumRanks;
+                                const uint32_t position = st.tasks.Position(snapshot_[cand]);
+                                next_bf16_position = position;
+                                next_bf16_expert = uint32_t(ctx.view.rank) * localExperts +
+                                    (position / Layout::kNumMaxTokensPerRank) % localExperts;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             ReceiverConsumeLoaded(ctx, ub, st, snapshot_[index], consumed % st.lanes,
-                                  (probe.keepFlagsMask & (1U << index)) != 0U);
+                                  (probe.keepFlagsMask & (1U << index)) != 0U,
+                                  next_bf16_position, next_bf16_expert);
             st.tasks.RemovePending(scan + index);
             ++consumed;
+        }
+        if constexpr (Layout::kSmoothInt8Mode) {
+            if constexpr (Layout::kQuantSlotsMode > 1U) {
+                if (st.prefetched_position != UINT32_MAX) trap();
+            }
         }
 #ifdef DEEPEP_LL_REFERENCE_PROFILE
         if (referenceEnabled) consumeCycles += profile->Clock() - pollEnd;
