@@ -221,6 +221,22 @@ class UdmaPolicy:
             raise ValueError("payload row bytes must be a positive integer")
         base = self.for_num_aiv(num_aiv)
         cores = num_aiv or 32
+        inherit_sender_tier = (
+            v2 and not expanded and bf16 and 8 <= cores <= 64
+            and ((operation == "dispatch" and self.world_size in (4, 8, 16, 32))
+                 or (operation in ("combine", "weighted") and self.world_size in (8, 16)))
+        )
+        if inherit_sender_tier:
+            tier = 8 if cores < 32 else 32
+            if cores != tier:
+                # Select the complete sender plan at the measured core budget.
+                # Extra cores may assist local work, but cannot change ownership,
+                # peer order, visit, or the weight transport preference.
+                plan = self.for_launch(tier, row_bytes, operation, bf16=bf16, expanded=expanded, v2=v2)
+                if operation == "combine":
+                    plan = replace(plan, self_copy=1 if cores - plan.send_workers >= plan.send_workers else 2)
+                plan.validate_num_aiv(num_aiv)
+                return plan
         plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
         if self.world_size == 128 and cores >= 16:
             # One fixed EP128 schedule for every row size and operation. Match
@@ -245,8 +261,8 @@ class UdmaPolicy:
             # EP32 unweighted combine has no fitted override: every core budget
             # retains rank/P4/W1/Q1/visit32, with spare cores used independently.
             # Select a measured tier without truncating the actual launch budget.
-            # Intermediate budgets retain the baseline; 64+ retains the historic
-            # large-budget plans, except for EP32 dispatch's existing inheritance.
+            # Paths not covered by sender-tier inheritance above retain their
+            # existing intermediate and large-budget selection rules.
             profile_cores = 8 if 8 <= cores < 16 else 32 if 32 <= cores < 64 else None
             if self.world_size == 32 and operation == "dispatch" and cores >= 32:
                 profile_cores = 32
