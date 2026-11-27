@@ -39,12 +39,13 @@ inline EpMemoryServerDedupLayout get_dispatch_buffer_size(uint32_t num_ranks, ui
     layout.data = DispatchServerDedupDataLayout(num_max_tokens_per_rank, num_hidden_elems, num_topk, num_experts,
                                                 mode);
     const bool prequantized = mode == EpServerDedupInputMode::PrequantizedFp8Packs;
-    const bool wire_fp8 = mode != EpServerDedupInputMode::Plain16;
+    const bool smooth_int8 = mode == EpServerDedupInputMode::SmoothInt8;
+    const bool wire_int8 = prequantized || smooth_int8;
     layout.xBytes = uint64_t(num_max_tokens_per_rank) * num_hidden_elems * (prequantized ? 1U : 2U);
     layout.inputScalesBytes = prequantized ? uint64_t(num_max_tokens_per_rank) * layout.data.scaleBytes : 0U;
     layout.expertIdsBytes = uint64_t(num_max_tokens_per_rank) * num_topk * sizeof(int32_t);
     layout.weightBytes = uint64_t(num_max_tokens_per_rank) * num_topk * sizeof(float);
-    layout.expandXBytes = layout.capacityRows * (wire_fp8 ? num_hidden_elems : num_hidden_elems * 2U);
+    layout.expandXBytes = layout.capacityRows * (wire_int8 ? num_hidden_elems : num_hidden_elems * 2U);
     layout.dynamicScalesBytes = layout.capacityRows * layout.data.scaleBytes;
     layout.expertTokenNumsBytes = layout.localExpertNum * sizeof(int64_t);
     layout.sendCountsBytes = uint64_t(num_experts) * sizeof(int32_t);
@@ -53,6 +54,10 @@ inline EpMemoryServerDedupLayout get_dispatch_buffer_size(uint32_t num_ranks, ui
     layout.sourceMaskBytes = uint64_t(num_max_tokens_per_rank) * sizeof(uint32_t);
     layout.relayReadIndexRowStrideBytes = uint64_t(num_topk) * 8U;
     layout.relayReadIndexBytes = layout.capacityRows * layout.relayReadIndexRowStrideBytes;
+    // Smooth INT8 needs two wires in one slot; the shorter (INT8) wire must end
+    // inside the BF16 slot tail so a single suffix probe covers both.
+    EP_HOST_ASSERT(!smooth_int8 || layout.data.wire16BlockCount >= layout.data.int8BlockCount);
+    EP_HOST_ASSERT(!smooth_int8 || layout.data.probeBlocks > 0U);
     EP_HOST_ASSERT(layout.data.requiredBytes <= kEpServerDedupWindowUsableBytes);
     EP_HOST_ASSERT(layout.data.blockCount > 0U && layout.data.blockCount <= UINT8_MAX);
     return layout;
@@ -100,7 +105,7 @@ static void launch_dispatch(
     const int& num_hidden_bytes, const int& num_topk,
     const int& num_experts, const int& num_vec_cores, const int& num_ub_bytes,
     const int& num_ranks_per_group, const bool& prequantized,
-    const bool& dedup, const bool& rdma,
+    const bool& smooth_int8, const bool& dedup, const bool& rdma,
     void* stream) {
     EP_HOST_ASSERT(num_vec_cores > 0 && num_max_tokens_per_rank > 0);
     EP_HOST_ASSERT(num_hidden_bytes > 0 && num_experts > 0 && num_topk > 0);
@@ -108,10 +113,10 @@ static void launch_dispatch(
     EP_HOST_ASSERT(x != nullptr && peer_ptrs != nullptr);
 
     // Compile. The template list mirrors the device dispatch_impl axes.
-    const std::string shape = std::format("{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
+    const std::string shape = std::format("{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
         num_ranks, num_max_tokens_per_rank, num_hidden_bytes, num_topk,
         num_experts, num_vec_cores, num_ub_bytes, num_ranks_per_group,
-        prequantized, dedup, rdma);
+        prequantized, smooth_int8, dedup, rdma);
     const std::string call_args =
         "x, expert_ids, expert_scales, expand_x_out, dynamic_scales_out, expert_token_nums_out, "
         "send_counts_out, token_type_out, destination_index_out, relay_read_index_out, source_mask_out, "

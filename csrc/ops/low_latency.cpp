@@ -86,11 +86,10 @@ uint8_t* reference_profile(py::dict tensors, uint32_t cores)
         throw std::invalid_argument("LL reference profile requires 512-byte alignment");
     return pointer;
 }
-deep_ep::EpMemoryServerDedupLayout layout(int p, int b, int h, int k, int e, bool fp8)
+deep_ep::EpMemoryServerDedupLayout layout(int p, int b, int h, int k, int e,
+                                          deep_ep::EpServerDedupInputMode mode)
 {
     const uint32_t coreNum = query_ll_core_config().active;
-    const auto mode = fp8 ? deep_ep::EpServerDedupInputMode::PrequantizedFp8Packs
-                         : deep_ep::EpServerDedupInputMode::Plain16;
     if (b <= 0 || b > 65536) {
         throw std::invalid_argument("LL dispatch exceeds topology, shape, UB or workspace limits");
     }
@@ -276,19 +275,29 @@ void bind_low_latency(py::module_& module)
                "Wait until deadlines[index] (device cycles) on every active AIV core; "
                "records, when requested, are int64[num_iters][cores][16] with the four "
                "leading words per slot holding enter, release, batch and core.");
-    module.def("low_latency_layout", [](int p, int b, int h, int k, int e, const std::string& dtype) {
+    module.def("low_latency_layout", [](int p, int b, int h, int k, int e, const std::string& dtype,
+                                        bool smooth) {
         // A rejected shape is a Host-only capability result, not a launch failure.
         check_dispatch_dtype(dtype);
+        if (smooth && dtype != "bfloat16") return py::object(py::none());
+        const auto mode = smooth ? deep_ep::EpServerDedupInputMode::SmoothInt8
+                                 : (dtype == "float8_e4m3fn"
+                                        ? deep_ep::EpServerDedupInputMode::PrequantizedFp8Packs
+                                        : deep_ep::EpServerDedupInputMode::Plain16);
         try {
-            auto plan = layout(p, b, h, k, e, dtype == "float8_e4m3fn");
+            auto plan = layout(p, b, h, k, e, mode);
             py::dict result;
             result["capacity_rows"] = plan.capacityRows;
-            result["scale_packs"] = (h + 127) / 128;
+            // Smooth INT8 emits one FP32 scale per expanded row; the legacy
+            // per-128 packing only applies to prequantized FP8.
+            result["scale_packs"] = smooth ? 1 : (h + 127) / 128;
+            result["smooth_int8"] = smooth;
             return py::object(result);
         } catch (const std::invalid_argument&) {
             return py::object(py::none());
         }
-    });
+    }, py::arg("world"), py::arg("tokens"), py::arg("hidden"), py::arg("topk"), py::arg("experts"),
+       py::arg("dtype"), py::arg("smooth") = false);
     module.def("low_latency_comm_args", [](Session& session) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         if (session.capacity() != deep_ep::kEpServerDedupPeerBytes ||
@@ -343,15 +352,23 @@ void bind_low_latency(py::module_& module)
                py::arg("world"), py::arg("tokens"), py::arg("hidden"), py::arg("topk"), py::arg("experts"),
                py::arg("dtype"), py::arg("capacity"), py::arg("rdma") = false);
     module.def("dispatch_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int rows,
-                                          int capacity, const std::string& dtype, uintptr_t stream_address) {
+                                          int capacity, const std::string& dtype, py::object smooth,
+                                          uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
         check_dispatch_dtype(dtype);
-        // DeepEP-Ascend carries no dtype enum: FP8 is exactly "scales present",
-        // everything else is plain BF16 on the same kernel.
+        // DeepEP-Ascend carries no dtype enum: FP8 is exactly "scales present".
+        // Smooth quantization is a separate optional tensor, never inferred from
+        // scales, and only consumes BF16 input.
         const bool fp8 = dtype == "float8_e4m3fn";
+        const bool smooth_int8 = !smooth.is_none();
+        if (smooth_int8 && dtype != "bfloat16") {
+            throw std::invalid_argument("Smooth INT8 dispatch requires BF16 input");
+        }
+        if (smooth_int8 && fp8) throw std::invalid_argument("Smooth INT8 cannot reuse prequantized FP8 input");
         const uint32_t cores = pin_session_cores(session);
-        const auto mode = fp8 ? deep_ep::EpServerDedupInputMode::PrequantizedFp8Packs
-                              : deep_ep::EpServerDedupInputMode::Plain16;
+        const auto mode = smooth_int8 ? deep_ep::EpServerDedupInputMode::SmoothInt8
+                                      : (fp8 ? deep_ep::EpServerDedupInputMode::PrequantizedFp8Packs
+                                             : deep_ep::EpServerDedupInputMode::Plain16);
         const auto plan = deep_ep::get_dispatch_buffer_size(
             uint32_t(session.world()), uint32_t(capacity), uint32_t(h), uint32_t(k), uint32_t(e), mode, cores);
         const uint32_t group = deep_ep::LlGroupForWorld(uint32_t(session.world()));
@@ -368,7 +385,7 @@ void bind_low_latency(py::module_& module)
         void* x = get("input", {b, h}, dtype.c_str());
         void* expert_ids = get("indices", {b, k}, "int32");
         void* expert_scales = get("weights", {b, k}, "float32");
-        void* expand_x_out = get("output", {rows, h}, dtype.c_str());
+        void* expand_x_out = get("output", {rows, h}, smooth_int8 ? "int8" : dtype.c_str());
         // Both formats occupy four bytes per 128 hidden elements. The kernel
         // transports opaque bytes: FP32 per-128 or packed E8M0 per-32.
         const char* scale_dtype = "int32";
@@ -378,7 +395,9 @@ void bind_low_latency(py::module_& module)
                 scale_dtype = "float32";
             }
         }
-        void* dynamic_scales_out = fp8 ? get("output_scales", {rows, (h + 127) / 128}, scale_dtype) : nullptr;
+        void* dynamic_scales_out = smooth_int8
+            ? get("output_scales", {rows, 1}, "float32")
+            : (fp8 ? get("output_scales", {rows, (h + 127) / 128}, scale_dtype) : nullptr);
         void* expert_token_nums_out = get("expert_recv_counts", {e / session.world()}, "int64");
         void* send_counts_out = get("send_counts", {e}, "int32");
         void* token_type_out = get("token_type", {c}, "int32");
@@ -388,7 +407,11 @@ void bind_low_latency(py::module_& module)
         // kernel only fills the first B rows.
         void* source_mask_out = get("source_mask", {capacity}, "int32");
         void* source_weights_out = get("source_weights", {capacity, k}, "float32");
-        void* input_scales = fp8 ? get("scales", {b, (h + 127) / 128}, scale_dtype) : nullptr;
+        // The smooth table rides in the input-scales slot: BF16 input has no
+        // per-token scales of its own, and the device reads it as [E, H] FP32.
+        void* smooth_ptr = smooth_int8 ? tensor(smooth, {e, h}, "float32") : nullptr;
+        void* input_scales = smooth_int8 ? smooth_ptr
+                                          : (fp8 ? get("scales", {b, (h + 127) / 128}, scale_dtype) : nullptr);
         void* profile_out = reference_profile(tensors, cores);
         void* rdma_remote_base = session.ll_rdma() ? session.workspace() : nullptr;
         void* rdma_stage_base = session.ll_rdma() ? session.ll_rdma_stage() : nullptr;
@@ -406,7 +429,7 @@ void bind_low_latency(py::module_& module)
             int64_t(session.capacity()), shmemx_get_ffts_config(),
             session.world(), capacity, fp8 ? h : h * 2, k, e, int(cores),
             int(deep_ep::jit_num_ubuf_bytes_per_vec_core()),
-            int(group), fp8, dedup, session.ll_rdma(),
+            int(group), fp8, smooth_int8, dedup, session.ll_rdma(),
             reinterpret_cast<void*>(stream_address));
     });
     module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int capacity,
