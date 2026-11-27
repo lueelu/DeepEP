@@ -42,6 +42,8 @@ def test_sender_templates_compile_with_and_without_diagnostics(tmp_path):
 using GM_ADDR = uint8_t*;
 constexpr int EVENT_ID5=5, EVENT_ID6=6, EVENT_ID7=7, PIPE_MTE3=3;
 struct { unsigned x; } threadIdx;
+uint32_t asc_ballot(bool);
+uint32_t asc_shfl_up(uint32_t,uint32_t,uint32_t);
 struct dim3 { explicit dim3(unsigned) {} };
 namespace __asc_simt_vf { void __trap(); }
 void trap();

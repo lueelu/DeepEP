@@ -57,7 +57,7 @@ def test_coalesced_combine_payload_mapping(tmp_path, limit, corrupt):
     """Expand actual production WQEs back into rows and compare every address.
 
     Compile-time checks include tails, span boundaries, multiple headers/QPs,
-    continuous/fragmented/duplicate destinations and the conservative byte cap.
+    dense peer ordinals, capacity tails and the conservative byte cap.
     """
     compiler = shutil.which("g++") or shutil.which("clang++")
     if not compiler:
@@ -66,7 +66,6 @@ def test_coalesced_combine_payload_mapping(tmp_path, limit, corrupt):
     body = cpp_functions(text, "BuildCombineWqesCoalesced")
     end = body.rfind(")", 0, body.index("{"))
     body = (body[:end] + ", Warp& warp" + body[end:]).replace("threadIdx.x", "warp.lane")
-    body = body.replace("reinterpret_cast<__ubuf__ int32_t*>(span[0])[pos]", "index_at(span[0], pos)")
     body = body.replace("asc_ballot(", "warp.ballot(").replace("asc_shfl_up(", "warp.up(")
     program = r"""
 #include <cstdint>
@@ -75,9 +74,7 @@ def test_coalesced_combine_payload_mapping(tmp_path, limit, corrupt):
 #define __ubuf__
 namespace __asc_simt_vf { void __trap(); }
 constexpr int32_t index_at(uint64_t seed, unsigned pos) {
-    unsigned pattern=seed%5, base=unsigned(seed/5);
-    return int32_t(base+(pattern==0 ? pos : pattern==1 ? pos*2 : pattern==2 ? pos/2 :
-                        pattern==3 ? pos+(pos/3)*2 : pos+(pos/7)*3));
+    return int32_t(seed + pos);
 }
 // Emulate exactly the three ballots and two shuffles. The scalar golden
 // computes masks independently, then every production lane must supply the
@@ -109,7 +106,7 @@ constexpr bool check(unsigned count,unsigned width,unsigned bytes,unsigned patte
     unsigned n=0, output=999;
     for(unsigned start=0;start<count;start+=width,++n) {
         unsigned len=count-start<width ? count-start : width;
-        spans[n*4]=(adjacent ? 8192-count+start : n*128)*5+pattern;
+        spans[n*4]=adjacent ? 8192-count+start : n*128+pattern;
         spans[n*4+1]=(uint64_t(len)<<32)|(17+start);
         spans[n*4+2]=n;
         spans[n*4+3]=start;
@@ -201,6 +198,98 @@ static_assert(matrix(65568));
         assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_dense_payload_reduce_mapping(tmp_path, corrupt):
+    """Compile-time sparse-route scatter golden, independent of reduce ownership."""
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("C++17 compiler required")
+    kernel = (ROOT / "csrc/direct/kernels/combine/combine_udma.cpp").read_text()
+    mapping = cpp_functions(kernel, "CompactWeightSlot").replace("__aicore__ inline", "constexpr")
+    if corrupt:
+        mapping = mapping.replace("channel - 1U", "channel")
+    program = r"""
+#include <cstdint>
+#include <initializer_list>
+#define ASCEND_DEEPEP_ARCH 3510
+#include "common/types.h"
+#include "common/platform.h"
+namespace AscendC {
+template<class T> struct LocalTensor {
+    const T* data;
+    constexpr T GetValue(unsigned i) const { return data[i]; }
+};
+}
+// MAPPING
+constexpr bool check(unsigned world, unsigned channels, unsigned cores, unsigned generation) {
+    constexpr unsigned tokens=67, capacity=73;
+    int32_t prefix[128*64]{}, heads[tokens*128]{}, expected[tokens*128]{};
+    ascend_deepep::CombineTilingData td{};
+    td.world_size=world; td.num_channels=channels; td.num_tokens=tokens; td.token_capacity=capacity;
+    const unsigned channel_tokens=(tokens+channels-1)/channels;
+    for(unsigned p=0;p<world;++p) {
+        unsigned dense_row=0;
+        for(unsigned c=0;c<channels;++c) {
+            unsigned ordinal=0;
+            for(unsigned t=c*channel_tokens;t<tokens && t<(c+1)*channel_tokens;++t) {
+                // Empty peers, repeated channel prefixes, sparse tokens and tails.
+                bool route=p%7!=0 && (t*3+p+generation)%5<2;
+                heads[t*world+p]=route ? int32_t(ordinal++) : -1;
+                expected[t*world+p]=route ? int32_t(dense_row++) : -1;
+            }
+            prefix[p*channels+c]=int32_t(dense_row);
+        }
+    }
+    AscendC::LocalTensor<int32_t> ub{prefix};
+    unsigned per_core=(tokens+cores-1)/cores;
+    for(unsigned core=0;core<cores;++core)
+        for(unsigned t=core*per_core;t<tokens && t<(core+1)*per_core;++t)
+            for(unsigned p=0;p<world;++p) {
+                int32_t ordinal=heads[t*world+p];
+                if(ordinal<0)continue;
+                uint64_t slot=CompactWeightSlot(td,ub,p,t,unsigned(ordinal));
+                if(slot!=uint64_t(p)*capacity+unsigned(expected[t*world+p]))return false;
+                if(slot<uint64_t(p)*capacity || slot>=uint64_t(p+1)*capacity)return false;
+            }
+    // Same production UB ledger: aligned metadata + five buffers at 14 B/element.
+    unsigned bytes=(world*channels*4+31)/32*32;
+    unsigned chunk=(ascend_deepep::platform::kKernelUbBytes-bytes)/(14*64)*64;
+    return chunk>=64 && bytes+14*chunk<=ascend_deepep::platform::kKernelUbBytes;
+}
+constexpr bool matrix() {
+    for(unsigned w : {4U,8U,16U,32U,64U,128U})
+        for(unsigned ch : {8U,16U,32U,64U})
+            for(unsigned cores : {8U,16U,32U,48U,64U})
+                for(unsigned gen : {0U,1U})
+                    if(!check(w,ch,cores,gen))return false;
+    return true;
+}
+static_assert(matrix());
+"""
+    path = tmp_path / "dense_mapping.cpp"
+    path.write_text(program.replace("// MAPPING", mapping))
+    budget = "-fconstexpr-steps=100000000" if "clang" in Path(compiler).name else "-fconstexpr-ops-limit=100000000"
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            budget,
+            "-I",
+            str(ROOT / "csrc/direct"),
+            "-c",
+            str(path),
+            "-o",
+            str(tmp_path / "dense.o"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert (result.returncode != 0) == corrupt, result.stderr
+    if corrupt:
+        assert "static assertion" in result.stderr, result.stderr
+
+
 def test_coalescing_gates_and_count_lifetime():
     host = (ROOT / "csrc/direct/ops/combine.cpp").read_text()
     start = host.index("    tiling.combine_payload_max_rows =")
@@ -213,6 +302,7 @@ def test_coalescing_gates_and_count_lifetime():
         "!pipeline_chunk_tokens",
         "!expanded_x.has_value()",
         "workspace.x_row_stride == hidden_bytes",
+        "send_channel_prefix_matrix.has_value()",
     ):
         assert condition in gate
     sender = (ROOT / "csrc/direct/kernels/combine/udma_combine_sender.h").read_text()
@@ -221,6 +311,13 @@ def test_coalescing_gates_and_count_lifetime():
     assert "Base::SubmitBatch(submitted, spans_, false)" in sender
     schedule = (ROOT / "csrc/direct/kernels/combine/udma_combine_schedule.h").read_text()
     assert "sender_base_bytes + (td.combine_payload_max_rows > 1U ? 32U : 0U)" in schedule
+    dense = schedule[
+        schedule.index("if (td.combine_payload_max_rows > 1U) {") : schedule.index(
+            "if constexpr (Phase == 3)", schedule.index("while (visit")
+        )
+    ]
+    assert "sender.PutRows(" in dense and "continue;" in dense
+    assert "DataCopy" not in dense and "src_gm" not in dense
 
 
 @pytest.mark.parametrize("corrupt_sink", [False, True])

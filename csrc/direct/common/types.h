@@ -180,7 +180,7 @@ struct alignas(8) CombineTilingData {
     uint32_t instance_id = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
     uint32_t combine_wqe_fast = 0;
-    uint32_t combine_payload_max_rows = 1; // Max contiguous payload rows per WQE; 1 preserves legacy builds.
+    uint32_t combine_payload_max_rows = 1; // >1: dense remote payload, max rows/WQE; 1: token-addressed legacy.
     uint32_t combine_self_double_buffer = 0;
     // Ordinary peer-schedule weights use dense rows within each contributor's
     // capacity-sized partition. Payload addressing remains unchanged.

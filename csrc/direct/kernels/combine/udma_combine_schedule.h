@@ -38,6 +38,7 @@ __aicore__ inline void CombineRemoteImpl(
     // here is per peer, so channel boundaries need not split the return stream.
     const uint32_t fields = td.has_topk_weights && !simt_weights && !compact_weights ? 2U : 1U;
     uint32_t row[Capacity]{}, end[Capacity]{}, loaded[Capacity]{}, cursor[Capacity]{}, field[Capacity]{};
+    uint32_t peer_begin[Capacity]{};
     uint32_t ready_chunk[Capacity];
     if constexpr (Phase == 3) {
         for (uint32_t p = 0; p < Capacity; ++p) ready_chunk[p] = UINT32_MAX;
@@ -49,6 +50,11 @@ __aicore__ inline void CombineRemoteImpl(
         end[p] = rank_gm.GetValue(peer * td.world_size + td.rank);
         // Split the original peer row interval, retaining src_idx and output addresses.
         const uint32_t begin = row[p], length = end[p] - begin;
+        peer_begin[p] = begin;
+        if (td.combine_payload_max_rows > 1U &&
+            (end[p] < begin || length > td.token_capacity || end[p] > td.num_recv_tokens)) {
+            trap(); return;
+        }
         const uint32_t lane = core % td.udma_workers_per_peer;
         row[p] = begin + uint64_t(length) * lane / td.udma_workers_per_peer;
         end[p] = begin + uint64_t(length) * (lane + 1U) / td.udma_workers_per_peer;
@@ -59,6 +65,20 @@ __aicore__ inline void CombineRemoteImpl(
             uint32_t visit = td.udma_wqes_per_visit;
             if (row[p] < end[p]) sender.BeginVisit(p);
             while (visit && row[p] < end[p]) {
+                if constexpr (Phase == 0) {
+                    if (td.combine_payload_max_rows > 1U) {
+                        // The whole peer input is already continuous. Preserve
+                        // logical-row visits and worker slices, bypass index DMA.
+                        const uint32_t available = end[p] - row[p];
+                        trace.Count(Trace::PutRowsCalls);
+                        const uint32_t count = sender.PutRows(
+                            p, nullptr, row[p], 0U, available < visit ? available : visit, peer_begin[p]);
+                        row[p] += count;
+                        remaining -= count;
+                        visit -= count;
+                        continue;
+                    }
+                }
                 if constexpr (Phase == 3) {
                     const uint32_t chunk = row[p] / td.pipeline_chunk_tokens;
                     if (ready_chunk[p] != chunk) {

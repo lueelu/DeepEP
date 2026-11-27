@@ -415,7 +415,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         std::getenv("DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"), static_cast<uint64_t>(hidden_bytes));
     tiling.combine_payload_max_rows =
         use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
-        !pipeline_chunk_tokens && !expanded_x.has_value() && workspace.x_row_stride == hidden_bytes
+        !pipeline_chunk_tokens && !expanded_x.has_value() && workspace.x_row_stride == hidden_bytes &&
+        send_channel_prefix_matrix.has_value()
             ? payload_max_rows : 1U;
     const char* self_db = std::getenv("DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER");
     TORCH_CHECK(!self_db || std::strcmp(self_db, "0") == 0 || std::strcmp(self_db, "1") == 0,
@@ -430,9 +431,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     tiling.combine_compact_weights = compact_weights_enabled && send_channel_prefix_matrix.has_value() &&
         topk_weights.has_value() && use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
         !pipeline_chunk_tokens && !expanded_x.has_value();
-    if (tiling.combine_compact_weights) {
+    // Reuse the row-limit field as the dense-payload contract. Mixed legacy
+    // weight descriptors and older native callers retain token-addressed rows.
+    if (topk_weights.has_value() && !tiling.combine_compact_weights)
+        tiling.combine_payload_max_rows = 1U;
+    if (tiling.combine_compact_weights || tiling.combine_payload_max_rows > 1U) {
         TORCH_CHECK(send_channel_prefix_matrix.has_value(),
-                    "compact combine weights require the original dispatch send channel prefixes");
+                    "compact combine requires the original dispatch send channel prefixes");
         CheckNpuContiguous(*send_channel_prefix_matrix, "send_channel_prefix_matrix");
         TORCH_CHECK(send_channel_prefix_matrix->scalar_type() == torch::kInt32 &&
                         send_channel_prefix_matrix->sizes() == channel_prefix_matrix.sizes() &&
@@ -445,10 +450,13 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         const int64_t head_bytes = CheckedMulInt64(world_size, 16 * 4, "combine weight head tile");
         TORCH_CHECK(1024 + AlignUpInt64(prefix_bytes, 32) + head_bytes <= platform::kKernelUbBytes,
                     "compact combine weight metadata exceeds UB capacity");
+        TORCH_CHECK(AlignUpInt64(prefix_bytes, 32) + 14 * 64 <= platform::kKernelUbBytes,
+                    "compact combine payload metadata exceeds UB capacity");
         tiling.combine_send_channel_prefix = reinterpret_cast<uint64_t>(send_channel_prefix_matrix->data_ptr());
         // Retain the padded workspace reservation; the dense view fits inside
         // it, so changing this mode never reallocates the symmetric Buffer.
-        tiling.topk_weights_row_stride = static_cast<uint32_t>(topk_weights_row_bytes);
+        if (tiling.combine_compact_weights)
+            tiling.topk_weights_row_stride = static_cast<uint32_t>(topk_weights_row_bytes);
     }
     tiling.x_buffer_offset = static_cast<uint64_t>(workspace.x_buffer_offset);
     tiling.topk_weights_buffer_offset = static_cast<uint64_t>(workspace.topk_weights_buffer_offset);

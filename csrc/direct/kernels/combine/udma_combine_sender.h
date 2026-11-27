@@ -112,10 +112,10 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesFast(
     wqe[7] = (weight ? weights : x) + row * (weight ? weight_bytes : x_bytes);
 }
 
-// One lane owns one logical row. Warp exchanges identify contiguous runs and
-// compact their heads into disjoint WQE slots; no lane scans another row's UB
-// indices. All 32 lanes (including tails) participate in every warp operation.
-// Span boundaries retain visit/peer/QP/window and worker ownership.
+// One lane owns one logical dense row. Warp exchanges compact chunk heads into
+// disjoint WQE slots. No lane reads the original token indices. All 32 lanes
+// (including tails) participate in every warp operation. Span boundaries retain
+// visit/peer/QP/batch and worker ownership.
 __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesCoalesced(
     __ubuf__ uint64_t* wqes, __ubuf__ uint64_t* spans, __ubuf__ uint64_t* headers,
     __ubuf__ uint64_t* remote_bases, __ubuf__ uint32_t* actual_count,
@@ -148,8 +148,10 @@ __simt_vf__ __launch_bounds__(32) inline void BuildCombineWqesCoalesced(
         invalid = span[2] >> 32U || begin > lane || length > count - begin || lane - begin >= length;
         if (!invalid) {
             const uint32_t pos = lane - begin;
-            const int32_t selected = reinterpret_cast<__ubuf__ int32_t*>(span[0])[pos];
-            invalid = selected < 0 || static_cast<uint32_t>(selected) >= token_capacity;
+            // Dense destination ordinal; no src_idx loads or token-contiguity
+            // search. A span never crosses a peer's worker-owned input slice.
+            const uint64_t selected = span[0] + pos;
+            invalid = selected >= token_capacity;
             token = static_cast<uint32_t>(selected);
             row = uint64_t(static_cast<uint32_t>(span[1])) + pos;
             peer = static_cast<uint32_t>(span[2]);
@@ -240,7 +242,8 @@ public:
 
     // Returns the WQEs admitted, which can end in the middle of an x/weight pair.
     // The caller retains the remainder of this peer's visit budget across tiles.
-    __aicore__ uint32_t PutRows(uint32_t p, __ubuf__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count)
+    __aicore__ uint32_t PutRows(uint32_t p, __ubuf__ int32_t* indices, uint32_t row, uint32_t field, uint32_t count,
+                              uint32_t peer_begin = 0)
     {
         p = Base::QueuePeer(p);
         if (rows_pending_ && active_state_ != peers_[p].state) {
@@ -254,7 +257,8 @@ public:
         const uint64_t prepared = Base::TraceNow();
         const uint32_t n = count < kBatchWqes - rows_pending_ ? count : kBatchWqes - rows_pending_;
         auto* span = reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kRequestsOffset) + spans_ * 4U;
-        span[0] = reinterpret_cast<uint64_t>(indices);
+        span[0] = td_.combine_payload_max_rows > 1U ? uint64_t(row - peer_begin)
+                                                  : reinterpret_cast<uint64_t>(indices);
         span[1] = uint64_t(row) | (uint64_t(n) << 32U);
         span[2] = uint64_t(p) | (uint64_t(field) << 32U);
         span[3] = rows_pending_;

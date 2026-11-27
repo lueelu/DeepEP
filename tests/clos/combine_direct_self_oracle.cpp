@@ -275,8 +275,13 @@ void Check(unsigned world, unsigned rank, unsigned tokens, unsigned hidden, unsi
     std::vector<float> input_weights((total + 1) * topk), output_weights(tokens * topk + 16);
     core_count = reduce_cores;
     for (unsigned generation : {0U, 1U})
+      for (unsigned dense_payload : {0U, 1U})
         for (unsigned compact : {0U, 1U})
             for (unsigned local_compact : {0U, 1U}) {
+                // Production enables dense payload only with aligned rows and
+                // compact (or absent) weights. Sparse routes still pack densely.
+                if (dense_payload && (hidden * 2 != td.x_row_stride || (topk && !compact))) continue;
+                td.combine_payload_max_rows = dense_payload ? 2U : 1U;
                 td.combine_compact_weights = compact && topk;
                 td.compact_self_rows = local_compact;
                 td.has_bias_0 = generation;
@@ -302,9 +307,10 @@ void Check(unsigned world, unsigned rank, unsigned tokens, unsigned hidden, unsi
                 for (unsigned peer = 0; peer < world; ++peer)
                     for (unsigned r = 0; r < routes[peer].size(); ++r) {
                         unsigned t = routes[peer][r];
-                        uint64_t payload_slot =
+                        uint64_t legacy_slot =
                             uint64_t(peer) * td.token_capacity + (peer == rank && local_compact ? r : t);
-                        uint64_t weight_slot = compact ? uint64_t(peer) * td.token_capacity + r : payload_slot;
+                        uint64_t payload_slot = dense_payload ? uint64_t(peer) * td.token_capacity + r : legacy_slot;
+                        uint64_t weight_slot = compact ? uint64_t(peer) * td.token_capacity + r : legacy_slot;
                         for (unsigned h = 0; h < hidden; ++h) {
                             T v = Encode<B>(Value(peer, t, h, generation));
                             expected[t * hidden + h] += Decode(v);
@@ -320,6 +326,7 @@ void Check(unsigned world, unsigned rank, unsigned tokens, unsigned hidden, unsi
                         }
                     }
                 for (unsigned direct : {0U, 1U}) {
+                    if (dense_payload && !direct) continue;
                     td.combine_direct_self = direct;
                     if (direct) {
                         // Any accidental SHMEM self read now produces NaN; input is authoritative.
@@ -376,6 +383,9 @@ int main()
                             Check<false>(world, rank, tokens, 32, channels, topk, reduce_cores, 0);
                         }
     Check<true>(16, 3, 65, 32, 8, 128, 48, 0);
+    Check<true>(16, 3, 17, 6144, 8, 8, 48, 0);
+    Check<true>(8, 3, 19, 2816, 32, 0, 8, 0);
+    Check<false>(4, 0, 3, 33008, 8, 6, 32, 0);  // Dense multi-chunk payload reduction.
     Check<false>(4, 0, 17, 17, 32, 1, 32, 0);
     for (unsigned route : {1U, 2U, 3U}) {
         Check<true>(8, 3, 19, 17, 8, 10, 48, route);

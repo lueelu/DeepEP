@@ -70,7 +70,8 @@ __aicore__ inline uint64_t CompactWeightSlot(const ascend_deepep::CombineTilingD
 {
     const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1U) / td.num_channels;
     const uint32_t channel = token / channel_tokens;
-    // Original send prefixes are inclusive ends, unlike recv-channel starts.
+    // Shared dense payload/weight mapping. Original send prefixes are
+    // inclusive ends, unlike recv-channel starts.
     const uint32_t begin = channel ? send_prefix.GetValue(contributor * td.num_channels + channel - 1U) : 0U;
     return uint64_t(contributor) * td.token_capacity + begin + ordinal;
 }
@@ -166,18 +167,37 @@ __aicore__ inline void V1CombineUdmaImpl(
         AscendC::GlobalTensor<int32_t> channel_starts;
         channel_starts.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix));
         // Communication is complete, so the reduction phase reuses UB from zero.
+        const bool compact_payload = tiling.combine_payload_max_rows > 1U;
+        // Reserve an aligned prefix table before the five payload buffers.
+        // 14 bytes/element = 2*2 input + 4 temporary + 4 accumulator + 2 output.
+        // Reduce cores are independent of the original dispatch channel count.
+        const uint32_t payload_prefix_elements = compact_payload ? tiling.world_size * tiling.num_channels : 0U;
+        const uint32_t payload_prefix_bytes = (payload_prefix_elements * sizeof(int32_t) + 31U) / 32U * 32U;
+        const uint32_t payload_chunk_elements = (kCombineUbBytes - payload_prefix_bytes) / (14U * 64U) * 64U;
+        const uint32_t payload_input_bytes = payload_chunk_elements * sizeof(T);
+        auto payload_prefix_ub = resource.template GetBufferByByte<int32_t>(0);
         AscendC::LocalTensor<uint8_t> input_pingpong_bytes_ub =
-            resource.template GetBufferByByte<uint8_t>(kCombineInputOffset);
-        AscendC::LocalTensor<float> temporary_ub = resource.template GetBufferByByte<float>(kCombineTemporaryOffset);
+            resource.template GetBufferByByte<uint8_t>(payload_prefix_bytes);
+        AscendC::LocalTensor<float> temporary_ub =
+            resource.template GetBufferByByte<float>(payload_prefix_bytes + 2U * payload_input_bytes);
         AscendC::LocalTensor<float> accumulator_ub =
-            resource.template GetBufferByByte<float>(kCombineAccumulatorOffset);
+            resource.template GetBufferByByte<float>(payload_prefix_bytes + 4U * payload_input_bytes);
         AscendC::LocalTensor<uint8_t> output_bytes_ub =
-            resource.template GetBufferByByte<uint8_t>(kCombineOutputOffset);
+            resource.template GetBufferByByte<uint8_t>(payload_prefix_bytes + 6U * payload_input_bytes);
         AscendC::LocalTensor<T> output_ub = output_bytes_ub.ReinterpretCast<T>();
 
         const int32_t tokens_per_channel = (num_tokens + core_num - 1) / core_num;
         const int32_t token_begin = CombineMin(core_idx * tokens_per_channel, num_tokens);
         const int32_t token_end = CombineMin(token_begin + tokens_per_channel, num_tokens);
+        if (compact_payload && token_begin < token_end) {
+            AscendC::GlobalTensor<int32_t> prefixes;
+            prefixes.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tiling.combine_send_channel_prefix));
+            AscendC::DataCopyExtParams copy{1, payload_prefix_elements * uint32_t(sizeof(int32_t)), 0, 0, 0};
+            AscendC::DataCopyPad(payload_prefix_ub, prefixes, copy,
+                                AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID6);
+        }
         uint64_t self_input_base = 0;
         if (tiling.combine_direct_self && token_begin < token_end && tiling.rank != 0) {
             AscendC::GlobalTensor<int32_t> ranks;
@@ -197,8 +217,8 @@ __aicore__ inline void V1CombineUdmaImpl(
                 ? send_head_gm.GetValue(token * world_size + rank) : -1;
             if (self_ordinal >= 0)
                 self_input_row = CombineLocalInputRow(tiling, channel_starts, self_input_base, token, self_ordinal);
-            for (int32_t hidden_begin = 0; hidden_begin < hidden; hidden_begin += kCombineChunkElements) {
-                const int32_t hidden_count = CombineMin(static_cast<int32_t>(kCombineChunkElements), hidden - hidden_begin);
+            for (int32_t hidden_begin = 0; hidden_begin < hidden; hidden_begin += payload_chunk_elements) {
+                const int32_t hidden_count = CombineMin(static_cast<int32_t>(payload_chunk_elements), hidden - hidden_begin);
                 const int32_t aligned_hidden_count = CombineAlignUpElements(hidden_count, 16);
                 const uint32_t hidden_chunk_bytes = static_cast<uint32_t>(hidden_count) * tiling.x_element_bytes;
 
@@ -229,7 +249,9 @@ __aicore__ inline void V1CombineUdmaImpl(
                             // Input tensors are tightly packed even when SHMEM rows are padded.
                             contributor_ptr = reinterpret_cast<__gm__ uint8_t*>(x) + self_input_row * hidden_bytes;
                         } else {
-                            const uint64_t local_slot = ContributorSlot(tiling, channel_starts, contributor, token, ordinal);
+                            const uint64_t local_slot = compact_payload
+                                ? CompactWeightSlot(tiling, payload_prefix_ub, contributor, token, ordinal)
+                                : ContributorSlot(tiling, channel_starts, contributor, token, ordinal);
                             contributor_ptr = reinterpret_cast<__gm__ uint8_t*>(symmetric_buffer) + tiling.x_buffer_offset +
                                               local_slot * tiling.x_row_stride;
                         }
@@ -240,7 +262,7 @@ __aicore__ inline void V1CombineUdmaImpl(
                     AscendC::DataCopyExtParams contributor_copy_params(1, hidden_chunk_bytes, 0, 0, 0);
                     const auto input_event_id = input_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
                     AscendC::LocalTensor<uint8_t> input_bytes_ub =
-                        input_pingpong_bytes_ub[input_buffer_idx * kCombineInputBufferBytes];
+                        input_pingpong_bytes_ub[input_buffer_idx * payload_input_bytes];
                     AscendC::LocalTensor<T> input_ub = input_bytes_ub.ReinterpretCast<T>();
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(input_event_id);
                     AscendC::DataCopyPad(
@@ -274,6 +296,11 @@ __aicore__ inline void V1CombineUdmaImpl(
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
 
         if (tiling.has_topk_weights != 0) {
+            // Scalar prefix readers are finished before weight DMA reuses UB.
+            if (compact_payload) {
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+                AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID6);
+            }
             // X reduction is drained, so top-k reduction also starts at UB offset 0.
             AscendC::LocalTensor<uint8_t> weight_input_bytes_ub =
                 resource.template GetBufferByByte<uint8_t>(kCombineTopkInputOffset);

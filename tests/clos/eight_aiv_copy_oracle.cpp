@@ -267,6 +267,9 @@ void CombineSelfCopy(R&, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
 }
 template <uint32_t Capacity, uint32_t Qps, class Trace>
 struct CombineSenderT {
+    uint32_t PutRows(uint32_t, int32_t*, uint32_t, uint32_t, uint32_t count, uint32_t) {
+        return count;
+    }
     CombineSenderT(const CombineTilingData&, uint32_t, uint8_t*, GM_ADDR, GM_ADDR, GM_ADDR,
                    uint32_t, uint32_t, uint32_t, uint32_t, bool) { combine_phase = 0; }
     uint32_t Count() const { return 1; }

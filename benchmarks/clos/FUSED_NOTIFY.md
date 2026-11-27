@@ -159,38 +159,49 @@ performance; both still require device validation.
 
 ## Interpreting results
 
-### Combine payload coalescing
+### Combine dense payload batches
 
 `DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS` is read on each combine call. When unset,
 the maximum is `2` for payload rows of at most 8192 bytes (inclusive), otherwise
 `1`. The byte count is hidden size times payload element size, excluding weights
 and metadata. For BF16 this includes H4096. Explicit integers from `1` through
 `32` override this default; set `1` to compare with the single-row builder.
-Values above one enable a separate SIMT builder for ordinary non-expanded
-peer-scheduled combine with dense payload strides. It reads AIV-loaded UB
-indices and merges only consecutive source **and** destination rows. Each lane
-loads its own index, then warp shuffles/ballots identify run heads and compact
-WQE positions. It does not repeat a full-batch index scan in every lane; inactive
-tail lanes still participate in all warp operations. Each WQE
+Values above one enable dense remote payload slots for ordinary non-expanded
+V2 peer-scheduled combine with aligned payload strides and original dispatch
+send-channel prefixes. Each contributor retains its capacity-sized SHMEM
+partition, but destinations use peer-local row ordinals rather than original
+token numbers. The source peer interval is already contiguous: no payload
+repacking or src_idx DMA is needed. SIMT builds batches from these continuous
+intervals even when the original token numbers are sparse. Each WQE
 is capped at 64 KiB, or one unchanged row if a row itself exceeds that size.
 It never merges across descriptor spans, visits, peers/QPs, worker partitions,
-index windows or the original 32-request submission batch. Unsupported paths
-retain individual-row WQEs, including interleaved legacy payload/weight WQEs.
+the original 32-logical-row submission batch. Unsupported paths
+retain individual-row WQEs, including interleaved legacy payload/weight WQEs,
+native callers without send prefixes, expanded input, early-single, pipeline
+and token schedules. Their effective row limit is reported as 1.
 The default compact-weight path is supported; weight transfers are unchanged.
 
 With coalescing enabled this builder takes precedence over `COMBINE_WQE_FAST`.
 P/W/Q, peer order and logical visit budgets are unchanged. SQ occupancy, head
 updates and diagnostic WQE counts use the reduced physical count. Final flags,
-quiet, local copies/direct self reads and reduce addressing are unchanged.
-The count has a separate 32-byte UB reservation; payload is never staged in UB.
-Rebuild Host and kernel together for the added tiling field.
+quiet and direct self reads are unchanged. Reduce loads the original send-prefix
+table contiguously into UB, then maps token/channel ordinals to dense payload
+slots without changing contributor accumulation order. Dispatch and reduce core
+counts remain independent. The payload reduction tile reserves space for this
+aligned table; weight reduction reuses UB after payload reduction drains.
+The count retains its separate 32-byte UB reservation; sending never stages
+payload in UB. SHMEM sizing, offsets and public handle format are unchanged.
+Rebuild Host and kernel together; the existing row-limit field now selects the
+dense layout for values above one. Rows=1 retains the old token-addressed path.
 
 Compare `1/2/4/8/16/32` using the same Buffer, routes and other settings; setting
 the environment before each call is sufficient outside graph capture. Validate
 zero-tolerance output first, then measure communication and full API separately.
 Use an independent diagnostic pass to compare physical WQE counts and build
-time. Discontinuous routes may save no WQEs and can become slower due to compaction;
-this experiment does not establish a performance gain or change the default.
+time, plus reduce time and complete API time. Prefix staging and changed reduce
+locality can offset sender savings; no performance gain is assumed. The default
+row-count threshold remains unchanged, so H6144 requires an explicit limit >1
+to exercise dense payloads.
 
 The existing `bench_fast_sweep.py` entry point also accepts a runtime-only
 combine sweep (do not combine this with `--small-rank-sweep`):
