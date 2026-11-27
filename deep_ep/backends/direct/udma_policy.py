@@ -306,7 +306,8 @@ class UdmaPolicy:
             if operation == "weighted":
                 # Keep the complete measured plan together: the weight-path
                 # comparison used RR/1/1/1/visit8 and after-submit self-copy.
-                # Retain that payload plan; weight preference is selected below.
+                # Retain its sender budget and visit; rank normalization below
+                # converts grouped ownership. Weight preference is selected below.
                 # Keep the EP64 plan with larger core budgets too: additional
                 # auxiliary AIVs must not silently switch weights back to UDMA.
                 # Interpolate between measured row widths; retain both endpoint
@@ -330,9 +331,11 @@ class UdmaPolicy:
                 # SIMT needs an AIV outside the payload sending plan.
                 use_simt_weights = _simt_weight_row_fits(self.world_size, row_bytes) and plan.send_workers < cores
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
-            if self.world_size in (4, 8, 16, 32) and (8 <= cores < 16 or 32 <= cores < 64):
+            if (self.world_size == 64 and cores >= 8) or (
+                self.world_size in (4, 8, 16, 32) and (8 <= cores < 16 or 32 <= cores < 64)
+            ):
                 # Normalize order after selecting P/W/Q, visit and copy/weight
-                # modes. EP64+ and the 64-core tier retain their schedules.
+                # modes. EP64 also normalizes its large-core weighted plan.
                 # RR -> rank can free a self-only owner slot; do not implicitly
                 # switch UDMA weights to SIMT when that exposes another helper.
                 # RR counts peers within a group. Convert that ownership width

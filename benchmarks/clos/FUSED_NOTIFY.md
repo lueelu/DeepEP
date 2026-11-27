@@ -7,6 +7,10 @@ ownership, sparse CQEs and completion guarantees, see
 
 ## Current defaults
 
+- EP64 automatic plans with 8--64 AIVs use rank order. The G16 weighted-combine profile at
+  32--64 AIVs and 8192--12288 payload bytes per row uses P4/W1/Q1/visit8
+  (16 payload senders), replacing group-round-robin P1 without changing visit,
+  weight preference or local-copy mode. Eight-core plans remain P8/W1/Q1/visit32.
 - EP128 with exactly 8 communication AIVs uses rank/P16/W1/Q1/visit32.
   Other EP128 core budgets retain their previous plans. P16 is supported only
   for rank order; existing P<=8 and token sender windows retain their sizes.

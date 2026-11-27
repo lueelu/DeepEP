@@ -678,7 +678,7 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
                 for row_bytes in (8192,8193,8194,9216,10240,12286,12287,12288):
                     plan = base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     expected_mode = 2 if row_bytes <= 8192 else mode
-                    expected_order, expected_p = (0,4) if ep == 32 else (3,1)
+                    expected_order, expected_p = (0,4)
                     assert plan.native_plan() == [1,expected_order,group,expected_p,1,1,8,2,expected_mode]
                     assert plan.send_workers == group
                     assert plan.send_workers < 32 and plan.valid_group_capacity()
@@ -909,7 +909,7 @@ def test_reported_300_operator_plans_allow_rank_conversion_and_copy_first_remova
             # Never regenerate the recorded measurements.
             historical[7] = historical[7] or 2
             senders = int(row['send_aivs'])
-            if ep in (4,8,16,32) and cores == 32:
+            if ep == 64 or (ep in (4,8,16,32) and cores == 32):
                 if historical[1] == 3:
                     historical[3] *= ep//group
                 historical[1] = 0
