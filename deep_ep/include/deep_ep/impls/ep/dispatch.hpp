@@ -1990,8 +1990,10 @@ __aicore__ inline void SenderSendWithoutDedup(DispatchContext& ctx, __ubuf__ Lay
     if (serverNum < 16U) {
         for (uint32_t i = begin; i < begin + count; ++i) {
             const uint32_t expert = uint32_t(ub->workspace.routes[i]);
+            const uint32_t next_expert = i + 1U < begin + count
+                ? uint32_t(ub->workspace.routes[i + 1U]) : UINT32_MAX;
             SenderSendPacket<Layout, XType>(ctx, ub, st, i / k_, i % k_, expert,
-                                            SenderCalTokenSendExpertCnt(ub, expert, i), 0U);
+                                            SenderCalTokenSendExpertCnt(ub, expert, i), 0U, next_expert);
         }
         return;
     }
@@ -2741,7 +2743,7 @@ EP_STATIC_ASSERT(offsetof(DispatchArgs, ffts_val) == 168U, "ffts slot offset");
 template <uint32_t kNumRanks, uint32_t kNumMaxTokensPerRank, uint32_t kNumHiddenBytes, uint32_t kNumTopk,
           uint32_t kNumExperts, uint32_t kNumVecCores, uint32_t kNumUbBytes, uint32_t kNumRanksPerGroup,
           bool kPrequantized, bool kSmoothInt8, bool kDedup, bool kRdma>
-constexpr uint32_t DispatchQuantSlots()
+constexpr __aicore__ __forceinline__ uint32_t DispatchQuantSlots()
 {
     if constexpr (!kSmoothInt8) {
         return 1U;
