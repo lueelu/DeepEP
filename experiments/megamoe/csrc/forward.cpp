@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 #include "kernels/mega_moe_urma/common/mega_moe_compute_contract.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_route_plan.hpp"
@@ -349,6 +351,23 @@ uint32_t SelectCv(int64_t world, int64_t bs)
     return world == 16 && bs <= 2560 ? 128U : 256U;
 }
 
+// Local MTE scratch is transient within one serial kernel execution, so all
+// Plans on the same NPU share one backing allocation by default.
+std::shared_ptr<torch::Tensor> AcquireSharedMteWorkspace(const torch::Tensor& example, int64_t bytes)
+{
+    static std::mutex mutex;
+    static std::unordered_map<int, std::weak_ptr<torch::Tensor>> shared_by_device;
+    const int device_index = static_cast<int>(example.device().index());
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& entry = shared_by_device[device_index];
+    if (auto existing = entry.lock(); existing && existing->defined() && existing->nbytes() >= bytes) {
+        return existing;
+    }
+    auto allocated = std::make_shared<torch::Tensor>(torch::empty({bytes}, example.options().dtype(torch::kUInt8)));
+    entry = allocated;
+    return allocated;
+}
+
 }  // namespace
 
 struct UrmaWorkspace {
@@ -566,6 +585,7 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
       world_(world),
       max_tokens_(max_tokens),
       shared_experts_(shared_experts),
+      ranks_per_node_(ranks_per_node),
       is_a8w4_(is_a8w4),
       symmetric_address_(symmetric_address),
       symmetric_bytes_(symmetric_bytes)
@@ -624,7 +644,8 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
         const int64_t bytes =
             info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
         TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
-        workspace_ = torch::empty({bytes}, example.options().dtype(torch::kUInt8));
+        workspace_owner_ = AcquireSharedMteWorkspace(example, bytes);
+        workspace_ = *workspace_owner_;
         context_ = torch::empty({static_cast<int64_t>(sizeof(context))}, workspace_.options());
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
@@ -664,8 +685,9 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     const int64_t bs = x.size(0), h = x.size(1), hidden = 2 * intermediate_;
     TORCH_CHECK(x.device() == example_.device() && bs > 0 && bs <= max_tokens_ && h == example_.size(1),
                 "Input shape/device exceeds prepared plan capacity");
-    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_ids.sizes() == torch::IntArrayRef({bs, topk_}),
-                "topk_ids must be int32 [BS,TopK]");
+    TORCH_CHECK((topk_ids.scalar_type() == torch::kInt32 || topk_ids.scalar_type() == torch::kInt64) &&
+                    topk_ids.sizes() == torch::IntArrayRef({bs, topk_}),
+                "topk_ids must be int32 or int64 [BS,TopK]");
     TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32 && topk_weights.sizes() == topk_ids.sizes(),
                 "topk_weights must be FP32 [BS,TopK]");
     TORCH_CHECK(activation_clamp >= 0.0F, "activation_clamp must be nonnegative and not NaN");
@@ -674,7 +696,12 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     TORCH_CHECK(x.scalar_type() == (prequantized ? c10::ScalarType::Float8_e4m3fn : torch::kBFloat16),
                 "x must be BF16, or FP8 E4M3 with E8M0 scales");
     if (prequantized) {
-        if (urma && x_scales->dim() == 3) {
+        if (x_scales->dim() == 2 && x_scales->scalar_type() == torch::kInt16) {
+            CheckTensor(*x_scales, 2, "x_scales");
+            TORCH_CHECK(x_scales->sizes() == torch::IntArrayRef({bs, CeilDiv(h, int64_t{64})}),
+                        "x_scales int16 must be [BS,H/64]");
+            x_scales = x_scales->view(torch::kUInt8).view(c10::ScalarType::Float8_e8m0fnu).reshape({bs, CeilDiv(h, int64_t{32})});
+        } else if (urma && x_scales->dim() == 3) {
             CheckTensor(*x_scales, 3, "x_scales");
             TORCH_CHECK(x_scales->sizes() == torch::IntArrayRef({bs, h / 64, 2}), "Invalid URMA input scale shape");
             x_scales = x_scales->reshape({bs, h / 32});
@@ -682,7 +709,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         CheckTensor(*x_scales, 2, "x_scales");
         TORCH_CHECK(x_scales->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
                         x_scales->sizes() == torch::IntArrayRef({bs, CeilDiv(h, int64_t{32})}),
-                    "x_scales must be E8M0 [BS,H/32]");
+                    "x_scales must be E8M0 [BS,H/32] or packed int16 [BS,H/64]");
     }
     const auto weight_type = is_a8w4_ ? torch::kUInt8 : c10::ScalarType::Float8_e4m3fn;
     TORCH_CHECK(weight1.scalar_type() == weight_type && weight2.scalar_type() == weight_type,
@@ -779,10 +806,14 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         }
     }
     if (!urma) {
+        if (topk_ids.scalar_type() == torch::kInt64) {
+            topk_ids = topk_ids.to(torch::kInt32);
+        }
         // Workspace/context capacity was prepared for max_tokens_. Recompute
         // only BS-dependent scheduling fields on the host for this launch.
         tiling_ = MakeTiling(bs, h, hidden, topk_, experts_, world_, max_tokens_, 0, is_a8w4_, shared_experts_,
                              platform_, topk_weights_type_);
+        tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node_);
     }
     tiling_.clampLimit = std::min(activation_clamp, std::numeric_limits<float>::max());
     // Common dispatch stage; only the device argument representation differs.

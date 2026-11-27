@@ -32,20 +32,20 @@ def main():
         torch.manual_seed(20260922 + rank)
         raw = []
         for n, k in ((2 * intermediate, h), (h, intermediate)):
-            packed = torch.randint(0, 256, (local_experts, n, k // 2), dtype=torch.uint8).npu()
-            scales = torch.full((local_experts, n, k // 64, 2), 120, dtype=torch.uint8).npu().view(torch.float8_e8m0fnu)
+            packed = torch.randint(-128, 128, (local_experts, n, k // 2), dtype=torch.int8).npu()
+            scales = torch.full((local_experts, n, k // 64, 2), 120, dtype=torch.uint8).npu().view(torch.int16).reshape(
+                local_experts, n, k // 64
+            )
             raw.append((packed, scales))
         w1, w2 = transform_weights_for_mega_moe(*raw)
         x = torch.randn((bs, h)).npu().to(torch.bfloat16)
-        buffer.topk_idx.copy_((torch.arange(bs)[:, None] + torch.arange(topk)) % (world * local_experts))
+        buffer.topk_idx.copy_(((torch.arange(bs)[:, None] + torch.arange(topk)) % (world * local_experts)).to(torch.int64))
         buffer.topk_weights.fill_(1 / topk)
         if args.input == "fp8":
             buffer.x.copy_(x.to(torch.float8_e4m3fn))
-            # 此小示例使用 scale=1；真实模型应提供每 32 元素的 E8M0 scale。
+            # 此小示例使用 scale=1；真实模型应提供每 32 元素的 E8M0 scale（打包为 int16）。
             buffer.x_sf.view(torch.uint8).fill_(127)
             x = None
-        buffer.validate_inputs(bs, x=x)
-        buffer.prepare(bs)
         y = torch.empty((bs, h), dtype=torch.bfloat16, device="npu")
         stats = torch.zeros(local_experts, dtype=torch.int32, device="npu")
         fp8_fp4_mega_moe(y, w1, w2, buffer, cumulative_local_expert_recv_stats=stats, x=x)

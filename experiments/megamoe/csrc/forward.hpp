@@ -48,11 +48,12 @@ private:
     std::unique_ptr<UrmaWorkspace> urma_;
     PlatformInfo platform_{};
     MegaMoeTilingData tiling_;
+    std::shared_ptr<torch::Tensor> workspace_owner_;
     torch::Tensor workspace_;
     torch::Tensor context_;
     uint64_t ffts_;
     torch::Tensor example_;
-    int64_t intermediate_, topk_, experts_, world_, max_tokens_, shared_experts_;
+    int64_t intermediate_, topk_, experts_, world_, max_tokens_, shared_experts_, ranks_per_node_;
     bool is_a8w4_;
     uint64_t symmetric_address_;
     int64_t symmetric_bytes_;
