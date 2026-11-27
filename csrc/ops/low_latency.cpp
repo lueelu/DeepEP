@@ -362,6 +362,11 @@ void bind_low_latency(py::module_& module)
         }
         auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
         const bool dedup = deep_ep::EpServerDedupEnabled(uint32_t(capacity), uint32_t(session.world()));
+        // PUT Combine stores the FIRST_HOP inbox base in one 32-bit header word
+        // and publishes base + member as an int32 destination_index row. Reject
+        // launches whose largest slot cannot be represented.
+        if (dedup && uint64_t(session.world()) * uint64_t(b) * uint64_t(k) > uint64_t(INT32_MAX) + 1U)
+            throw std::invalid_argument("LL PUT inbox slots exceed int32 metadata");
 
         void* comm_args = get("comm_args", {sizeof(deep_ep::comm::CommArgs)}, "uint8");
         void* peer_ptrs = static_cast<uint8_t*>(comm_args) + offsetof(deep_ep::comm::CommArgs, peerMems);

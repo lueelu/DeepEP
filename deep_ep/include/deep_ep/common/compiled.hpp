@@ -63,12 +63,24 @@ constexpr uint32_t kEpServerDedupMaxTopK = 32U;
 // The wire header and TokenType output use the same values.
 enum class EpServerDedupTokenType : uint32_t { Direct = 1U, FirstHop = 2U, Terminal = 3U };
 
+// FIRST_HOP packets carry the PUT Combine route in the words that used to be
+// padding. A TERMINAL row publishes owner/inbox columns only when putTag
+// matches, so packets produced by an older Dispatch are never misread.
+constexpr uint32_t kEpServerDedupPutRouteTag = 0x50555431U;  // 'PUT1'
+
 struct alignas(32) EpServerDedupPacketHeader {
     uint32_t srcRank;
     uint32_t srcTokenId;
     uint32_t topK;  // Original route index / returnK, not the shape K.
     uint32_t type;
-    uint32_t padding[4];
+    // FIRST_HOP-only. putOwnerRank is the actual FIRST_HOP target selected by
+    // the sender; putInboxBase is (srcRank * B + srcTokenId) * shapeK, where B
+    // is this launch's real token count, not the admitted capacity M.
+    // Member m (1-based, 0 is FIRST_HOP itself) writes putInboxBase + m.
+    uint32_t putOwnerRank;
+    uint32_t putInboxBase;
+    uint32_t putTag;
+    uint32_t reserved;
 };
 
 // Block 0: index=N, weightBits=selfWeight. Member: index=expert|(q<<16).
@@ -90,6 +102,10 @@ static_assert(alignof(EpServerDedupPacketHeader) == 32U, "packet header alignmen
 static_assert(offsetof(EpServerDedupPacketHeader, srcTokenId) == 4U, "source token offset");
 static_assert(offsetof(EpServerDedupPacketHeader, topK) == 8U, "return k offset");
 static_assert(offsetof(EpServerDedupPacketHeader, type) == 12U, "packet role offset");
+static_assert(offsetof(EpServerDedupPacketHeader, putOwnerRank) == 16U, "PUT owner offset");
+static_assert(offsetof(EpServerDedupPacketHeader, putInboxBase) == 20U, "PUT inbox base offset");
+static_assert(offsetof(EpServerDedupPacketHeader, putTag) == 24U, "PUT tag offset");
+static_assert(offsetof(EpServerDedupPacketHeader, reserved) == 28U, "reserved header word offset");
 static_assert(sizeof(EpServerDedupReadIndexBlock) == 8U, "read index block ABI");
 static_assert(offsetof(EpServerDedupReadIndexBlock, weightBits) == 4U, "weight bits offset");
 static_assert(sizeof(EpServerDedupDirectTask) == 16U, "source direct task ABI");

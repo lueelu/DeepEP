@@ -93,13 +93,32 @@ __aicore__ inline void WriteServerDedupPayloadRange(__gm__ uint8_t* output, __ub
     if (bytes) asc_copy_ub2gm_align(reinterpret_cast<__gm__ uint8_t*>(output + written), reinterpret_cast<__ubuf__ uint8_t*>(wire + ServerDedupWireOffset(logical)), 1U, bytes, asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM, bytes + 0U, math::align(bytes, 32U) + 0U);
 }
 __aicore__ inline uint32_t BuildServerDedupMetadata(__ubuf__ uint32_t* type, __ubuf__ uint32_t* destination,
-                                                  ServerDedupPacketTail tail, uint32_t slot)
+                                                  ServerDedupPacketTail tail, uint32_t slot, uint32_t capacity,
+                                                  uint32_t localExperts, uint32_t rank)
 {
     auto* header = tail.Header();
     const uint32_t role = header[3U];
     type[0] = role;
     if (role == uint32_t(EpServerDedupTokenType::Terminal)) {
         destination[0] = slot; destination[1] = UINT32_MAX; destination[2] = UINT32_MAX;
+        // FIRST_HOP packets carry the owner and inbox base. Only a matching tag
+        // exposes the new columns, so older packets keep the legacy sentinel.
+        if (header[6U] == kEpServerDedupPutRouteTag) {
+            // Dispatch physical slots are capacity-M partitions while the PUT
+            // inbox is B-based and capacity >= B. Decode the row's expert and q
+            // with M, then match the unchanged packed member key. The first
+            // column keeps p so the base Combine still applies its M->B map.
+            const uint32_t q = slot % capacity;
+            const uint32_t localExpert = (slot / capacity) % localExperts;
+            const uint32_t key = (rank * localExperts + localExpert) | (q << 16U);
+            const uint32_t members = tail.ReadIndex()[0U];
+            for (uint32_t m = 0; m < members; ++m) {
+                if (tail.Entry(m)[0U] != key) continue;
+                destination[1] = header[4U];
+                destination[2] = header[5U] + m + 1U;
+                break;
+            }
+        }
     } else {
         for (uint32_t i = 0; i < 3U; ++i) destination[i] = header[i];
     }
@@ -1557,7 +1576,8 @@ __aicore__ inline void SenderInputOperations<Layout, XType>::LoadInput(uint32_t 
 
 template <class Layout, class XType>
 __aicore__ inline void SenderFillTail(DispatchContext& ctx, __ubuf__ Layout* ub, SenderPhaseState& st,
-                                     __ubuf__ uint8_t* payload, uint32_t token, uint32_t firstK, uint32_t mask)
+                                     __ubuf__ uint8_t* payload, uint32_t token, uint32_t firstK,
+                                     uint32_t destination, uint32_t mask)
 {
     using layout_t = typename Layout::layout_t;
     constexpr uint32_t k_ = Layout::kNumTopk;
@@ -1570,6 +1590,15 @@ __aicore__ inline void SenderFillTail(DispatchContext& ctx, __ubuf__ Layout* ub,
     auto* index = reinterpret_cast<__ubuf__ uint32_t*>(payload + data_.readIndexPayloadOffset);
     header[0] = uint32_t(ctx.view.rank); header[1] = token; header[2] = firstK;
     header[3] = uint32_t(mask ? EpServerDedupTokenType::FirstHop : EpServerDedupTokenType::Direct);
+    // The selected FIRST_HOP owner and its inbox base travel with the packet.
+    // TERMINAL receivers resolve their member ordinal from the unchanged member
+    // table, so nothing is added per relay member or per forwarded packet.
+    // token is still the global token id here, before the core-local rebase.
+    if (enableDedup_ && mask) {
+        header[4U] = destination;
+        header[5U] = uint32_t((uint64_t(ctx.view.rank) * ctx.num_tokens + token) * k_);
+        header[6U] = kEpServerDedupPutRouteTag;
+    }
     if (!enableDedup_) { index[0] = 0U; return; }
     auto* weights = reinterpret_cast<__ubuf__ float*>(index);
     token -= start_;
@@ -1636,7 +1665,7 @@ __aicore__ inline void SenderSendPacket(DispatchContext& ctx, __ubuf__ Layout* u
 #endif
     SenderInputOperations<Layout, XType> operations{ctx, ub, st};
     st.input_reuse.Prepare(token, operations);
-    SenderFillTail<Layout, XType>(ctx, ub, st, st.cached_payload, token, firstK, mask);
+    SenderFillTail<Layout, XType>(ctx, ub, st, st.cached_payload, token, firstK, destination, mask);
     asc_sync_notify(PIPE_S, PIPE_V, EVENT_ID0);
     asc_sync_wait(PIPE_S, PIPE_V, EVENT_ID0);
     const uint32_t lane = st.packets % lanes_;
@@ -2017,7 +2046,8 @@ __aicore__ inline void ReceiverConsumeLoaded(DispatchContext& ctx, __ubuf__ Layo
     ServerDedupPacketTail tail(wire, headerOffset,
         uint32_t(keepFlags ? data_.relayReadIndexWireOffset : data_.readIndexPayloadOffset));
     bool firstHop = false;
-    if (dedupMode_) firstHop = BuildServerDedupMetadata(type, destination, tail, st.tasks.Position(j)) ==
+    if (dedupMode_) firstHop = BuildServerDedupMetadata(type, destination, tail, st.tasks.Position(j),
+        Layout::kNumMaxTokensPerRank, uint32_t(layout_t::kNumLocalExperts), uint32_t(ctx.view.rank)) ==
         uint32_t(EpServerDedupTokenType::FirstHop);
     else for (uint32_t i = 0; i < 3U; ++i) destination[i] = tail.Header()[i];
     if (firstHop) {
@@ -2124,6 +2154,8 @@ __aicore__ inline void RecvStage(DispatchContext& ctx, __ubuf__ Layout* ub, Rece
     asc_sync_notify(PIPE_MTE2, PIPE_S, EVENT_ID0);
     asc_sync_wait(PIPE_MTE2, PIPE_S, EVENT_ID0);
     if (profile) profile->Mark<30>();  // w30: receive_prefix_loaded_after_MTE2_S
+    // Physical source slots are capacity-M partitions. The PUT inbox is B-based,
+    // so TERMINAL metadata must decode each row with this same M stride.
     st.tasks.Build(prefix_, uint32_t(view_.rank), uint32_t(view_.num_ranks), experts_,
                    Layout::kNumMaxTokensPerRank, st.receiver,
                    ub->workspace.phases.receiver.task_pos,
