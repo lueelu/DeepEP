@@ -143,8 +143,11 @@ performance; both still require device validation.
 
 ### Combine payload coalescing
 
-`DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS` is read on each combine call. It defaults
-to `1` (the existing builder) and accepts integers from `1` through `32`.
+`DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS` is read on each combine call. When unset,
+the maximum is `2` for payload rows of at most 8192 bytes (inclusive), otherwise
+`1`. The byte count is hidden size times payload element size, excluding weights
+and metadata. For BF16 this includes H4096. Explicit integers from `1` through
+`32` override this default; set `1` to compare with the single-row builder.
 Values above one enable a separate SIMT builder for ordinary non-expanded
 peer-scheduled combine with dense payload strides. It reads AIV-loaded UB
 indices and merges only consecutive source **and** destination rows. Each lane

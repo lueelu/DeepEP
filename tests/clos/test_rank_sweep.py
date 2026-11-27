@@ -218,6 +218,12 @@ def test_payload_summary_without_implicit_baseline(tmp_path):
         for r in rows
         for k in ("api_change_vs_auto", "bandwidth_change_vs_auto", "api_worse_in_either_round")
     )
+    # An unset limit is now selected by row bytes; never report it as explicit rows=1.
+    for config in configs:
+        config.pop("payload_max_rows")
+    sweep.write_summary(state)
+    with (tmp_path / "summary.csv").open(encoding="utf-8-sig", newline="") as f:
+        assert all(row["payload_max_rows"] == "auto" for row in csv.DictReader(f))
 
 
 def test_finalists_keep_api_and_communication_winners():

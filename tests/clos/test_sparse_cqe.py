@@ -27,13 +27,20 @@ def test_payload_merge_option_validation(tmp_path):
     )
     prefix = '#include <cstdint>\n#define TORCH_CHECK(ok, ...) if (!(ok)) throw "invalid";\n' + parser
     valid = (
-        "static_assert(ParseCombinePayloadMaxRows(nullptr)==1);\n"
-        'static_assert(ParseCombinePayloadMaxRows("1")==1);\n'
-        'static_assert(ParseCombinePayloadMaxRows("0004")==4);\n'
-        'static_assert(ParseCombinePayloadMaxRows("32")==32);\n'
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 5632)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8191)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8192)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8193)==1);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12288)==1);\n"
+        'static_assert(ParseCombinePayloadMaxRows("1", 5632)==1);\n'
+        'static_assert(ParseCombinePayloadMaxRows("2", 12288)==2);\n'
+        'static_assert(ParseCombinePayloadMaxRows("0004", 8192)==4);\n'
+        'static_assert(ParseCombinePayloadMaxRows("32", 8192)==32);\n'
     )
     for value in (None, "", "0", "33", "-1", "2x", " 4", "1.5", "9999999999999999999999999"):
-        body = valid if value is None else f"constexpr auto result=ParseCombinePayloadMaxRows({json.dumps(value)});"
+        body = (
+            valid if value is None else f"constexpr auto result=ParseCombinePayloadMaxRows({json.dumps(value)}, 8192);"
+        )
         path = tmp_path / "option.cpp"
         path.write_text(prefix + body)
         result = subprocess.run(

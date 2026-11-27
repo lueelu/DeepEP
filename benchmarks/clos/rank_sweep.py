@@ -570,7 +570,7 @@ def write_summary(s):
                 visit=c["visit"],
                 sender_cores=c["payload_aivs"],
                 reduce_cores=s.args.reduce_cores,
-                payload_max_rows=c.get("payload_max_rows", 1),
+                payload_max_rows=c.get("payload_max_rows", "auto"),
                 combine_wqe_fast=c.get("combine_wqe_fast", 0),
                 GBps_per_rank=r["GBps"],
                 precision="zero_tolerance_passed",

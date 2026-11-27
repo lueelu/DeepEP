@@ -18,9 +18,9 @@
 
 namespace {
 
-uint32_t ParseCombinePayloadMaxRows(const char* value)
+uint32_t ParseCombinePayloadMaxRows(const char* value, uint64_t payload_row_bytes)
 {
-    if (!value) return 1;
+    if (!value) return payload_row_bytes <= 8192U ? 2U : 1U;
     uint32_t rows = 0;
     TORCH_CHECK(*value, "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be an integer in [1, 32]");
     for (const char* p = value; *p; ++p) {
@@ -410,7 +410,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
         !pipeline_chunk_tokens && !expanded_x.has_value();
     const uint32_t payload_max_rows = ParseCombinePayloadMaxRows(
-        std::getenv("DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"));
+        std::getenv("DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"), static_cast<uint64_t>(hidden_bytes));
     tiling.combine_payload_max_rows =
         use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
         !pipeline_chunk_tokens && !expanded_x.has_value() && workspace.x_row_stride == hidden_bytes
