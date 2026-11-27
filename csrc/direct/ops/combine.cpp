@@ -225,8 +225,10 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
         TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
-                        udma_peers_per_worker == 8,
-                    "udma_peers_per_worker must be 1, 2, 4 or 8");
+                        udma_peers_per_worker == 8 || udma_peers_per_worker == 16,
+                    "udma_peers_per_worker must be 1, 2, 4, 8 or 16");
+        TORCH_CHECK(udma_peers_per_worker <= 8 || udma_launch.order == ascend_deepep::udma::kRankOrder,
+                    "P16 requires rank peer order");
         TORCH_CHECK(udma_wqes_per_visit == 4 || udma_wqes_per_visit == 8 || udma_wqes_per_visit == 16 ||
                         udma_wqes_per_visit == 32 || udma_wqes_per_visit == 64 || udma_wqes_per_visit == 128,
                     "udma_wqes_per_visit must be 4, 8, 16, 32, 64 or 128");

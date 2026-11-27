@@ -43,8 +43,9 @@ def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128), quick=False)
     result = []
     for order in ORDERS:
         grouped = order == "group_round_robin"
+        peer_choices = (1, 2, 4) if grouped else (1, 2, 4, 8, 16) if order == "rank" else (1, 2, 4, 8)
         for peers, (workers, qps), visit in itertools.product(
-            (1, 2, 4) if grouped else (1, 2, 4, 8), ((1, 1), (1, 2), (2, 1)), visits
+            peer_choices, ((1, 1), (1, 2), (2, 1)), visits
         ):
             owners = math.ceil((group_size if grouped else ep - 1) / peers)
             if owners * workers > aiv or owners * workers * qps > 32:
@@ -62,6 +63,8 @@ def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128), quick=False)
     peers, visit = (1, 8) if ep <= 16 else (4, 32)
     while math.ceil((ep - 1) / peers) * workers > min(aiv, 32) and peers < 8:
         peers *= 2
+    if ep == 128 and aiv == 8:
+        peers = 16
     baseline = f"rank_p{peers}_w{workers}_q1_v{visit}"
     result.sort(key=lambda c: c["id"] != baseline)
     return result

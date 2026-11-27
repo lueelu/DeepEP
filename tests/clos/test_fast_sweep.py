@@ -40,6 +40,10 @@ def test_quick_subset_and_auto_baseline():
     quick = sweep.candidates(64, 32, 8, quick=True)
     assert {c["id"] for c in quick} < {c["id"] for c in configs}
     assert {c["order"] for c in quick} == {"rank", "group_round_robin"}
+    ep128 = sweep.candidates(128,8,16,quick=True)
+    assert ep128[0]["id"] == "rank_p16_w1_q1_v32"
+    assert ep128[0]["payload_aivs"] == 8
+    assert all(c["order"] == "rank" for c in ep128 if c["peers"] == 16)
 
 
 @pytest.mark.parametrize("ep", [4, 8, 16, 32])
@@ -452,8 +456,9 @@ int main() {
       if (rank==peer) { assert(mask==0); continue; }
       assert(mask & 1);
       for (uint32_t order=0; order<=3; ++order)
-      for (uint32_t peers : {1U,2U,4U,8U})
+      for (uint32_t peers : {1U,2U,4U,8U,16U})
       for (uint32_t lanes : {1U,2U}) {
+        if (peers==16 && order!=0) continue;
         if (order==3 && peers==8) continue;
         const auto workers=Workers(world,peers,order,group);
         if (workers*lanes>32) continue;
@@ -531,14 +536,20 @@ static_assert(pair_coverage(16,16,2,2,2,3,15));
 static_assert(pair_coverage(32,16,0,4,1,0,31));
 static_assert(pair_coverage(64,16,0,8,1,0,63));
 static_assert(pair_coverage(128,16,3,2,2,17,127));
+static_assert(pair_coverage(128,16,0,16,1,17,127));
+static_assert(pair_coverage(128,16,0,16,2,127,0));
+static_assert(Workers(128,16)==8);
+static_assert(DispatchLiveSendUbBytes(16,1)==23200);
+static_assert(DispatchLiveSendUbBytes(16,2)==26784);
 static_assert(pair_coverage(256,16,1,8,1,127,255));
 static_assert(pair_coverage(64,16,0,8,1,0,0));
 int main() {
   for (uint32_t world : {4U,8U,16U,32U,64U,128U,256U}) {
     const uint32_t group = world < 16 ? world : 16;
     for (uint32_t order=0; order<4; ++order)
-    for (uint32_t p : {1U,2U,4U,8U})
+    for (uint32_t p : {1U,2U,4U,8U,16U})
     for (uint32_t lanes : {1U,2U}) {
+      if (p==16 && order!=0) continue;
       const auto owners=Workers(world,p,order,group);
       if (owners*lanes>32 || (order==3 && (p>4 || ((group+owners-1)/owners)*(world/group)>64))) continue;
       const char* names[]={"rank","group","group_staggered","group_round_robin"};
@@ -571,7 +582,13 @@ int main() {
   assert(!narrow.Allows(0,8,1,2));
   const QpReservation both("rank:8:1:1;rank:4:1:1",0,64,16);
   assert(both.Allows(0,8,1,1) && both.Allows(0,4,1,1));
-  for (const auto* bad : {"rank:0:1:1","rank:8:2:2","rank:8:1:1;","rank:8:1", "rank:8:1:1:1", "rank:-1:1:1", "unknown:8:1:1", ";"}) {
+  const QpReservation p16("rank:16:1:1",0,128,16);
+  assert(p16.Allows(0,16,1,1));
+  assert(!p16.Allows(0,8,1,1) && !p16.Allows(0,16,1,2));
+  assert(!p16.Allows(1,16,1,1) && !p16.Allows(3,16,1,1));
+  const QpReservation ab("rank:16:1:1;group_round_robin:2:1:1",0,128,16);
+  assert(ab.Allows(0,16,1,1) && ab.Allows(3,2,1,1));
+  for (const auto* bad : {"rank:0:1:1","rank:8:2:2","rank:8:1:1;","rank:8:1", "rank:8:1:1:1", "rank:-1:1:1", "unknown:8:1:1", "group:16:1:1", "group_round_robin:16:1:1", ";"}) {
     bool rejected=false;
     try { QpReservation unused(bad,0,64,16); } catch (const std::invalid_argument&) { rejected=true; }
     assert(rejected);

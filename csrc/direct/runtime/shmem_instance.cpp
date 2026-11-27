@@ -254,7 +254,8 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
     const auto v = values[6], copy = values[7], weight = values[8];
     // Dispatch plans also carry the normalized after-submit marker (2).
     // Spare-AIV copy (1) and weight transport overrides remain combine-only.
-    if (order < 0 || order > 3 || group != ranks_per_group_ || p < 1 || p > 8 || !ValidPeers(p) || (w != 1 && w != 2) ||
+    if (order < 0 || order > 3 || group != ranks_per_group_ || p < 1 || p > kMaxRankPeers || !ValidPeers(p) ||
+        (p > kMaxPeers && order != kRankOrder) || (w != 1 && w != 2) ||
         (q != 1 && q != 2) || w * q > 2 || v < 4 || v > 128 || !ValidVisit(v) || copy < 0 || copy > 2 || weight < 0 ||
         weight > 2 || (!combine && ((copy != 0 && copy != 2) || weight)))
         throw std::invalid_argument("UDMA launch plan is outside the reserved schedule set");

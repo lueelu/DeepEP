@@ -152,10 +152,12 @@ class UdmaPolicy:
             raise ValueError(f"num_aiv/num_sms must be zero or an even count <= {_MAX_NUM_AIV}")
         budget = min(32 // self.qps_per_worker, 32 if num_aiv == 0 else num_aiv)
         policy = self
+        if self.world_size == 128 and num_aiv == 8 and self.workers_per_peer == self.qps_per_worker == 1:
+            policy = replace(self, peer_order=0, peers_per_worker=16, wqes_per_visit=32)
         while policy.send_workers > budget and policy.peers_per_worker < 8:
             policy = replace(policy, peers_per_worker=policy.peers_per_worker * 2)
         if policy.send_workers > budget:
-            # Rank ownership cannot fit EP128/AIV8. Logical groups are a
+            # Other constrained budgets retain the existing fallback. Logical groups are a
             # correctness fallback, never evidence of physical server locality.
             group = self.ranks_per_group or _logical_group(self.world_size)
             for p in (1, 2, 4):

@@ -52,7 +52,7 @@ public:
         // Compile coverage once. Launch validation then costs a single bit test,
         // including when different schedules happen to use the same physical QPs.
         for (uint32_t order = 0; order < 4; ++order)
-            for (uint32_t p = 1; p <= 8; p *= 2)
+            for (uint32_t p = 1; p <= kMaxRankPeers; p *= 2)
                 for (uint32_t lanes = 1; lanes <= 2; ++lanes) {
                     if (!Valid(world, group, order, p, lanes)) continue;
                     bool covered = true;
@@ -74,15 +74,16 @@ private:
     static bool Valid(uint32_t world, uint32_t group, uint32_t order, uint32_t p, uint32_t lanes)
     {
         if (order > 3 || !ValidPeers(p)) return false;
+        if (p > kMaxPeers && order != kRankOrder) return false;
         const auto owners = Workers(world, p, order, group);
         return owners * lanes <= kQpCount &&
             (order != kGroupRoundRobinOrder ||
              (p <= 4 && ((group + owners - 1) / owners) * (world / group) <= kGroupPeerCapacity));
     }
-    static uint32_t Bit(uint32_t order, uint32_t p, uint32_t lanes)
+    static uint64_t Bit(uint32_t order, uint32_t p, uint32_t lanes)
     {
-        const uint32_t slot = p == 1 ? 0 : p == 2 ? 1 : p == 4 ? 2 : 3;
-        return uint32_t{1} << ((order * 4 + slot) * 2 + lanes - 1);
+        const uint32_t slot = p == 1 ? 0 : p == 2 ? 1 : p == 4 ? 2 : p == 8 ? 3 : 4;
+        return uint64_t{1} << ((order * 5 + slot) * 2 + lanes - 1);
     }
 public:
     static constexpr uint64_t Mask(uint32_t rank, uint32_t peer, uint32_t world, uint32_t group,
@@ -97,7 +98,7 @@ public:
     }
 private:
     std::vector<uint64_t> masks_;
-    uint32_t allowed_ = 0;
+    uint64_t allowed_ = 0;
 };
 
 } // namespace ascend_deepep::udma

@@ -97,10 +97,15 @@ constexpr unsigned kPressureScratchOffset=kHeadersOffset+64;
 uint64_t* Signal(GM_ADDR,uint64_t,uint32_t);
 // SENDERS
 template class SenderT<8,1>;
+template class SenderT<16,1>;
 template class SenderT<8,2,DispatchDeviceTrace>;
 template class DispatchSenderT<8,1>;
+template class DispatchSenderT<16,1>;
+template class DispatchSenderT<16,2,DispatchDeviceTrace>;
 template class DispatchSenderT<64,2,DispatchDeviceTrace>;
 template class CombineSenderT<8,1>;
+template class CombineSenderT<16,1>;
+template class CombineSenderT<16,2,DispatchDeviceTrace>;
 template class CombineSenderT<64,2,DispatchDeviceTrace>;
 }
 """
@@ -148,10 +153,10 @@ def test_combine_routing_accepts_traced_and_existing_callers(tmp_path):
 #include <cstdint>
 #define __aicore__
 using GM_ADDR = uint8_t*;
-struct CombineTilingData { unsigned udma_qps_per_worker, udma_peer_order; };
+struct CombineTilingData { unsigned udma_qps_per_worker, udma_peer_order, udma_peers_per_worker; };
 struct DisabledDispatchDeviceTrace { explicit DisabledDispatchDeviceTrace(uint64_t) {} };
 struct EnabledTrace { explicit EnabledTrace(uint64_t) {} };
-constexpr unsigned kGroupRoundRobinOrder=1, kGroupPeerCapacity=8, kMaxPeers=256;
+constexpr unsigned kGroupRoundRobinOrder=1, kGroupPeerCapacity=8, kMaxPeers=256, kMaxRankPeers=16;
 // FUNCTIONS
 void test() {
     int resource=0;

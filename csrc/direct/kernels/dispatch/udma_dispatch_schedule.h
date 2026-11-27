@@ -339,10 +339,14 @@ __aicore__ inline void DispatchRemote(
     if (td.udma_qps_per_worker == 2) {
         if (td.udma_peer_order == kGroupRoundRobinOrder)
             DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
+        else if (td.udma_peers_per_worker > kMaxPeers)
+            DispatchRemoteImpl<kMaxRankPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
         else
             DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
     } else if (td.udma_peer_order == kGroupRoundRobinOrder)
         DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
+    else if (td.udma_peers_per_worker > kMaxPeers)
+        DispatchRemoteImpl<kMaxRankPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
     else
         DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
 }

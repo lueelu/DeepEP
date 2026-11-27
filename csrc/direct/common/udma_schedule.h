@@ -12,6 +12,8 @@
 namespace ascend_deepep::udma {
 inline constexpr uint32_t kQpCount = 32;
 inline constexpr uint32_t kMaxPeers = 8;
+// Preserve legacy/token windows; only P16 rank senders use the larger table.
+inline constexpr uint32_t kMaxRankPeers = 16;
 inline constexpr uint32_t kTileTokens = 256;
 inline constexpr uint32_t kBatchWqes = 32;
 inline constexpr uint32_t kWqeBytes = 64;
@@ -38,7 +40,7 @@ inline constexpr uint32_t DispatchLiveSendUbBytes(uint32_t capacity, uint32_t qp
 
 ASCEND_DEEPEP_SCHEDULE_FN bool ValidPeers(uint32_t peers)
 {
-    return peers == 1 || peers == 2 || peers == 4 || peers == 8;
+    return peers == 1 || peers == 2 || peers == 4 || peers == 8 || peers == 16;
 }
 ASCEND_DEEPEP_SCHEDULE_FN bool ValidVisit(uint32_t wqes)
 {
@@ -145,9 +147,10 @@ ASCEND_DEEPEP_SCHEDULE_FN uint64_t PeerMask(
     if (rank == peer)
         return 0;
     uint64_t mask = 1; // SDK control QP.
-    for (uint32_t peers = 1; peers <= kMaxPeers; peers *= 2) {
+    for (uint32_t peers = 1; peers <= kMaxRankPeers; peers *= 2) {
         for (uint32_t op = 0; op < 2; ++op) {
             const uint32_t order = op ? combine_order : dispatch_order;
+            if (peers > kMaxPeers && order != kRankOrder) continue;
             const uint32_t count = order == kGroupRoundRobinOrder ? peers_per_group : peers;
             if (Workers(world, count, order, ranks_per_group) * workers_per_peer <= kQpCount) {
                 for (uint32_t lane = 0; lane < workers_per_peer; ++lane) {

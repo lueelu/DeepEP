@@ -392,7 +392,7 @@ def test_auto_policy_budget_boundaries_and_manual_opt_out():
                     assert not feasible, (ep, cores)
                 else:
                     assert chosen.valid_group_capacity() and chosen.send_workers <= min(cores, 32), (ep, cores)
-                    assert chosen.peers_per_worker in (1, 2, 4, 8)
+                    assert chosen.peers_per_worker in (1, 2, 4, 8, 16)
                     assert chosen.config(cores).num_aiv == cores
         base = resolve_udma_policy(True, 32, 'udma', None, None, None, None, None)
         assert base.for_num_aiv(0) == base
@@ -963,7 +963,7 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
 
         # Actual four-node topologies: keep all AIV8 launch plans unchanged.
         for ep, group, order, p, w in ((4,1,0,1,2), (8,2,0,2,2), (16,4,0,2,1),
-                                      (32,8,0,4,1), (64,16,0,8,1), (128,16,3,2,1)):
+                                      (32,8,0,4,1), (64,16,0,8,1), (128,16,0,16,1)):
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                            ranks_per_group=group,topology_known=True)
             for op in ('dispatch','combine','weighted'):
@@ -1119,6 +1119,34 @@ def test_ep128_defaults_preserve_fixed_candidate_across_shapes_and_budgets():
     """)
 
 
+def test_ep128_eight_core_rank_p16_preserves_other_core_plans():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.config import Config
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        assert Config(8,udma_peers_per_worker=16).udma_peers_per_worker == 16
+        for group in (1,2,4,8,16,32,64,128):
+            for known in (False,True):
+                base = replace(resolve_udma_policy(True,128,'udma',None,None,None,None,None),
+                               ranks_per_group=group,topology_known=known)
+                assert base.config(8).udma_peers_per_worker == 16
+                for op in ('dispatch','combine','weighted'):
+                    for size in (2048,5632,8192,12288,14336):
+                        for opts in ({'bf16':True},{'bf16':False},{'bf16':True,'expanded':True},{'bf16':True,'v2':False}):
+                            plan = base.for_launch(8,size,op,**opts)
+                            mode = 1 if op == 'weighted' and opts == {'bf16':True} else 0
+                            assert plan.native_plan() == [1,0,group,16,1,1,32,2,mode]
+                            assert plan.send_workers == 8
+                            assert plan.valid_group_capacity()
+        base = replace(base,ranks_per_group=16,topology_known=True)
+        for cores in (10,12,14):
+            assert base.for_launch(cores,5632,'dispatch',bf16=True).native_plan() == [1,3,16,2,1,1,32,2,0]
+        for cores in (0,*range(16,65,2)):
+            for op in ('dispatch','combine','weighted'):
+                assert base.for_launch(cores,5632,op,bf16=True).native_plan() == [1,0,16,8,1,1,16,2,0]
+    """)
+
+
 def test_auto_topology_uses_ep_rank_order_and_collects_only_at_construction():
     run_host("""
         from deep_ep import _machine
@@ -1160,7 +1188,7 @@ def test_large_ep_low_core_fallback_and_invalid_launch_inputs():
                             assert p.valid_group_capacity()
                             assert p.ranks_per_group == group
                 if ep == 128:
-                    assert base.for_launch(8,5632,'combine',bf16=True).peer_order == 3
+                    assert base.for_launch(8,5632,'combine',bf16=True).native_plan()[:7] == [1,0,group,16,1,1,32]
                 for cores in (True,False,8.0,3,-2,66):
                     try: base.for_launch(cores,5632,'dispatch',bf16=True)
                     except (TypeError,ValueError): pass
@@ -1278,7 +1306,8 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
                 if (g > ep) continue;
                 for (unsigned rank=0; rank<ep; ++rank)
                   for (unsigned order=0; order<=3; ++order)
-                    for (unsigned p : {1U,2U,4U,8U}) {
+                    for (unsigned p : {1U,2U,4U,8U,16U}) {
+                      if (p==16 && order!=0) continue;
                       if (order==3 && p==8) continue;
                       unsigned owners=Workers(ep,p,order,g);
                       for (unsigned lanes : {1U,2U}) {
@@ -1422,6 +1451,8 @@ static_assert(reject(4,3) && reject(5,3) && reject(6,3) && reject(6,256));
 static_assert(reject(6,96) && reject(6,129) && reject(6,(int64_t{1}<<32)+64));
 static_assert(matches(64,16,8,false,{1,0,16,8,1,1,64,2,0}));
 static_assert(matches(64,16,8,true,{1,0,16,8,1,1,128,2,1}));
+static_assert(matches(128,16,8,false,{1,0,16,16,1,1,32,2,0}));
+static_assert(matches(128,16,8,true,{1,0,16,16,1,1,32,2,1}));
 static_assert(reject(7,-1) && reject(7,1) && reject(7,3));
 static_assert(reject(8,-1) && reject(8,1) && reject(8,2) && reject(8,3));
 static_assert(reject(7,2,-2) && reject(7,2,7) && reject(7,2,6));

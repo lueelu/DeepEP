@@ -175,10 +175,14 @@ __aicore__ inline void CombineRemote(
     if (td.udma_qps_per_worker == 2) {
         if (td.udma_peer_order == kGroupRoundRobinOrder)
             CombineRemoteImpl<kGroupPeerCapacity, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
+        else if (td.udma_peers_per_worker > kMaxPeers)
+            CombineRemoteImpl<kMaxRankPeers, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
         else
             CombineRemoteImpl<kMaxPeers, Phase, 2>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
     } else if (td.udma_peer_order == kGroupRoundRobinOrder)
         CombineRemoteImpl<kGroupPeerCapacity, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
+    else if (td.udma_peers_per_worker > kMaxPeers)
+        CombineRemoteImpl<kMaxRankPeers, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
     else
         CombineRemoteImpl<kMaxPeers, Phase, 1>(r, x, weights, idx, rp, cp, workspace, td, core, trace);
 }

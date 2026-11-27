@@ -7,6 +7,20 @@ ownership, sparse CQEs and completion guarantees, see
 
 ## Current defaults
 
+- EP128 with exactly 8 communication AIVs uses rank/P16/W1/Q1/visit32.
+  Other EP128 core budgets retain their previous plans. P16 is supported only
+  for rank order; existing P<=8 and token sender windows retain their sizes.
+  Fresh/cached dispatch and combine select a separate 16-peer sender. Its Q1
+  live UB prefix is 23,200 bytes for dispatch and at most 21,664 bytes for
+  combine (including merged-row scratch), followed by existing local-work
+  storage. Output row mapping and final completion semantics are unchanged.
+  All launched AIVs still participate in entry/final sync.
+  To compare with the former G16 8-core plan in one tuning Buffer, reserve
+  `rank:16:1:1;group_round_robin:2:1:1` before initialization and compare
+  `rank_p16_w1_q1_v32` with `group_round_robin_p2_w1_q1_v32` using
+  `bench_fast_sweep.py --strategies`. Keep the actual metadata/weight modes
+  identical and validate outputs before measuring; this is not a performance
+  guarantee and requires rebuilding Host and device libraries.
 - V2 fresh dispatch uses independent SIMT layout, following resolved `num_sms`.
   `DEEPEP_CLOS_V2_SIMT_LAYOUT=0` selects the original layout baseline.
 - Automatic V2 non-expanded BF16 plans for EP8/16/32 use rank ordering in
