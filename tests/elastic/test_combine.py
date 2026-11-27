@@ -2,7 +2,7 @@
 
 """Installed-wheel Combine precision test; payload Dispatch is explicitly opt-in.
 
-Combine payload uses the official FP32 sine -> BF16 fixture, with a single
+Combine payload uses a deterministic FP32 sine -> BF16 fixture, with a single
 ordered golden adapted to this repository's server/rank reduction semantics.
 BF16 payload and FP32 returned weights use torch.equal (no error tolerance).
 
@@ -520,7 +520,7 @@ def expected_output(routes, experts, rank, generation, hidden=7168):
 
 
 def bf16_expert_rows(entries, world, tokens, topk, hidden, seed, device):
-    """Official generate_pre_combine_data formula, selected by source/token/slot.
+    """Generate deterministic BF16 rows selected by source/token/slot.
 
     Reference: DeepEP-Ascend 4dfccac4, deep_ep/utils/refs.py.
     Calculate the sine in FP32 on the same device as the golden, then cast to
@@ -1235,8 +1235,8 @@ def run_case(buffer, args, rank, world, info, log, references):
             with torch.npu.stream(producer):
                 event.current_stream_wait()
                 pool = getattr(args, "_gm_huge_pool", None)
-                # Like the official test, construct expert outputs independently
-                # of Dispatch. Optional Dispatch correctness was checked above.
+                # Construct expert outputs independently of Dispatch.
+                # Optional Dispatch correctness was checked above.
                 expert = bf16_expert_input(entries, args, generation, "npu", pool)
                 if getattr(args, "input_storage", "gm") == "gm-huge" and expert.numel():
                     from deep_ep import _C
