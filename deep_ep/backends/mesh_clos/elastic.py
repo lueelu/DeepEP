@@ -410,7 +410,7 @@ class ElasticBuffer:
         pinned.copy_(source)
         return pinned.to(device=device, non_blocking=True)
 
-    def _low_latency_plan(self, x, topk_idx, topk_weights, num_experts, capacity):
+    def _low_latency_plan(self, x, topk_idx, topk_weights, num_experts, capacity, smooth=None):
         """Check only Host metadata before selecting LL; never read routes."""
         import torch
 
@@ -435,6 +435,20 @@ class ElasticBuffer:
             return None
         if (self.hidden and h != self.hidden) or (self.num_topk and k != self.num_topk):
             return None
+        if smooth is not None:
+            # Source-side smooth quantization is BF16-only and cannot be combined
+            # with prequantized FP8 input. The table is replicated on every rank;
+            # the caller owns cross-rank consistency.
+            if hidden.dtype != torch.bfloat16 or scales is not None:
+                return None
+            if (
+                not isinstance(smooth, torch.Tensor)
+                or smooth.dtype != torch.float32
+                or tuple(smooth.shape) != (num_experts, h)
+                or not smooth.is_contiguous()
+                or smooth.device != hidden.device
+            ):
+                return None
         if hidden.dtype == torch.float8_e4m3fn:
             if (
                 not isinstance(scales, torch.Tensor)
@@ -459,11 +473,12 @@ class ElasticBuffer:
         if scales is not None and not scales.is_contiguous():
             return None
         return require_native("ElasticBuffer.dispatch").low_latency_layout(
-            runtime.world_size, capacity, h, k, num_experts, str(hidden.dtype).removeprefix("torch.")
+            runtime.world_size, capacity, h, k, num_experts, str(hidden.dtype).removeprefix("torch."),
+            smooth is not None
         )
 
     def _dispatch_low_latency(
-        self, x, topk_idx, topk_weights, num_experts, capacity, do_handle_copy, do_cpu_sync, plan
+        self, x, topk_idx, topk_weights, num_experts, capacity, do_handle_copy, do_cpu_sync, plan, smooth=None
     ):
         import torch
         from ...utils.event import EventHandle, EventOverlap
@@ -474,6 +489,7 @@ class ElasticBuffer:
         b, h = hidden.shape
         k = topk_idx.shape[1]
         dtype = str(hidden.dtype).removeprefix("torch.")
+        smooth_int8 = smooth is not None
         with runtime.notify_lock:
             if runtime.notify_failed:
                 raise RuntimeError("A previous communication launch failed; restart the distributed job")
@@ -481,11 +497,13 @@ class ElasticBuffer:
             with npu.stream(runtime.stream):
                 producer.current_stream_wait()
                 indices = topk_idx.clone() if do_handle_copy else topk_idx
-                for value in (hidden, topk_idx, indices, topk_weights, scales):
+                for value in (hidden, topk_idx, indices, topk_weights, scales, smooth):
                     if value is not None:
                         value.record_stream(runtime.stream)
                 # Every allocation is kept alive on error after the first collective.
-                retained = (hidden, indices, topk_weights) + (() if scales is None else (scales,))
+                retained = (hidden, indices, topk_weights) + (() if scales is None else (scales,)) + (
+                    () if smooth is None else (smooth,)
+                )
                 runtime.notify_inflight = retained
                 try:
                     rows = self._notify_low_latency(indices, num_experts) if do_cpu_sync is not False else None
@@ -497,17 +515,25 @@ class ElasticBuffer:
                         runtime.low_latency_comm_args = self._upload_low_latency(
                             native.low_latency_comm_args(runtime.native), hidden.device
                         )
+                    if smooth_int8:
+                        output, output_scales = (
+                            torch.empty((output_rows, h), dtype=torch.int8, device=hidden.device),
+                            torch.empty((output_rows, 1), dtype=torch.float32, device=hidden.device),
+                        )
+                    else:
+                        output = torch.empty((output_rows, h), dtype=hidden.dtype, device=hidden.device)
+                        output_scales = (
+                            torch.empty((output_rows, (h + 127) // 128), dtype=scales.dtype, device=hidden.device)
+                            if scales is not None
+                            else None
+                        )
                     tensors = {
                         "input": hidden,
                         "indices": indices.to(torch.int32),
                         "weights": topk_weights,
                         "scales": scales,
-                        "output": torch.empty((output_rows, h), dtype=hidden.dtype, device=hidden.device),
-                        "output_scales": torch.empty(
-                            (output_rows, (h + 127) // 128), dtype=scales.dtype, device=hidden.device
-                        )
-                        if scales is not None
-                        else None,
+                        "output": output,
+                        "output_scales": output_scales,
                         "expert_recv_counts": torch.empty(
                             (num_experts // runtime.world_size,), dtype=torch.int64, device=hidden.device
                         ),
@@ -526,7 +552,7 @@ class ElasticBuffer:
                         value.record_stream(runtime.stream)
                     native.dispatch_low_latency(
                         runtime.native, tensors, b, h, k, num_experts, output_rows, capacity, dtype,
-                        runtime.stream.npu_stream
+                        smooth, runtime.stream.npu_stream
                     )
                     result = EPHandle(
                         True,
@@ -558,6 +584,7 @@ class ElasticBuffer:
                     result._buffer_token = self._handle_token
                     result.rank, result.world_size = runtime.rank, runtime.world_size
                     result.num_tokens, result.num_topk, result.hidden = b, k, h
+                    result.smooth_int8 = smooth_int8
                     out, out_scales = tensors["output"], tensors["output_scales"]
                     if rows is not None:
                         out = out.narrow(0, 0, rows)
@@ -569,7 +596,7 @@ class ElasticBuffer:
                     raise
             event.current_stream_wait()
             runtime.notify_inflight = None
-            return (out, out_scales) if scales is not None else out, None, None, result, event
+            return (out, out_scales) if out_scales is not None else out, None, None, result, event
 
     def _combine_low_latency(
         self,
@@ -693,6 +720,7 @@ class ElasticBuffer:
         do_expand: Optional[bool] = None,
         do_zero_padding: bool = False,
         use_aligned_col_major_sf: bool = False,
+        smooth: Optional[torch.Tensor] = None,
     ) -> Tuple[
         Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]],
         Optional[torch.Tensor],
@@ -721,6 +749,8 @@ class ElasticBuffer:
         internally, so expert output must not be preweighted. With CPU sync
         and an existing EP group LL returns exact R rows; otherwise it returns
         P*M*min(K,E/P) capacity rows. Default M resolution is unchanged.
+        `smooth` enables low-latency smooth INT8 dispatch for BF16 input: the
+        expanded output becomes int8 with one FP32 dequant scale per row.
         """
         require_native("ElasticBuffer.dispatch")
         import torch
@@ -733,6 +763,8 @@ class ElasticBuffer:
             raise ValueError("Dispatch requires combine_only=False when constructing ElasticBuffer")
         if issubclass(type(handle), EPHandle) and handle.is_low_latency:
             raise NotImplementedError("Cached dispatch is not supported for LL handles")
+        if smooth is not None and handle is not None:
+            raise NotImplementedError("Smooth INT8 dispatch does not support cached handles")
         if handle is None:
             hidden = x[0] if isinstance(x, tuple) and len(x) == 2 else x
             if isinstance(hidden, torch.Tensor) and hidden.ndim == 2:
@@ -765,7 +797,11 @@ class ElasticBuffer:
                     and do_zero_padding is False
                     and use_aligned_col_major_sf is False
                 )
-                plan = self._low_latency_plan(x, topk_idx, topk_weights, num_experts, capacity) if ll_options else None
+                plan = (
+                    self._low_latency_plan(x, topk_idx, topk_weights, num_experts, capacity, smooth)
+                    if ll_options
+                    else None
+                )
                 if plan is not None:
                     if runtime.capacity != 8 << 30:
                         raise ValueError(
@@ -773,7 +809,12 @@ class ElasticBuffer:
                             f"got {runtime.capacity} bytes for EP{runtime.world_size}"
                         )
                     return self._dispatch_low_latency(
-                        x, topk_idx, topk_weights, num_experts, capacity, do_handle_copy, do_cpu_sync, plan
+                        x, topk_idx, topk_weights, num_experts, capacity, do_handle_copy, do_cpu_sync, plan,
+                        smooth
+                    )
+                if smooth is not None:
+                    raise NotImplementedError(
+                        "Smooth INT8 dispatch requires the low-latency path and a BF16 [E, H] FP32 smooth table"
                     )
         with runtime.notify_lock:
             error, signature = None, []

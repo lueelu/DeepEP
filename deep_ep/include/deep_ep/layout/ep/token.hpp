@@ -78,6 +78,16 @@ struct EpServerDedupDataLayout {
     uint64_t sourceOffset = 0, sourceBytes = 0;
     uint64_t dispatchOffset = 0, dispatchBytes = 0;
     uint64_t relayOffset = 0, relayBytes = 0, requiredBytes = 0;
+    // SmoothInt8 carries two wire formats in one physical slot. The fields above
+    // describe the INT8 wire (source-quantized intra-host payload and terminal
+    // output). The BF16 entry wire used across machines is stored separately.
+    // Both formats share the largest slot stride and the same slot tail so a
+    // single tail flag probe can tell them apart.
+    uint64_t int8BlockCount = 0, int8Stride = 0, int8PackedPayloadBytes = 0;
+    uint64_t wire16BlockCount = 0, wire16Stride = 0, wire16PackedPayloadBytes = 0;
+    uint64_t wire16PayloadBytes = 0, wire16HeaderPayloadOffset = 0, wire16ReadIndexPayloadOffset = 0;
+    uint64_t int8TailOffset = 0;
+    uint32_t probeStartBlock = 0, probeBlocks = 0;
 };
 
 constexpr __aicore__ __forceinline__ uint64_t DispatchDedupAlign(uint64_t value, uint64_t alignment)
@@ -92,14 +102,16 @@ constexpr __aicore__ __forceinline__ EpServerDedupDataLayout DispatchServerDedup
                                                                                     uint32_t topK, uint32_t experts,
                                                                                     EpServerDedupInputMode mode)
 {
-    const bool wireFp8 = mode != EpServerDedupInputMode::Plain16;
+    const bool prequantized = mode == EpServerDedupInputMode::PrequantizedFp8Packs;
+    const bool smoothInt8 = mode == EpServerDedupInputMode::SmoothInt8;
+    // One-byte payloads keep the header right after the packed data; only plain
+    // BF16 uses its own two-byte width.
+    const bool int8Wire = prequantized || smoothInt8;
     EpServerDedupDataLayout layout{};
     layout.quantCount = DispatchDedupAlign(h, 256U);
-    layout.scaleBytes = mode == EpServerDedupInputMode::PrequantizedFp8Packs
-                            ? ((uint64_t(h) + 127U) / 128U) * 4U
-                            : (wireFp8 ? DispatchDedupAlign((uint64_t(h) + 31U) / 32U, 2U) : 0);
+    layout.scaleBytes = prequantized ? ((uint64_t(h) + 127U) / 128U) * 4U : (smoothInt8 ? 4U : 0U);
     layout.headerPayloadOffset =
-        DispatchDedupAlign(wireFp8 ? layout.quantCount + layout.scaleBytes : uint64_t(h) * 2U, 32U);
+        DispatchDedupAlign(int8Wire ? layout.quantCount + layout.scaleBytes : uint64_t(h) * 2U, 32U);
     layout.readIndexPayloadOffset = layout.headerPayloadOffset + 32U;
     const uint64_t readIndexBytes = uint64_t(topK) * 8U;
     if (layout.readIndexPayloadOffset % 480U + readIndexBytes > 480U)
@@ -112,6 +124,40 @@ constexpr __aicore__ __forceinline__ EpServerDedupDataLayout DispatchServerDedup
     layout.packedPayloadBytes = layout.blockCount * 480U;
     layout.tokenStride = layout.blockCount * 512U;
     layout.returnStride = (uint64_t(h) * 2U + 479U) / 480U * 512U;
+    if (smoothInt8) {
+        // Entry wire: raw BF16 token plus the same header/read-index tail.
+        const uint64_t readIndexBytes16 = uint64_t(topK) * 8U;
+        const uint64_t header16 = DispatchDedupAlign(uint64_t(h) * 2U, 32U);
+        uint64_t index16 = header16 + 32U;
+        if (index16 % 480U + readIndexBytes16 > 480U) index16 = DispatchDedupAlign(index16, 480U);
+        const uint64_t payload16 = DispatchDedupAlign(index16 + readIndexBytes16, 32U);
+        const uint64_t blocks16 = (payload16 + 479U) / 480U;
+        layout.int8BlockCount = layout.blockCount;
+        layout.int8Stride = layout.tokenStride;
+        layout.int8PackedPayloadBytes = layout.packedPayloadBytes;
+        layout.wire16BlockCount = blocks16;
+        layout.wire16PayloadBytes = payload16;
+        layout.wire16HeaderPayloadOffset = header16;
+        layout.wire16ReadIndexPayloadOffset = index16;
+        layout.wire16PackedPayloadBytes = blocks16 * 480U;
+        layout.wire16Stride = blocks16 * 512U;
+        // Same-slot dual format: both wires end at one shared slot tail. The
+        // tail probe covers the intersection of the two block ranges so the
+        // first flag block of either format (which carries its marker) is
+        // always included.
+        if (blocks16 >= layout.int8BlockCount) {
+            layout.int8TailOffset = (blocks16 - layout.int8BlockCount) * 512U;
+            layout.probeStartBlock = uint32_t(blocks16 - layout.int8BlockCount);
+            layout.probeBlocks = uint32_t(layout.int8BlockCount);
+            layout.blockCount = blocks16;
+            layout.packedPayloadBytes = layout.wire16PackedPayloadBytes;
+            layout.tokenStride = layout.wire16Stride;
+        } else {
+            layout.int8TailOffset = 0U;
+            layout.probeStartBlock = 0U;
+            layout.probeBlocks = uint32_t(blocks16);
+        }
+    }
     layout.sourceOffset = kEpServerDedupControlBytes;
     layout.sourceBytes = uint64_t(bs) * topK * layout.returnStride;
     layout.dispatchOffset = DispatchDedupAlign(layout.sourceOffset + layout.sourceBytes, 512U);

@@ -112,8 +112,11 @@ constexpr int DISPATCH_DEDUP_FLAG_BUFF_BYTES = 4 * 1024 * 1024;
 
 namespace deep_ep {
 // Wire FP8 does not imply internal quantization. Values also form the tiling ABI.
+// SmoothInt8 is not a prequantized input: BF16 tokens enter and the kernel emits
+// per-token dynamic INT8 output with one FP32 dequant scale per expanded row.
 enum class EpServerDedupInputMode : uint8_t {
     Plain16 = 0,
+    SmoothInt8 = 1,
     PrequantizedFp8Packs = 2,
 };
 }  // namespace deep_ep
