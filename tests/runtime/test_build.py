@@ -5,6 +5,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import ModuleType
@@ -75,6 +76,50 @@ def load(path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_deepjit_probes_use_the_host_target_standard(tmp_path):
+    cmake = shutil.which("cmake")
+    deepjit = ROOT / "third-party/deep_jit"
+    if not cmake or not shutil.which("c++") or not (deepjit / "README.md").is_file():
+        pytest.skip("Requires CMake, a host C++ compiler and the DeepJIT submodule")
+
+    # Reuse a tree where the old C++17 probe cached a negative result and left
+    # a generated <format> on the consumer's include path.
+    build_dir = tmp_path / "build"
+    shim = build_dir / "generated/deepjit-compat/format"
+    shim.parent.mkdir(parents=True)
+    shim.write_text('#error "stale format shim"\n')
+    (tmp_path / "CMakeLists.txt").write_text(r"""
+cmake_minimum_required(VERSION 3.20)
+project(deepjit_format_test LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+include(CheckCXXSourceCompiles)
+set(CMAKE_CXX_STANDARD 20)
+check_cxx_source_compiles([=[
+#include <format>
+int main() { return std::format("{}", 42).empty(); }
+]=] NATIVE_FORMAT)
+set(CMAKE_CXX_STANDARD 17)
+set(DEEPEP_DEEPJIT_HAS_STD_FORMAT FALSE CACHE INTERNAL "Old probe")
+include("${DEEP_EP_ROOT}/cmake/DeepJIT.cmake")
+if(NOT CMAKE_CXX_STANDARD EQUAL 17 OR (NATIVE_FORMAT AND NOT DEEPEP_DEEPJIT_COMPAT_MODE STREQUAL "native"))
+    message(FATAL_ERROR "DeepJIT selected the wrong host standard or format library")
+endif()
+add_executable(consumer main.cpp)
+deepep_apply_deepjit(consumer)
+""")
+    (tmp_path / "main.cpp").write_text(r"""
+#include <deep_jit/utils/hash.hpp>
+#include <format>
+static_assert(__cplusplus >= 202002L);
+int main() { return std::format("{}", deep_jit::hash::FNV1a().get_hex_digest()).empty(); }
+""")
+    subprocess.run([cmake, "-S", str(tmp_path), "-B", str(build_dir), f"-DDEEP_EP_ROOT={ROOT}",
+                    f"-DDEEPJIT_ROOT={deepjit}", f"-DDEEPEP_DEEPJIT_FMT_ROOT={ROOT / 'third-party/fmt'}"], check=True)
+    subprocess.run([cmake, "--build", str(build_dir)], check=True)
+    subprocess.run([str(build_dir / "consumer")], check=True)
 
 
 @pytest.fixture

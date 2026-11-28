@@ -41,7 +41,6 @@ find_package(Torch REQUIRED)
 set(TORCH_NPU_PATH "${_deepep_torch_npu}")
 pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp
     csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp csrc/ubx/v2.cpp)
-set_target_properties(_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 target_include_directories(_C PRIVATE csrc "${CMAKE_SOURCE_DIR}/deep_ep/include" "${ASCEND_HOME_PATH}/include"
     "${SHMEM_ROOT}/include" "${TORCH_NPU_PATH}/include" "${TORCH_NPU_PATH}/include/third_party/acl/inc"
     ${TORCH_INCLUDE_DIRS})

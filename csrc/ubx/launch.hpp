@@ -1,5 +1,6 @@
 // Copyright (c) 2026, Lu Lu
 #pragma once
+#include <format>
 #include "kernels/ep/dispatch.hpp"
 
 namespace deep_ep {
