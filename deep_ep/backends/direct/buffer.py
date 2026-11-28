@@ -75,6 +75,11 @@ class Buffer:
     num_sms: int = 32
 
     @property
+    def shmem_init_timeout_secs(self) -> int:
+        """SHMEM initialization and bootstrap timeout in seconds (read-only)."""
+        return self._shmem_init_timeout_secs
+
+    @property
     def combine_notify(self) -> bool:
         """Whether this Buffer requests a separate combine rendezvous (read-only)."""
         return self._combine_notify
@@ -103,10 +108,13 @@ class Buffer:
         udma_qps_per_worker: Optional[int] = None,
         udma_auto_policy: bool = True,
         use_1g_huge_pages: bool = False,
+        shmem_init_timeout_secs: int = 600,
         combine_notify: bool = False,
         shmem_ip_port: Optional[str] = None,
         num_max_tokens_per_rank: Optional[int] = None,
     ) -> None:
+        _validate_shmem_init_timeout(shmem_init_timeout_secs)
+        self._shmem_init_timeout_secs = shmem_init_timeout_secs
         if type(combine_notify) is not bool:
             raise TypeError("combine_notify must be a bool")
         self._combine_notify = combine_notify
@@ -222,6 +230,7 @@ class Buffer:
                 udma_schedule,
                 peer_options,
                 combine_notify=combine_notify,
+                shmem_init_timeout_secs=shmem_init_timeout_secs,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
                     if self._udma_auto_policy is not None
@@ -246,6 +255,8 @@ class Buffer:
                 self._udma_auto_policy is not None,
                 self._udma_auto_policy.reservation_spec() if self._udma_auto_policy is not None else "",
                 combine_notify,
+                False,  # V1 does not fuse layout/notify.
+                shmem_init_timeout_secs,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -1264,6 +1275,14 @@ def _validate_udma_peer_order(
     return result + ((0, workers_per_peer) if workers_per_peer != 1 else ())
 
 
+def _validate_shmem_init_timeout(seconds: int) -> None:
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise TypeError("shmem_init_timeout_secs must be an integer")
+    # SHMEM bootstrap converts seconds to uint32 milliseconds.
+    if not 1 <= seconds <= 4294967:
+        raise ValueError("shmem_init_timeout_secs must be in [1, 4294967] seconds")
+
+
 def _prepare_shmem_bootstrap(
     group,
     comm,
@@ -1279,6 +1298,7 @@ def _prepare_shmem_bootstrap(
     udma_auto_options=None,
     combine_notify=False,
     fused_layout_notify=False,
+    shmem_init_timeout_secs=600,
 ):
     native = load_native_module()
     options = (
@@ -1292,6 +1312,7 @@ def _prepare_shmem_bootstrap(
         udma_peer_options,
         combine_notify,
         fused_layout_notify,
+        shmem_init_timeout_secs,
     )
     if udma_auto_options is not None:
         options += (udma_auto_options,)

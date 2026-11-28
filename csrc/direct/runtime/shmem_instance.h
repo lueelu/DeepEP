@@ -22,7 +22,7 @@ public:
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
                   int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {},
-                  bool combine_notify = false, bool fused_layout_notify = false);
+                  bool combine_notify = false, bool fused_layout_notify = false, int64_t shmem_init_timeout_secs = 600);
 
     ~ShmemInstance();
 
@@ -110,6 +110,7 @@ public:
 private:
     const bool combine_notify_ = false;
     const bool fused_layout_notify_ = false;
+    const uint32_t shmem_init_timeout_secs_;
     uint64_t npu_timeout_cycles_ = 0;
     uint32_t shmem_sync_timeout_us_ = 0;
     uint32_t notify_host_timeout_seconds_ = 0;

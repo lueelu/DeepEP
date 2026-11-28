@@ -31,6 +31,14 @@ constexpr uint64_t kMicrosecondsPerSecond = 1000000;
 aclshmemx_uniqueid_t g_default_flag_uid{};
 std::map<uint32_t, std::string> bootstrap_keys;
 
+uint32_t ValidateInitTimeoutSeconds(int64_t seconds)
+{
+    constexpr uint32_t max_seconds = std::numeric_limits<uint32_t>::max() / 1000U;
+    TORCH_CHECK(seconds >= 1 && seconds <= max_seconds, "shmem_init_timeout_secs must be in [1, ", max_seconds,
+                "] seconds");
+    return static_cast<uint32_t>(seconds);
+}
+
 uint32_t ReadTimeoutSeconds(const char* name, uint32_t default_seconds,
                             uint32_t max_seconds = std::numeric_limits<uint32_t>::max())
 {
@@ -100,9 +108,10 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
                              int64_t udma_qps_per_worker, bool auto_resources, std::string auto_qp_plans,
-                             bool combine_notify, bool fused_layout_notify)
+                             bool combine_notify, bool fused_layout_notify, int64_t shmem_init_timeout_secs)
     : combine_notify_(combine_notify),
       fused_layout_notify_(fused_layout_notify),
+      shmem_init_timeout_secs_(ValidateInitTimeoutSeconds(shmem_init_timeout_secs)),
       rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
@@ -487,6 +496,10 @@ void ShmemInstance::InitRuntime()
             init_flags = ACLSHMEMX_INIT_WITH_UNIQUEID;
         }
 
+        // Set after UID attribute setup, which may restore SDK defaults.
+        attributes.option_attr.shm_init_timeout = shmem_init_timeout_secs_;
+        attributes.option_attr.shm_create_timeout = shmem_init_timeout_secs_;
+        attributes.option_attr.control_operation_timeout = shmem_init_timeout_secs_;
         attributes.runtime_config.sync_timeout_us = shmem_sync_timeout_us_;
         attributes.instance_id = instance_id_;
         deepep::InstanceEndpoint endpoint(attributes);

@@ -20,6 +20,7 @@ from .buffer import (
     _try_record_event,
     _use_comm_stream,
     _validate_udma_peer_order,
+    _validate_shmem_init_timeout,
 )
 from .config import Config
 from .config import (
@@ -112,6 +113,11 @@ class ElasticBuffer:
     """
 
     @property
+    def shmem_init_timeout_secs(self) -> int:
+        """SHMEM initialization and bootstrap timeout in seconds (read-only)."""
+        return self._shmem_init_timeout_secs
+
+    @property
     def combine_notify(self) -> bool:
         """Whether this Buffer requests a separate combine rendezvous (read-only)."""
         return self._combine_notify
@@ -153,9 +159,12 @@ class ElasticBuffer:
         udma_peers_per_worker: Optional[int] = None,
         udma_wqes_per_visit: Optional[int] = None,
         udma_auto_policy: bool = True,
+        shmem_init_timeout_secs: int = 600,
         combine_notify: bool = False,
         fused_layout_notify: bool = False,
     ) -> None:
+        _validate_shmem_init_timeout(shmem_init_timeout_secs)
+        self._shmem_init_timeout_secs = shmem_init_timeout_secs
         if type(combine_notify) is not bool:
             raise TypeError("combine_notify must be a bool")
         self._combine_notify = combine_notify
@@ -327,6 +336,7 @@ class ElasticBuffer:
                 udma_schedule,
                 peer_options,
                 combine_notify=combine_notify,
+                shmem_init_timeout_secs=shmem_init_timeout_secs,
                 fused_layout_notify=fused_layout_notify,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
@@ -352,6 +362,7 @@ class ElasticBuffer:
                 self._udma_auto_policy.reservation_spec() if self._udma_auto_policy is not None else "",
                 combine_notify,
                 fused_layout_notify,
+                shmem_init_timeout_secs,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:

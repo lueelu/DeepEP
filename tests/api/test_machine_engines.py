@@ -31,9 +31,9 @@ def public_runtime(monkeypatch):
 
     class Native:
         def __init__(self, *args):
-            assert len(args) in (20, 21)
-            if len(args) == 21:
-                assert args[20] is False
+            assert len(args) == 22
+            assert args[20] is False
+            assert args[21] == 600
             assert args[19] is False
             assert type(args[16]) is int and args[16] in (1, 2)
             assert type(args[17]) is bool and args[17] == (args[3] == "udma")

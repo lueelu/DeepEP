@@ -1060,7 +1060,7 @@ def test_fused_layout_is_buffer_local_and_forwarded_to_native(fused):
         b._destroyed = True
         assert b.fused_layout_notify is {fused!r}
         assert calls[0]['fused_layout_notify'] is {fused!r}
-        assert len(calls[1]) == 21 and calls[1][20] is {fused!r}
+        assert len(calls[1]) == 22 and calls[1][20] is {fused!r}
         try:
             b.fused_layout_notify = not {fused!r}
         except AttributeError:
@@ -1083,7 +1083,7 @@ def test_fused_layout_rank_disagreement_rejected_before_initialization():
         b.load_native_module = lambda: SimpleNamespace(get_shmem_bootstrap=lambda key: (0, []))
         def gather(group, comm, size, value):
             options, state, uid = value
-            peer = options[:-1] + (not options[-1],)
+            peer = options[:-2] + (not options[-2], options[-1])
             return [value, (peer, state, uid)]
         b._bootstrap_all_gather = gather
         try:
@@ -1093,4 +1093,76 @@ def test_fused_layout_rank_disagreement_rejected_before_initialization():
             assert 'same workspace' in str(exc)
         else:
             raise AssertionError('fusion rank mismatch accepted')
+    """)
+
+
+@pytest.mark.parametrize("api", ["Buffer", "ElasticBuffer"])
+@pytest.mark.parametrize("timeout", [None, 1, 900, 4294967])
+def test_shmem_init_timeout_constructor_forwarding_and_validation(api, timeout):
+    run_host(f"""
+        from deep_ep.backends.direct import buffer as v1, elastic as v2
+        m = v1 if {api!r} == 'Buffer' else v2
+        cls = getattr(m, {api!r})
+        calls = []
+        m._resolve_group_or_comm = lambda group, comm: (0, 2, group)
+        m.get_global_comm_stream = lambda: None
+        v1._is_capturing = lambda: False
+        v2._validate_group_consensus = lambda *args: None
+        v2.ElasticBuffer.barrier = lambda *args, **kwargs: None
+        def bootstrap(*args, **kwargs):
+            calls.append(kwargs['shmem_init_timeout_secs'])
+            return [], 'test'
+        m._prepare_shmem_bootstrap = bootstrap
+        class Native:
+            def __init__(self, *args):
+                calls.append(args[-1])
+            def num_device_aiv(self):
+                return 64
+        m.get_native_class = lambda _: Native
+        options = dict(num_bytes=128 << 20, transport='udma', udma_auto_policy=False,
+                       udma_schedule='peer', udma_dispatch_peer_order='rank',
+                       udma_combine_peer_order='rank', udma_workers_per_peer=1, udma_qps_per_worker=1)
+        if {api!r} == 'ElasticBuffer':
+            options.update(udma_peers_per_worker=1, udma_wqes_per_visit=8)
+        if {timeout!r} is not None:
+            options['shmem_init_timeout_secs'] = {timeout!r}
+        b = cls(object(), **options)
+        b._destroyed = True
+        expected = 600 if {timeout!r} is None else {timeout!r}
+        assert calls == [expected, expected]
+        assert b.shmem_init_timeout_secs == expected
+        try:
+            b.shmem_init_timeout_secs = 60
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError('timeout must be read-only')
+        for bad, error in [(True, TypeError), ('600', TypeError), (1.5, TypeError),
+                           (None, TypeError), (0, ValueError), (-1, ValueError), (4294968, ValueError)]:
+            try:
+                cls(object(), shmem_init_timeout_secs=bad)
+            except error:
+                pass
+            else:
+                raise AssertionError('invalid timeout accepted')
+    """)
+
+
+@pytest.mark.parametrize("endpoint", [None, "tcp://localhost:1234"])
+def test_shmem_init_timeout_rank_disagreement_rejected_before_uid(endpoint):
+    run_host(f"""
+        from deep_ep.backends.direct import buffer as b
+        b.load_native_module = lambda: SimpleNamespace(get_shmem_bootstrap=lambda key: (0, []))
+        def gather(group, comm, size, value):
+            options, state, uid = value
+            peer = options[:-1] + (options[-1] + 1,)
+            return [value, (peer, state, uid)]
+        b._bootstrap_all_gather = gather
+        try:
+            b._prepare_shmem_bootstrap(object(), None, 0, 2, 64 << 20, 'udma', False,
+                                       {endpoint!r}, shmem_init_timeout_secs=600)
+        except ValueError as exc:
+            assert 'same workspace' in str(exc)
+        else:
+            raise AssertionError('timeout rank mismatch accepted')
     """)
