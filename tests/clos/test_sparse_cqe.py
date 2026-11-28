@@ -32,10 +32,16 @@ def test_payload_merge_option_validation(tmp_path):
         "static_assert(ParseCombinePayloadMaxRows(nullptr, 8192)==4);\n"
         "static_assert(ParseCombinePayloadMaxRows(nullptr, 8193)==2);\n"
         "static_assert(ParseCombinePayloadMaxRows(nullptr, 12288)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12289)==1);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 14336)==1);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12289)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 14336)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 16384)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 24576)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 32767)==2);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 32768)==1);\n"
+        "static_assert(ParseCombinePayloadMaxRows(nullptr, 32769)==1);\n"
         'static_assert(ParseCombinePayloadMaxRows("1", 5632)==1);\n'
         'static_assert(ParseCombinePayloadMaxRows("2", 12288)==2);\n'
+        'static_assert(ParseCombinePayloadMaxRows("2", 32768)==2);\n'
         'static_assert(ParseCombinePayloadMaxRows("0004", 8192)==4);\n'
         'static_assert(ParseCombinePayloadMaxRows("32", 8192)==32);\n'
     )

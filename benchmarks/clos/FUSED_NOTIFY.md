@@ -163,9 +163,9 @@ performance; both still require device validation.
 
 `DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS` is read on each combine call. When unset,
 the maximum is `4` for payload rows of at most 8192 bytes (inclusive), `2` for
-rows above 8192 and at most 12288 bytes, and `1` for larger rows. The byte count
+rows above 8192 and below 32768 bytes, and `1` for rows of at least 32768 bytes. The byte count
 is hidden size times payload element size, excluding weights and metadata.
-For BF16 this means H<=4096 uses 4, 4096<H<=6144 uses 2, and H>6144 uses 1.
+For BF16 this means H<=4096 uses 4, 4096<H<16384 uses 2, and H>=16384 uses 1.
 Explicit integers from `1` through
 `32` override this default; set `1` to compare with the single-row builder.
 Values above one enable dense remote payload slots for ordinary non-expanded

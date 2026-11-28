@@ -1066,7 +1066,44 @@ def test_ep32_unweighted_combine_preserves_eight_core_sender_plan():
     """)
 
 
-def test_large_row_extension_is_opt_in_scoped_and_reserved():
+def test_ep8_ep16_wide_rows_inherit_fixed_sender_tiers_by_default():
+    run_host("""
+        import os
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        os.environ.pop('DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY',None)
+        expected = {
+            (8,8,'dispatch'):(2,2,1,32), (8,32,'dispatch'):(1,1,1,16),
+            (8,8,'combine'):(1,1,1,32), (8,32,'combine'):(1,1,1,32),
+            (16,8,'dispatch'):(2,1,1,16), (16,32,'dispatch'):(4,2,1,16),
+            (16,8,'combine'):(2,1,1,8), (16,32,'combine'):(2,1,1,8),
+        }
+        for ep in (8,16):
+            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=ep,topology_known=True)
+            assert not base.extend_large_rows
+            reserved = set(base.reservation_spec().split(';'))
+            for cores in range(8,65,2):
+                tier = 8 if cores < 32 else 32
+                for op in ('dispatch','combine','weighted'):
+                    p,w,q,visit = expected[(ep,tier,'combine' if op=='weighted' else op)]
+                    for size in (12288,12289,14336,16384,24576,32766,32768,65536):
+                        plan = base.for_launch(cores,size,op,bf16=True)
+                        assert (plan.peer_order,plan.peers_per_worker,plan.workers_per_peer,
+                                plan.qps_per_worker,plan.wqes_per_visit) == (0,p,w,q,visit)
+                        assert plan.native_plan() == base.for_launch(cores,12288,op,bf16=True).native_plan()
+                        assert f'rank:{p}:{w}:{q}' in reserved
+                        assert plan.send_workers <= cores and plan.send_workers*q <= 32
+                        assert base.config(cores).num_aiv == cores
+                        if op == 'weighted': assert plan.weight_mode == 1
+                        for opts in ({'bf16':False},{'bf16':True,'expanded':True},{'bf16':True,'v2':False}):
+                            fallback = base.for_launch(cores,size,op,**opts)
+                            original = replace(base.for_num_aiv(cores),wqes_per_visit=32,self_copy=0,weight_mode=0)
+                            assert fallback.native_plan() == original.native_plan()
+    """)
+
+
+def test_large_row_extension_defaults_and_compatibility_option_are_reserved():
     run_host("""
         import os
         from dataclasses import replace
@@ -1078,7 +1115,7 @@ def test_large_row_extension_is_opt_in_scoped_and_reserved():
         old = resolve(8)
         assert not old.extend_large_rows
         old_plan = old.for_launch(32,14336,'combine',bf16=True).native_plan()
-        assert old_plan[3:6] == [1,2,1]
+        assert old_plan[3:6] == [1,1,1]
         os.environ['DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY'] = '1'
         enabled = resolve(8)
         assert enabled.extend_large_rows and old.signature() != enabled.signature()

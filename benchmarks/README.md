@@ -11,7 +11,9 @@ Modified by Joyce_An 2026
 
 普通V2 BF16非展开、已识别为连续单机G4的EP4，8～30核dispatch在H7168及更大hidden默认延续H6144的rank/P1/W1/Q2/v32：3个payload发送核，其余核处理metadata和本卡复制。fresh/cached共用该计划；32～64核以及combine计划不变。实际行宽和容量检查不变，宽hidden的设备性能仍需验证。
 
-其他大行宽发送计划延伸仍默认关闭。设备对照时可在创建 Buffer **之前**，为所有rank设置 `DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY=1`：普通V2 BF16非展开、EP4/8/16、8～64核、payload行宽超过12288字节时，继承12288字节对应的发送计划。设为`0`或不设置使用当前默认策略（包括上述EP4低核dispatch延伸）。该选项在构造时固定并参与rank配置一致性检查；不会改变实际tensor大小、UB/通信容量检查或payload合并行数。使用允许环境选项的 `clos/bench_v2_bandwidth.py` 做对照；下面的默认策略摸测入口会拒绝该实验覆盖项。
+普通V2 BF16非展开、EP8/16、8～64核的H7168及更大hidden也默认继承H6144的完整发送计划，包括P/W/Q、visit及权重偏好；8～30核继承8核档、32～64核继承32核档，原拓扑适用条件保留。无需设置 `DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY`。该兼容选项设为`1`时仍可额外延伸EP4的其他路径，设为`0`不会撤销已默认生效的继承。实际tensor行宽、UB和通信容量检查不变。
+
+普通非展开UDMA peer combine默认按实际payload行字节数合并：`<=8192`用rows4，`8192<bytes<32768`用rows2，`>=32768`用rows1。BF16对应H<=4096、4096<H<16384、H>=16384；H7168现在默认rows2，仍可通过 `DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS` 显式对照。特殊路径继续保留原有rows1安全回退。H7168的rows2已有设备对照收益，更大hidden及新的EP8/16继承计划仍需设备验证。
 
 visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变。visit 是一个 peer 每轮的 WQE 预算，64/128 会拆为多个最多32条的提交，不扩大 WQE 暂存区，也不改变 SQ 信用保护。带权重等多字段路径按 WQE 计数，不等于同等数量的 token。新增取值需同步更新 Python 和 Host 库。
 

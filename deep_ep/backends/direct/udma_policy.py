@@ -101,7 +101,7 @@ class UdmaPolicy:
     peer_order: int = 0
     self_copy: int = 2  # 1: spare AIVs; 2: after submit; legacy 0 aliases 2.
     weight_mode: int = 0  # 0: legacy; 1: UDMA; 2: SIMT when spare AIVs exist.
-    extend_large_rows: bool = False  # Opt-in H6144 sender-plan extension; captured at Buffer construction.
+    extend_large_rows: bool = False  # Additional EP4 extension; EP8/16 inherit wide-row plans by default.
 
     def __post_init__(self):
         # Historical profiles/manual callers may still supply 0. Never report
@@ -254,7 +254,7 @@ class UdmaPolicy:
         base = self.for_num_aiv(num_aiv)
         cores = num_aiv or 32
         if (
-            self.extend_large_rows
+            (self.extend_large_rows or self.world_size in (8, 16))
             and self.world_size in (4, 8, 16)
             and v2
             and not expanded
@@ -262,6 +262,8 @@ class UdmaPolicy:
             and 8 <= cores <= 64
             and row_bytes > 12288
         ):
+            # EP8/16 retain the H6144 plan for wider rows by default. The
+            # compatibility option also extends the remaining EP4 paths.
             # Only inherit scheduling. Actual tensor sizes, transfer bounds and
             # payload coalescing remain based on the real row width in the Host/kernel.
             return self.for_launch(num_aiv, 12288, operation, bf16=True)
