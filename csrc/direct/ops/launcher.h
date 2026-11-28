@@ -24,7 +24,7 @@ void LaunchCachedNotifyDispatchKernel(const ascend_deepep::DispatchTilingData& t
 void LaunchCachedDispatchPlanKernel(torch::Tensor routes, torch::Tensor plan, torch::Tensor send_head,
                                     const ascend_deepep::DispatchTilingData& tiling, uint64_t ffts_addr);
 
-void LaunchV1DispatchKernel(
+void LaunchDispatchKernel(
     torch::Tensor x, const c10::optional<torch::Tensor>& x_scales, const c10::optional<torch::Tensor>& topk_idx,
     const c10::optional<torch::Tensor>& topk_weights, const c10::optional<torch::Tensor>& num_tokens_per_rank,
     torch::Tensor is_token_in_rank, const c10::optional<torch::Tensor>& num_tokens_per_expert, torch::Tensor recv_x,
@@ -36,13 +36,13 @@ void LaunchV1DispatchKernel(
 
 enum class CombinePhase { Fused, Communication, Reduction, EarlySingles, Remaining, Pipeline };
 
-void LaunchV1CombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& topk_weights,
-                           const c10::optional<torch::Tensor>& bias_0, const c10::optional<torch::Tensor>& bias_1,
-                           torch::Tensor src_idx, torch::Tensor rank_prefix_matrix, torch::Tensor channel_prefix_matrix,
-                           torch::Tensor send_head, torch::Tensor recv_x,
-                           const c10::optional<torch::Tensor>& recv_topk_weights,
-                           const ascend_deepep::CombineTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr,
-                           bool use_udma, CombinePhase phase);
+void LaunchCombineKernel(torch::Tensor x, const c10::optional<torch::Tensor>& topk_weights,
+                         const c10::optional<torch::Tensor>& bias_0, const c10::optional<torch::Tensor>& bias_1,
+                         torch::Tensor src_idx, torch::Tensor rank_prefix_matrix, torch::Tensor channel_prefix_matrix,
+                         torch::Tensor send_head, torch::Tensor recv_x,
+                         const c10::optional<torch::Tensor>& recv_topk_weights,
+                         const ascend_deepep::CombineTilingData& tiling, void* symmetric_buffer, uint64_t ffts_addr,
+                         bool use_udma, CombinePhase phase, bool separate_notify);
 
 void LaunchExpandKernel(torch::Tensor x, const c10::optional<torch::Tensor>& x_scales,
                         const c10::optional<torch::Tensor>& topk_idx, const c10::optional<torch::Tensor>& topk_weights,

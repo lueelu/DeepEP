@@ -24,8 +24,7 @@ uint32_t ParseCombinePayloadMaxRows(const char* value, uint64_t payload_row_byte
     uint32_t rows = 0;
     TORCH_CHECK(*value, "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be an integer in [1, 32]");
     for (const char* p = value; *p; ++p) {
-        TORCH_CHECK(*p >= '0' && *p <= '9',
-                    "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be an integer in [1, 32]");
+        TORCH_CHECK(*p >= '0' && *p <= '9', "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be an integer in [1, 32]");
         rows = rows * 10U + uint32_t(*p - '0');
         TORCH_CHECK(rows <= 32U, "DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS must be in [1, 32]");
     }
@@ -158,7 +157,7 @@ CombineResult CombineEpilogue::Run()
     return launch_();
 }
 
-std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Combine(
     torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> bias_0,
     c10::optional<torch::Tensor> bias_1, torch::Tensor src_idx, torch::Tensor rank_prefix_matrix,
     torch::Tensor channel_prefix_matrix, torch::Tensor send_head, int64_t num_aiv,
@@ -223,7 +222,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                 "aggregate pipeline requires combine cores to match dispatch channels");
     if (udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder) udma_peers_per_worker = udma_launch.peers;
     if (use_udma) {
-        TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
+        TORCH_CHECK(shmem.SharedJetty(), "UDMA requires a shared-Jetty Buffer runtime");
         TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
                         udma_peers_per_worker == 8 || udma_peers_per_worker == 16,
                     "udma_peers_per_worker must be 1, 2, 4, 8 or 16");
@@ -320,8 +319,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     TORCH_CHECK(!trace_option || std::strcmp(trace_option, "0") == 0 || std::strcmp(trace_option, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_DEVICE_TIMING must be 0 or 1");
     if (trace_option && std::strcmp(trace_option, "1") == 0) {
-        TORCH_CHECK(use_udma && epilogue && !shmem.TokenSchedule() && !aggregate &&
-                    !pipeline_chunk_tokens && !expanded_x.has_value(),
+        TORCH_CHECK(use_udma && epilogue && !shmem.TokenSchedule() && !aggregate && !pipeline_chunk_tokens &&
+                        !expanded_x.has_value(),
                     "combine device timing requires ordinary peer-scheduled split UDMA combine");
         TORCH_CHECK(c10_npu::currentStreamCaptureStatusMayInitCtx() == c10_npu::CaptureStatus::None,
                     "combine device timing does not support graph capture");
@@ -392,32 +391,33 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     // The ordinary split path owns a fully materialized, contiguous input
     // through its reduction epilogue. Local rows need no SHMEM staging.
     // Early single-source, pipeline and token schedules retain their copies.
-    tiling.combine_direct_self = use_udma && epilogue && !tiling.udma_token_schedule &&
-        !aggregate && !pipeline_chunk_tokens && !expanded_x.has_value();
+    tiling.combine_direct_self = use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
+                                 !pipeline_chunk_tokens && !expanded_x.has_value();
     // Legacy staging controls never re-enable a copy on the direct-self path.
     // For staging, only the local reader uses compact dispatch row order.
     const char* compact_self = std::getenv("DEEPEP_CLOS_COMBINE_COMPACT_SELF");
     TORCH_CHECK(!compact_self || std::strcmp(compact_self, "0") == 0 || std::strcmp(compact_self, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_COMPACT_SELF must be 0 or 1");
     const bool compact_self_enabled = !compact_self || std::strcmp(compact_self, "1") == 0;
-    tiling.compact_self_rows = compact_self_enabled && !tiling.combine_direct_self &&
-        use_udma && epilogue && !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens &&
-        !expanded_x.has_value() &&
-        x.scalar_type() == torch::kBFloat16 && workspace.x_row_stride == hidden_bytes &&
+    tiling.compact_self_rows =
+        compact_self_enabled && !tiling.combine_direct_self && use_udma && epilogue && !tiling.udma_token_schedule &&
+        !aggregate && !pipeline_chunk_tokens && !expanded_x.has_value() && x.scalar_type() == torch::kBFloat16 &&
+        workspace.x_row_stride == hidden_bytes &&
         (!topk_weights.has_value() || workspace.topk_weights_row_stride == topk_weights_row_bytes);
     const char* wqe_fast = std::getenv("DEEPEP_CLOS_COMBINE_WQE_FAST");
     TORCH_CHECK(!wqe_fast || std::strcmp(wqe_fast, "0") == 0 || std::strcmp(wqe_fast, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_WQE_FAST must be 0 or 1");
-    tiling.combine_wqe_fast = wqe_fast && std::strcmp(wqe_fast, "1") == 0 &&
-        use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
-        !pipeline_chunk_tokens && !expanded_x.has_value();
-    const uint32_t payload_max_rows = ParseCombinePayloadMaxRows(
-        std::getenv("DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"), static_cast<uint64_t>(hidden_bytes));
-    tiling.combine_payload_max_rows =
-        use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
-        !pipeline_chunk_tokens && !expanded_x.has_value() && workspace.x_row_stride == hidden_bytes &&
-        send_channel_prefix_matrix.has_value()
-            ? payload_max_rows : 1U;
+    tiling.combine_wqe_fast = wqe_fast && std::strcmp(wqe_fast, "1") == 0 && use_udma && epilogue &&
+                              !tiling.udma_token_schedule && !aggregate && !pipeline_chunk_tokens &&
+                              !expanded_x.has_value();
+    const uint32_t payload_max_rows = ParseCombinePayloadMaxRows(std::getenv("DEEPEP_CLOS_COMBINE_PAYLOAD_MAX_ROWS"),
+                                                                 static_cast<uint64_t>(hidden_bytes));
+    tiling.combine_payload_max_rows = use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
+                                              !pipeline_chunk_tokens && !expanded_x.has_value() &&
+                                              workspace.x_row_stride == hidden_bytes &&
+                                              send_channel_prefix_matrix.has_value()
+                                          ? payload_max_rows
+                                          : 1U;
     const char* self_db = std::getenv("DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER");
     TORCH_CHECK(!self_db || std::strcmp(self_db, "0") == 0 || std::strcmp(self_db, "1") == 0,
                 "DEEPEP_CLOS_COMBINE_SELF_DOUBLE_BUFFER must be 0 or 1");
@@ -429,12 +429,11 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     // V2 supplies the original send prefixes. Older native callers without
     // that mapping retain their token-addressed weight layout.
     tiling.combine_compact_weights = compact_weights_enabled && send_channel_prefix_matrix.has_value() &&
-        topk_weights.has_value() && use_udma && epilogue && !tiling.udma_token_schedule && !aggregate &&
-        !pipeline_chunk_tokens && !expanded_x.has_value();
+                                     topk_weights.has_value() && use_udma && epilogue && !tiling.udma_token_schedule &&
+                                     !aggregate && !pipeline_chunk_tokens && !expanded_x.has_value();
     // Reuse the row-limit field as the dense-payload contract. Mixed legacy
     // weight descriptors and older native callers retain token-addressed rows.
-    if (topk_weights.has_value() && !tiling.combine_compact_weights)
-        tiling.combine_payload_max_rows = 1U;
+    if (topk_weights.has_value() && !tiling.combine_compact_weights) tiling.combine_payload_max_rows = 1U;
     if (tiling.combine_compact_weights || tiling.combine_payload_max_rows > 1U) {
         TORCH_CHECK(send_channel_prefix_matrix.has_value(),
                     "compact combine requires the original dispatch send channel prefixes");
@@ -512,6 +511,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
                            tiling.combine_direct_self};
     // Capture the prepared tensors/tiling by value once; no recomputation or
     // allocation between communication and reduction, and no host synchronize.
+    const bool separate_notify = shmem.CombineNotify();
     auto launch = [=](CombinePhase phase) {
         (void)combine_trace;
         // Explicit odr-use retains GM source owners, not just tiling addresses.
@@ -525,9 +525,9 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
         if (phase == CombinePhase::Reduction) {
             phase_tiling.block_dim = static_cast<uint32_t>(reduce_aivs);
         }
-        LaunchV1CombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
-                              send_head, recv_x, recv_topk_weights, phase_tiling, symmetric_buffer, ffts_addr, use_udma,
-                              phase);
+        LaunchCombineKernel(x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix,
+                            send_head, recv_x, recv_topk_weights, phase_tiling, symmetric_buffer, ffts_addr, use_udma,
+                            phase, separate_notify);
 
         return CombineResult{recv_x, recv_topk_weights};
     };

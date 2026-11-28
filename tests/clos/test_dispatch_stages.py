@@ -170,12 +170,12 @@ def test_cached_weighted_profiler_accounts_for_plan_rebuild(tmp_path, packed):
     names = ["cached_notify_combine_kernel", notify]
     if not packed:
         names.append("cached_dispatch_plan_kernel")
-    names.append("v1_dispatch_udma_kernel")
+    names.append("direct_dispatch_udma_kernel")
     costs = {
         "cached_notify_combine_kernel": 999,
         notify: 20,
         "cached_dispatch_plan_kernel": 30,
-        "v1_dispatch_udma_kernel": 40,
+        "direct_dispatch_udma_kernel": 40,
     }
     with (tmp_path / "kernel_details.csv").open("w", newline="") as file:
         writer = csv.writer(file)
@@ -184,7 +184,7 @@ def test_cached_weighted_profiler_accounts_for_plan_rebuild(tmp_path, packed):
             writer.writerow([name, i * 1000, costs[name]])
     result = bench.capture_stages(tmp_path, 2, True, cached_weighted=True, cached_pack=packed)
     assert result["notify_total_us"] == [20 if packed else 50] * 2
-    assert result["v1_dispatch_udma_kernel"] == [40, 40]
+    assert result["direct_dispatch_udma_kernel"] == [40, 40]
     with pytest.raises(RuntimeError, match="sequence"):
         bench.capture_stages(tmp_path, 2, True, cached_weighted=True, cached_pack=not packed)
 
@@ -477,7 +477,7 @@ def test_channel_comparison_keeps_notify_comm_and_api_separate():
                 payload_bytes_per_rank=1000000,
                 stats_us={
                     "notify_dispatch_kernel": {"mean": 20 + mode * 10},
-                    "v1_dispatch_udma_kernel": {"mean": comm},
+                    "direct_dispatch_udma_kernel": {"mean": comm},
                     "api_wall_us": {"mean": 150 - mode * 5},
                 },
             )
@@ -504,7 +504,7 @@ def test_zeng_dispatch_override_preserves_metadata_and_auto_policy():
         base = UdmaPolicy(8, 2, 1, 2, 32, ranks_per_group=8, topology_known=True)
         wrapper = DispatchBenchmarkPolicy(base)
         automatic = wrapper.for_launch(8, 5632, 'dispatch', bf16=True)
-        assert automatic.qps_per_worker == 2
+        assert (automatic.peers_per_worker, automatic.workers_per_peer, automatic.qps_per_worker) == (2,2,1)
         wrapper.variant = 'zeng'
         plan = wrapper.for_launch(8, 5632, 'dispatch', bf16=True)
         assert (plan.peer_order, plan.peers_per_worker, plan.workers_per_peer,
@@ -540,7 +540,7 @@ def test_channel_comparison_separates_tiles_and_payload_plans():
                         payload_bytes_per_rank=1000000,
                         stats_us={
                             name: {"mean": 100 - mode * 10}
-                            for name in ("notify_dispatch_kernel", "v1_dispatch_udma_kernel", "api_wall_us")
+                            for name in ("notify_dispatch_kernel", "direct_dispatch_udma_kernel", "api_wall_us")
                         },
                     )
                 )
@@ -570,7 +570,7 @@ def test_overlap_comparison_separates_cores_and_rejects_changed_policy():
                     payload_bytes_per_rank=1000000,
                     stats_us={
                         name: {"mean": 80 if mode == "all" else 100}
-                        for name in ("notify_dispatch_kernel", "v1_dispatch_udma_kernel", "api_wall_us")
+                        for name in ("notify_dispatch_kernel", "direct_dispatch_udma_kernel", "api_wall_us")
                     },
                 )
             )
@@ -622,7 +622,7 @@ def test_capture_excludes_alignment_and_guards(tmp_path, cached, corrupt, simt_l
     names = ["cached_notify_combine_kernel"]
     if not cached:
         names.append("dispatch_layout_simt_kernel" if simt_layout else "dispatch_layout_kernel")
-    names += ["cached_notify_dispatch_kernel" if cached else "notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+    names += ["cached_notify_dispatch_kernel" if cached else "notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
     rows = []
     for sample in range(7):  # 2 guards + 3 samples + 2 guards
         for name in names:
@@ -639,4 +639,4 @@ def test_capture_excludes_alignment_and_guards(tmp_path, cached, corrupt, simt_l
     else:
         result = bench.capture_stages(tmp_path, 3, cached)
         assert "cached_notify_combine_kernel" not in result
-        assert result["v1_dispatch_udma_kernel"] == [3, 4, 5]
+        assert result["direct_dispatch_udma_kernel"] == [3, 4, 5]

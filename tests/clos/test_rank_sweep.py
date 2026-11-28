@@ -353,11 +353,11 @@ def test_auto_winner_is_frozen_for_held_out_shapes():
 def test_profile_candidates_and_guards_are_not_mixed(tmp_path, op):
     barrier = "cached_notify_combine_kernel"
     if op.startswith("combine"):
-        names = [barrier, barrier, "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+        names = [barrier, barrier, "direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
     elif op.startswith("fresh"):
-        names = [barrier, "dispatch_layout_simt_kernel", "notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+        names = [barrier, "dispatch_layout_simt_kernel", "notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
     else:
-        names = [barrier, "cached_notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+        names = [barrier, "cached_notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
     rows = []
     # Two global guards, then each candidate's warmup+samples+two guards, then two guards.
     for iteration in range(2 * (1 + 3 + 2) + 4):
@@ -373,7 +373,8 @@ def test_profile_candidates_and_guards_are_not_mixed(tmp_path, op):
     save()
     values = sweep.parse_profile(tmp_path, op, [{}, {}], 1, 3)
     comm_offset = (
-        names.index("v1_combine_udma_comm_kernel" if op.startswith("combine") else "v1_dispatch_udma_kernel") + 1
+        names.index("direct_combine_udma_comm_kernel" if op.startswith("combine") else "direct_dispatch_udma_kernel")
+        + 1
     )
     assert values[0]["comm"] == [30 + comm_offset, 40 + comm_offset, 50 + comm_offset]
     assert values[1]["comm"] == [90 + comm_offset, 100 + comm_offset, 110 + comm_offset]
@@ -434,13 +435,13 @@ def test_measure_profiles_device_stages_without_api_sampling(tmp_path, monkeypat
 
     def invoke():
         boundaries.append("invoke")
-        calls.append(os.environ["DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY"])
+        calls.append("invoke")
 
     rows = sweep.measure(
         session, {"tokens": 4096, "hidden": 2816, "aiv": 8}, "combine", configs, invoke, 15000, "test", 2
     )
     # One untimed launch audit per config, then profiler guards/warmups/samples only.
-    assert calls == (["1"] if defaults_only else ["0"]) * 2 + ["1"] * 14
+    assert calls == ["invoke"] * 16
     assert boundaries == ["prepare", "invoke", "done"] * 16
     assert "DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY" not in os.environ
     assert rows[0]["GBps"] == 1

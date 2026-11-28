@@ -40,7 +40,7 @@ def test_quick_subset_and_auto_baseline():
     quick = sweep.candidates(64, 32, 8, quick=True)
     assert {c["id"] for c in quick} < {c["id"] for c in configs}
     assert {c["order"] for c in quick} == {"rank", "group_round_robin"}
-    ep128 = sweep.candidates(128,8,16,quick=True)
+    ep128 = sweep.candidates(128, 8, 16, quick=True)
     assert ep128[0]["id"] == "rank_p16_w1_q1_v32"
     assert ep128[0]["payload_aivs"] == 8
     assert all(c["order"] == "rank" for c in ep128 if c["peers"] == 16)
@@ -398,9 +398,9 @@ def test_profile_stage_separation_and_missing_sample(tmp_path, op):
     combine = op != "cached_dispatch"
     names = ["cached_notify_combine_kernel"]
     names += (
-        ["cached_notify_combine_kernel", "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+        ["cached_notify_combine_kernel", "direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
         if combine
-        else ["cached_notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+        else ["cached_notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
     )
     warmup, samples = 2, 3
     calls = warmup + samples + 2 + 4

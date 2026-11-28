@@ -296,6 +296,7 @@ class UdmaPolicy:
                 plan.validate_num_aiv(num_aiv)
                 return plan
         plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
+        auxiliary_sender_budget = 0
         if self.world_size == 128 and cores >= 16:
             # One fixed EP128 schedule for every row size and operation. Match
             # the measured rank/P8/W1/Q1/visit16 candidate and weight path.
@@ -328,10 +329,10 @@ class UdmaPolicy:
                 row_bytes <= 12288 or (self.world_size == 4 and profile_cores == 8 and operation == "dispatch")
             )
             if entry is not None and profile_row_fits and self.topology_known and self.ranks_per_group in entry[0]:
-                _, order, p, w, q, visit, copy = entry
+                _, p, w, q, visit, copy, auxiliary_sender_budget = entry
                 plan = replace(
                     self,
-                    peer_order=order,
+                    peer_order=0,
                     peers_per_worker=p,
                     workers_per_peer=w,
                     qps_per_worker=q,
@@ -351,20 +352,15 @@ class UdmaPolicy:
                 if cores - candidate.send_workers > 2 and candidate.valid_group_capacity():
                     plan = candidate
             if operation == "combine":
-                # Count payload AIVs, not QPs. Keep at least one spare copy
-                # AIV per sender; otherwise overlap self-copy after submission.
-                # Use this launch's communication budget, independent of reduce.
-                spare_aivs = cores - plan.send_workers
-                plan = replace(plan, self_copy=1 if spare_aivs >= plan.send_workers else 2)
+                # Keep the accepted profile's auxiliary-core threshold. Rank
+                # ownership may omit a self-only slot; that must not change
+                # copy/weight preference while cleaning up the scheduling table.
+                copy_budget = max(plan.send_workers, auxiliary_sender_budget)
+                plan = replace(plan, self_copy=1 if cores >= 2 * copy_budget else 2)
             if operation == "weighted":
-                # Keep the complete measured plan together: the weight-path
-                # comparison used RR/1/1/1/visit8 and after-submit self-copy.
-                # Retain its sender budget and visit; rank normalization below
-                # converts grouped ownership. Weight preference is selected below.
-                # Keep the EP64 plan with larger core budgets too: additional
-                # auxiliary AIVs must not silently switch weights back to UDMA.
-                # Interpolate between measured row widths; retain both endpoint
-                # plans and the existing topology/core-budget requirements.
+                # Explicit rank plans retain the accepted weighted visit bands.
+                # Auxiliary budgets in the profiles preserve the measured weight
+                # preference even when a self-only sender slot is eliminated.
                 measured_weight_fit = (
                     self.topology_known
                     and (self.world_size, self.ranks_per_group) in ((32, 8), (64, 16))
@@ -374,30 +370,19 @@ class UdmaPolicy:
                 if measured_weight_fit:
                     plan = replace(
                         plan,
-                        peer_order=3,
-                        peers_per_worker=1,
+                        peer_order=0,
+                        peers_per_worker=4,
                         workers_per_peer=1,
                         qps_per_worker=1,
                         wqes_per_visit=8,
                         self_copy=2,
                     )
                 # SIMT needs an AIV outside the payload sending plan.
-                use_simt_weights = _simt_weight_row_fits(self.world_size, row_bytes) and plan.send_workers < cores
+                use_simt_weights = (
+                    _simt_weight_row_fits(self.world_size, row_bytes)
+                    and max(plan.send_workers, auxiliary_sender_budget) < cores
+                )
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
-            if (self.world_size == 64 and cores >= 8) or (
-                self.world_size in (4, 8, 16, 32) and (8 <= cores < 16 or cores == 32)
-            ):
-                # Normalize order after selecting P/W/Q, visit and copy/weight
-                # modes. EP64 also normalizes its large-core weighted plan.
-                # RR -> rank can free a self-only owner slot; do not implicitly
-                # switch UDMA weights to SIMT when that exposes another helper.
-                # RR counts peers within a group. Convert that ownership width
-                # to global rank peers so EP32/G8 P1 retains eight senders with
-                # rank P4, instead of expanding to 31 senders with rank P1.
-                rank_peers = plan.peers_per_worker
-                if plan.peer_order == 3:
-                    rank_peers *= self.world_size // plan.ranks_per_group
-                plan = replace(plan, peer_order=0, peers_per_worker=rank_peers)
             if self.world_size == 64 and cores == 32 and operation == "dispatch":
                 # Keep eight payload owners and leave 24 AIVs for local work.
                 # Channel count and visit remain launch inputs, unchanged here.
@@ -528,41 +513,42 @@ def _contiguous_group_size(hosts):
 # key: EP, communication AIVs, row-byte bucket, operation.
 # The large-row EP8/16 rank candidates share parameters across the measured
 # H2816/4096/6144 interval; no token-count or exact-hidden exceptions.
-# value: measured G, order (rank/group/staggered/RR), P, W, Q, visit, self-copy.
+# value: measured G, rank P, W, Q, visit, self-copy, sender budget for auxiliary-core selection.
+# No intermediate group/RR plan or post-selection rank conversion is used.
 _PROFILES = {
-    (4, 8, "large", "dispatch"): ((4,), 2, 1, 1, 2, 32, 0),
-    (4, 8, "large", "combine"): ((4,), 3, 1, 2, 1, 32, 2),
-    (4, 8, "large", "weighted"): ((4,), 3, 1, 2, 1, 32, 2),
-    (4, 8, "small", "dispatch"): ((4,), 3, 1, 2, 1, 32, 0),
-    (4, 8, "small", "combine"): ((4,), 3, 1, 2, 1, 32, 2),
-    (4, 8, "small", "weighted"): ((4,), 1, 1, 1, 2, 32, 2),
-    (4, 32, "small", "dispatch"): ((4,), 0, 1, 2, 1, 32, 0),
-    (4, 32, "small", "combine"): ((4,), 3, 1, 2, 1, 32, 1),
-    (4, 32, "small", "weighted"): ((4,), 3, 1, 2, 1, 32, 2),
-    (8, 8, "large", "dispatch"): ((8,), 0, 2, 2, 1, 32, 0),
-    (8, 8, "large", "combine"): ((8,), 0, 1, 1, 1, 32, 2),
-    (8, 8, "large", "weighted"): ((8,), 3, 1, 1, 1, 32, 2),
-    (8, 8, "small", "dispatch"): ((8,), 3, 1, 1, 2, 32, 0),
-    (8, 8, "small", "combine"): ((8,), 2, 1, 1, 2, 32, 2),
-    (8, 8, "small", "weighted"): ((8,), 3, 1, 1, 2, 32, 2),
-    (8, 32, "large", "dispatch"): ((8,), 2, 1, 1, 1, 16, 0),
-    (8, 32, "large", "combine"): ((8,), 0, 1, 1, 1, 32, 1),
-    (8, 32, "large", "weighted"): ((8,), 0, 1, 1, 1, 32, 0),
-    (8, 32, "small", "dispatch"): ((8,), 3, 1, 2, 1, 16, 0),
-    (8, 32, "small", "combine"): ((8,), 2, 1, 2, 1, 8, 1),
-    (8, 32, "small", "weighted"): ((8,), 3, 1, 1, 1, 16, 2),
-    (16, 8, "large", "dispatch"): ((8, 16), 2, 2, 1, 1, 16, 0),
-    (16, 8, "large", "combine"): ((8, 16), 0, 2, 1, 1, 8, 2),
-    (16, 8, "large", "weighted"): ((8, 16), 0, 2, 1, 1, 8, 2),
-    (16, 8, "small", "dispatch"): ((8, 16), 1, 2, 1, 2, 32, 0),
-    (16, 8, "small", "combine"): ((8, 16), 0, 2, 1, 2, 32, 2),
-    (16, 8, "small", "weighted"): ((8, 16), 2, 4, 2, 1, 32, 2),
-    (16, 32, "large", "dispatch"): ((8, 16), 2, 4, 2, 1, 16, 0),
-    (16, 32, "large", "combine"): ((8, 16), 2, 2, 1, 1, 8, 1),
-    (16, 32, "large", "weighted"): ((8, 16), 0, 2, 1, 1, 8, 0),
-    (16, 32, "small", "dispatch"): ((8, 16), 0, 2, 2, 1, 8, 0),
-    (16, 32, "small", "combine"): ((8, 16), 0, 2, 1, 1, 32, 1),
-    (16, 32, "small", "weighted"): ((8, 16), 1, 2, 2, 1, 4, 0),
-    (32, 32, "large", "dispatch"): ((8,), 1, 4, 1, 1, 32, 0),
-    (32, 32, "large", "weighted"): ((8,), 2, 4, 1, 1, 4, 0),
+    (4, 8, "large", "dispatch"): ((4,), 1, 1, 2, 32, 0, 3),
+    (4, 8, "large", "combine"): ((4,), 1, 2, 1, 32, 2, 8),
+    (4, 8, "large", "weighted"): ((4,), 1, 2, 1, 32, 2, 8),
+    (4, 8, "small", "dispatch"): ((4,), 1, 2, 1, 32, 0, 8),
+    (4, 8, "small", "combine"): ((4,), 1, 2, 1, 32, 2, 8),
+    (4, 8, "small", "weighted"): ((4,), 1, 1, 2, 32, 2, 3),
+    (4, 32, "small", "dispatch"): ((4,), 1, 2, 1, 32, 0, 6),
+    (4, 32, "small", "combine"): ((4,), 1, 2, 1, 32, 1, 8),
+    (4, 32, "small", "weighted"): ((4,), 1, 2, 1, 32, 2, 8),
+    (8, 8, "large", "dispatch"): ((8,), 2, 2, 1, 32, 0, 8),
+    (8, 8, "large", "combine"): ((8,), 1, 1, 1, 32, 2, 7),
+    (8, 8, "large", "weighted"): ((8,), 1, 1, 1, 32, 2, 8),
+    (8, 8, "small", "dispatch"): ((8,), 1, 1, 2, 32, 0, 8),
+    (8, 8, "small", "combine"): ((8,), 1, 1, 2, 32, 2, 7),
+    (8, 8, "small", "weighted"): ((8,), 1, 1, 2, 32, 2, 8),
+    (8, 32, "large", "dispatch"): ((8,), 1, 1, 1, 16, 0, 7),
+    (8, 32, "large", "combine"): ((8,), 1, 1, 1, 32, 1, 7),
+    (8, 32, "large", "weighted"): ((8,), 1, 1, 1, 32, 0, 7),
+    (8, 32, "small", "dispatch"): ((8,), 1, 2, 1, 16, 0, 16),
+    (8, 32, "small", "combine"): ((8,), 1, 2, 1, 8, 1, 14),
+    (8, 32, "small", "weighted"): ((8,), 1, 1, 1, 16, 2, 8),
+    (16, 8, "large", "dispatch"): ((8, 16), 2, 1, 1, 16, 0, 8),
+    (16, 8, "large", "combine"): ((8, 16), 2, 1, 1, 8, 2, 8),
+    (16, 8, "large", "weighted"): ((8, 16), 2, 1, 1, 8, 2, 8),
+    (16, 8, "small", "dispatch"): ((8, 16), 2, 1, 2, 32, 0, 8),
+    (16, 8, "small", "combine"): ((8, 16), 2, 1, 2, 32, 2, 8),
+    (16, 8, "small", "weighted"): ((8, 16), 4, 2, 1, 32, 2, 8),
+    (16, 32, "large", "dispatch"): ((8, 16), 4, 2, 1, 16, 0, 8),
+    (16, 32, "large", "combine"): ((8, 16), 2, 1, 1, 8, 1, 8),
+    (16, 32, "large", "weighted"): ((8, 16), 2, 1, 1, 8, 0, 8),
+    (16, 32, "small", "dispatch"): ((8, 16), 2, 2, 1, 8, 0, 16),
+    (16, 32, "small", "combine"): ((8, 16), 2, 1, 1, 32, 1, 8),
+    (16, 32, "small", "weighted"): ((8, 16), 2, 2, 1, 4, 0, 16),
+    (32, 32, "large", "dispatch"): ((8,), 4, 1, 1, 32, 0, 8),
+    (32, 32, "large", "weighted"): ((8,), 4, 1, 1, 4, 0, 8),
 }

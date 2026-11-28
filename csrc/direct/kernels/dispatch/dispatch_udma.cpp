@@ -38,7 +38,7 @@ __aicore__ inline uint32_t DispatchAlignUp32(uint32_t value)
 } // namespace
 
 template <class Trace>
-__aicore__ inline void V1DispatchUdmaKernelImpl(
+__aicore__ inline void DispatchUdmaKernelImpl(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
@@ -99,7 +99,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     if (tiling.has_x_scales && tiling.needs_x_scales_pack) {
         dispatch_scales = symmetric_buffer + tiling.x_scales_input_buffer_offset;
         if (!overlap_scales) {
-            asc_vf_call<ascend_deepep::PackV1DispatchScalesSimtVf>(
+            asc_vf_call<ascend_deepep::PackDispatchScalesSimtVf>(
                 dim3(128), reinterpret_cast<const __gm__ uint32_t*>(x_scales),
                 reinterpret_cast<__gm__ uint32_t*>(dispatch_scales), tiling.num_tokens, tiling.num_scales,
                 tiling.scale_token_stride, tiling.scale_hidden_stride, uint32_t(core_idx), uint32_t(core_num));
@@ -163,7 +163,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             // Both producers read immutable original input independently. No
             // normalization-to-peer-pack barrier is needed on this path.
             if (tiling.needs_x_scales_pack) {
-                asc_vf_call<ascend_deepep::PackV1DispatchScalesSimtVf>(dim3(128),
+                asc_vf_call<ascend_deepep::PackDispatchScalesSimtVf>(dim3(128),
                     reinterpret_cast<const __gm__ uint32_t*>(x_scales),
                     reinterpret_cast<__gm__ uint32_t*>(dispatch_scales), tiling.num_tokens, tiling.num_scales,
                     tiling.scale_token_stride, tiling.scale_hidden_stride, worker, workers);
@@ -423,7 +423,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     trace.Save(resource, core_idx);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_dispatch_udma_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_dispatch_udma_kernel(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
@@ -431,13 +431,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     ascend_deepep::DispatchTilingData tiling, uint64_t ffts_addr)
 {
     aclshmemx_instance_ctx_set(tiling.instance_id);
-    V1DispatchUdmaKernelImpl<ascend_deepep::udma::DisabledDispatchDeviceTrace>(
+    DispatchUdmaKernelImpl<ascend_deepep::udma::DisabledDispatchDeviceTrace>(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, tiling, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_dispatch_udma_trace_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_dispatch_udma_trace_kernel(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
@@ -445,13 +445,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     ascend_deepep::DispatchTilingData tiling, uint64_t ffts_addr)
 {
     aclshmemx_instance_ctx_set(tiling.instance_id);
-    V1DispatchUdmaKernelImpl<ascend_deepep::udma::DispatchDeviceTrace>(
+    DispatchUdmaKernelImpl<ascend_deepep::udma::DispatchDeviceTrace>(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, tiling, ffts_addr);
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_dispatch_udma_plan_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* x_scales, uint8_t* topk_idx, uint8_t* topk_weights,
     uint8_t* num_tokens_per_rank, uint8_t* is_token_in_rank, uint8_t* num_tokens_per_expert, uint8_t* symmetric_buffer,
     uint8_t* recv_x, uint8_t* recv_x_scales, uint8_t* recv_topk_idx, uint8_t* recv_topk_weights,
@@ -460,19 +460,19 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
 {
     auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
     if (td->dispatch_device_trace) {
-        v1_dispatch_udma_trace_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
+        direct_dispatch_udma_trace_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
             x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
             symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
             channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, *td, ffts_addr);
     } else {
-        v1_dispatch_udma_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
+        direct_dispatch_udma_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
             x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
             symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
             channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, *td, ffts_addr);
     }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT uint64_t v1_multi_instance_abi_4() {
+extern "C" ASCEND_DEEPEP_EXPORT uint64_t direct_multi_instance_abi_4() {
     return (uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
            uint64_t(sizeof(ascend_deepep::CombineTilingData));
 }

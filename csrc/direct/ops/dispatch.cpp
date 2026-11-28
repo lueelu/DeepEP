@@ -284,19 +284,19 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
            std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            c10::optional<torch::Tensor>>
-V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<torch::Tensor> topk_idx,
-           c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> num_tokens_per_rank,
-           torch::Tensor is_token_in_rank, c10::optional<torch::Tensor> num_tokens_per_expert,
-           int64_t cached_num_recv_tokens, c10::optional<torch::Tensor> cached_rank_prefix_matrix,
-           c10::optional<torch::Tensor> cached_channel_prefix_matrix, int64_t expert_alignment,
-           int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
-           int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy, int rank, int world_size,
-           std::size_t symmetric_buffer_bytes, std::size_t& notify_workspace_bytes, bool symmetric_workspace_active,
-           bool use_udma, ShmemInstance& shmem, void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
-           c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
-           c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
-           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan,
-           c10::optional<torch::Tensor> cached_send_head, bool allow_omit_topk_output, bool layout_inputs_prepared)
+Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<torch::Tensor> topk_idx,
+         c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> num_tokens_per_rank,
+         torch::Tensor is_token_in_rank, c10::optional<torch::Tensor> num_tokens_per_expert,
+         int64_t cached_num_recv_tokens, c10::optional<torch::Tensor> cached_rank_prefix_matrix,
+         c10::optional<torch::Tensor> cached_channel_prefix_matrix, int64_t expert_alignment, int64_t num_worst_tokens,
+         int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
+         bool zero_copy, int rank, int world_size, std::size_t symmetric_buffer_bytes,
+         std::size_t& notify_workspace_bytes, bool symmetric_workspace_active, bool use_udma, ShmemInstance& shmem,
+         void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
+         c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
+         c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
+         bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan,
+         c10::optional<torch::Tensor> cached_send_head, bool allow_omit_topk_output, bool layout_inputs_prepared)
 {
     DispatchHostTiming host_timing;
     const auto udma_launch =
@@ -457,7 +457,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     const int64_t num_channels = resolved_num_aiv;
     if (udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder) udma_peers_per_worker = udma_launch.peers;
     if (use_udma) {
-        TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
+        TORCH_CHECK(shmem.SharedJetty(), "UDMA requires a shared-Jetty Buffer runtime");
         TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
                         udma_peers_per_worker == 8 || udma_peers_per_worker == 16,
                     "udma_peers_per_worker must be 1, 2, 4, 8 or 16");
@@ -646,11 +646,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                         "DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS must be 0(auto), 32, 64, 128 or 256");
             requested_tile = static_cast<uint32_t>(std::atoi(tile_option));
         }
-        const uint32_t peer_capacity = udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder
-                                           ? ascend_deepep::udma::kGroupPeerCapacity
-                                           : (udma_launch.peers > ascend_deepep::udma::kMaxPeers
-                                                  ? ascend_deepep::udma::kMaxRankPeers
-                                                  : ascend_deepep::udma::kMaxPeers);
+        const uint32_t peer_capacity =
+            udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder
+                ? ascend_deepep::udma::kGroupPeerCapacity
+                : (udma_launch.peers > ascend_deepep::udma::kMaxPeers ? ascend_deepep::udma::kMaxRankPeers
+                                                                      : ascend_deepep::udma::kMaxPeers);
         const uint32_t packing_ub = ascend_deepep::platform::kKernelUbBytes -
                                     ascend_deepep::udma::DispatchLiveSendUbBytes(peer_capacity, udma_launch.qps);
         const uint32_t descriptor_bytes =
@@ -929,10 +929,10 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     }
     host_timing.Mark(OutputReady);
     host_timing.Mark(CommSubmitBegin);
-    LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
-                           num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
-                           rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
-                           send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+    LaunchDispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
+                         num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
+                         rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head,
+                         dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
     host_timing.Mark(CommSubmitted);
     host_timing.Finish();
     return {recv_x,

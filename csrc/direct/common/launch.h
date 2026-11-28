@@ -62,7 +62,7 @@ ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
     void* stream,
     uint8_t* tiling_host, uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_dispatch_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_dispatch_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -85,7 +85,7 @@ ASCEND_DEEPEP_EXPORT void v1_dispatch_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_dispatch_udma_plan_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -114,7 +114,7 @@ ASCEND_DEEPEP_EXPORT void cached_notify_combine_kernel_do(
     void* stream,
     uint64_t ffts_addr, uint32_t instance_id);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -131,7 +131,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_comm_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_comm_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -148,7 +148,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_comm_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_reduce_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_reduce_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -165,7 +165,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_reduce_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_udma_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_udma_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -182,7 +182,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_udma_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_udma_comm_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -199,7 +199,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_udma_early_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_udma_early_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -216,7 +216,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_udma_early_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_udma_pipeline_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_udma_pipeline_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -233,7 +233,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_udma_pipeline_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_udma_remaining_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_udma_remaining_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,
@@ -250,7 +250,7 @@ ASCEND_DEEPEP_EXPORT void v1_combine_udma_remaining_kernel_do(
     uint8_t* tiling_host,
     uint64_t ffts_addr);
 
-ASCEND_DEEPEP_EXPORT void v1_combine_udma_reduce_kernel_do(
+ASCEND_DEEPEP_EXPORT void direct_combine_udma_reduce_kernel_do(
     uint32_t block_dim,
     void* stream,
     uint8_t* x,

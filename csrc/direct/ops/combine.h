@@ -54,7 +54,7 @@ private:
     bool consumed_{false};
 };
 
-std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Combine(
     torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> bias_0,
     c10::optional<torch::Tensor> bias_1, torch::Tensor src_idx, torch::Tensor rank_prefix_matrix,
     torch::Tensor channel_prefix_matrix, torch::Tensor send_head, int64_t num_aiv,

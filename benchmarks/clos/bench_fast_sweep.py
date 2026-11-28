@@ -44,9 +44,7 @@ def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128), quick=False)
     for order in ORDERS:
         grouped = order == "group_round_robin"
         peer_choices = (1, 2, 4) if grouped else (1, 2, 4, 8, 16) if order == "rank" else (1, 2, 4, 8)
-        for peers, (workers, qps), visit in itertools.product(
-            peer_choices, ((1, 1), (1, 2), (2, 1)), visits
-        ):
+        for peers, (workers, qps), visit in itertools.product(peer_choices, ((1, 1), (1, 2), (2, 1)), visits):
             owners = math.ceil((group_size if grouped else ep - 1) / peers)
             if owners * workers > aiv or owners * workers * qps > 32:
                 continue
@@ -343,16 +341,19 @@ def parse_capture(directory, op, configs, warmup, samples):
         raise RuntimeError(f"expected one profiler CSV, found {len(paths)}")
     with paths[0].open(encoding="utf-8-sig", newline="") as f:
         rows = sorted(csv.DictReader(f), key=lambda x: float(x["Start Time(us)"].strip()))
+    from stage_metrics import normalize_kernel_rows
+
+    rows = normalize_kernel_rows(rows)
     # buffer.barrier() and pre-combine notify share a kernel name. Match the
     # complete ordered call, so the outer barrier is never charged to notify.
     names = (
-        ["cached_notify_combine_kernel", "cached_notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+        ["cached_notify_combine_kernel", "cached_notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
         if op == "cached_dispatch"
         else [
             "cached_notify_combine_kernel",
             "cached_notify_combine_kernel",
-            "v1_combine_udma_comm_kernel",
-            "v1_combine_udma_reduce_kernel",
+            "direct_combine_udma_comm_kernel",
+            "direct_combine_udma_reduce_kernel",
         ]
     )
     width = warmup + samples + 2
@@ -411,13 +412,12 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
         result[-1].current_stream_wait()
         torch.npu.synchronize()
 
-    from stage_metrics import L2CacheFlush, prepare_v2_sample, profile_combine_notify
+    from stage_metrics import L2CacheFlush, prepare_v2_sample
 
     flush_cache = L2CacheFlush(torch, buffer, args.flush_l2_cache)
     # Start/stop the profiler once for the entire strategy list, not per strategy.
     profiler = torch_npu.profiler
     with (
-        profile_combine_notify(op in ("combine_unweighted", "combine_weighted")),
         profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
             on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
@@ -629,6 +629,7 @@ def main():
     init_started = time.monotonic()
     buffer = ElasticBuffer(
         group,
+        combine_notify=True,
         num_bytes=workspace,
         num_max_tokens_per_rank=capacity,
         hidden=0,

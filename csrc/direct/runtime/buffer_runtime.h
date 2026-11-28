@@ -28,11 +28,12 @@ class BufferRuntime : public torch::jit::CustomClassHolder {
 public:
     BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes, const std::string& transport,
                   bool low_latency_mode, const std::string& ip_port, bool use_1g_huge_pages,
-                  const std::vector<int64_t>& unique_id, const std::string& bootstrap_key, bool v1_shared_jetty,
-                  bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
+                  const std::vector<int64_t>& unique_id, const std::string& bootstrap_key, bool shared_jetty,
+                  bool token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {});
+                  int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {},
+                  bool combine_notify = false);
 
     ~BufferRuntime() noexcept;
 

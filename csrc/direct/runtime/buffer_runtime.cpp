@@ -26,7 +26,7 @@
 #include "shmem.h"
 #include "tiling/platform/platform_ascendc.h"
 
-extern "C" uint64_t v1_multi_instance_abi_4();
+extern "C" uint64_t direct_multi_instance_abi_4();
 
 namespace ascend_deepep::runtime {
 namespace {
@@ -126,11 +126,11 @@ int64_t GetDeviceNumAiv()
 
 BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes, const std::string& transport,
                              bool low_latency_mode, const std::string& ip_port, bool use_1g_huge_pages,
-                             const std::vector<int64_t>& unique_id, const std::string& bootstrap_key,
-                             bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
-                             int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
-                             int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker, bool auto_resources, std::string auto_qp_plans)
+                             const std::vector<int64_t>& unique_id, const std::string& bootstrap_key, bool shared_jetty,
+                             bool token_schedule, int64_t udma_dispatch_peer_order, int64_t udma_combine_peer_order,
+                             int64_t udma_ranks_per_group, int64_t udma_peers_per_group_per_worker,
+                             int64_t udma_workers_per_peer, int64_t udma_qps_per_worker, bool auto_resources,
+                             std::string auto_qp_plans, bool combine_notify)
     : rank_(rank),
       num_ranks_(num_ranks),
       num_bytes_(num_bytes),
@@ -139,13 +139,14 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
       data_op_engine_type_(ResolveDataOpEngineType(transport)),
       low_latency_mode_(low_latency_mode),
       use_1g_huge_pages_(use_1g_huge_pages),
-      shmem_(std::make_shared<ShmemInstance>(
-          rank, num_ranks, ip_port, data_op_engine_type_, use_1g_huge_pages, unique_id, bootstrap_key, v1_shared_jetty,
-          v1_token_schedule, udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
-          udma_peers_per_group_per_worker, udma_workers_per_peer, udma_qps_per_worker, auto_resources, auto_qp_plans))
+      shmem_(std::make_shared<ShmemInstance>(rank, num_ranks, ip_port, data_op_engine_type_, use_1g_huge_pages,
+                                             unique_id, bootstrap_key, shared_jetty, token_schedule,
+                                             udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
+                                             udma_peers_per_group_per_worker, udma_workers_per_peer,
+                                             udma_qps_per_worker, auto_resources, auto_qp_plans, combine_notify))
 {
-    TORCH_CHECK(v1_multi_instance_abi_4() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
-                                              uint64_t(sizeof(ascend_deepep::CombineTilingData))),
+    TORCH_CHECK(direct_multi_instance_abi_4() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
+                                                  uint64_t(sizeof(ascend_deepep::CombineTilingData))),
                 "Kernel/native tiling ABI mismatch; rebuild and install with scripts/build.sh");
 
     ValidateHugePageMode(use_1g_huge_pages_, num_bytes_, data_op_engine_type_);
@@ -348,7 +349,7 @@ BufferRuntime::FreshDispatchHostResult BufferRuntime::IntranodeDispatchFromTopk(
     auto layout = simt_layout ? GetDispatchLayoutV2Simt(topk_idx, num_experts, num_aiv, allocation_stream_id)
                               : GetDispatchLayout(topk_idx, num_experts, allocation_stream_id);
     std::vector<torch::Tensor> public_handle;
-    auto result = ascend_deepep::ops::V1Dispatch(
+    auto result = ascend_deepep::ops::Dispatch(
         x, x_scales, topk_idx, topk_weights, std::get<0>(layout), std::get<3>(layout), std::get<2>(layout), 0,
         c10::nullopt, c10::nullopt, expert_alignment, num_worst_tokens, num_aiv, num_max_nvl_chunked_send_tokens,
         num_max_nvl_chunked_recv_tokens, false, static_cast<int>(rank_), static_cast<int>(num_ranks_),
@@ -401,7 +402,7 @@ BufferRuntime::IntranodeDispatchWithPlan(
 {
     TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
-    auto result = ascend_deepep::ops::V1Dispatch(
+    auto result = ascend_deepep::ops::Dispatch(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         cached_num_recv_tokens, cached_rank_prefix_matrix, cached_channel_prefix_matrix, expert_alignment,
         num_worst_tokens, num_aiv, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, zero_copy,
@@ -433,7 +434,7 @@ BufferRuntime::IntranodeDispatchWithHandle(
     TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     std::vector<torch::Tensor> public_handle;
-    auto result = ascend_deepep::ops::V1Dispatch(
+    auto result = ascend_deepep::ops::Dispatch(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         cached_num_recv_tokens, cached_rank_prefix_matrix, cached_channel_prefix_matrix, expert_alignment,
         num_worst_tokens, num_aiv, num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, zero_copy,
@@ -456,7 +457,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> BufferRuntime::Intranode
 {
     TORCH_CHECK(num_aiv <= num_device_aiv_, "combine num_aiv must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
-    auto result = ascend_deepep::ops::V1Combine(
+    auto result = ascend_deepep::ops::Combine(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head, num_aiv,
         num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, static_cast<int>(rank_),
         static_cast<int>(num_ranks_), static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes),
@@ -505,7 +506,7 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
         if (!pipeline_chunk_tokens) aggregate = std::move(plan.launch);
     }
     c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> epilogue;
-    ascend_deepep::ops::V1Combine(
+    ascend_deepep::ops::Combine(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head, num_aiv,
         num_max_nvl_chunked_send_tokens, num_max_nvl_chunked_recv_tokens, static_cast<int>(rank_),
         static_cast<int>(num_ranks_), static_cast<std::size_t>(num_bytes_ > 0 ? num_bytes_ : kCommMetaBytes),
@@ -554,8 +555,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> BufferRuntime::Aggregate
 
 void BufferRuntime::ElasticBarrier(int64_t num_aiv)
 {
-    // The reused V1 team barrier uses SHMEM sync-pool signals, not UDMA queues.
-    // It is also valid for the shared-Jetty V1 backend of ElasticBuffer.
+    // The shared team barrier uses SHMEM sync-pool signals, not UDMA queues.
+    // It is also valid for the shared-Jetty backend of ElasticBuffer.
     TORCH_CHECK(num_aiv > 0 && num_aiv <= num_device_aiv_, "elastic barrier num_aiv must be in (0, ", num_device_aiv_,
                 "]");
     LaunchElasticBarrierKernel(num_aiv, RequireShmem().FftsAddr(), RequireShmem().InstanceId());

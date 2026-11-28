@@ -119,6 +119,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
                                  "comm_submit_begin", "comm_submitted", "native_return",       "api_return",
                                  "complete",          "fused",          "host_prep",           "deferred_plan",
                                  "mapped_counts"};
-    // Keep the Python dtype contract tied to the native V1 dispatch path.
+    // Keep the Python dtype contract tied to the shared dispatch path.
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<ascend_deepep::topk_idx_t>::value);
 }

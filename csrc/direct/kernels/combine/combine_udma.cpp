@@ -88,7 +88,7 @@ __aicore__ inline uint64_t CombineLocalInputRow(const ascend_deepep::CombineTili
 
 template <typename T, bool DoCommunication = true, bool DoReduction = true, uint32_t Phase = 0,
           class Trace = ascend_deepep::udma::DisabledDispatchDeviceTrace>
-__aicore__ inline void V1CombineUdmaImpl(
+__aicore__ inline void CombineUdmaImpl(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, const ascend_deepep::CombineTilingData& tiling)
@@ -396,7 +396,7 @@ __aicore__ inline void V1CombineUdmaImpl(
 
 } // namespace
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_combine_udma_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
@@ -408,28 +408,28 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 
     if (tiling.x_dtype == kCombineDtypeBfloat16) {
-        V1CombineUdmaImpl<bfloat16_t>(
+        CombineUdmaImpl<bfloat16_t>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     } else if (tiling.x_dtype == kCombineDtypeFloat16) {
-        V1CombineUdmaImpl<half>(
+        CombineUdmaImpl<half>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_combine_udma_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* bias_0, uint8_t* bias_1,
     uint8_t* src_idx, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* send_head,
     uint8_t* symmetric_buffer, uint8_t* recv_x, uint8_t* recv_topk_weights, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::CombineTilingData*>(tiling_host);
-    v1_combine_udma_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+    direct_combine_udma_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_comm_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_combine_udma_comm_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
@@ -441,17 +441,17 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 
     if (tiling.x_dtype == kCombineDtypeBfloat16) {
-        V1CombineUdmaImpl<bfloat16_t, true, false>(
+        CombineUdmaImpl<bfloat16_t, true, false>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     } else if (tiling.x_dtype == kCombineDtypeFloat16) {
-        V1CombineUdmaImpl<half, true, false>(
+        CombineUdmaImpl<half, true, false>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_comm_trace_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_combine_udma_comm_trace_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
@@ -463,34 +463,34 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 
     if (tiling.x_dtype == kCombineDtypeBfloat16) {
-        V1CombineUdmaImpl<bfloat16_t, true, false, 0, ascend_deepep::udma::DispatchDeviceTrace>(
+        CombineUdmaImpl<bfloat16_t, true, false, 0, ascend_deepep::udma::DispatchDeviceTrace>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     } else if (tiling.x_dtype == kCombineDtypeFloat16) {
-        V1CombineUdmaImpl<half, true, false, 0, ascend_deepep::udma::DispatchDeviceTrace>(
+        CombineUdmaImpl<half, true, false, 0, ascend_deepep::udma::DispatchDeviceTrace>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_comm_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_combine_udma_comm_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* bias_0, uint8_t* bias_1,
     uint8_t* src_idx, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* send_head,
     uint8_t* symmetric_buffer, uint8_t* recv_x, uint8_t* recv_topk_weights, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::CombineTilingData*>(tiling_host);
     if (td->combine_device_trace) {
-        v1_combine_udma_comm_trace_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+        direct_combine_udma_comm_trace_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
     } else {
-        v1_combine_udma_comm_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+        direct_combine_udma_comm_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
     }
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_udma_reduce_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void direct_combine_udma_reduce_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
@@ -502,28 +502,28 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void v1_combine_u
     }
 
     if (tiling.x_dtype == kCombineDtypeBfloat16) {
-        V1CombineUdmaImpl<bfloat16_t, false, true>(
+        CombineUdmaImpl<bfloat16_t, false, true>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     } else if (tiling.x_dtype == kCombineDtypeFloat16) {
-        V1CombineUdmaImpl<half, false, true>(
+        CombineUdmaImpl<half, false, true>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_reduce_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_combine_udma_reduce_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* bias_0, uint8_t* bias_1,
     uint8_t* src_idx, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* send_head,
     uint8_t* symmetric_buffer, uint8_t* recv_x, uint8_t* recv_topk_weights, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::CombineTilingData*>(tiling_host);
-    v1_combine_udma_reduce_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+    direct_combine_udma_reduce_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_early_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_combine_udma_early_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
@@ -535,29 +535,29 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 
     if (tiling.x_dtype == kCombineDtypeBfloat16) {
-        V1CombineUdmaImpl<bfloat16_t, true, false, 1>(
+        CombineUdmaImpl<bfloat16_t, true, false, 1>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     } else if (tiling.x_dtype == kCombineDtypeFloat16) {
-        V1CombineUdmaImpl<half, true, false, 1>(
+        CombineUdmaImpl<half, true, false, 1>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_early_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_combine_udma_early_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* bias_0, uint8_t* bias_1,
     uint8_t* src_idx, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* send_head,
     uint8_t* symmetric_buffer, uint8_t* recv_x, uint8_t* recv_topk_weights, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::CombineTilingData*>(tiling_host);
-    v1_combine_udma_early_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+    direct_combine_udma_early_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }
 
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_remaining_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_combine_udma_remaining_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
@@ -569,29 +569,29 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 
     if (tiling.x_dtype == kCombineDtypeBfloat16) {
-        V1CombineUdmaImpl<bfloat16_t, true, false, 2>(
+        CombineUdmaImpl<bfloat16_t, true, false, 2>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     } else if (tiling.x_dtype == kCombineDtypeFloat16) {
-        V1CombineUdmaImpl<half, true, false, 2>(
+        CombineUdmaImpl<half, true, false, 2>(
             x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
             symmetric_buffer, recv_x, recv_topk_weights, tiling);
     }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_remaining_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_combine_udma_remaining_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* bias_0, uint8_t* bias_1,
     uint8_t* src_idx, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* send_head,
     uint8_t* symmetric_buffer, uint8_t* recv_x, uint8_t* recv_topk_weights, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::CombineTilingData*>(tiling_host);
-    v1_combine_udma_remaining_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+    direct_combine_udma_remaining_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }
 
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_combine_udma_pipeline_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_combine_udma_pipeline_kernel(
     GM_ADDR x, GM_ADDR topk_weights, GM_ADDR bias_0, GM_ADDR bias_1, GM_ADDR src_idx, GM_ADDR rank_prefix_matrix,
     GM_ADDR channel_prefix_matrix, GM_ADDR send_head, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_topk_weights, ascend_deepep::CombineTilingData tiling, uint64_t ffts_addr)
@@ -611,13 +611,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_combine_udma_pipeline_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_combine_udma_pipeline_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* topk_weights, uint8_t* bias_0, uint8_t* bias_1,
     uint8_t* src_idx, uint8_t* rank_prefix_matrix, uint8_t* channel_prefix_matrix, uint8_t* send_head,
     uint8_t* symmetric_buffer, uint8_t* recv_x, uint8_t* recv_topk_weights, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::CombineTilingData*>(tiling_host);
-    v1_combine_udma_pipeline_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
+    direct_combine_udma_pipeline_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kCombineUbBytes), stream>>>(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head,
         symmetric_buffer, recv_x, recv_topk_weights, *td, ffts_addr);
 }

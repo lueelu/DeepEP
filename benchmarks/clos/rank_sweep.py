@@ -220,9 +220,12 @@ def parse_profile(directory, op, configs, warmup, samples):
         raise RuntimeError(f"expected one kernel_details.csv, found {len(paths)}")
     with paths[0].open(encoding="utf-8-sig", newline="") as f:
         rows = sorted(csv.DictReader(f), key=lambda r: float(r["Start Time(us)"]))
+    from stage_metrics import normalize_kernel_rows
+
+    rows = normalize_kernel_rows(rows)
     barrier = "cached_notify_combine_kernel"
     if op.startswith("combine"):
-        sequence = [barrier, barrier, "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+        sequence = [barrier, barrier, "direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
         labels = [None, "notify", "comm", "reduce"]
     else:
         sequence, labels = [barrier], [None]
@@ -237,7 +240,7 @@ def parse_profile(directory, op, configs, warmup, samples):
         else:
             sequence += ["cached_notify_dispatch_kernel"]
             labels += ["notify"]
-        sequence += ["v1_dispatch_udma_kernel"]
+        sequence += ["direct_dispatch_udma_kernel"]
         labels += ["comm"]
     recognized = set(sequence) | {
         "cached_dispatch_plan_kernel",
@@ -311,8 +314,6 @@ def check_launch(native, result, plan, op, cores, reduce):
 
 
 def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
-    from stage_metrics import profile_combine_notify
-
     s = session
     prof = s.torch_npu.profiler
     tag = f"t{shape['tokens']}_h{shape['hidden']}_a{shape['aiv']}"
@@ -322,26 +323,24 @@ def measure(session, shape, op, configs, invoke, logical_bytes, phase, samples):
     if s.rank == 0:
         print(f"PHASE {tag}/{op}/{phase} candidates={len(configs)}", flush=True)
     observations = []
-    with profile_combine_notify(getattr(s.args, "combine_defaults_only", False) and op.startswith("combine")):
-        for config in configs:
-            s.activate(config, op)
-            s.prepare()
-            result = s.done(invoke())
-            plan = s.policy.for_launch(shape["aiv"], shape["hidden"] * 2, op_kind(op), bf16=True, expanded=False)
-            observation = check_launch(s.native, result, plan, op, shape["aiv"], s.args.reduce_cores)
-            if "payload_max_rows" in config:
-                observation.update(check_payload_limit(s.native, config))
-            elif getattr(s.args, "combine_defaults_only", False):
-                observation.update(
-                    payload_max_rows_submitted=int(s.native.last_combine_payload_max_rows()),
-                    combine_wqe_fast_submitted=int(s.native.last_combine_wqe_fast()),
-                )
-            observations.append(observation)
-            del result
+    for config in configs:
+        s.activate(config, op)
+        s.prepare()
+        result = s.done(invoke())
+        plan = s.policy.for_launch(shape["aiv"], shape["hidden"] * 2, op_kind(op), bf16=True, expanded=False)
+        observation = check_launch(s.native, result, plan, op, shape["aiv"], s.args.reduce_cores)
+        if "payload_max_rows" in config:
+            observation.update(check_payload_limit(s.native, config))
+        elif getattr(s.args, "combine_defaults_only", False):
+            observation.update(
+                payload_max_rows_submitted=int(s.native.last_combine_payload_max_rows()),
+                combine_wqe_fast_submitted=int(s.native.last_combine_wqe_fast()),
+            )
+        observations.append(observation)
+        del result
     # Retain device-stage profiling and its existing combine-notify diagnostic.
     # There is no separate host/API sampling pass.
     with (
-        profile_combine_notify(op.startswith("combine")),
         prof.profile(
             activities=[prof.ProfilerActivity.CPU, prof.ProfilerActivity.NPU],
             on_trace_ready=prof.tensorboard_trace_handler(str(directory)),
@@ -650,8 +649,6 @@ def run(args):
     from stage_metrics import L2CacheFlush, prepare_v2_sample
 
     unexpected = {k: v for k, v in os.environ.items() if k.startswith("DEEPEP_CLOS_") and v}
-    if defaults_only and unexpected.get("DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY") == "1":
-        unexpected.pop("DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY")
     if unexpected:
         raise RuntimeError(f"clear DEEPEP_CLOS_* overrides for the default comparison: {unexpected}")
     rank, world, device = (int(os.environ[k]) for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
@@ -754,6 +751,7 @@ def run(args):
     with store_topology_collective(group):
         buffer = ElasticBuffer(
             group,
+            combine_notify=True,
             num_bytes=workspace,
             num_max_tokens_per_rank=capacity,
             hidden=0,

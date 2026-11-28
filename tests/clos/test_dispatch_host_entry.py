@@ -125,7 +125,7 @@ constexpr int kCommMetaBytes=128, ACLSHMEM_DATA_OP_UDMA=2;
 std::vector<int> order;
 c10::optional<int64_t> expected_allocation;
 namespace ascend_deepep::ops {
-    template<class... Args> auto V1Dispatch(Args... args) {
+    template<class... Args> auto Dispatch(Args... args) {
         assert(order == std::vector<int>{1});
         order.push_back(2);
         auto a=std::make_tuple(args...);

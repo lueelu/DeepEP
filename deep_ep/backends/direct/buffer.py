@@ -49,8 +49,8 @@ class Buffer:
     ``num_bytes`` is the usable communication-workspace capacity. The native
     runtime maps it into one CANN SHMEM heap together with its metadata.
     ``transport`` selects the CANN SHMEM data-operation engine; ``auto`` uses
-    MTE. ``udma`` enables both MTE and UDMA resources and selects the URMA V1
-    dispatch kernel; other transports keep the UBMEM V1 dispatch kernel.
+    MTE. ``udma`` enables both MTE and UDMA resources and selects the UDMA
+    dispatch kernel; other transports keep the MTE dispatch kernel.
     ``udma_schedule="peer"`` retains the peer-owned UDMA scheduler. Experimental
     ``"token"`` assigns input channels/return rows to half the AIVs (at most 32),
     each with its own QP to all peers. All ranks must select the same schedule
@@ -73,6 +73,11 @@ class Buffer:
     # it is the number of AIV task blocks used by a communication kernel. Zero
     # asks the backend to select the platform default explicitly.
     num_sms: int = 32
+
+    @property
+    def combine_notify(self) -> bool:
+        """Whether this Buffer requests a separate combine rendezvous (read-only)."""
+        return self._combine_notify
 
     def __init__(
         self,
@@ -98,9 +103,13 @@ class Buffer:
         udma_qps_per_worker: Optional[int] = None,
         udma_auto_policy: bool = True,
         use_1g_huge_pages: bool = False,
+        combine_notify: bool = False,
         shmem_ip_port: Optional[str] = None,
         num_max_tokens_per_rank: Optional[int] = None,
     ) -> None:
+        if type(combine_notify) is not bool:
+            raise TypeError("combine_notify must be a bool")
+        self._combine_notify = combine_notify
         if _is_capturing():
             raise RuntimeError("construct Buffer outside NPU graph capture")
         if num_max_tokens_per_rank is not None:
@@ -212,6 +221,7 @@ class Buffer:
                 num_max_tokens_per_rank,
                 udma_schedule,
                 peer_options,
+                combine_notify=combine_notify,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
                     if self._udma_auto_policy is not None
@@ -235,6 +245,7 @@ class Buffer:
                 *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
                 self._udma_auto_policy is not None,
                 self._udma_auto_policy.reservation_spec() if self._udma_auto_policy is not None else "",
+                combine_notify,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -1282,6 +1293,7 @@ def _prepare_shmem_bootstrap(
     udma_schedule="peer",
     udma_peer_options=(0, 0, 0),
     udma_auto_options=None,
+    combine_notify=False,
 ):
     native = load_native_module()
     options = (
@@ -1293,6 +1305,7 @@ def _prepare_shmem_bootstrap(
         num_max_tokens_per_rank,
         udma_schedule,
         udma_peer_options,
+        combine_notify,
     )
     if udma_auto_options is not None:
         options += (udma_auto_options,)

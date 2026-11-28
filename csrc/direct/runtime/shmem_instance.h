@@ -18,10 +18,11 @@ public:
     ShmemInstance(int64_t rank, int64_t world_size, std::string ip_port);
     ShmemInstance(int64_t rank, int64_t world_size, std::string ip_port, int64_t data_op_engine_type,
                   bool use_1g_huge_pages = false, std::vector<int64_t> unique_id = {}, std::string bootstrap_key = {},
-                  bool v1_shared_jetty = false, bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
+                  bool shared_jetty = false, bool token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {});
+                  int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {},
+                  bool combine_notify = false);
 
     ~ShmemInstance();
 
@@ -65,6 +66,10 @@ public:
     int64_t WorldSize() const;
     void* WorkspacePtr() const;
     bool Use1gHugePages() const;
+    bool CombineNotify() const
+    {
+        return combine_notify_;
+    }
     bool SharedJetty() const
     {
         return shared_jetty_;
@@ -99,6 +104,7 @@ public:
     }
 
 private:
+    const bool combine_notify_ = false;
     uint64_t npu_timeout_cycles_ = 0;
     uint32_t shmem_sync_timeout_us_ = 0;
     uint32_t notify_host_timeout_seconds_ = 0;

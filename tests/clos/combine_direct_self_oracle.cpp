@@ -275,90 +275,95 @@ void Check(unsigned world, unsigned rank, unsigned tokens, unsigned hidden, unsi
     std::vector<float> input_weights((total + 1) * topk), output_weights(tokens * topk + 16);
     core_count = reduce_cores;
     for (unsigned generation : {0U, 1U})
-      for (unsigned dense_payload : {0U, 1U})
-        for (unsigned compact : {0U, 1U})
-            for (unsigned local_compact : {0U, 1U}) {
-                // Production enables dense payload only with aligned rows and
-                // compact (or absent) weights. Sparse routes still pack densely.
-                if (dense_payload && (hidden * 2 != td.x_row_stride || (topk && !compact))) continue;
-                td.combine_payload_max_rows = dense_payload ? 2U : 1U;
-                td.combine_compact_weights = compact && topk;
-                td.compact_self_rows = local_compact;
-                td.has_bias_0 = generation;
-                td.has_bias_1 = generation;
-                td.topk_weights_row_stride = compact ? topk * 4 : (topk * 4 + 31) / 32 * 32;
-                const uint64_t workspace_bytes = td.topk_weights_buffer_offset +
-                                                 uint64_t(world) * td.token_capacity * td.topk_weights_row_stride + 32;
-                std::vector<uint8_t> workspace(workspace_bytes, 0xff);
-                for (unsigned r = 0; r < routes[rank].size(); ++r) {
-                    for (unsigned h = 0; h < hidden; ++h)
-                        input[(base + r) * hidden + h] = Encode<B>(Value(rank, routes[rank][r], h, generation));
-                    for (unsigned k = 0; k < topk; ++k)
-                        input_weights[(base + r) * topk + k] = Value(rank, routes[rank][r], k + 7, generation);
-                }
-                std::vector<float> expected(tokens * hidden), expected_weights(tokens * topk);
-                for (unsigned t = 0; t < tokens; ++t)
-                    for (unsigned h = 0; h < hidden; ++h) {
-                        bias0[t * hidden + h] = Encode<B>(Value(1, t, h, generation));
-                        bias1[t * hidden + h] = Encode<B>(Value(2, t, h, generation));
-                        if (generation)
-                            expected[t * hidden + h] = Decode(bias0[t * hidden + h]) + Decode(bias1[t * hidden + h]);
+        for (unsigned dense_payload : {0U, 1U})
+            for (unsigned compact : {0U, 1U})
+                for (unsigned local_compact : {0U, 1U}) {
+                    // Production enables dense payload only with aligned rows and
+                    // compact (or absent) weights. Sparse routes still pack densely.
+                    if (dense_payload && (hidden * 2 != td.x_row_stride || (topk && !compact))) continue;
+                    td.combine_payload_max_rows = dense_payload ? 2U : 1U;
+                    td.combine_compact_weights = compact && topk;
+                    td.compact_self_rows = local_compact;
+                    td.has_bias_0 = generation;
+                    td.has_bias_1 = generation;
+                    td.topk_weights_row_stride = compact ? topk * 4 : (topk * 4 + 31) / 32 * 32;
+                    const uint64_t workspace_bytes = td.topk_weights_buffer_offset +
+                                                     uint64_t(world) * td.token_capacity * td.topk_weights_row_stride +
+                                                     32;
+                    std::vector<uint8_t> workspace(workspace_bytes, 0xff);
+                    for (unsigned r = 0; r < routes[rank].size(); ++r) {
+                        for (unsigned h = 0; h < hidden; ++h)
+                            input[(base + r) * hidden + h] = Encode<B>(Value(rank, routes[rank][r], h, generation));
+                        for (unsigned k = 0; k < topk; ++k)
+                            input_weights[(base + r) * topk + k] = Value(rank, routes[rank][r], k + 7, generation);
                     }
-                for (unsigned peer = 0; peer < world; ++peer)
-                    for (unsigned r = 0; r < routes[peer].size(); ++r) {
-                        unsigned t = routes[peer][r];
-                        uint64_t legacy_slot =
-                            uint64_t(peer) * td.token_capacity + (peer == rank && local_compact ? r : t);
-                        uint64_t payload_slot = dense_payload ? uint64_t(peer) * td.token_capacity + r : legacy_slot;
-                        uint64_t weight_slot = compact ? uint64_t(peer) * td.token_capacity + r : legacy_slot;
+                    std::vector<float> expected(tokens * hidden), expected_weights(tokens * topk);
+                    for (unsigned t = 0; t < tokens; ++t)
                         for (unsigned h = 0; h < hidden; ++h) {
-                            T v = Encode<B>(Value(peer, t, h, generation));
-                            expected[t * hidden + h] += Decode(v);
-                            std::memcpy(workspace.data() + td.x_buffer_offset + payload_slot * td.x_row_stride + h * 2,
-                                        &v, 2);
+                            bias0[t * hidden + h] = Encode<B>(Value(1, t, h, generation));
+                            bias1[t * hidden + h] = Encode<B>(Value(2, t, h, generation));
+                            if (generation)
+                                expected[t * hidden + h] =
+                                    Decode(bias0[t * hidden + h]) + Decode(bias1[t * hidden + h]);
                         }
-                        for (unsigned k = 0; k < topk; ++k) {
-                            float v = Value(peer, t, k + 7, generation);
-                            expected_weights[t * topk + k] += v;
-                            std::memcpy(workspace.data() + td.topk_weights_buffer_offset +
-                                            weight_slot * td.topk_weights_row_stride + k * 4,
-                                        &v, 4);
+                    for (unsigned peer = 0; peer < world; ++peer)
+                        for (unsigned r = 0; r < routes[peer].size(); ++r) {
+                            unsigned t = routes[peer][r];
+                            uint64_t legacy_slot =
+                                uint64_t(peer) * td.token_capacity + (peer == rank && local_compact ? r : t);
+                            uint64_t payload_slot =
+                                dense_payload ? uint64_t(peer) * td.token_capacity + r : legacy_slot;
+                            uint64_t weight_slot = compact ? uint64_t(peer) * td.token_capacity + r : legacy_slot;
+                            for (unsigned h = 0; h < hidden; ++h) {
+                                T v = Encode<B>(Value(peer, t, h, generation));
+                                expected[t * hidden + h] += Decode(v);
+                                std::memcpy(
+                                    workspace.data() + td.x_buffer_offset + payload_slot * td.x_row_stride + h * 2, &v,
+                                    2);
+                            }
+                            for (unsigned k = 0; k < topk; ++k) {
+                                float v = Value(peer, t, k + 7, generation);
+                                expected_weights[t * topk + k] += v;
+                                std::memcpy(workspace.data() + td.topk_weights_buffer_offset +
+                                                weight_slot * td.topk_weights_row_stride + k * 4,
+                                            &v, 4);
+                            }
                         }
+                    for (unsigned direct : {0U, 1U}) {
+                        if (dense_payload && !direct) continue;
+                        td.combine_direct_self = direct;
+                        if (direct) {
+                            // Any accidental SHMEM self read now produces NaN; input is authoritative.
+                            std::memset(workspace.data() + td.x_buffer_offset +
+                                            uint64_t(rank) * td.token_capacity * td.x_row_stride,
+                                        0xff, td.token_capacity * td.x_row_stride);
+                            std::memset(workspace.data() + td.topk_weights_buffer_offset +
+                                            uint64_t(rank) * td.token_capacity * td.topk_weights_row_stride,
+                                        0xff, td.token_capacity * td.topk_weights_row_stride);
+                        }
+                        std::fill(output.begin(), output.end(), Encode<B>(7));
+                        std::fill(output_weights.begin(), output_weights.end(), 123.0F);
+                        for (current_core = 0; current_core < int(reduce_cores); ++current_core) {
+                            CombineUdmaImpl<T, false, true>(
+                                reinterpret_cast<GM_ADDR>(input.data()),
+                                reinterpret_cast<GM_ADDR>(input_weights.data()),
+                                reinterpret_cast<GM_ADDR>(bias0.data()), reinterpret_cast<GM_ADDR>(bias1.data()),
+                                nullptr, reinterpret_cast<GM_ADDR>(ranks.data()),
+                                reinterpret_cast<GM_ADDR>(starts.data()), reinterpret_cast<GM_ADDR>(heads.data()),
+                                workspace.data(), reinterpret_cast<GM_ADDR>(output.data()),
+                                reinterpret_cast<GM_ADDR>(output_weights.data()), td);
+                            for (auto& row : AscendC::events)
+                                for (int event : row) assert(event == 0);
+                        }
+                        for (unsigned i = 0; i < tokens * hidden; ++i)
+                            assert(output[i].bits == Encode<B>(expected[i]).bits);
+                        for (unsigned i = 0; i < tokens * topk; ++i) assert(output_weights[i] == expected_weights[i]);
+                        for (unsigned i = tokens * hidden; i < output.size(); ++i)
+                            assert(output[i].bits == Encode<B>(7).bits);
+                        for (unsigned i = tokens * topk; i < output_weights.size(); ++i)
+                            assert(output_weights[i] == 123.0F);
                     }
-                for (unsigned direct : {0U, 1U}) {
-                    if (dense_payload && !direct) continue;
-                    td.combine_direct_self = direct;
-                    if (direct) {
-                        // Any accidental SHMEM self read now produces NaN; input is authoritative.
-                        std::memset(workspace.data() + td.x_buffer_offset +
-                                        uint64_t(rank) * td.token_capacity * td.x_row_stride,
-                                    0xff, td.token_capacity * td.x_row_stride);
-                        std::memset(workspace.data() + td.topk_weights_buffer_offset +
-                                        uint64_t(rank) * td.token_capacity * td.topk_weights_row_stride,
-                                    0xff, td.token_capacity * td.topk_weights_row_stride);
-                    }
-                    std::fill(output.begin(), output.end(), Encode<B>(7));
-                    std::fill(output_weights.begin(), output_weights.end(), 123.0F);
-                    for (current_core = 0; current_core < int(reduce_cores); ++current_core) {
-                        V1CombineUdmaImpl<T, false, true>(
-                            reinterpret_cast<GM_ADDR>(input.data()), reinterpret_cast<GM_ADDR>(input_weights.data()),
-                            reinterpret_cast<GM_ADDR>(bias0.data()), reinterpret_cast<GM_ADDR>(bias1.data()), nullptr,
-                            reinterpret_cast<GM_ADDR>(ranks.data()), reinterpret_cast<GM_ADDR>(starts.data()),
-                            reinterpret_cast<GM_ADDR>(heads.data()), workspace.data(),
-                            reinterpret_cast<GM_ADDR>(output.data()), reinterpret_cast<GM_ADDR>(output_weights.data()),
-                            td);
-                        for (auto& row : AscendC::events)
-                            for (int event : row) assert(event == 0);
-                    }
-                    for (unsigned i = 0; i < tokens * hidden; ++i)
-                        assert(output[i].bits == Encode<B>(expected[i]).bits);
-                    for (unsigned i = 0; i < tokens * topk; ++i) assert(output_weights[i] == expected_weights[i]);
-                    for (unsigned i = tokens * hidden; i < output.size(); ++i)
-                        assert(output[i].bits == Encode<B>(7).bits);
-                    for (unsigned i = tokens * topk; i < output_weights.size(); ++i)
-                        assert(output_weights[i] == 123.0F);
                 }
-            }
 }
 
 int main()

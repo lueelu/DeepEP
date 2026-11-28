@@ -24,7 +24,7 @@ def test_direct_self_production_reduction(tmp_path, corrupt_local_row):
         "ContributorSlot",
         "CompactWeightSlot",
         "CombineLocalInputRow",
-        "V1CombineUdmaImpl",
+        "CombineUdmaImpl",
     )
     if corrupt_local_row:
         functions = functions.replace(

@@ -219,7 +219,7 @@ def test_profile_sequence_excludes_outer_barrier(tmp_path, fused, simt, expanded
     names = ["cached_notify_combine_kernel"]
     if not fused:
         names.append("dispatch_layout_simt_kernel" if simt else "dispatch_layout_kernel")
-    names += ["notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+    names += ["notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
     if expanded:
         names.append("expand_kernel")
     path = tmp_path / "kernel_details.csv"

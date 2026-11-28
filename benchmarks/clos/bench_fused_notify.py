@@ -107,10 +107,13 @@ def parse_capture(directory, fused, samples, expanded=False, guards=0, simt_layo
         raise RuntimeError(f"expected one kernel_details.csv, found {len(paths)}")
     with paths[0].open(encoding="utf-8-sig", newline="") as f:
         rows = sorted(csv.DictReader(f), key=lambda r: float(r["Start Time(us)"]))
+    from stage_metrics import normalize_kernel_rows
+
+    rows = normalize_kernel_rows(rows)
     names = ["cached_notify_combine_kernel"]
     if not fused:
         names.append("dispatch_layout_simt_kernel" if simt_layout else "dispatch_layout_kernel")
-    names += ["notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+    names += ["notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
     if expanded:
         names.append("expand_kernel")
     known = set(names) | {"dispatch_layout_kernel", "dispatch_layout_simt_kernel", "expand_kernel"}
@@ -209,6 +212,7 @@ def main():
     with store_topology_collective(group):
         buffer = ElasticBuffer(
             group,
+            combine_notify=True,
             num_max_tokens_per_rank=args.tokens,
             hidden=args.hidden,
             num_topk=args.topk,
@@ -414,7 +418,7 @@ def main():
                             means_us=summary,
                             policy=policy,
                             logical_payload_bytes_per_rank=mean_payload_bytes,
-                            payload_gbps=mean_payload_bytes / summary["v1_dispatch_udma_kernel"] / 1000,
+                            payload_gbps=mean_payload_bytes / summary["direct_dispatch_udma_kernel"] / 1000,
                         )
                     )
                     (capture / "samples.json").write_text(json.dumps(stages, indent=2), encoding="utf-8")
@@ -498,7 +502,7 @@ def main():
                         layout_us=s.get("dispatch_layout_kernel", 0),
                         notify_us=s["notify_dispatch_kernel"],
                         layout_notify_us=s["layout_plus_notify"],
-                        comm_us=s["v1_dispatch_udma_kernel"],
+                        comm_us=s["direct_dispatch_udma_kernel"],
                         expand_us=s.get("expand_kernel", 0),
                         api_wall_us=s["api_wall_us_unprofiled"],
                         payload_gbps=row["payload_gbps"],

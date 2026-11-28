@@ -384,7 +384,7 @@ __aicore__ inline void WaitIncoming(
                 const auto timeout_s = static_cast<uint32_t>(td.npu_timeout_cycles / kNpuSystemCyclesPerSecond);
                 if constexpr (IsDispatch) {
                     AscendC::printf(
-                        "[V1_UDMA_TIMEOUT] op=dispatch stage=wait_incoming rank=%u aiv_core_idx=%u "
+                        "[DEEPEP_UDMA_TIMEOUT] op=dispatch stage=wait_incoming rank=%u aiv_core_idx=%u "
                         "peer_rank=%u worker_idx=%u instance_id=%u cached=%u "
                         "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_s=%u\n",
                         td.rank, core, source, worker, td.instance_id, td.cached_mode,
@@ -392,7 +392,7 @@ __aicore__ inline void WaitIncoming(
                         elapsed_us, timeout_s);
                 } else {
                     AscendC::printf(
-                        "[V1_UDMA_TIMEOUT] op=combine stage=wait_incoming rank=%u aiv_core_idx=%u "
+                        "[DEEPEP_UDMA_TIMEOUT] op=combine stage=wait_incoming rank=%u aiv_core_idx=%u "
                         "peer_rank=%u worker_idx=%u instance_id=%u "
                         "signal=0x%llx expected=1 observed=%llu elapsed_us=%llu timeout_s=%u\n",
                         td.rank, core, source, worker, td.instance_id,

@@ -52,20 +52,21 @@ METADATA = dict(
 @pytest.mark.parametrize("flush", [False, True])
 @pytest.mark.parametrize("barrier", ["_Z24barrier_on_stream_kernelim", "cached_notify_combine_kernel"])
 @pytest.mark.parametrize("simt_layout", [False, True])
-def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush, barrier, simt_layout):
+@pytest.mark.parametrize("archived_names", [False, True])
+def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush, barrier, simt_layout, archived_names):
     from benchmarks.clos.stage_metrics import L2_FLUSH_RANGE, PROFILE_SAMPLE_RANGE, parse_profile
 
     events, rows = [], []
     columns = ["Name", "Start Time(us)", "Duration(us)", "Device_id", "Step Id", "Block Num"]
     names = (
-        ["cached_notify_combine_kernel", "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+        ["cached_notify_combine_kernel", "direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
         if op.startswith("combine")
         else (
             ["dispatch_layout_simt_kernel" if simt_layout else "dispatch_layout_kernel", "notify_dispatch_kernel"]
             if op == "dispatch"
             else ["cached_notify_dispatch_kernel"]
         )
-        + ["v1_dispatch_udma_kernel"]
+        + ["direct_dispatch_udma_kernel"]
     )
 
     def linked(name, host, device, task):
@@ -100,7 +101,9 @@ def test_clos_pre_sample_flush_and_rank_barrier_are_excluded(tmp_path, op, flush
         with (tmp_path / "kernel_details.csv").open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=columns)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(
+                dict(row, Name=row["Name"].replace("direct_", "v1_", 1)) if archived_names else row for row in rows
+            )
         return parse_profile(
             tmp_path, op, False, 2, 0, 32, sample_markers=True, flush_l2_cache=flush, all_rank_sync_each_iteration=True
         )
@@ -164,27 +167,25 @@ def test_v2_sample_preparation_finishes_flush_before_reused_stream_barrier(enabl
         ]
 
 
-@pytest.mark.parametrize("previous", [None, "0", "1"])
-@pytest.mark.parametrize("fail", [False, True])
-def test_clos_notify_switch_is_restored_after_capture(monkeypatch, previous, fail):
-    import os
-    from benchmarks.clos.stage_metrics import COMBINE_NOTIFY_ENV, profile_combine_notify
+def test_shared_kernel_names_accept_archived_profiles():
+    from benchmarks.clos.stage_metrics import normalize_kernel_rows
 
-    if previous is None:
-        monkeypatch.delenv(COMBINE_NOTIFY_ENV, raising=False)
-    else:
-        monkeypatch.setenv(COMBINE_NOTIFY_ENV, previous)
-    try:
-        with profile_combine_notify(True):
-            assert os.environ[COMBINE_NOTIFY_ENV] == "1"
-            with profile_combine_notify(False):
-                assert os.environ[COMBINE_NOTIFY_ENV] == "0"
-            assert os.environ[COMBINE_NOTIFY_ENV] == "1"
-            if fail:
-                raise RuntimeError("profiler exit")
-    except RuntimeError:
-        assert fail
-    assert os.environ.get(COMBINE_NOTIFY_ENV) == previous
+    rows = [
+        {"Name": name}
+        for name in (
+            "v1_dispatch_udma_kernel",
+            "v1_combine_udma_comm_kernel",
+            "direct_combine_udma_reduce_kernel",
+            "cached_notify_combine_kernel",
+        )
+    ]
+    assert [r["Name"] for r in normalize_kernel_rows(rows)] == [
+        "direct_dispatch_udma_kernel",
+        "direct_combine_udma_comm_kernel",
+        "direct_combine_udma_reduce_kernel",
+        "cached_notify_combine_kernel",
+    ]
+    assert rows[0]["Name"] == "v1_dispatch_udma_kernel"
 
 
 @pytest.mark.parametrize("expanded", [False, True])
@@ -195,7 +196,9 @@ def test_clos_combine_notify_is_separate_and_complete(tmp_path, expanded, api):
     columns = ["Name", "Start Time(us)", "Duration(us)", "Device_id", "Step Id", "Block Num"]
     names = (["aggregate_kernel"] if expanded else []) + ["cached_notify_combine_kernel"]
     names += (
-        ["v1_combine_udma_kernel"] if api == "v1" else ["v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+        ["direct_combine_udma_kernel"]
+        if api == "v1"
+        else ["direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
     )
     rows = [
         dict(zip(columns, (name, 100 * sample + 10 * i, 3, 0, 1, 32)))

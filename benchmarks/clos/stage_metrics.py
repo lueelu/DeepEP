@@ -3,9 +3,7 @@
 import csv
 import hashlib
 import json
-import os
 from collections import Counter
-from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,21 +11,17 @@ L2_CACHE_FLUSH_BYTES = 256_000_000
 L2_FLUSH_RANGE = "deepep_benchmark_l2_flush"
 PROFILE_SAMPLE_RANGE = "deepep_benchmark_sample/"
 PROFILE_GUARD_ITERS = 2
-COMBINE_NOTIFY_ENV = "DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY"
 
 
-@contextmanager
-def profile_combine_notify(enabled):
-    """Scope the extra UDMA rendezvous to capture; restore even on profiler exit."""
-    previous = os.environ.get(COMBINE_NOTIFY_ENV)
-    os.environ[COMBINE_NOTIFY_ENV] = "1" if enabled else "0"
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(COMBINE_NOTIFY_ENV, None)
-        else:
-            os.environ[COMBINE_NOTIFY_ENV] = previous
+def normalize_kernel_rows(rows):
+    """Canonicalize archived V1-prefixed shared kernels without modifying files."""
+    result = []
+    for row in rows:
+        name = row["Name"]
+        if name.startswith(("v1_dispatch", "v1_combine")) and "kernel" in name:
+            row = dict(row, Name="direct_" + name[3:])
+        result.append(row)
+    return result
 
 
 class ProfileSamples:
@@ -102,12 +96,12 @@ STAGES = {
     "notify_dispatch_kernel": "notify",
     "cached_notify_dispatch_kernel": "notify",
     "cached_notify_combine_kernel": "notify",
-    "v1_dispatch_udma_kernel": "comm",
-    "v1_combine_udma_comm_kernel": "comm",
-    "v1_combine_udma_early_kernel": "early_submit",
-    "v1_combine_udma_remaining_kernel": "comm",
-    "v1_combine_udma_reduce_kernel": "reduce",
-    "v1_combine_udma_kernel": "fused_combine",
+    "direct_dispatch_udma_kernel": "comm",
+    "direct_combine_udma_comm_kernel": "comm",
+    "direct_combine_udma_early_kernel": "early_submit",
+    "direct_combine_udma_remaining_kernel": "comm",
+    "direct_combine_udma_reduce_kernel": "reduce",
+    "direct_combine_udma_kernel": "fused_combine",
     "expand_kernel": "expand",
     "aggregate_kernel": "aggregate",
 }
@@ -515,6 +509,7 @@ def parse_profile(
         raise ValueError("empty profiler artifact")
     with csvs[0].open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
+    rows = normalize_kernel_rows(rows)
     rows.sort(key=lambda r: Decimal(r["Start Time(us)"].strip()))
     sample_intervals, sample_host_ranges, discarded = [], None, 0
     flush_intervals, flush_kernels = [], []
@@ -546,16 +541,16 @@ def parse_profile(
     layout = "dispatch_layout_simt_kernel" if counts["dispatch_layout_simt_kernel"] else "dispatch_layout_kernel"
     if api != "v2" and counts["dispatch_layout_simt_kernel"]:
         raise ValueError("SIMT layout is only supported by V2")
-    early = bool(counts["v1_combine_udma_early_kernel"] or counts["v1_combine_udma_remaining_kernel"])
+    early = bool(counts["direct_combine_udma_early_kernel"] or counts["direct_combine_udma_remaining_kernel"])
     if early and not (combine and expanded and api == "v2"):
         raise ValueError("early single-source stages require expanded combine")
     main = (
-        ("v1_combine_udma_remaining_kernel" if early else "v1_combine_udma_comm_kernel")
+        ("direct_combine_udma_remaining_kernel" if early else "direct_combine_udma_comm_kernel")
         if combine
-        else "v1_dispatch_udma_kernel"
+        else "direct_dispatch_udma_kernel"
     )
     if fused:
-        main = "v1_combine_udma_kernel"
+        main = "direct_combine_udma_kernel"
     required = [main]
     # New V1/V2 profiles require a separate all-AIV entry rendezvous. Archived reports
     # without it remain readable; partial/mixed sequences always fail below.
@@ -565,7 +560,7 @@ def parse_profile(
         else []
     )
     required += (
-        combine_notify + ([] if fused else ["v1_combine_udma_reduce_kernel"])
+        combine_notify + ([] if fused else ["direct_combine_udma_reduce_kernel"])
         if combine
         else [layout, "notify_dispatch_kernel"]
         if op == "dispatch"
@@ -574,8 +569,8 @@ def parse_profile(
     if expanded:
         required.append("aggregate_kernel" if combine else "expand_kernel")
     if early:
-        required.append("v1_combine_udma_early_kernel")
-        if counts["v1_combine_udma_comm_kernel"]:
+        required.append("direct_combine_udma_early_kernel")
+        if counts["direct_combine_udma_comm_kernel"]:
             raise ValueError("mixed serial and early communication stages")
     if any(counts[n] != iterations for n in required):
         raise ValueError(f"{root}: unexpected kernel counts {counts}; required {required}")
@@ -584,17 +579,17 @@ def parse_profile(
     forbidden = (
         ["expand_kernel", "dispatch_layout_kernel", "notify_dispatch_kernel"]
         if combine
-        else ["aggregate_kernel", "v1_combine_udma_reduce_kernel"]
+        else ["aggregate_kernel", "direct_combine_udma_reduce_kernel"]
     )
     forbidden += (
         [
-            "v1_combine_udma_comm_kernel",
-            "v1_combine_udma_reduce_kernel",
-            "v1_combine_udma_early_kernel",
-            "v1_combine_udma_remaining_kernel",
+            "direct_combine_udma_comm_kernel",
+            "direct_combine_udma_reduce_kernel",
+            "direct_combine_udma_early_kernel",
+            "direct_combine_udma_remaining_kernel",
         ]
         if fused
-        else ["v1_combine_udma_kernel"]
+        else ["direct_combine_udma_kernel"]
     )
     if not expanded:
         forbidden += ["aggregate_kernel", "expand_kernel"]
@@ -608,7 +603,7 @@ def parse_profile(
     sequence = [r["Name"] for r in rows[:width]]
     if any([r["Name"] for r in rows[i * width : (i + 1) * width]] != sequence for i in range(iterations)):
         raise ValueError("kernel sequence changed between iterations; cannot assign samples")
-    if combine and not fused and sequence.index(main) >= sequence.index("v1_combine_udma_reduce_kernel"):
+    if combine and not fused and sequence.index(main) >= sequence.index("direct_combine_udma_reduce_kernel"):
         raise ValueError("reduce precedes communication")
     if expanded and (
         (combine and sequence.index("aggregate_kernel") >= sequence.index(main))
@@ -617,7 +612,7 @@ def parse_profile(
         raise ValueError("local stage order mismatch")
     if early and not (
         sequence.index("cached_notify_combine_kernel")
-        < sequence.index("v1_combine_udma_early_kernel")
+        < sequence.index("direct_combine_udma_early_kernel")
         < sequence.index("aggregate_kernel")
     ):
         raise ValueError("early send must follow initialization and precede aggregate")

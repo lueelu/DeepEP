@@ -35,7 +35,7 @@ __aicore__ inline void WaitAggregateReady(const CombineTilingData& td, uint32_t 
         const uint64_t elapsed = static_cast<uint64_t>(AscendC::GetSystemCycle()) - start;
         if (elapsed >= td.npu_timeout_cycles) {
             AscendC::printf(
-                "[V1_UDMA_TIMEOUT] op=combine stage=aggregate_ready rank=%u aiv_core_idx=%u instance_id=%u "
+                "[DEEPEP_UDMA_TIMEOUT] op=combine stage=aggregate_ready rank=%u aiv_core_idx=%u instance_id=%u "
                 "row=%u chunk=%u expected=1 observed=%llu elapsed_us=%llu timeout_s=%u\n",
                 td.rank, core, td.instance_id, row, chunk, static_cast<unsigned long long>(value),
                 static_cast<unsigned long long>(elapsed / kNpuSystemCyclesPerUs),

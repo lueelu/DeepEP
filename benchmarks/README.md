@@ -11,7 +11,7 @@ Modified by Joyce_An 2026
 
 所有自动UDMA launch在通信核数大于32时，统一继承相同shape、算子、接口及dtype的完整32核计划，包括P/W/Q、发送顺序、visit及copy/weight偏好；实际启动核数仍使用用户设置值。EP32/G8带权combine的64核不再丢失32核的visit拟合；EP32/G16保持P4/W1/Q1/v32，EP64各hidden对应的既有visit不变。独立reduce核数不参与发送计划选择。
 
-自动策略仍保留以下历史选择条件，不能把“继承32核”理解成所有hidden/API/拓扑都使用同一个计划：
+自动策略表直接保存 rank 计划，不再先选 group/RR 再转换。仍保留以下明确的适用条件，不能把“继承32核”理解成所有hidden/API/拓扑都使用同一个计划：
 
 | 条件 | 仍保留的行为 |
 | --- | --- |
@@ -31,6 +31,10 @@ Modified by Joyce_An 2026
 
 visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变。visit 是一个 peer 每轮的 WQE 预算，64/128 会拆为多个最多32条的提交，不扩大 WQE 暂存区，也不改变 SQ 信用保护。带权重等多字段路径按 WQE 计数，不等于同等数量的 token。新增取值需同步更新 Python 和 Host 库。
 
+普通自动 Buffer 会按本 EP/拓扑的所有可用自动计划预留 QP 并集，涵盖动态2～64核、V1/V2、dtype/展开兼容路径和各行宽档位。每对 peer 保留控制 QP0，并合并双向映射；无需另设 `DEEPEP_CLOS_QP_PLANS`。低于8核的容量回退可能让 EP64/128 的预留集合仍含 RR，但不改变8～64核的 rank launch。手动摸测则按实际候选集合预留。
+
+按 G=min(EP,16) 计算，每 rank 的 peer-QP 位数相较旧的全策略 `TuningPeerMask` 并集：EP4为18～22→16，EP8为66～81→54，EP16为206～265→118，EP32为500～616→121，EP64为1016～1256→313～343，EP128为1851～2460→631～691。此处统计连接映射位，不是物理SQ数量或初始化耗时实测；不同rank可能不同。
+
 `clos/bench_fast_sweep.py` 在候选策略过滤完成后，自动将本次所有算子（包括准备 handle 的 fresh dispatch）的 QP 映射并集传给 SHMEM，每个进程只初始化一个 Buffer。`--plan-only` 和输出 `plan.json` 中的 `qp_plans` 记录建链范围；`BUFFER_READY` 记录初始化耗时。visit 不改变 QP 映射，固定 P/W/Q 的 visit 扫描不会额外预建其他策略的连接。普通模式**不做精度验证**；下面的精简 rank 模式会检查入围配置。
 
 ### EP4/8/16/32 精简 rank 摸测
@@ -38,16 +42,15 @@ visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变
 仅重测当前自动 combine（不摸测）时，复用同一入口：
 
 ```bash
-export DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY=1
 torchrun --nproc_per_node=16 benchmarks/clos/bench_fast_sweep.py \
   --combine-defaults-only --ep-size 16 --skip-precision --single-pass \
   --no-huge-pages --reduce-cores 48 --warmup 5 --final-samples 30 \
   --output combine_defaults_ep16
 ```
 
-默认 T8192、H2816/4096/6144、通信8/32核、K8/E256/BF16/expand0，两种权重路径，共12组/EP；也可用重复的 `--case TOKENS,HIDDEN,TOPK,AIV` 缩小范围。每rank仅构造一次 Buffer，所有shape和核数复用；准备 handle 的 dispatch 不计入结果。P/W/Q、visit、payload rows 和 WQE fast 均采用当前自动值，不扫描或覆盖。进程环境须清除其他 `DEEPEP_CLOS_*` 覆盖项，仅允许上述 notify=1；脚本按实际计划并集预留 QP，并保存实际 launch/rows。
+默认 T8192、H2816/4096/6144、通信8/32核、K8/E256/BF16/expand0，两种权重路径，共12组/EP；也可用重复的 `--case TOKENS,HIDDEN,TOPK,AIV` 缩小范围。每rank仅构造一次 Buffer，所有shape和核数复用；准备 handle 的 dispatch 不计入结果。P/W/Q、visit、payload rows 和 WQE fast 均采用当前自动值，不扫描或覆盖。进程环境须清除其他 `DEEPEP_CLOS_*` 覆盖项；脚本按实际计划并集预留 QP，并保存实际 launch/rows。
 
-该模式始终在 combine profiler 中开启独立 notify；解析器要求每次调用的顺序为 `采样前barrier → notify → 通信 → reduce`，前置barrier不计入notify。只输出notify/通信的逐rank原始样本、均值/P50/P95和通信带宽，不采集API耗时；reduce仍执行。`--skip-precision` 明确将报告标为 `precision=skipped`，不能据此宣称精度通过。`--single-pass` 不跑反序、不追加采样。带宽分子和逐样本最慢rank口径沿用下面的说明，notify不计入带宽分母。
+所有 CLOS benchmark 在 Buffer 初始化时固定传入 `combine_notify=True`，预热、精度和正式采样使用同一设置，不再读取 `DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY`，也不增加命令行选项。该模式的解析器要求每次调用的顺序为 `采样前barrier → notify → 通信 → reduce`，前置barrier不计入notify。只输出notify/通信的逐rank原始样本、均值/P50/P95和通信带宽，不采集API耗时；reduce仍执行。`--skip-precision` 明确将报告标为 `precision=skipped`，不能据此宣称精度通过。`--single-pass` 不跑反序、不追加采样。带宽分子和逐样本最慢rank口径沿用下面的说明，notify不计入带宽分母。
 
 EP4/8在单机分别用4/8进程，EP32用两机各16进程；各EP独立会话，不能跨EP复用同一个Buffer。先用 `--plan-only` 核对用例。失败时保留构造/设备第一条错误和已完成结果，不自动重启或删掉慢样本。若仍出现初始化同步错误，notify测量尚未开始，不能把该轮当作性能结果。
 
@@ -156,3 +159,5 @@ hidden 值可被 BF16 精确表示；FP8 先生成 BF16，再按固定参考的�
 退出码 0 表示规划成功；当前请求 native 测量返回 2，错误为缺少 native benchmark adapter。参数、配置或输出路径错误也返回非零。结构化失败结果只记录错误类型，详细错误位于 stderr。
 
 `_config.py` 实现配置及字节计算，`_utils.py` 实现通用计时、统计和序列化，`_backend.py` 定义内部适配协议。可运行 `python -m pytest tests/test_benchmark.py -q` 检查这些协议；CPU 合成样本不作为性能数据发布。
+
+共享 dispatch/combine kernel 统一使用 `direct_dispatch_*` / `direct_combine_*` 名称；profiling 解析器仍可读取归档中的 `v1_dispatch_*` / `v1_combine_*` 名称。公共 V1/V2 API 名称不变。

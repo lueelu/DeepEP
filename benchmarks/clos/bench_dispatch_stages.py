@@ -279,7 +279,7 @@ def channel_comparison(results):
             pairs=len(off),
         )
         notify = notify_stage(off[0])
-        for label, stage in (("notify", notify), ("comm", "v1_dispatch_udma_kernel"), ("api", "api_wall_us")):
+        for label, stage in (("notify", notify), ("comm", "direct_dispatch_udma_kernel"), ("api", "api_wall_us")):
             a = [r["stats_us"][stage]["mean"] for r in off]
             b = [r["stats_us"][stage]["mean"] for r in on]
             row.update(
@@ -321,7 +321,7 @@ def overlap_comparison(results, mode_key="overlap_mode", effective_key="overlap_
             row = dict(zip(keys, config))
             row.update(mode=mode, pairs=len(on), effective_masks=sorted({r[effective_key] for r in on}))
             notify = notify_stage(off[0])
-            for label, stage in (("notify", notify), ("comm", "v1_dispatch_udma_kernel"), ("api", "api_wall_us")):
+            for label, stage in (("notify", notify), ("comm", "direct_dispatch_udma_kernel"), ("api", "api_wall_us")):
                 a = [r["stats_us"][stage]["mean"] for r in off]
                 b = [r["stats_us"][stage]["mean"] for r in on]
                 row[label + "_off_us"] = statistics.mean(a)
@@ -424,6 +424,9 @@ def capture_stages(directory, samples, cached, cached_weighted=False, cached_pac
         raise RuntimeError("expected exactly one kernel_details.csv")
     with paths[0].open(encoding="utf-8-sig", newline="") as file:
         rows = sorted(csv.DictReader(file), key=lambda row: float(row["Start Time(us)"]))
+    from stage_metrics import normalize_kernel_rows
+
+    rows = normalize_kernel_rows(rows)
     names = ["cached_notify_combine_kernel"]  # out-of-measurement alignment
     layout = (
         "dispatch_layout_simt_kernel"
@@ -438,7 +441,7 @@ def capture_stages(directory, samples, cached, cached_weighted=False, cached_pac
     names.append(notify)
     if cached_weighted and not cached_pack:
         names.append("cached_dispatch_plan_kernel")
-    names.append("v1_dispatch_udma_kernel")
+    names.append("direct_dispatch_udma_kernel")
     selected = [
         row
         for row in rows
@@ -604,6 +607,7 @@ def main(argv=None):
     with store_topology_collective(group):
         buffer = ElasticBuffer(
             group,
+            combine_notify=True,
             num_max_tokens_per_rank=args.tokens,
             hidden=args.hidden,
             num_topk=args.topk,
@@ -1006,7 +1010,7 @@ def main(argv=None):
                         policy=policy,
                         stats_us=stats,
                         payload_bytes_per_rank=payload,
-                        payload_gbps=payload / stats["v1_dispatch_udma_kernel"]["mean"] / 1000,
+                        payload_gbps=payload / stats["direct_dispatch_udma_kernel"]["mean"] / 1000,
                     )
                 )
                 (out / "summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")

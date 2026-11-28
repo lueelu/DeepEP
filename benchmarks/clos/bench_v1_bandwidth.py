@@ -118,7 +118,6 @@ def worker(args):
     args.profile_warmup, args.profile_iters = args.warmup, args.iterations
     args.profile_sample_markers = True
     args.combine_notify = True
-    os.environ[shared.COMBINE_NOTIFY_ENV] = "0"
     device = args.first_device + local_rank
     destination = args.output / f"rank{rank}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -142,6 +141,7 @@ def worker(args):
         args.num_bytes = config.get_nvl_buffer_size_hint(args.hidden * 2, args.ep_size, num_tokens=args.num_tokens)
         buffer = Buffer(
             dist.group.WORLD,
+            combine_notify=True,
             num_nvl_bytes=args.num_bytes,
             explicitly_destroy=True,
             transport="udma",
@@ -317,17 +317,16 @@ def worker(args):
             print(f"PROFILE_BEGIN rank={rank} op={op} host_sync_each_iteration=True", flush=True)
             args.profile_dir = str(destination / op / "profiler")
             try:
-                with shared.profile_combine_notify(op.startswith("combine")):
-                    profiling._profile_operator(
-                        rank,
-                        args,
-                        op,
-                        flush_cache.wrap(fn),
-                        sample_callback=shared.ProfileSamples(torch),
-                        guard_iters=shared.PROFILE_GUARD_ITERS,
-                        synchronize_each_iteration=True,
-                        before_iteration=before_iteration,
-                    )
+                profiling._profile_operator(
+                    rank,
+                    args,
+                    op,
+                    flush_cache.wrap(fn),
+                    sample_callback=shared.ProfileSamples(torch),
+                    guard_iters=shared.PROFILE_GUARD_ITERS,
+                    synchronize_each_iteration=True,
+                    before_iteration=before_iteration,
+                )
             except profiling._ProfileComplete:
                 pass
             profile = shared.parse_profile_collective(
@@ -345,7 +344,8 @@ def worker(args):
                 require_combine_notify=True,
             )
             profile["sampling"]["host_sync_each_iteration"] = True
-            profile["sampling"]["combine_notify_profile_only"] = op.startswith("combine")
+            profile["sampling"]["combine_notify"] = True
+            profile["sampling"]["combine_notify_profile_only"] = False
             dist.barrier()
             for _ in range(args.warmup):
                 if before_iteration is not None:

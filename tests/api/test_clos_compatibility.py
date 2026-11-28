@@ -49,6 +49,58 @@ def test_multi_buffer_bootstrap_uses_fresh_uid_and_capacity_independent_identity
     """)
 
 
+def test_combine_notify_is_per_buffer_and_agreed_before_initialization():
+    run_host("""
+        import os
+        from deep_ep.backends.direct import buffer, elastic
+        group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+        buffer.load_native_module = lambda: SimpleNamespace(get_shmem_bootstrap=lambda key: (0, []))
+        buffer._bootstrap_all_gather = lambda group, comm, size, value: [value] * size
+        def prepare(enabled):
+            return buffer._prepare_shmem_bootstrap(group, None, 0, 2, 64<<20, 'mte', False,
+                                                  'tcp://host:123', combine_notify=enabled)
+        assert prepare(False)[1] == prepare(True)[1]  # A per-instance option, not a different bootstrap domain.
+        def mismatch(group, comm, size, value):
+            options, state, uid = value
+            other = options[:-1] + (not options[-1],)
+            return [value, (other, state, uid)]
+        buffer._bootstrap_all_gather = mismatch
+        try: prepare(True)
+        except ValueError: pass
+        else: raise AssertionError('inconsistent notify can deadlock peers')
+
+        class Submitted(Exception): pass
+        calls, options = [], []
+        def native(*args):
+            calls.append(args)
+            raise Submitted
+        def bootstrap(*args, **kwargs):
+            options.append(kwargs['combine_notify'])
+            return [], 'test'
+        buffer._is_capturing = lambda: False
+        elastic._validate_group_consensus = lambda *args: None
+        os.environ['DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY'] = '1'
+        for module, cls in ((buffer, buffer.Buffer), (elastic, elastic.ElasticBuffer)):
+            module.get_native_class = lambda _: native
+            module._prepare_shmem_bootstrap = bootstrap
+            for enabled in (False, True, False):
+                obj = object.__new__(cls)
+                try: cls.__init__(obj, group, num_bytes=64<<20, transport='mte', combine_notify=enabled)
+                except Submitted: pass
+                else: raise AssertionError('native construction was not reached')
+                assert calls[-1][-1] is enabled and options[-1] is enabled
+                assert len(calls[-1]) == 20 and obj.combine_notify is enabled
+                try: obj.combine_notify = not enabled
+                except AttributeError: pass
+                else: raise AssertionError('notify must remain fixed for this Buffer')
+                obj._destroyed = True
+            for invalid in (None, 0, 1, '1'):
+                try: cls(group, combine_notify=invalid)
+                except TypeError: pass
+                else: raise AssertionError('non-bool notify accepted')
+    """)
+
+
 def test_extended_visit_config_is_explicit_and_preserved():
     run_host("""
         from deep_ep.backends.direct.config import Config
@@ -579,7 +631,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
     run_host("""
         from dataclasses import replace, FrozenInstanceError
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy, _PROFILES
-        for (ep, cores, bucket, op), (groups, order, p, w, q, visit, copy) in _PROFILES.items():
+        for (ep, cores, bucket, op), (groups, p, w, q, visit, copy, auxiliary_budget) in _PROFILES.items():
             for group in groups:
                 base = replace(resolve_udma_policy(True, ep, 'udma', None, None, None, None, None),
                                ranks_per_group=group, topology_known=True)
@@ -588,7 +640,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 plan = base.for_launch(*args, bf16=True)
                 assert plan is base.for_launch(*args, bf16=True)
                 expected_order = 0
-                rank_p = p * (ep//group if order == 3 else 1)
+                rank_p = p
                 assert plan.native_plan()[:7] == [1, expected_order, group, rank_p, w, q, visit]
                 assert plan.self_copy == (copy or 2)
                 assert plan.send_workers <= cores and plan.send_workers * q <= 32
@@ -758,16 +810,16 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy, _PROFILES
 
-        for (ep, tier, bucket, op), (groups, order, p, w, q, visit, copy) in _PROFILES.items():
+        for (ep, tier, bucket, op), (groups, p, w, q, visit, copy, auxiliary_budget) in _PROFILES.items():
             for group in groups:
                 base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                                ranks_per_group=group, topology_known=True)
                 for cores in (range(8,16,2) if tier == 8 else range(32,64,2)):
                     plan = base.for_launch(cores,2048 if bucket == 'small' else 5632,op,bf16=True)
-                    rank_p = p * (ep//group if order == 3 else 1)
+                    rank_p = p
                     assert plan.native_plan()[:7] == [1,0,group,rank_p,w,q,visit]
                     assert base.config(cores).num_aiv == cores
-                    selected_senders = ((group+p-1)//p if order == 3 else (ep-2)//p+1)*w
+                    selected_senders = auxiliary_budget
                     if op == 'combine':
                         assert plan.self_copy == (1 if cores >= 2*selected_senders else 2)
                     if op == 'weighted':
@@ -791,6 +843,8 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                                     try: base.for_num_aiv(cores)
                                     except ValueError: continue
                                     raise
+                                if ep <= 128 and cores >= 8:
+                                    assert plan.peer_order == 0
                                 assert plan.send_workers <= cores
                                 assert plan.send_workers*plan.qps_per_worker <= 32
                                 assert plan.valid_group_capacity()

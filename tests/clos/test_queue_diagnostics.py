@@ -135,7 +135,7 @@ def test_device_fields_match_native_export_and_fit_row():
 
 
 def test_combine_host_trace_owns_tensor_and_rejects_unsupported_paths():
-    body = cpp_functions((ROOT / "csrc/direct/ops/combine.cpp").read_text(), "V1Combine")
+    body = cpp_functions((ROOT / "csrc/direct/ops/combine.cpp").read_text(), "Combine")
     assert "(void)combine_trace;" in body
     assert "currentStreamCaptureStatusMayInitCtx()" in body
     assert "!shmem.TokenSchedule()" in body and "!pipeline_chunk_tokens && !expanded_x.has_value()" in body
@@ -182,7 +182,9 @@ void test() {
     assert result.returncode == 0, result.stderr
 
 
-def test_combine_profiler_excludes_alignment_and_checks_sequence(tmp_path):
+@pytest.mark.parametrize("independent_notify", [False, True])
+@pytest.mark.parametrize("archived_names", [False, True])
+def test_combine_profiler_excludes_alignment_and_checks_sequence(tmp_path, independent_notify, archived_names):
     import csv
 
     sys.path.insert(0, str(ROOT / "benchmarks/clos"))
@@ -194,15 +196,22 @@ def test_combine_profiler_excludes_alignment_and_checks_sequence(tmp_path):
         spec.loader.exec_module(bench)
     finally:
         sys.path.pop(0)
-    names = ["cached_notify_combine_kernel", "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
+    names = ["cached_notify_combine_kernel", "direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
+    sequence = ([names[0]] + names) if independent_notify else names
+    durations = [999, 7, 20, 30] if independent_notify else [999, 20, 30]
     path = tmp_path / "kernel_details.csv"
     with path.open("w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["Name", "Start Time(us)", "Duration(us)"])
-        for i, name in enumerate(names * 6):
-            writer.writerow([name, i * 100, [999, 20, 30][i % 3]])
+        for i, name in enumerate(sequence * 6):
+            writer.writerow(
+                [name.replace("direct_", "v1_", 1) if archived_names else name, i * 100, durations[i % len(sequence)]]
+            )
     result = bench.capture_combine_stages(tmp_path, 2)
-    assert result == {names[1]: [20, 20], names[2]: [30, 30], "alignment_notify_us": [999, 999]}
+    expected = {names[1]: [20, 20], names[2]: [30, 30], "alignment_notify_us": [999, 999]}
+    if independent_notify:
+        expected[names[0]] = [7, 7]
+    assert result == expected
     with pytest.raises(RuntimeError, match="sequence"):
         bench.capture_combine_stages(tmp_path, 3)
 

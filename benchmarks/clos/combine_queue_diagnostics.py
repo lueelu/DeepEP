@@ -8,7 +8,7 @@ import os
 import statistics
 import time
 
-from stage_metrics import prepare_v2_sample
+from stage_metrics import normalize_kernel_rows, prepare_v2_sample
 
 TRACE_ENV = "DEEPEP_CLOS_COMBINE_DEVICE_TIMING"
 COMPACT_ENV = "DEEPEP_CLOS_COMBINE_COMPACT_SELF"
@@ -21,13 +21,23 @@ def capture_combine_stages(directory, samples):
         raise RuntimeError("expected one combine profiler export")
     with paths[0].open(encoding="utf-8-sig", newline="") as file:
         rows = sorted(csv.DictReader(file), key=lambda row: float(row["Start Time(us)"]))
-    names = ["cached_notify_combine_kernel", "v1_combine_udma_comm_kernel", "v1_combine_udma_reduce_kernel"]
-    selected = [row for row in rows if row["Name"] in names]
-    if [row["Name"] for row in selected] != names * (samples + 4):
+    rows = normalize_kernel_rows(rows)
+    notify = "cached_notify_combine_kernel"
+    kernels = [notify, "direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
+    selected = [row for row in rows if row["Name"] in kernels]
+    # New captures have both the outer alignment barrier and the Buffer's
+    # independent notify. Archived captures may have only the former.
+    sequence = [notify] + kernels
+    labels = ["alignment_notify_us"] + kernels
+    actual = [row["Name"] for row in selected]
+    if actual == kernels * (samples + 4):
+        sequence, labels = kernels, ["alignment_notify_us"] + kernels[1:]
+    elif actual != sequence * (samples + 4):
         raise RuntimeError("unexpected combine kernel sequence; retain raw export")
-    result = {name: [float(row["Duration(us)"]) for row in selected[i::3]][2:-2] for i, name in enumerate(names)}
-    # prepare_v2_sample issues this alignment notify outside the timed API.
-    result["alignment_notify_us"] = result.pop(names[0])
+    result = {
+        label: [float(row["Duration(us)"]) for row in selected[i :: len(sequence)]][2:-2]
+        for i, label in enumerate(labels)
+    }
     if any(not math.isfinite(value) or value <= 0 for values in result.values() for value in values):
         raise ValueError("invalid combine duration")
     return result
@@ -200,7 +210,7 @@ def run_combine_diagnostics(
                     policy=asdict(plan),
                     stats_us=stats,
                     payload_bytes_per_rank=payload,
-                    payload_gbps=payload / stats["v1_combine_udma_comm_kernel"]["mean"] / 1000,
+                    payload_gbps=payload / stats["direct_combine_udma_comm_kernel"]["mean"] / 1000,
                     note="Alignment notify is reported separately, outside API; communication Begin is inside comm.",
                 )
             )

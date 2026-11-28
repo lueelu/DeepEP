@@ -104,12 +104,17 @@ class ElasticBuffer:
     Fresh dispatch defaults to 32 AIVs. Cached dispatch and combine inherit
     the EPHandle core count. UDMA automatically tunes peer/rank scheduling.
 
-    Dispatch and combine share the optimized V1 backend. V2 keeps EPHandle,
+    Dispatch and combine share the direct communication backend. V2 keeps EPHandle,
     optional expert expansion and independently allocated GM outputs. UDMA
     uses the same shared-Jetty scheduler as V1; MTE retains its own transport.
     ``use_1g_huge_pages`` optionally backs the symmetric workspace with 1 GiB
     HBM pages through CANN SHMEM's user-buffer initialization path.
     """
+
+    @property
+    def combine_notify(self) -> bool:
+        """Whether this Buffer requests a separate combine rendezvous (read-only)."""
+        return self._combine_notify
 
     def __init__(
         self,
@@ -143,7 +148,11 @@ class ElasticBuffer:
         udma_peers_per_worker: Optional[int] = None,
         udma_wqes_per_visit: Optional[int] = None,
         udma_auto_policy: bool = True,
+        combine_notify: bool = False,
     ) -> None:
+        if type(combine_notify) is not bool:
+            raise TypeError("combine_notify must be a bool")
+        self._combine_notify = combine_notify
         rank, num_ranks, resolved_group = _resolve_group_or_comm(group, None)
         transport = _normalize_transport(transport or os.environ.get("ASCEND_DEEPEP_TRANSPORT", "auto"))
         self._udma_auto_policy = resolve_udma_policy(
@@ -306,6 +315,7 @@ class ElasticBuffer:
                 num_max_tokens_per_rank or None,
                 udma_schedule,
                 peer_options,
+                combine_notify=combine_notify,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
                     if self._udma_auto_policy is not None
@@ -328,6 +338,7 @@ class ElasticBuffer:
                 *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
                 self._udma_auto_policy is not None,
                 self._udma_auto_policy.reservation_spec() if self._udma_auto_policy is not None else "",
+                combine_notify,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -339,7 +350,7 @@ class ElasticBuffer:
         self._communication_stream = get_global_comm_stream()
 
         # Match the V2 initialization visibility contract on the communication
-        # stream. The native barrier kernel is reused from the V1 resource layer.
+        # stream. The native barrier kernel is shared by the direct resource layer.
         self.barrier(use_comm_stream=True, with_cpu_sync=True)
 
     @property
