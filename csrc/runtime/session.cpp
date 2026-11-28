@@ -255,12 +255,12 @@ std::vector<uint8_t> Session::udma_unique_id()
 std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_bytes, uint64_t workspace_bytes,
                                               const std::string& endpoint, const std::vector<uint8_t>& uid_bytes)
 {
-    if (size < 1 || size > 8 || rank < 0 || rank >= size ||
+    if (size < 1 || size > ACLSHMEM_MAX_PES || rank < 0 || rank >= size ||
         heap_bytes > uint64_t(std::numeric_limits<int64_t>::max()) || workspace_bytes == 0 ||
         workspace_bytes > heap_bytes || (!uid_bytes.empty() && uid_bytes.size() != sizeof(aclshmemx_uniqueid_t)) ||
         (uid_bytes.empty() && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
                                endpoint.find('\0') != std::string::npos))) {
-        throw std::invalid_argument("Invalid UDMA rank, heap, workspace, bootstrap endpoint or unique ID");
+        throw std::invalid_argument("Invalid UDMA rank/world size, heap, workspace, bootstrap endpoint or unique ID");
     }
     InstanceLock guard(instance_mutex());
     if (deepep_has_instances() || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {

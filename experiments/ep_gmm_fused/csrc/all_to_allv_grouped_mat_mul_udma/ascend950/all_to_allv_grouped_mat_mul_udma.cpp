@@ -7,6 +7,7 @@
 #include <c10/core/DeviceGuard.h>
 #include <torch/library.h>
 
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
@@ -91,8 +92,18 @@ constexpr TilingProfile kM131072K3584N6144ExportTiling{
 constexpr TilingProfile kM131072K3584N3072ExportTiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 8, 32, 32, 1, 16, 2048, 2, 16, 1, 8, 8};
 
-const TilingProfile& SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
-                                  bool outputAllToAllV)
+// EP4 / 28 experts, M=65536 export winners from the 2026-11-25 Event search,
+// confirmed by msprof (100 calls, max-rank p50): N6144 7068.9 us / 94.51% MFU,
+// N3072 3579.6 us / 93.32% MFU. Halving M halves the staging demand, so these
+// profiles keep 512 stage rows and double the export/self-copy workers instead
+// of the 2048-row staging used by the M=131072 profiles above.
+constexpr TilingProfile kM65536K3584N6144ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 2, 64, 64, 1, 16, 512, 2, 8, 1, 16, 8};
+constexpr TilingProfile kM65536K3584N3072ExportTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 2, 64, 64, 1, 16, 512, 3, 8, 1, 0, 4};
+
+TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
+                           bool outputAllToAllV)
 {
     // Every rank participating in one collective launch must select the same
     // communication geometry. In an imbalanced route, received_rows is local
@@ -100,6 +111,14 @@ const TilingProfile& SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t w
     // This operator requires the input M/K/N and the export mode to be
     // rank-invariant; those values are therefore safe selection keys.
     const bool isFourRank28ExpertCase = worldSize == 4 && expertNum == 28;
+    if (isFourRank28ExpertCase && outputAllToAllV && m == 65536 && k == 3584) {
+        if (n == 6144) {
+            return kM65536K3584N6144ExportTiling;
+        }
+        if (n == 3072) {
+            return kM65536K3584N3072ExportTiling;
+        }
+    }
     if (isFourRank28ExpertCase && outputAllToAllV && m == 131072 && k == 3584) {
         if (n == 6144) {
             return kM131072K3584N6144ExportTiling;
@@ -115,7 +134,13 @@ const TilingProfile& SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t w
     if (isEightRank256ExpertCase && m == 131072 && k == 2048 && n == 512) {
         return outputAllToAllV ? kM131072K2048N512ExportTiling : kM131072K2048N512NonExportTiling;
     }
-    return kDefaultTiling;
+    TilingProfile result = kDefaultTiling;
+    if (worldSize > 8) {
+        const uint32_t alignedK = static_cast<uint32_t>(TilingValidation::CeilDiv(k, 256) * 256);
+        result.stageRows = TilingValidation::DefaultStageRows(alignedK, worldSize, result.m0, result.stageRows,
+                                                              result.workspaceStages);
+    }
+    return result;
 }
 
 TilingProfile ResolveTiling(const TilingProfile& defaultTiling, at::IntArrayRef values, bool exportOutput)
@@ -176,7 +201,8 @@ void AttachUdma(const at::Tensor& deviceAnchor, int64_t rank, int64_t worldSize,
                 int64_t workspaceBytes)
 {
     CheckNpuTensor(deviceAnchor, "device_anchor", at::kByte);
-    TORCH_CHECK(worldSize > 0 && worldSize <= 8 && rank >= 0 && rank < worldSize, "invalid UDMA topology");
+    TORCH_CHECK(worldSize > 0 && worldSize <= TilingValidation::kMaxRanks && rank >= 0 && rank < worldSize,
+                "invalid UDMA topology");
     TORCH_CHECK(workspaceAddress > 0 && workspaceBytes > 0, "invalid public runtime workspace");
     const c10::OptionalDeviceGuard guard(deviceAnchor.device());
     UdmaRuntime::Instance().Attach(static_cast<int32_t>(rank), static_cast<int32_t>(worldSize),
@@ -208,7 +234,8 @@ void InitializeAndLaunch(const TilingProfile& tiling, const Catlass::GemmCoord& 
                          uint32_t worldSize, uint32_t epSize, uint32_t expertNum, uint32_t outputRows, uint8_t* x,
                          uint8_t* weight, uint8_t* output, uint8_t* localTokensPerExpert,
                          uint8_t* globalTokensPerLocalExpert, uint8_t* workspace, uint8_t* allToAllVOutput,
-                         uint8_t* routeMetadata, uint32_t blockDim, aclrtStream stream, uint64_t fftsAddress)
+                         uint8_t* routeMetadata, uint32_t blockDim, aclrtStream stream, uint64_t fftsAddress,
+                         const at::Tensor& tensorAnchor)
 {
     using DeviceOp = typename Config::Device;
     using Kernel = typename Config::Kernel;
@@ -246,12 +273,32 @@ void InitializeAndLaunch(const TilingProfile& tiling, const Catlass::GemmCoord& 
     DeviceOp deviceOp;
     const Catlass::Status initializeStatus = deviceOp.Initialize(arguments);
     TORCH_CHECK(initializeStatus == Catlass::Status::kSuccess, "failed to initialize the CatCCOS device operator");
-    const typename DeviceOp::Params params = deviceOp.params();
-    auto launch = [=]() -> int {
-        LaunchAllToAllVGroupedMatMulUdma<Kernel>(params, blockDim, stream, fftsAddress);
-        return 0;
-    };
-    at_npu::native::OpCommand::RunOpApi("AllToAllVGroupedMatMulUdma", launch);
+    if constexpr (Config::kUseGmScheduler) {
+        using Scheduler = typename Config::BlockMmadScheduler;
+        const int64_t schedulerBytes =
+            static_cast<int64_t>(static_cast<uint64_t>(blockDim) * Scheduler::WORKSPACE_BYTES);
+        const auto schedulerWorkspace = at::empty({schedulerBytes}, tensorAnchor.options().dtype(at::kByte));
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(schedulerWorkspace.data_ptr()) % 64 == 0,
+                    "scheduler workspace must be cache-line aligned");
+        c10_npu::NPUCachingAllocator::recordStream(schedulerWorkspace.storage().data_ptr(),
+                                                   c10_npu::getCurrentNPUStream());
+        typename DeviceOp::Params params = deviceOp.params();
+        params.ptrSchedulerWorkspace = reinterpret_cast<uint8_t*>(schedulerWorkspace.data_ptr());
+        auto launch = [=]() -> int {
+            // Keep the allocation alive while RunOpApi queues the launch callback.
+            (void)schedulerWorkspace;
+            LaunchAllToAllVGroupedMatMulUdma<Kernel>(params, blockDim, stream, fftsAddress);
+            return 0;
+        };
+        at_npu::native::OpCommand::RunOpApi("AllToAllVGroupedMatMulUdma", launch);
+    } else {
+        const typename DeviceOp::Params params = deviceOp.params();
+        auto launch = [=]() -> int {
+            LaunchAllToAllVGroupedMatMulUdma<Kernel>(params, blockDim, stream, fftsAddress);
+            return 0;
+        };
+        at_npu::native::OpCommand::RunOpApi("AllToAllVGroupedMatMulUdma", launch);
+    }
 }
 
 at::Tensor AllToAllVGroupedMatMulUdmaImpl(
@@ -275,6 +322,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     runtime.EnsureInitialized();
     runtime.CheckDevice(x.device().index());
     const int64_t worldSize = runtime.WorldSize();
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks, "ep_size must be in [1, 128]");
     TORCH_CHECK(epSize == worldSize, "TP=1 is required: ep_size must equal UDMA world_size");
     TORCH_CHECK(expertNum > 0 && expertNum % epSize == 0, "expert_num must be positive and divisible by ep_size");
     const int64_t localExpertNum = expertNum / epSize;
@@ -307,6 +355,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
         ResolveTiling(SelectTiling(m, k, n, static_cast<uint32_t>(worldSize), static_cast<uint32_t>(expertNum),
                                    allToAllVOutputOptional.has_value()),
                       tilingValues, allToAllVOutputOptional.has_value());
+    TORCH_CHECK(tiling.stageRows > 0, "symmetric workspace cannot hold one M0 tile per EP rank");
     {
         const auto hardware = TilingHardware(x);
         const TilingValidation::AllToAllV requested{tiling.m0,
@@ -381,22 +430,33 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     TORCH_CHECK(blockDim > 0, "failed to query Ascend AI-core count");
     const uint32_t exportCoreCount = tiling.exportCoreCount == 0 ? blockDim : tiling.exportCoreCount;
     TORCH_CHECK(exportCoreCount > 0 && exportCoreCount <= blockDim, "export_core_count must be in [1, AI-core count]");
-    TORCH_CHECK(tiling.selfCopyCores > 0 && static_cast<uint64_t>(worldSize) + tiling.selfCopyCores - 1 <= blockDim,
+    TORCH_CHECK(TilingValidation::ValidSelfCopyCores(static_cast<uint32_t>(worldSize), blockDim, tiling.selfCopyCores),
                 "self_copy_cores exceeds the available AIV worker pool");
     const uint64_t fftsAddress = runtime.FftsAddress();
     auto launchWithConfig = [&](auto configTag) {
-        using SelectedConfig = typename decltype(configTag)::type;
-        InitializeAndLaunch<SelectedConfig>(
-            tiling, shape, static_cast<uint32_t>(runtime.Rank()), static_cast<uint32_t>(worldSize),
-            static_cast<uint32_t>(epSize), static_cast<uint32_t>(expertNum), receivedRows,
-            // UDMA PUT reads its local source directly from ordinary NPU GM.
-            reinterpret_cast<uint8_t*>(x.data_ptr()), reinterpret_cast<uint8_t*>(weight.data_ptr()),
-            reinterpret_cast<uint8_t*>(output.data_ptr()), reinterpret_cast<uint8_t*>(localTokensPerExpert.data_ptr()),
-            reinterpret_cast<uint8_t*>(globalTokensPerLocalExpert.data_ptr()), runtime.Workspace(),
-            allToAllVOutputOptional.has_value() ? reinterpret_cast<uint8_t*>(allToAllVOutput.data_ptr()) : nullptr,
-            routeMetadataOptional.has_value() ? reinterpret_cast<uint8_t*>(routeMetadataOptional.value().data_ptr())
-                                              : nullptr,
-            blockDim, stream, fftsAddress);
+        using Config = typename decltype(configTag)::type;
+        auto launchSelected = [&](auto selectedTag) {
+            using SelectedConfig = typename decltype(selectedTag)::type;
+            InitializeAndLaunch<SelectedConfig>(
+                tiling, shape, static_cast<uint32_t>(runtime.Rank()), static_cast<uint32_t>(worldSize),
+                static_cast<uint32_t>(epSize), static_cast<uint32_t>(expertNum), receivedRows,
+                // UDMA PUT reads its local source directly from ordinary NPU GM.
+                reinterpret_cast<uint8_t*>(x.data_ptr()), reinterpret_cast<uint8_t*>(weight.data_ptr()),
+                reinterpret_cast<uint8_t*>(output.data_ptr()),
+                reinterpret_cast<uint8_t*>(localTokensPerExpert.data_ptr()),
+                reinterpret_cast<uint8_t*>(globalTokensPerLocalExpert.data_ptr()), runtime.Workspace(),
+                allToAllVOutputOptional.has_value() ? reinterpret_cast<uint8_t*>(allToAllVOutput.data_ptr()) : nullptr,
+                routeMetadataOptional.has_value() ? reinterpret_cast<uint8_t*>(routeMetadataOptional.value().data_ptr())
+                                                  : nullptr,
+                blockDim, stream, fftsAddress, x);
+        };
+        if (worldSize <= 8) {
+            // A distinct R8/E64 kernel preserves the original stack and peer schedule.
+            using LegacyConfig = typename Config::template WithScheduler<false>;
+            launchSelected(TypeTag<LegacyConfig>{});
+        } else {
+            launchSelected(configTag);
+        }
     };
     auto launchByMSplit = [&](auto mSplit1, auto mSplit2, auto mSplit4) {
         if (tiling.mSplit == 2) {
@@ -498,7 +558,8 @@ at::Tensor AllToAllVGroupedMatMulUdmaMeta(const at::Tensor& x, const at::Tensor&
 {
     (void)ResolveTiling(kDefaultTiling, tiling, false);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
-    TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     return at::empty({receivedRows, weight.size(2)}, x.options());
 }
@@ -509,7 +570,8 @@ at::Tensor AllToAllVGroupedMatMulUdmaOutMeta(const at::Tensor& x, const at::Tens
 {
     (void)ResolveTiling(kDefaultTiling, tiling, false);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
-    TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(output.dim() == 2 && output.size(0) == receivedRows && output.size(1) == weight.size(2),
                 "invalid out shape");
@@ -522,6 +584,8 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaExportMeta(
     at::IntArrayRef tiling)
 {
     (void)ResolveTiling(kDefaultTiling, tiling, true);
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(
         allToAllVOutput.dim() == 2 && allToAllVOutput.size(0) == receivedRows && allToAllVOutput.size(1) == x.size(1),
@@ -536,7 +600,8 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaOutExportMeta(
 {
     (void)ResolveTiling(kDefaultTiling, tiling, true);
     TORCH_CHECK(x.dim() == 2 && weight.dim() == 3, "expected x[m,k] and weight[e,k,n]");
-    TORCH_CHECK(epSize > 0 && expertNum > 0 && expertNum % epSize == 0, "invalid expert topology");
+    TORCH_CHECK(epSize > 0 && epSize <= TilingValidation::kMaxRanks && expertNum > 0 && expertNum % epSize == 0,
+                "invalid expert topology: ep_size must be in [1, 128] and divide expert_num");
     TORCH_CHECK(receivedRows >= 0 && receivedRows <= epSize * x.size(0), "invalid received_rows");
     TORCH_CHECK(output.dim() == 2 && output.size(0) == receivedRows && output.size(1) == weight.size(2),
                 "invalid out shape");

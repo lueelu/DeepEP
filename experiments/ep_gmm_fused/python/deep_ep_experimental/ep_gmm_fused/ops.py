@@ -275,7 +275,7 @@ def alltoallv_gmm(
         raise ValueError("all_to_allv_out must have shape [sum(global_tokens_per_local_expert), x.shape[1]]")
     route_metadata = (
         _build_route_metadata(global_host_values, ep_size, expert_num, x.device)
-        if global_host_values is not None
+        if global_host_values is not None and ep_size <= _MOE_ROUTE_MAX_RANKS
         else None
     )
     if out is None:

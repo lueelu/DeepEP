@@ -8,6 +8,8 @@
 
 #include "../../tiling_validation.hpp"
 
+#include <type_traits>
+
 #include "catlass/arch/arch.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/epilogue/tile/tile_copy.hpp"
@@ -28,13 +30,15 @@
 #include "catccos/detail/remote_copy_type.hpp"
 #include "catccos/dgemm/alltoallv_allgather_problem_shape.hpp"
 #include "catccos/dgemm/block/block_scheduler_alltoallv_allgather.hpp"
+#include "catccos/dgemm/block/block_scheduler_alltoallv_allgather_gm.hpp"
 #include "catccos/dgemm/device/device_dgemm.hpp"
 #include "catccos/dgemm/kernel/ascend950_alltoallv_grouped_matmul.hpp"
 
 namespace deepep::ep_gmm_fused {
 
 template <class ElementA, class LayoutA, class ElementB, class LayoutB, class ElementC, class LayoutC, uint32_t M0,
-          uint32_t N0, uint32_t K0, bool ExportAllToAllV = false, uint32_t WorkspaceStages = 2, uint32_t MSplit = 1>
+          uint32_t N0, uint32_t K0, bool ExportAllToAllV = false, uint32_t WorkspaceStages = 2, uint32_t MSplit = 1,
+          bool UseGmScheduler = true>
 struct AllToAllVGroupedMatMulUdmaConfig {
     static_assert(WorkspaceStages == 2 || WorkspaceStages == 3,
                   "Ascend950 BF16 UDMA MoE supports two or three workspace stages");
@@ -45,6 +49,10 @@ struct AllToAllVGroupedMatMulUdmaConfig {
     static constexpr uint32_t kK0 = K0;
     static constexpr uint32_t kWorkspaceStages = WorkspaceStages;
     static constexpr uint32_t kMSplit = MSplit;
+    static constexpr bool kUseGmScheduler = UseGmScheduler;
+    template <bool UseGm>
+    using WithScheduler = AllToAllVGroupedMatMulUdmaConfig<ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC, M0,
+                                                           N0, K0, ExportAllToAllV, WorkspaceStages, MSplit, UseGm>;
     using MmadDispatchPolicy = Catlass::Gemm::MmadPingpong<ArchTag, true>;
     using L1TileShape = tla::Shape<tla::Int<M0>, tla::Int<N0>, tla::Int<K0>>;
     using L0TileShape = tla::Shape<tla::Int<M0>, tla::Int<N0>, tla::Int<64>>;
@@ -77,14 +85,17 @@ struct AllToAllVGroupedMatMulUdmaConfig {
     using BlockExport =
         Catccos::Comm::Block::CommBlock<ExportDispatch, AType, AType, void, TileExportCopy, TileScheduler>;
 
-    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, 8, 64>;
-    using BlockMmadScheduler = Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, MSplit>;
+    using MoeConstraints = Catccos::DGemm::MoeConstraints<1, UseGmScheduler ? TilingValidation::kMaxRanks : 8, 64>;
+    using BlockMmadScheduler =
+        std::conditional_t<UseGmScheduler,
+                           Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGatherGm<MoeConstraints, MSplit>,
+                           Catccos::DGemm::Block::BlockMmadSchedulerAllToAllVAllGather<MoeConstraints, MSplit>>;
     using BlockScheduler = Catccos::Comm::Block::BlockCommSchedulerAllToAllVAllGather<MoeConstraints>;
     using ProblemShape = Catccos::DGemm::AllToAllVAllGatherProblemShape;
     using Kernel =
         Catccos::DGemm::Kernel::Ascend950AllToAllVGroupedMatmul<ProblemShape, BlockMmad, BlockComm, BlockMmadScheduler,
                                                                 BlockScheduler, WorkspaceStages, true, ExportAllToAllV,
-                                                                BlockExport>;
+                                                                BlockExport, UseGmScheduler>;
     using Device = Catccos::DGemm::Device::DeviceDGemm<Kernel>;
 };
 

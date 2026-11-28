@@ -118,10 +118,11 @@ def validate_tiling(
             _integer(name, value)
     if m is not None:
         _integer("m", m, 0 if operator == GROUPED_MATMUL else 1)
-    if world_size is not None and world_size > 8:
-        raise ValueError("world_size must not exceed 8")
-    if aic_cores is not None and world_size is not None and aic_cores < world_size:
-        raise ValueError("at least one AI core per rank is required")
+    if world_size is not None and world_size > 128:
+        raise ValueError("world_size must not exceed 128")
+    if aic_cores is not None and world_size is not None:
+        if result["self_copy_cores"] > max(1, aic_cores - world_size + 1):
+            raise ValueError("self_copy_cores exceeds the available AIV worker pool")
     ub_capacity = min(_integer("ub_bytes", ub_bytes), UB_BYTES)
     local_rows = result["local_copy_tile_rows"]
 
@@ -153,8 +154,6 @@ def validate_tiling(
         if aic_cores is not None:
             if result["export_core_count"] > aic_cores:
                 raise ValueError("export_core_count exceeds the AI-core count")
-            if world_size is not None and world_size + result["self_copy_cores"] - 1 > aic_cores:
-                raise ValueError("self_copy_cores exceeds the available AIV worker pool")
             if n is not None and world_size is not None:
                 tasks = (result["stage_rows"] // result["m0"]) * world_size * ((n + result["n0"] - 1) // result["n0"])
                 if tasks > UINT32_MAX - aic_cores:
@@ -174,8 +173,6 @@ def validate_tiling(
         if m is not None and m > UINT32_MAX - result["m0"] + 1:
             raise ValueError("input rows overflow the target-order tiling scheduler")
         if aic_cores is not None and world_size is not None:
-            if world_size + result["self_copy_cores"] - 1 > aic_cores:
-                raise ValueError("self_copy_cores exceeds the available AIV worker pool")
             if stage_rows == 0:
                 blocks = aic_cores * result["comm_interval"]
                 if blocks > UINT32_MAX:
@@ -214,6 +211,11 @@ def default_tiling(case):
     export = case.get("output_all_to_allv", False)
     if operator == ALL_TO_ALLV:
         values = [128, 256, 256, 64, 1280, 2, 32, 1, 0, 1]
+        if case["world_size"] > 8:
+            capacity = WORKSPACE_BYTES // 2 // values[5] // case["world_size"] // _aligned(k, 256)
+            values[4] = min(values[4], capacity) // values[0] * values[0]
+            if values[4] == 0:
+                raise ValueError("symmetric workspace cannot hold one M0 tile per EP rank")
         if business and m == 131072 and k == 2048:
             if n == 1024:
                 values = (
@@ -232,15 +234,33 @@ def default_tiling(case):
             and n in (6144, 3072)
         ):
             values = [256, 256, 256, 32, 2048, 2, 16, 1, 8, 4 if n == 6144 else 8]
+        elif (
+            export
+            and case["world_size"] == 4
+            and case["expert_num"] == 28
+            and m == 65536
+            and k == 3584
+            and n in (6144, 3072)
+        ):
+            values = (
+                [256, 256, 256, 64, 512, 2, 8, 1, 16, 8]
+                if n == 6144
+                else [256, 256, 256, 64, 512, 3, 8, 1, 0, 4]
+            )
     elif operator == GROUPED_MATMUL:
         values = [128, 256, 256, 10, 32, 0, 2, 1]
+        if case["world_size"] > 8:
+            values[5] = values[0]
         if business and n == 2048:
             if k == 1024:
                 values = [128, 256, 256, 10, 4, 0, 2, 1]
             elif k == 512:
                 values = [128, 256, 256, 16, 16, 0, 2, 1]
         elif case["world_size"] == 4 and case["expert_num"] == 28 and n == 3584 and k in (3072, 6144):
-            values = [256, 256, 256, 8, 8, 2048, 3 if k == 3072 else 2, 8]
+            values = [256, 256, 256, 1, 1 if k == 3072 else 16, 256, 3, 8]
+        elif case["world_size"] == 64 and case["expert_num"] == 896 and n == 3584 and k in (3072, 6144):
+            # Same performance-selected EP64 profiles as the native launcher.
+            values = [128, 256, 256, 1, 1 if k == 3072 else 16, 256, 3, 1]
         # Native fallback caps the requested copy rows to the compiled UB size.
         capacity = (UB_BYTES - UDMA_SCRATCH_BYTES) // (4 * _aligned(n, 16))
         values[4] = min(values[4], capacity)

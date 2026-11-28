@@ -26,8 +26,8 @@ def build_global_route_matrix(m: int, ep_size: int, expert_num: int) -> List[Lis
     """Build ``[source rank][global expert]`` token counts for balanced TP=1 routing."""
     if m <= 0 or ep_size <= 0 or expert_num <= 0:
         raise ValueError("m, ep_size, and expert_num must be positive")
-    if ep_size > 8:
-        raise ValueError("ep_size must not exceed 8")
+    if ep_size > 128:
+        raise ValueError("ep_size must not exceed 128")
     if expert_num % ep_size:
         raise ValueError("expert_num must be divisible by ep_size")
 

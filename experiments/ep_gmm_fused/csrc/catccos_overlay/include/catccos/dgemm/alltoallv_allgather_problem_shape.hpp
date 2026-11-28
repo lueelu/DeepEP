@@ -32,6 +32,26 @@ struct MoeConstraints {
 
 using DefaultMoeConstraints = MoeConstraints<2, 8, 8>;
 
+// Each remote peer has exactly one queue owner. Additional self-copy workers
+// are available only after all peers have received a primary physical core.
+struct MoePeerSchedule {
+    uint32_t firstPeer;
+    uint32_t peerStride;
+    uint32_t selfWorkerIdx;
+    bool isPrimaryPeerCore;
+    bool isExtraSelfCopyCore;
+
+    CATLASS_HOST_DEVICE
+    MoePeerSchedule(uint32_t rankSize, uint32_t rankIdx, uint32_t coreCount, uint32_t coreIdx, uint32_t selfCopyCores)
+        : firstPeer(coreIdx < rankSize ? coreIdx : rankIdx),
+          peerStride(coreIdx < rankSize ? coreCount : rankSize),
+          selfWorkerIdx(coreIdx < rankSize ? 0 : coreIdx - rankSize + 1),
+          isPrimaryPeerCore(coreIdx < rankSize),
+          isExtraSelfCopyCore(coreIdx >= rankSize && coreIdx < rankSize + selfCopyCores - 1)
+    {
+    }
+};
+
 struct AllToAllVAllGatherProblemShape {
     using UnderlyingProblemShape = GemmCoord;
 

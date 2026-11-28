@@ -5,6 +5,7 @@
 
 #include "udma_runtime.hpp"
 
+#include "../../tiling_validation.hpp"
 #include "shmem.h"
 
 #include <ATen/ATen.h>
@@ -20,7 +21,7 @@ void UdmaRuntime::Attach(int32_t rank, int32_t worldSize, uintptr_t workspace, u
 {
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(rank >= 0 && rank < worldSize, "invalid UDMA rank ", rank, " for world size ", worldSize);
-    TORCH_CHECK(worldSize > 0 && worldSize <= 8, "UDMA world size must be in [1, 8]");
+    TORCH_CHECK(worldSize > 0 && worldSize <= TilingValidation::kMaxRanks, "UDMA world size must be in [1, 128]");
     TORCH_CHECK(!initialized_, "UDMA workspace is already attached");
     TORCH_CHECK(workspace != 0 && workspaceBytes >= kKernelWorkspaceBytes, "invalid public runtime workspace");
 

@@ -97,7 +97,7 @@ struct AllToAllVExportParams<true, ElementA_> {
 
 template <class ProblemShape_, class BlockMmad_, class BlockComm_, class BlockMmadScheduler_, class BlockCommScheduler_,
           uint32_t WORKSPACE_STAGES_, bool USE_UDMA_PEER_SERIAL_SCHEDULE_ = false, bool EXPORT_ALLTOALLV_ = false,
-          class BlockExport_ = void>
+          class BlockExport_ = void, bool USE_GM_SCHEDULER_ = true>
 class Ascend950AllToAllVGroupedMatmul {
 public:
     using ProblemShape = ProblemShape_;
@@ -124,6 +124,7 @@ public:
     static constexpr uint32_t WORKSPACE_STAGES = WORKSPACE_STAGES_;
     static constexpr bool USE_UDMA_PEER_SERIAL_SCHEDULE = USE_UDMA_PEER_SERIAL_SCHEDULE_;
     static constexpr bool EXPORT_ALLTOALLV = EXPORT_ALLTOALLV_;
+    static constexpr bool USE_GM_SCHEDULER = USE_GM_SCHEDULER_;
     static_assert(!EXPORT_ALLTOALLV || WORKSPACE_STAGES >= 2,
                   "Pipelined AllToAllV export requires at least two staging buffers");
     static_assert(!EXPORT_ALLTOALLV || USE_UDMA_PEER_SERIAL_SCHEDULE,
@@ -148,6 +149,8 @@ public:
         LayoutTagA layoutTagA;
         LayoutTagB layoutTagB;
         GM_ADDR ptrSymmetric;
+        // Ordinary local GM, one private scheduling table per AIC.
+        GM_ADDR ptrSchedulerWorkspace{nullptr};
         GM_ADDR syncMmadFinish;
         GM_ADDR syncCommFinish;
         uint32_t exportCoreCount;
@@ -274,6 +277,19 @@ public:
     template <int32_t CORE_TYPE = g_coreType>
     CATLASS_DEVICE void operator()(Params const& params);
 
+    CATLASS_DEVICE static BlockMmadScheduler MakeMmadScheduler(Params const& params, uint32_t commShapeM,
+                                                               MatrixCoord const& blockShapeMN)
+    {
+        if constexpr (USE_GM_SCHEDULER) {
+            const uint64_t schedulerOffset =
+                static_cast<uint64_t>(AscendC::GetBlockIdx()) * BlockMmadScheduler::WORKSPACE_BYTES;
+            GM_ADDR schedulerWorkspace = params.ptrSchedulerWorkspace + schedulerOffset;
+            return BlockMmadScheduler{params.problemShape, commShapeM, blockShapeMN, schedulerWorkspace};
+        } else {
+            return BlockMmadScheduler{params.problemShape, commShapeM, blockShapeMN};
+        }
+    }
+
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
     {
@@ -282,7 +298,7 @@ public:
         GemmCoord blockShape = GemmCoord{L1_TILE_M, L1_TILE_N, L1_TILE_K};
         uint32_t commShapeM = params.stageRows == 0 ? params.commInterval * L1_TILE_M : params.stageRows;
         MatrixCoord commShape{commShapeM, params.problemShape.k()};
-        BlockMmadScheduler scheduler{params.problemShape, commShapeM, blockShape.GetCoordMN()};
+        BlockMmadScheduler scheduler = MakeMmadScheduler(params, commShapeM, blockShape.GetCoordMN());
 
         auto rankSize = params.problemShape.rankSize();
         // Match the AIV staging stride while retaining the logical K for tail tiles.
@@ -457,101 +473,220 @@ public:
             }
 
             if constexpr (USE_UDMA_PEER_SERIAL_SCHEDULE) {
-                // A UDMA queue is owned by one AIV subcore for each destination PE.
-                // Sharing a PE and sync-id between many AIV cores can corrupt or
-                // drop requests. The regular variant keeps local MTE on subcore 0
-                // and remote UDMA puts on subcore 1; the export variant reserves
-                // subcore 0 for the preceding stage's export.
-                bool isPrimaryPeerCore = aicoreIdx < rankSize;
-                bool isExtraSelfCopyCore = aicoreIdx >= rankSize && aicoreIdx < rankSize + selfCopyCores - 1;
-                if (isPrimaryPeerCore || isExtraSelfCopyCore) {
-                    uint32_t dstRankIdx = isExtraSelfCopyCore ? rankIdx : aicoreIdx;
-                    bool isLocalCopy = dstRankIdx == rankIdx;
-                    uint32_t selfWorkerIdx = isExtraSelfCopyCore ? aicoreIdx - rankSize + 1 : 0;
-                    bool ownsPeer;
-                    if constexpr (EXPORT_ALLTOALLV) {
-                        // Subcore 0 is dedicated to export. Subcore 1 owns both
-                        // the self MTE copy and remote UDMA submission so the
-                        // complete next communication round overlaps export.
-                        ownsPeer = subcoreIdx == 1 && (!isLocalCopy || selfWorkerIdx < selfCopyCores);
-                    } else {
-                        ownsPeer = (isLocalCopy && subcoreIdx == 0 && selfWorkerIdx < selfCopyCores) ||
-                                   (!isLocalCopy && isPrimaryPeerCore && subcoreIdx == 1);
-                    }
-                    if (ownsPeer) {
-                        auto commOffset = scheduler.GetBlockOffset(0, dstRankIdx);
-                        auto actualCommShape = remapperSrc.GetResidueShape(commOffset);
-                        if (Numel(actualCommShape) != 0) {
-                            // Uneven AllToAllV routes can give ranks different communication-loop counts.
-                            // Wait only when this loop has payload for the destination peer.
-                            auto remoteSyncMmadFinish =
-                                static_cast<__gm__ int32_t*>(shmem_ptr(syncMmadFinish, dstRankIdx));
-                            aclshmem_signal_wait_until(remoteSyncMmadFinish, ACLSHMEM_CMP_EQ, commIdx + 1);
+                if constexpr (!USE_GM_SCHEDULER) {
+                    // A UDMA queue is owned by one AIV subcore for each destination PE.
+                    // Sharing a PE and sync-id between many AIV cores can corrupt or
+                    // drop requests. The regular variant keeps local MTE on subcore 0
+                    // and remote UDMA puts on subcore 1; the export variant reserves
+                    // subcore 0 for the preceding stage's export.
+                    bool isPrimaryPeerCore = aicoreIdx < rankSize;
+                    bool isExtraSelfCopyCore = aicoreIdx >= rankSize && aicoreIdx < rankSize + selfCopyCores - 1;
+                    if (isPrimaryPeerCore || isExtraSelfCopyCore) {
+                        uint32_t dstRankIdx = isExtraSelfCopyCore ? rankIdx : aicoreIdx;
+                        bool isLocalCopy = dstRankIdx == rankIdx;
+                        uint32_t selfWorkerIdx = isExtraSelfCopyCore ? aicoreIdx - rankSize + 1 : 0;
+                        bool ownsPeer;
+                        if constexpr (EXPORT_ALLTOALLV) {
+                            // Subcore 0 is dedicated to export. Subcore 1 owns both
+                            // the self MTE copy and remote UDMA submission so the
+                            // complete next communication round overlaps export.
+                            ownsPeer = subcoreIdx == 1 && (!isLocalCopy || selfWorkerIdx < selfCopyCores);
+                        } else {
+                            ownsPeer = (isLocalCopy && subcoreIdx == 0 && selfWorkerIdx < selfCopyCores) ||
+                                       (!isLocalCopy && isPrimaryPeerCore && subcoreIdx == 1);
+                        }
+                        if (ownsPeer) {
+                            auto commOffset = scheduler.GetBlockOffset(0, dstRankIdx);
+                            auto actualCommShape = remapperSrc.GetResidueShape(commOffset);
+                            if (Numel(actualCommShape) != 0) {
+                                // Uneven AllToAllV routes can give ranks different communication-loop counts.
+                                // Wait only when this loop has payload for the destination peer.
+                                auto remoteSyncMmadFinish =
+                                    static_cast<__gm__ int32_t*>(shmem_ptr(syncMmadFinish, dstRankIdx));
+                                aclshmem_signal_wait_until(remoteSyncMmadFinish, ACLSHMEM_CMP_EQ, commIdx + 1);
 
-                            if (isLocalCopy) {
-                                // The MTE path stages data through a bounded UB tile, so
-                                // retain the regular communication-block granularity.
-                                for (uint32_t blockIdx = selfWorkerIdx; blockIdx < scheduler.GetBlockCount();
-                                     blockIdx += selfCopyCores) {
-                                    auto blockOffset = scheduler.GetBlockOffset(blockIdx, dstRankIdx);
-                                    auto blockOffsetSrc = remapperSrc(blockOffset);
-                                    auto blockOffsetDst = blockOffset.GetLocalCoord();
-                                    auto actualBlockShape = scheduler.RemapActualBlockShape(blockOffset, remapperSrc);
-                                    if (Numel(actualBlockShape) == 0) {
-                                        continue;
+                                if (isLocalCopy) {
+                                    // The MTE path stages data through a bounded UB tile, so
+                                    // retain the regular communication-block granularity.
+                                    for (uint32_t blockIdx = selfWorkerIdx; blockIdx < scheduler.GetBlockCount();
+                                         blockIdx += selfCopyCores) {
+                                        auto blockOffset = scheduler.GetBlockOffset(blockIdx, dstRankIdx);
+                                        auto blockOffsetSrc = remapperSrc(blockOffset);
+                                        auto blockOffsetDst = blockOffset.GetLocalCoord();
+                                        auto actualBlockShape =
+                                            scheduler.RemapActualBlockShape(blockOffset, remapperSrc);
+                                        if (Numel(actualBlockShape) == 0) {
+                                            continue;
+                                        }
+
+                                        auto gmBlockSrc = gmA[layoutA.GetOffset(blockOffsetSrc)];
+                                        auto gmBlockDst = gmSymmetric[layoutTagSymmetric.GetOffset(blockOffsetDst)];
+                                        auto layoutBlockSrc = layoutA.GetTileLayout(actualBlockShape);
+                                        auto layoutBlockDst = layoutTagSymmetric.GetTileLayout(actualBlockShape);
+
+                                        blockRemoteCopy(gmBlockSrc, layoutBlockSrc, gmBlockDst, layoutBlockDst,
+                                                        actualBlockShape, dstRankIdx);
                                     }
+                                    // All self-copy workers are joined by the
+                                    // loop-end hardware barrier. Keep a single
+                                    // SHMEM signal owner for the local PE; the
+                                    // leader publishes the scheduler's complete
+                                    // block count while the barrier protects data
+                                    // visibility before AIC is released.
+                                    if (selfWorkerIdx == 0) {
+                                        auto peerCompletedBlocks =
+                                            static_cast<int32_t>(Numel(CeilDiv(actualCommShape, blockShape)));
+                                        if constexpr (EXPORT_ALLTOALLV) {
+                                            completedBlocks = peerCompletedBlocks;
+                                        } else {
+                                            // This worker owns only a self MTE copy.
+                                            aclshmemx_mte_quiet();
+                                            aclshmemx_signal_op(syncCommFinish, peerCompletedBlocks,
+                                                                ACLSHMEM_SIGNAL_ADD, dstRankIdx);
+                                        }
+                                    }
+                                } else {
+                                    // UDMA does not need the MTE communication block. Submit
+                                    // the whole contiguous slice once, matching the proven
+                                    // Ascend950 UDMA AllGather schedule. Besides reducing WQE
+                                    // pressure, quiet now observes the complete peer slice.
+                                    auto commOffsetSrc = remapperSrc(commOffset);
+                                    auto commOffsetDst = commOffset.GetLocalCoord();
+                                    auto gmCommSrc = gmA[layoutA.GetOffset(commOffsetSrc)];
+                                    auto gmCommDst = gmSymmetric[layoutTagSymmetric.GetOffset(commOffsetDst)];
+                                    auto layoutCommSrc = layoutA.GetTileLayout(actualCommShape);
+                                    auto layoutCommDst = layoutTagSymmetric.GetTileLayout(actualCommShape);
 
-                                    auto gmBlockSrc = gmA[layoutA.GetOffset(blockOffsetSrc)];
-                                    auto gmBlockDst = gmSymmetric[layoutTagSymmetric.GetOffset(blockOffsetDst)];
-                                    auto layoutBlockSrc = layoutA.GetTileLayout(actualBlockShape);
-                                    auto layoutBlockDst = layoutTagSymmetric.GetTileLayout(actualBlockShape);
-
-                                    blockRemoteCopy(gmBlockSrc, layoutBlockSrc, gmBlockDst, layoutBlockDst,
-                                                    actualBlockShape, dstRankIdx);
-                                }
-                                // All self-copy workers are joined by the
-                                // loop-end hardware barrier. Keep a single
-                                // SHMEM signal owner for the local PE; the
-                                // leader publishes the scheduler's complete
-                                // block count while the barrier protects data
-                                // visibility before AIC is released.
-                                if (selfWorkerIdx == 0) {
+                                    blockRemoteCopy(gmCommSrc, layoutCommSrc, gmCommDst, layoutCommDst, actualCommShape,
+                                                    dstRankIdx);
                                     auto peerCompletedBlocks =
                                         static_cast<int32_t>(Numel(CeilDiv(actualCommShape, blockShape)));
                                     if constexpr (EXPORT_ALLTOALLV) {
                                         completedBlocks = peerCompletedBlocks;
                                     } else {
-                                        // This worker owns only a self MTE copy.
-                                        aclshmemx_mte_quiet();
+                                        blockRemoteCopy.CompleteForSignal();
                                         aclshmemx_signal_op(syncCommFinish, peerCompletedBlocks, ACLSHMEM_SIGNAL_ADD,
                                                             dstRankIdx);
                                     }
                                 }
-                            } else {
-                                // UDMA does not need the MTE communication block. Submit
-                                // the whole contiguous slice once, matching the proven
-                                // Ascend950 UDMA AllGather schedule. Besides reducing WQE
-                                // pressure, quiet now observes the complete peer slice.
-                                auto commOffsetSrc = remapperSrc(commOffset);
-                                auto commOffsetDst = commOffset.GetLocalCoord();
-                                auto gmCommSrc = gmA[layoutA.GetOffset(commOffsetSrc)];
-                                auto gmCommDst = gmSymmetric[layoutTagSymmetric.GetOffset(commOffsetDst)];
-                                auto layoutCommSrc = layoutA.GetTileLayout(actualCommShape);
-                                auto layoutCommDst = layoutTagSymmetric.GetTileLayout(actualCommShape);
-
-                                blockRemoteCopy(gmCommSrc, layoutCommSrc, gmCommDst, layoutCommDst, actualCommShape,
-                                                dstRankIdx);
-                                auto peerCompletedBlocks =
-                                    static_cast<int32_t>(Numel(CeilDiv(actualCommShape, blockShape)));
-                                if constexpr (EXPORT_ALLTOALLV) {
-                                    completedBlocks = peerCompletedBlocks;
-                                } else {
-                                    blockRemoteCopy.CompleteForSignal();
-                                    aclshmemx_signal_op(syncCommFinish, peerCompletedBlocks, ACLSHMEM_SIGNAL_ADD,
-                                                        dstRankIdx);
-                                }
+                                completionPeerIdx = dstRankIdx;
                             }
-                            completionPeerIdx = dstRankIdx;
+                        }
+                    }
+                } else {
+                    // A UDMA queue is owned by one AIV subcore for each destination PE.
+                    // A core visits multiple peers when EP exceeds the core count.
+                    // Sharing a PE and sync-id between many AIV cores can corrupt or
+                    // drop requests. The regular variant keeps local MTE on subcore 0
+                    // and remote UDMA puts on subcore 1; the export variant reserves
+                    // subcore 0 for the preceding stage's export.
+                    MoePeerSchedule peerSchedule{rankSize, rankIdx, coreCount, aicoreIdx, selfCopyCores};
+                    bool isPrimaryPeerCore = peerSchedule.isPrimaryPeerCore;
+                    bool isExtraSelfCopyCore = peerSchedule.isExtraSelfCopyCore;
+                    uint32_t firstPeer = peerSchedule.firstPeer;
+                    uint32_t peerStride = peerSchedule.peerStride;
+                    for (uint32_t dstRankIdx = firstPeer;
+                         (isPrimaryPeerCore || isExtraSelfCopyCore) && dstRankIdx < rankSize;
+                         dstRankIdx += peerStride) {
+                        bool isLocalCopy = dstRankIdx == rankIdx;
+                        uint32_t selfWorkerIdx = peerSchedule.selfWorkerIdx;
+                        bool ownsPeer;
+                        if constexpr (EXPORT_ALLTOALLV) {
+                            // Subcore 0 is dedicated to export. Subcore 1 owns both
+                            // the self MTE copy and remote UDMA submission so the
+                            // complete next communication round overlaps export.
+                            ownsPeer = subcoreIdx == 1 && (!isLocalCopy || selfWorkerIdx < selfCopyCores);
+                        } else {
+                            ownsPeer = (isLocalCopy && subcoreIdx == 0 && selfWorkerIdx < selfCopyCores) ||
+                                       (!isLocalCopy && isPrimaryPeerCore && subcoreIdx == 1);
+                        }
+                        if (ownsPeer) {
+                            auto commOffset = scheduler.GetBlockOffset(0, dstRankIdx);
+                            auto actualCommShape = remapperSrc.GetResidueShape(commOffset);
+                            if (Numel(actualCommShape) != 0) {
+                                // Uneven AllToAllV routes can give ranks different communication-loop counts.
+                                // Wait only when this loop has payload for the destination peer.
+                                auto remoteSyncMmadFinish =
+                                    static_cast<__gm__ int32_t*>(shmem_ptr(syncMmadFinish, dstRankIdx));
+                                aclshmem_signal_wait_until(remoteSyncMmadFinish, ACLSHMEM_CMP_EQ, commIdx + 1);
+
+                                if (isLocalCopy) {
+                                    // The MTE path stages data through a bounded UB tile, so
+                                    // retain the regular communication-block granularity.
+                                    for (uint32_t blockIdx = selfWorkerIdx; blockIdx < scheduler.GetBlockCount();
+                                         blockIdx += selfCopyCores) {
+                                        auto blockOffset = scheduler.GetBlockOffset(blockIdx, dstRankIdx);
+                                        auto blockOffsetSrc = remapperSrc(blockOffset);
+                                        auto blockOffsetDst = blockOffset.GetLocalCoord();
+                                        auto actualBlockShape =
+                                            scheduler.RemapActualBlockShape(blockOffset, remapperSrc);
+                                        if (Numel(actualBlockShape) == 0) {
+                                            continue;
+                                        }
+
+                                        auto gmBlockSrc = gmA[layoutA.GetOffset(blockOffsetSrc)];
+                                        auto gmBlockDst = gmSymmetric[layoutTagSymmetric.GetOffset(blockOffsetDst)];
+                                        auto layoutBlockSrc = layoutA.GetTileLayout(actualBlockShape);
+                                        auto layoutBlockDst = layoutTagSymmetric.GetTileLayout(actualBlockShape);
+
+                                        blockRemoteCopy(gmBlockSrc, layoutBlockSrc, gmBlockDst, layoutBlockDst,
+                                                        actualBlockShape, dstRankIdx);
+                                    }
+                                    // All self-copy workers are joined by the
+                                    // loop-end hardware barrier. Keep a single
+                                    // SHMEM signal owner for the local PE; the
+                                    // leader publishes the scheduler's complete
+                                    // block count while the barrier protects data
+                                    // visibility before AIC is released.
+                                    if (selfWorkerIdx == 0) {
+                                        auto peerCompletedBlocks =
+                                            static_cast<int32_t>(Numel(CeilDiv(actualCommShape, blockShape)));
+                                        if constexpr (EXPORT_ALLTOALLV) {
+                                            completedBlocks = peerCompletedBlocks;
+                                        } else {
+                                            // This worker owns only a self MTE copy.
+                                            aclshmemx_mte_quiet();
+                                            aclshmemx_signal_op(syncCommFinish, peerCompletedBlocks,
+                                                                ACLSHMEM_SIGNAL_ADD, dstRankIdx);
+                                        }
+                                    }
+                                } else {
+                                    // UDMA does not need the MTE communication block. Submit
+                                    // the whole contiguous slice once, matching the proven
+                                    // Ascend950 UDMA AllGather schedule. Besides reducing WQE
+                                    // pressure, quiet now observes the complete peer slice.
+                                    auto commOffsetSrc = remapperSrc(commOffset);
+                                    auto commOffsetDst = commOffset.GetLocalCoord();
+                                    auto gmCommSrc = gmA[layoutA.GetOffset(commOffsetSrc)];
+                                    auto gmCommDst = gmSymmetric[layoutTagSymmetric.GetOffset(commOffsetDst)];
+                                    auto layoutCommSrc = layoutA.GetTileLayout(actualCommShape);
+                                    auto layoutCommDst = layoutTagSymmetric.GetTileLayout(actualCommShape);
+
+                                    blockRemoteCopy(gmCommSrc, layoutCommSrc, gmCommDst, layoutCommDst, actualCommShape,
+                                                    dstRankIdx);
+                                    auto peerCompletedBlocks =
+                                        static_cast<int32_t>(Numel(CeilDiv(actualCommShape, blockShape)));
+                                    if constexpr (EXPORT_ALLTOALLV) {
+                                        completedBlocks = peerCompletedBlocks;
+                                    } else {
+                                        blockRemoteCopy.CompleteForSignal();
+                                        aclshmemx_signal_op(syncCommFinish, peerCompletedBlocks, ACLSHMEM_SIGNAL_ADD,
+                                                            dstRankIdx);
+                                    }
+                                }
+                                completionPeerIdx = dstRankIdx;
+                            }
+                        }
+                        if constexpr (EXPORT_ALLTOALLV) {
+                            // A completion counter belongs to one peer. Drain and
+                            // signal before this worker proceeds to its next peer;
+                            // the final peer retains the existing loop-end drain.
+                            if (completedBlocks > 0 && dstRankIdx + peerStride < rankSize) {
+                                blockRemoteCopy.CompleteForSignal();
+                                aclshmemx_signal_op(syncCommFinish, completedBlocks, ACLSHMEM_SIGNAL_ADD,
+                                                    completionPeerIdx);
+                                completedBlocks = 0;
+                            }
                         }
                     }
                 }
@@ -666,6 +801,10 @@ private:
         }
 
         uint64_t sourceOffsets[BlockMmadScheduler::MoeConstraints::RANK_SIZE_LIMIT]{0};
+        bool useRouteMetadata = params.routeMetadata != nullptr;
+        if constexpr (USE_GM_SCHEDULER) {
+            useRouteMetadata = params.problemShape.rankSize() <= MOE_ROUTE_MAX_RANKS && useRouteMetadata;
+        }
         uint64_t outputOffset = 0;
         uint64_t windowStart = static_cast<uint64_t>(commIdx) * commShapeM;
         uint64_t windowEnd = windowStart + commShapeM;
@@ -675,7 +814,7 @@ private:
                 uint64_t sourceOffset = sourceOffsets[srcRankIdx];
                 uint64_t tokenCount = params.problemShape.globalTokensPerLocalExpert(srcRankIdx, localExpertIdx);
                 uint64_t segmentOutputOffset = outputOffset;
-                if (params.routeMetadata != nullptr) {
+                if (useRouteMetadata) {
                     uint32_t segmentIdx = localExpertIdx * params.problemShape.rankSize() + srcRankIdx;
                     sourceOffset = params.routeMetadata->segments[segmentIdx].sourceRowOffset;
                     tokenCount = params.routeMetadata->segments[segmentIdx].rows;
@@ -709,7 +848,7 @@ private:
                     auto layoutDst = layoutOutput.GetTileLayout(actualBlockShape);
                     blockExport(gmSrc, layoutSrc, gmDst, layoutDst, actualBlockShape);
                 }
-                if (params.routeMetadata == nullptr) {
+                if (!useRouteMetadata) {
                     sourceOffsets[srcRankIdx] += tokenCount;
                     outputOffset += tokenCount;
                 }

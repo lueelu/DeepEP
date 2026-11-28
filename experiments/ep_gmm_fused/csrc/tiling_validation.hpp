@@ -14,6 +14,7 @@
 // be checked on a CPU. No function here modifies the device synchronization.
 namespace deepep::ep_gmm_fused::TilingValidation {
 
+constexpr uint32_t kMaxRanks = 128;
 constexpr uint64_t kSymmetricDataBytes = 400ULL * 1024 * 1024;
 // CATLASS Ascend950 LocalTensorBuffer allocates ArchTag::UB_SIZE, not the
 // physical 256 KiB. Device configuration headers assert this budget matches.
@@ -37,6 +38,24 @@ struct GroupedMatMul {
 inline uint64_t CeilDiv(uint64_t value, uint64_t divisor)
 {
     return value / divisor + (value % divisor != 0);
+}
+
+inline uint32_t DefaultStageRows(uint32_t columns, uint32_t worldSize, uint32_t tileRows, uint32_t preferredRows,
+                                 uint32_t stages)
+{
+    if (columns == 0 || worldSize == 0) {
+        return 0;
+    }
+    const uint64_t capacity = kSymmetricDataBytes / 2 / stages / worldSize / columns;
+    return static_cast<uint32_t>(std::min<uint64_t>(preferredRows, capacity) / tileRows * tileRows);
+}
+
+inline bool ValidSelfCopyCores(uint32_t worldSize, uint32_t coreCount, uint32_t selfCopyCores)
+{
+    // When ranks outnumber workers, each worker owns several peers, including
+    // the local peer on rank % coreCount. Extra self-copy workers need spare cores.
+    return selfCopyCores > 0 && coreCount > 0 &&
+           selfCopyCores <= (coreCount > worldSize ? coreCount - worldSize + 1 : 1);
 }
 
 inline uint32_t LocalCopyRowCapacity(uint32_t columns, uint64_t ubBytes)
@@ -127,8 +146,11 @@ inline const char* ParseGroupedMatMul(const int64_t* values, size_t count, Group
 
 inline const char* CheckHardware(uint32_t worldSize, uint32_t coreCount, uint64_t ubBytes)
 {
-    if (worldSize == 0 || worldSize > 8 || coreCount < worldSize) {
-        return "tiling requires world_size in [1, 8] and at least one AI core per rank";
+    if (worldSize == 0 || worldSize > kMaxRanks || coreCount == 0) {
+        return "tiling requires world_size in [1, 128] and a positive AI-core count";
+    }
+    if (worldSize <= 8 && coreCount < worldSize) {
+        return "EP up to 8 requires at least one AI core per rank";
     }
     if (ubBytes <= kWqeScratchBytes) {
         return "failed to query a usable device UB capacity";
@@ -142,7 +164,7 @@ inline const char* ValidateAllToAllV(const AllToAllV& tiling, uint32_t m, uint32
     if (const char* error = CheckHardware(worldSize, coreCount, ubBytes)) {
         return error;
     }
-    if (tiling.exportCoreCount > coreCount || static_cast<uint64_t>(worldSize) + tiling.selfCopyCores - 1 > coreCount) {
+    if (tiling.exportCoreCount > coreCount || !ValidSelfCopyCores(worldSize, coreCount, tiling.selfCopyCores)) {
         return "tiling worker count exceeds the available AI cores";
     }
     // Export and communication run on different AIV subcores. Each uses two
@@ -176,7 +198,7 @@ inline const char* ValidateGroupedMatMul(const GroupedMatMul& tiling, uint32_t n
     if (nLoops == 0 || n > kUintMax - tiling.n0 + 1) {
         return "N must be positive and its tile ceiling must fit uint32";
     }
-    if (tiling.selfCopyCores == 0 || static_cast<uint64_t>(worldSize) + tiling.selfCopyCores - 1 > coreCount) {
+    if (!ValidSelfCopyCores(worldSize, coreCount, tiling.selfCopyCores)) {
         return "self_copy_cores exceeds the available AIV worker pool";
     }
     if (tiling.stageRows % tiling.m0 != 0 || (tiling.workspaceStages != 2 && tiling.workspaceStages != 3)) {

@@ -129,7 +129,7 @@ def init_udma_group(
             requested = UdmaConfig(rank, world_size, init_method, heap_size, f"npu:{local_rank}")
         valid = (
             all(isinstance(v, int) and not isinstance(v, bool) for v in (rank, world_size, heap_size, local_rank))
-            and 0 <= rank < world_size <= 8
+            and 0 <= rank < world_size <= 128
             and local_rank >= 0
             and _WORKSPACE_BYTES < heap_size < 1 << 63
             and (_config is None or (requested == _config and group is _group_ref))
