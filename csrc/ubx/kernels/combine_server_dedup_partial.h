@@ -44,7 +44,9 @@ public:
         window_ = window;
         blocks_ = (h * 2U + 479U) / 480U;
         packetBytes_ = blocks_ * 512U;
-        inputBytes_ = layout.inputBytes;
+        // Keep the M4 input lanes contiguous at the 480-byte wire payload pitch.
+        // The shared layout reserves at least this much per lane; M5 uses its own offsets.
+        inputBytes_ = blocks_ * 480U;
         stageBase_ = window + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET + uint64_t(bs) * k * packetBytes_;
         inputLanes_ = layout.inputLanes;
         outputLanes_ = layout.outputLanes;
@@ -176,9 +178,9 @@ private:
                 if (!MembersArrived(source, token, members)) continue;
                 const uint32_t row = uint32_t(rows_.GetValue(task));
                 if (dtype_ == UbxDispatch::DISPATCH_DEDUP_DATA_TYPE_FP16)
-                    Aggregate<half>(row, source, members + 1U);
+                    Aggregate<half>(row, source, token, members + 1U);
                 else
-                    Aggregate<bfloat16_t>(row, source, members + 1U);
+                    Aggregate<bfloat16_t>(row, source, token, members + 1U);
                 Send(completed++ % outputLanes_, source, token, uint32_t(table2Ub_.GetValue(2U)));
                 done_.SetValue(task, 1);
             }
@@ -308,7 +310,7 @@ private:
         DataCopyPad(table3Ub_, table3_[uint64_t(row) * k_ * 2U], {1U, k_ * 8U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         Sync<HardEvent::MTE2_S>();
     }
-    __aicore__ inline void Load(uint32_t row, uint32_t source, uint32_t member)
+    __aicore__ inline void Load(uint32_t row, uint32_t source, uint32_t token, uint32_t member)
     {
         const uint32_t lane = (inputSequence_ + member) % inputLanes_;
 
@@ -320,22 +322,34 @@ private:
             DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U},
                         {false, 0U, 0U, uint16_t(0)});
         } else {
-            const uint32_t token = uint32_t(table2Ub_.GetValue(1U));
             LoadStageWire(Inbox(source, token, member), inputs_[lane * inputBytes_ / 2U], h_ * 2U);
         }
         SetFlag<HardEvent::MTE2_V>(lane);
     }
-    __aicore__ inline void PreloadInputs(uint32_t row, uint32_t source, uint32_t contributions)
+    __aicore__ inline void PreloadInputs(uint32_t row, uint32_t source, uint32_t token, uint32_t contributions)
     {
         const uint32_t preload = contributions < inputLanes_ ? contributions : inputLanes_;
-        for (uint32_t member = 0; member < preload; ++member) {
-            Load(row, source, member);
+        Load(row, source, token, 0U);  // The owner's expert row lives outside the inbox.
+        for (uint32_t member = 1U; member < preload; ++member) {
+            const uint32_t lane = (inputSequence_ + member) % inputLanes_;
+            if (member + 1U == preload || lane + 1U == inputLanes_) {
+                Load(row, source, token, member);
+                continue;
+            }
+            // Dispatch places consecutive members of one token in consecutive slots.
+            // One strided DMA skips every flag and fills two adjacent free UB lanes.
+            WaitFlag<HardEvent::V_MTE2>(lane);
+            WaitFlag<HardEvent::V_MTE2>(lane + 1U);
+            LoadStageWire(Inbox(source, token, member), inputs_[lane * inputBytes_ / 2U], 2U * inputBytes_);
+            SetFlag<HardEvent::MTE2_V>(lane);
+            SetFlag<HardEvent::MTE2_V>(lane + 1U);
+            ++member;
         }
     }
     template <class T>
-    __aicore__ inline void Aggregate(uint32_t row, uint32_t source, uint32_t contributions)
+    __aicore__ inline void Aggregate(uint32_t row, uint32_t source, uint32_t token, uint32_t contributions)
     {
-        PreloadInputs(row, source, contributions);
+        PreloadInputs(row, source, token, contributions);
         const auto weights = table3Ub_.ReinterpretCast<float>();
         for (uint32_t member = 0; member < contributions; ++member) {
             const uint32_t lane = (inputSequence_ + member) % inputLanes_;
@@ -348,7 +362,7 @@ private:
 
             // Prefetch may reuse this input after Cast, independent of weighted
             // accumulation and the previous token's outstanding partial send.
-            if (member + inputLanes_ < contributions) Load(row, source, member + inputLanes_);
+            if (member + inputLanes_ < contributions) Load(row, source, token, member + inputLanes_);
 
             PipeBarrier<PIPE_V>();
             if (member == 0U)

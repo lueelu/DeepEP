@@ -426,20 +426,26 @@ void bind_low_latency(py::module_& module)
     module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int capacity,
                                          const std::string& dtype, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
-        CombineDedup::Layout plan{};
+        ubx::PutLaunchPlan put_plan{};
         if (!stream_address || session.capacity() != deep_ep::kEpServerDedupPeerBytes ||
             (dtype != "bfloat16" && dtype != "float16") || b <= 0 || capacity < b) {
             throw std::invalid_argument("Invalid LL combine dtype, shape, workspace or stream");
+        }
+        const auto input_shape = tensors["input"].attr("shape").cast<Shape>();
+        if (input_shape.size() != 2 || input_shape[0] < 0 || input_shape[1] != h) {
+            throw std::invalid_argument("LL combine input must have shape [rows, H]");
         }
         uint32_t cores = 0;
         uint32_t ub_bytes = 0;
         if (session.ll_rdma()) {
             cores = pin_session_cores(session);
             ub_bytes = device_combine_ub_bytes();
-            plan.capacityRows =
-                ubx::v2_capacity(session.world(), b, h, k, e, cores, deep_ep::kNumRanksPerHost, ub_bytes);
-        } else if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active)) {
-            throw std::invalid_argument("Invalid LL combine shape");
+            put_plan = ubx::v2_plan(session.world(), b, h, k, e, cores, deep_ep::kNumRanksPerHost, ub_bytes,
+                                    input_shape[0]);
+        } else {
+            CombineDedup::Layout plan{};
+            if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active))
+                throw std::invalid_argument("Invalid LL combine shape");
         }
         // Row metadata was sized by the Dispatch capacity M, while the kernel
         // still works row-by-row over the actual B tokens.
@@ -462,10 +468,6 @@ void bind_low_latency(py::module_& module)
         args.commArgs = get("comm_args", {sizeof(deep_ep::CommArgs)}, "uint8");
         // Python validates rows against the dispatch handle. The device selects
         // rows below the actual receive count; C_B sizes metadata, not expert storage.
-        const auto input_shape = tensors["input"].attr("shape").cast<Shape>();
-        if (input_shape.size() != 2 || input_shape[0] < 0 || input_shape[1] != h) {
-            throw std::invalid_argument("LL combine input must have shape [rows, H]");
-        }
         args.expertOut = get("input", input_shape, dtype.c_str());
         args.destinationIndex = get("destination_index", {c, 3}, "int32");
         args.sendCounts = get("send_counts", {e}, "int32");
@@ -481,7 +483,7 @@ void bind_low_latency(py::module_& module)
         if (session.ll_rdma()) {
             deep_ep::launch_combine_put(
                 reinterpret_cast<void*>(stream_address), cores, deep_ep::LlGroupForWorld(world), ub_bytes, h, k, e,
-                args.commArgs, args.expertOut, args.destinationIndex, args.sendCounts, args.expertScales,
+                put_plan, args.commArgs, args.expertOut, args.destinationIndex, args.sendCounts, args.expertScales,
                 args.tokenType, args.relayReadIndex, args.sourceMask, args.yOut, args.tilingData);
         } else {
             combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);

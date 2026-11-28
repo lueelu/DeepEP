@@ -20,7 +20,7 @@ namespace UbxCombine {
 using namespace AscendC;
 
 // Member PUTs, DIRECT/partial returns and final per-source-token aggregation.
-template <uint32_t Group, uint32_t UbBytes>
+template <uint32_t Group, uint32_t UbBytes, bool WholeTable, bool RemoteFirst>
 class CombineMemoryServerDedupKernel {
     static_assert(UbBytes > 0 && UbBytes <= kEpServerDedupCombineMaxUbBytes && UbBytes % 32U == 0,
                   "invalid Combine UB arena size");
@@ -29,7 +29,7 @@ public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
                                 GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK,
-                                uint32_t experts, uint8_t dtype, int64_t magic, bool enableDedup = true)
+                                uint32_t experts, uint8_t dtype, int64_t magic, bool enableDedup, uint32_t rowLimit)
     {
         coreNum_ = GetBlockNum();
         recvCores_ = EpCombineRecvCoreCount(coreNum_);
@@ -65,15 +65,13 @@ public:
         Sync<HardEvent::MTE2_S>();
 
         const int32_t tokens = tokenCount.GetValue(0U);
-        const uint32_t localExperts = experts / uint32_t(args_->rankSize);
-        const uint32_t copies = topK < localExperts ? topK : localExperts;
-        const uint64_t capacity = uint64_t(args_->rankSize) * bs * copies;
-        if (tokens < 0 || uint64_t(tokens) > capacity) {
+        if (tokens < 0 || uint32_t(tokens) > rowLimit) {
             Trap();  // Invalid device data must not become a truncated successful launch.
             return;
         }
         totalRows_ = uint32_t(tokens);
-        const auto plan = PlanPutRows(totalRows_, bs_, h_, topK_, recvCores_, UbBytes);
+        const auto plan = WholeTable ? FitPutRows(totalRows_, bs_, h_, topK_, recvCores_, UbBytes)
+                                     : PlanPutRows(totalRows_, bs_, h_, topK_, recvCores_, UbBytes);
         tokens_ = plan.rows;
         lanes_ = plan.lanes;
         workspace_ = plan.receive;
@@ -107,16 +105,16 @@ public:
     {
         const uint32_t tile = tokens_;
         if (enableDedup_) {
-            if (tile == totalRows_) PushMembers();
+            if (WholeTable || tile == totalRows_) PushMembers();
             else ForEachTile<RowPhase::Member>(tile);
         }
         // Keep NIC staging slots live across tiles until retirement.
         returnBatch_.Init(args_, resultStride_);
         if (core_ < sendCores_) {
-            if (tile == totalRows_) ReturnDirectTokens();
+            if (WholeTable || tile == totalRows_) ReturnDirectTokens();
             else ForEachTile<RowPhase::Direct>(tile);
         } else if (enableDedup_) {
-            if (tile == totalRows_) ReturnPartialTokens(0U);
+            if (WholeTable || tile == totalRows_) ReturnPartialTokens(0U);
             else ForEachTile<RowPhase::Partial>(tile);
             DrainSharedOutputs(AggregateSourceTokens());
         } else {
@@ -397,13 +395,8 @@ private:
         }
         PipeBarrier<PIPE_V>();
 
-        const uint32_t split = servers / 2U;
-        const uint32_t ownLength = ownServer < split ? split : servers - split;
-        const uint32_t ownStep = (ownLength - 1U) * (servers >= 16U ? 2U : 1U);
         for (uint32_t visit = 0U; visit < servers; ++visit) {
-            // Defer the local group without an extra selection pass.
-            const uint32_t step = visit + 1U == servers ? ownStep : visit + uint32_t(visit >= ownStep);
-            const uint32_t server = CombineReturnServer<Group>(servers, ownServer, step);
+            const uint32_t server = CombineDirectServer<Group, RemoteFirst>(servers, ownServer, visit);
             const uint32_t count = SelectDirectServer(server);
             const uint32_t first = ServerDedupFirstOwned(core_, owner, directCores);
             owner = (owner + count) % directCores;

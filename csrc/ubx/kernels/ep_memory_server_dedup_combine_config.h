@@ -182,20 +182,32 @@ struct PutRowPlan {
     EpCombineM45WorkspaceLayout receive{};
 };
 
-// First try all rows on this rank. Only a rank whose live UB does not fit
-// goes through the tiled loop. Sender and receiver reuse the same arena.
+COMBINE_DEDUP_EP_COMBINE_CONSTEXPR PutRowPlan FitPutRows(uint32_t rows, uint32_t bs, uint32_t h,
+                                                         uint32_t k, uint32_t recvCores, uint32_t ubBytes)
+{
+    const uint32_t lanes = EpCombinePayloadLaneCount(rows, h, ubBytes);
+    if (!lanes) return {};
+    const auto receive = EpCombineM45Layout(rows, bs, h, k, recvCores, ubBytes);
+    if (!receive.inputLanes) return {};
+    return {rows, lanes, receive};
+}
+
+constexpr uint32_t kPutTileRows = 2048U;
+constexpr uint32_t kPutMinSendLanes = 4U;
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR PutRowPlan PlanPutRows(uint32_t rows, uint32_t bs, uint32_t h,
                                                           uint32_t k, uint32_t recvCores, uint32_t ubBytes)
 {
-    for (;;) {
-        const uint32_t lanes = EpCombinePayloadLaneCount(rows, h, ubBytes);
-        if (lanes) {
-            const auto receive = EpCombineM45Layout(rows, bs, h, k, recvCores, ubBytes);
-            if (receive.inputLanes) return {rows, lanes, receive};
-        }
-        if (rows <= 1U) return {};
-        rows = rows > 2048U ? 2048U : rows / 2U;
+    const auto whole = FitPutRows(rows, bs, h, k, recvCores, ubBytes);
+    if (whole.lanes && (rows <= kPutTileRows || whole.lanes >= kPutMinSendLanes)) return whole;
+
+    for (uint32_t span = rows > kPutTileRows ? kPutTileRows : rows / 2U; span; span /= 2U) {
+        const auto tile = FitPutRows(span, bs, h, k, recvCores, ubBytes);
+        // A fitting table only gives up a full scan if the first tile restores
+        // sender parallelism. An overflowing table must find a legal tile.
+        if (whole.lanes) return tile.lanes >= kPutMinSendLanes ? tile : whole;
+        if (tile.lanes) return tile;
     }
+    return whole;
 }
 // M5 reuses all space after its own metadata except the retained physical
 // output slots. Each input remembers which M4 sends must retire before overwrite.
