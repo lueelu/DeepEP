@@ -20,8 +20,11 @@ namespace UbxCombine {
 using namespace AscendC;
 
 // Member PUTs, DIRECT/partial returns and final per-source-token aggregation.
-template <uint32_t Group>
+template <uint32_t Group, uint32_t UbBytes>
 class CombineMemoryServerDedupKernel {
+    static_assert(UbBytes > 0 && UbBytes <= kEpServerDedupCombineMaxUbBytes && UbBytes % 32U == 0,
+                  "invalid Combine UB arena size");
+
 public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
@@ -53,7 +56,7 @@ public:
         outputAddr_ = yOut;
         // Load the device-produced prefix through MTE2 rather than caching a
         // mutable GM scalar across launches.
-        pipe_.InitBuffer(arena_, kEpServerDedupCombineUbBytes);
+        pipe_.InitBuffer(arena_, UbBytes);
         auto tokenCount = Allocate<int32_t>(32U);
         GlobalTensor<int32_t> prefix;
         prefix.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(sendCounts));
@@ -70,7 +73,7 @@ public:
             return;
         }
         totalRows_ = uint32_t(tokens);
-        const auto plan = PlanPutRows(totalRows_, bs_, h_, topK_, recvCores_);
+        const auto plan = PlanPutRows(totalRows_, bs_, h_, topK_, recvCores_, UbBytes);
         tokens_ = plan.rows;
         lanes_ = plan.lanes;
         workspace_ = plan.receive;

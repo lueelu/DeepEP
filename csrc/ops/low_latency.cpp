@@ -34,6 +34,12 @@ extern "C" uint32_t deepep_ll_reference_profile_enabled();
 namespace {
 using Shape = std::vector<int64_t>;
 constexpr uint64_t kRankBaseBiasBytes = 1024U;
+
+uint32_t device_combine_ub_bytes()
+{
+    return ubx::combine_ub_bytes(deep_ep::jit_num_ubuf_bytes_per_vec_core());
+}
+
 uint32_t pin_session_cores(Session& session)
 {
     session.workspace();
@@ -326,7 +332,8 @@ void bind_low_latency(py::module_& module)
                [](int p, int b, int h, int k, int e, const std::string& dtype, int num_max_tokens_per_rank, bool rdma) {
                    if (rdma) {
                        return bytes(ubx::v2_tiling(p, b, h, k, e, combine_dtype_code(dtype), num_max_tokens_per_rank,
-                                                 query_ll_core_config().active, deep_ep::kNumRanksPerHost));
+                                                 query_ll_core_config().active, deep_ep::kNumRanksPerHost,
+                                                 device_combine_ub_bytes()));
                    }
                    CombineDedup::Layout plan{};
                    if ((dtype != "bfloat16" && dtype != "float16") ||
@@ -425,10 +432,12 @@ void bind_low_latency(py::module_& module)
             throw std::invalid_argument("Invalid LL combine dtype, shape, workspace or stream");
         }
         uint32_t cores = 0;
+        uint32_t ub_bytes = 0;
         if (session.ll_rdma()) {
             cores = pin_session_cores(session);
+            ub_bytes = device_combine_ub_bytes();
             plan.capacityRows =
-                ubx::v2_capacity(session.world(), b, h, k, e, cores, deep_ep::kNumRanksPerHost);
+                ubx::v2_capacity(session.world(), b, h, k, e, cores, deep_ep::kNumRanksPerHost, ub_bytes);
         } else if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active)) {
             throw std::invalid_argument("Invalid LL combine shape");
         }
@@ -471,9 +480,9 @@ void bind_low_latency(py::module_& module)
         session.invalidate_dispatch_controls();
         if (session.ll_rdma()) {
             deep_ep::launch_combine_put(
-                reinterpret_cast<void*>(stream_address), cores, deep_ep::LlGroupForWorld(world), h, k, e, args.commArgs,
-                args.expertOut, args.destinationIndex, args.sendCounts, args.expertScales, args.tokenType,
-                args.relayReadIndex, args.sourceMask, args.yOut, args.tilingData);
+                reinterpret_cast<void*>(stream_address), cores, deep_ep::LlGroupForWorld(world), ub_bytes, h, k, e,
+                args.commArgs, args.expertOut, args.destinationIndex, args.sendCounts, args.expertScales,
+                args.tokenType, args.relayReadIndex, args.sourceMask, args.yOut, args.tilingData);
         } else {
             combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
         }

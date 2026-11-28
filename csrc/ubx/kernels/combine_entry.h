@@ -6,7 +6,7 @@
 #include <ubx/kernels/dispatch_server_dedup_magic.h>
 #include <ubx/kernels/ep_memory_server_dedup_combine_tiling.h>
 
-template <uint32_t Group, uint32_t Hidden, uint32_t TopK, uint32_t Experts>
+template <uint32_t Group, uint32_t Hidden, uint32_t TopK, uint32_t Experts, uint32_t UbBytes>
 __aicore__ inline void CombinePut(
     GM_ADDR comm, GM_ADDR expert, GM_ADDR destination, GM_ADDR counts, GM_ADDR weights, GM_ADDR types, GM_ADDR relay,
     GM_ADDR mask, GM_ADDR output, GM_ADDR tiling)
@@ -24,7 +24,7 @@ __aicore__ inline void CombinePut(
         return;
     }
     const bool dedup = deep_ep::EpServerDedupEnabled(td->numMaxTokensPerRank, args->rankSize);
-    UbxCombine::CombineMemoryServerDedupKernel<Group> kernel;
+    UbxCombine::CombineMemoryServerDedupKernel<Group, UbBytes> kernel;
     kernel.Init(comm, expert, destination, counts, weights, types, relay, mask, output,
                 td->bs, Hidden, TopK, Experts, td->dtype, magic, dedup);
     kernel.Process();

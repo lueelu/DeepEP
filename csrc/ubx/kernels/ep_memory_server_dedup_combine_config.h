@@ -11,8 +11,8 @@
 #include <ubx/kernels/combine_core_layout.h>
 
 namespace UbxCombine {
-constexpr uint32_t kEpServerDedupCombineUbBytes = 240U * 1024U;
-constexpr uint32_t kEpServerDedupCombineRecvUbBytes = kEpServerDedupCombineUbBytes;
+// Keep the existing vector repeat bounds on devices with larger UB.
+constexpr uint32_t kEpServerDedupCombineMaxUbBytes = 240U * 1024U;
 // Reserve event 7 for metadata/control; keep one more payload event spare.
 constexpr uint32_t kEpServerDedupCombineM4MaxInputLanes = 6U;
 constexpr uint32_t kEpServerDedupCombineM5MaxInputLanes = 7U;  // MTE2_V(7) belongs to probe
@@ -20,7 +20,7 @@ constexpr uint32_t kEpServerDedupCombineM5MaxOutputLanes = 2U;
 constexpr uint32_t kEpServerDedupCombineTableRows = 512U;
 // Even before metadata is reserved, one admitted input/output pair has fewer
 // than 256 blocks, so packing never narrows an oversized vector repeat count.
-static_assert(kEpServerDedupCombineUbBytes / (480U + 512U) <= 255U, "M3 vector repeat budget");
+static_assert(kEpServerDedupCombineMaxUbBytes / (480U + 512U) <= 255U, "M3 vector repeat budget");
 // Prefix count, a DIRECT comparison mask and the shared routing table.
 constexpr uint32_t kEpServerDedupCombineResidentUbBytes = 32U + 256U;
 constexpr uint32_t kEpServerDedupCombineFixedUbBytes =
@@ -49,14 +49,14 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineRowUbBytes(uint32_t tokens)
 {
     return 3U * EpCombineAlign(tokens == 0U ? 4U : tokens * 4U, 256U) + EpCombineAlign((tokens + 7U) / 8U + 32U, 256U);
 }
-COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombinePayloadLaneCount(uint32_t tokens, uint32_t h)
+COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombinePayloadLaneCount(uint32_t tokens, uint32_t h, uint32_t ubBytes)
 {
-    if (h == 0U || h > kEpServerDedupCombineUbBytes / 2U || tokens > kEpServerDedupCombineUbBytes / 12U) {
+    if (h == 0U || h > ubBytes / 2U || tokens > ubBytes / 12U) {
         return 0U;
     }
     const uint32_t fixed = kEpServerDedupCombineFixedUbBytes + EpCombineRdmaBytes(h) + EpCombineRowUbBytes(tokens);
-    if (fixed >= kEpServerDedupCombineUbBytes) return 0U;
-    const uint32_t available = kEpServerDedupCombineUbBytes - fixed;
+    if (fixed >= ubBytes) return 0U;
+    const uint32_t available = ubBytes - fixed;
     // M3 vector packing reads every 480B payload block, including its tail.
     // M1 uses the same input lanes and drains them before M3. Output lanes
     // remain distinct until their MTE3 consumers have completed.
@@ -119,7 +119,7 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5WorkBytes(uint32_t h, uin
 // phase metadata changes meaning; output slots stay live across M4 -> M5.
 struct EpCombineM45WorkspaceLayout {
     uint32_t computeBytes = 0U, phaseOffset = 0U, phaseBytes = 0U;
-    uint32_t residentBytes = 0U;
+    uint32_t residentBytes = 0U, scratchBytes = 0U;
     uint32_t inputOffset = 0U, outputOffset = 0U, finalInputOffset = 0U;
     uint32_t inputBytes = 0U, outputBytes = 0U;
     uint32_t inputLanes = 0U, outputLanes = 0U, finalOutputLanes = 0U;
@@ -130,17 +130,16 @@ struct EpCombineM45WorkspaceLayout {
 // No change to layout, lane counts or the M4 -> M5 live-output handoff.
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineRouteSnapshotBytes(const EpCombineM45WorkspaceLayout& layout)
 {
-    const uint32_t begin = layout.residentBytes + layout.inputOffset;
-    return layout.inputLanes && layout.outputLanes && begin < kEpServerDedupCombineRecvUbBytes
-               ? kEpServerDedupCombineRecvUbBytes - begin
+    return layout.inputLanes && layout.outputLanes && layout.inputOffset < layout.scratchBytes
+               ? layout.scratchBytes - layout.inputOffset
                : 0U;
 }
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR EpCombineM45WorkspaceLayout EpCombineM45Layout(
-    uint32_t tokens, uint32_t bs, uint32_t h, uint32_t k, uint32_t recvCores = UbxDispatch::kLlDefaultPlanCoreNum / 2U)
+    uint32_t tokens, uint32_t bs, uint32_t h, uint32_t k, uint32_t recvCores, uint32_t ubBytes)
 {
     EpCombineM45WorkspaceLayout result{};
     if (recvCores == 0U || recvCores > UbxDispatch::kLlMaxRecvCoreNum ||
-        bs == 0U || h == 0U || h > kEpServerDedupCombineRecvUbBytes / 12U || k == 0U || k > 32U)
+        bs == 0U || h == 0U || h > ubBytes / 12U || k == 0U || k > 32U)
         return result;
     const uint64_t owned = EpCombineM5TokenCount(bs, recvCores);
     const uint64_t partial = EpCombineM4TaskBytes(tokens, recvCores) +
@@ -158,10 +157,11 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR EpCombineM45WorkspaceLayout EpCombineM45Layou
     const uint64_t fixed = result.residentBytes + computeBuffers * compute + phase;
     const uint32_t input = EpCombineAlign(((h * 2U + 479U) / 480U) * 480U, 128U);
     const uint32_t output = ((h * 2U + 479U) / 480U) * 512U;
-    if (fixed + input + output > kEpServerDedupCombineRecvUbBytes) return result;
-    const uint32_t reads = uint32_t((kEpServerDedupCombineRecvUbBytes - fixed - output) / input);
+    if (fixed + input + output > ubBytes) return result;
+    result.scratchBytes = ubBytes - result.residentBytes;
+    const uint32_t reads = uint32_t((ubBytes - fixed - output) / input);
     result.inputLanes = reads > kEpServerDedupCombineM4MaxInputLanes ? kEpServerDedupCombineM4MaxInputLanes : reads;
-    const uint32_t writes = uint32_t((kEpServerDedupCombineRecvUbBytes - fixed - result.inputLanes * input) / output);
+    const uint32_t writes = uint32_t((ubBytes - fixed - result.inputLanes * input) / output);
     result.outputLanes = writes > 8U ? 8U : writes;
     result.finalOutputLanes = result.outputLanes > kEpServerDedupCombineM5MaxOutputLanes
                                   ? kEpServerDedupCombineM5MaxOutputLanes
@@ -185,12 +185,12 @@ struct PutRowPlan {
 // First try all rows on this rank. Only a rank whose live UB does not fit
 // goes through the tiled loop. Sender and receiver reuse the same arena.
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR PutRowPlan PlanPutRows(uint32_t rows, uint32_t bs, uint32_t h,
-                                                          uint32_t k, uint32_t recvCores)
+                                                          uint32_t k, uint32_t recvCores, uint32_t ubBytes)
 {
     for (;;) {
-        const uint32_t lanes = EpCombinePayloadLaneCount(rows, h);
+        const uint32_t lanes = EpCombinePayloadLaneCount(rows, h, ubBytes);
         if (lanes) {
-            const auto receive = EpCombineM45Layout(rows, bs, h, k, recvCores);
+            const auto receive = EpCombineM45Layout(rows, bs, h, k, recvCores, ubBytes);
             if (receive.inputLanes) return {rows, lanes, receive};
         }
         if (rows <= 1U) return {};
@@ -215,7 +215,7 @@ EpCombineM5Layout(const EpCombineM45WorkspaceLayout& shared, uint32_t partialTas
     const uint32_t first = (partialTasks - retained) % shared.outputLanes;
     for (uint32_t lane = 0; lane < shared.finalOutputLanes; ++lane)
         result.outputSlots[lane] = (first + lane) % shared.outputLanes;
-    const uint32_t limit = kEpServerDedupCombineRecvUbBytes - shared.residentBytes;
+    const uint32_t limit = shared.scratchBytes;
     uint32_t cursor = shared.finalInputOffset;
     while (result.inputLanes < kEpServerDedupCombineM5MaxInputLanes && cursor + shared.inputBytes <= limit) {
         bool overlapsOutput = false;
@@ -241,7 +241,7 @@ EpCombineM5Layout(const EpCombineM45WorkspaceLayout& shared, uint32_t partialTas
 }
 // Three FP32 H buffers alone bound H, and therefore K*N. The admitted
 // per-token flag clear fits CANN's 12-bit DataCopyPad blockCount (4095).
-static_assert(32U * ((2U * (kEpServerDedupCombineRecvUbBytes / 12U) + 479U) / 480U) <= 4095U,
+static_assert(32U * ((2U * (kEpServerDedupCombineMaxUbBytes / 12U) + 479U) / 480U) <= 4095U,
               "M5 flag clear blockCount budget");
 #undef COMBINE_DEDUP_EP_COMBINE_CONSTEXPR
 }  // namespace UbxCombine
