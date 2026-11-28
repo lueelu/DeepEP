@@ -738,7 +738,7 @@ def test_weight_preference_does_not_return_to_simt_as_rows_grow():
                             # Legacy mode 0 uses SIMT when a helper exists,
                             # under the normal SIMT-enabled peer kernel build.
                             preferred = _simt_weight_row_fits(ep,size)
-                            weight_cores = (8 if cores < 32 else 32) if ep in (8,16,64) else cores
+                            weight_cores = (8 if cores < 32 else 32) if ep in (8,16,64) else min(cores,32)
                             simt = plan.weight_mode != 1 and plan.send_workers < weight_cores
                             # The low-core rank override preserves the weight
                             # mode selected before removing the RR self owner.
@@ -921,14 +921,11 @@ def test_reported_300_operator_plans_allow_rank_conversion_and_copy_first_remova
                 # Intentional sender-budget change; retain the raw fixture.
                 historical[3:6] = [8,1,1]
                 senders = 8
-            if cores == 64 and (op == 'dispatch' and ep in (4,8,16,32,64)
-                                or op in ('combine','weighted') and ep in (8,16,64)):
+            if cores > 32:
                 # These budgets now deliberately inherit the separately checked
                 # 32-core anchor; the old 64-core fixture remains unmodified.
                 inherited = base.for_launch(32,hidden*2,op,bf16=True)
                 historical = inherited.native_plan()
-                if op == 'combine':
-                    historical[7] = 1 if cores >= 2*inherited.send_workers else 2
                 senders = inherited.send_workers
             assert plan.native_plan() == historical, (key, op, plan)
             assert plan.send_workers == senders, (key, op, plan)
@@ -986,6 +983,38 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
     """)
 
 
+def test_all_large_core_launches_inherit_complete_32_core_plans():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        for ep in (4,8,16,32,64,128,256):
+            for group in sorted({1,min(ep,8),min(ep,16)}):
+                for known in (False,True):
+                    base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                   ranks_per_group=group,topology_known=known)
+                    for op in ('dispatch','combine','weighted'):
+                        for size in (32,2047,2048,4096,4097,5632,8191,8192,12288,12289,14336,32768,65536):
+                            for opts in ({'bf16':True},{'bf16':False},{'bf16':True,'v2':False},
+                                         {'bf16':True,'expanded':True}):
+                                anchor = base.for_launch(32,size,op,**opts)
+                                for cores in range(34,65,2):
+                                    plan = base.for_launch(cores,size,op,**opts)
+                                    assert plan.native_plan() == anchor.native_plan(), (ep,group,known,op,size,cores,opts)
+                                    assert plan.send_workers == anchor.send_workers
+                                    assert plan.send_workers <= cores and plan.send_workers*plan.qps_per_worker <= 32
+                                    assert base.config(cores).num_aiv == cores
+        # Preserve the measured visit intervals; only eliminate core-budget fallbacks.
+        for ep,group in ((32,8),(32,16),(64,16)):
+            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                           ranks_per_group=group,topology_known=True)
+            for hidden in (2816,4096,6144,7168,16384):
+                expected = (4 if hidden<4096 else 8 if hidden<=6144 else 32) if (ep,group)==(32,8) else (
+                    8 if ep==64 and 4096<=hidden<=6144 else 32)
+                for cores in (32,48,64):
+                    assert base.for_launch(cores,hidden*2,'weighted',bf16=True).wqes_per_visit == expected
+    """)
+
+
 def test_sender_tiers_inherit_complete_plans_without_changing_launch_budget():
     run_host("""
         from dataclasses import replace
@@ -1002,7 +1031,7 @@ def test_sender_tiers_inherit_complete_plans_without_changing_launch_budget():
                                 anchor = base.for_launch(tier,size,op,bf16=True)
                                 plan = base.for_launch(cores,size,op,bf16=True)
                                 expected = anchor.native_plan()
-                                if op == 'combine':
+                                if op == 'combine' and cores < 32:
                                     expected[7] = 1 if cores >= 2*anchor.send_workers else 2
                                 assert plan.native_plan() == expected, (ep,group,known,op,size,cores)
                                 assert plan.send_workers == anchor.send_workers
@@ -1198,7 +1227,7 @@ def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
             for cores in (8,20,32,48,64):
                 for row_bytes in (2048,5632,12288):
                     plan = policy.for_launch(cores,row_bytes,'combine',bf16=True)
-                    expected = 1 if cores-plan.send_workers >= plan.send_workers else 2
+                    expected = 1 if min(cores,32)-plan.send_workers >= plan.send_workers else 2
                     if ep == 128 and cores >= 16:
                         expected = 2  # Fixed rank/P8/visit16, but never copy before sending.
                     assert plan.self_copy == expected

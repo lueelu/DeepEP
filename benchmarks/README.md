@@ -9,6 +9,20 @@ Modified by Joyce_An 2026
 
 普通 V2 BF16 非展开路径中，EP64 dispatch 的8～64核均保留8个payload发送核；combine的8～30核继承8核计划，32～64核继承32核计划。EP128的8～14核使用rank/P16/W1/Q1/v32，16～64核保持rank/P8/W1/Q1/v16。额外核数不再反复改变发送分工。
 
+所有自动UDMA launch在通信核数大于32时，统一继承相同shape、算子、接口及dtype的完整32核计划，包括P/W/Q、发送顺序、visit及copy/weight偏好；实际启动核数仍使用用户设置值。EP32/G8带权combine的64核不再丢失32核的visit拟合；EP32/G16保持P4/W1/Q1/v32，EP64各hidden对应的既有visit不变。独立reduce核数不参与发送计划选择。
+
+自动策略仍保留以下历史选择条件，不能把“继承32核”理解成所有hidden/API/拓扑都使用同一个计划：
+
+| 条件 | 仍保留的行为 |
+| --- | --- |
+| EP32/G8带权combine，32核及以上，BF16普通V2路径 | P4/W1/Q1不变；2048<H<4096用v4，4096≤H≤6144用v8，H>6144用v32。EP32/G16不走该拟合，保持v32。 |
+| EP64/G16带权combine，32核及以上，BF16普通V2路径 | P4/W1/Q1不变；4096≤H≤6144用v8，其他宽度用v32。本次保留此宽度边界。 |
+| EP4/8/16的小hidden | 原profile在BF16 H1024进入，H2048及以下使用small档；更小hidden使用基础计划。不同档可能改变P/W/Q及visit。 |
+| EP4/G4带权combine，BF16 H1024～2048 | 8～14核为P1/W1/Q2；16～30核仍使用P1/W2/Q1。两者visit均为32。 |
+| 拓扑未识别或不在profile适用G范围、非BF16、V1、按expanded选择的路径 | 不强行套用普通BF16 profile，保留相应基础计划；32核以上仍完整继承该路径自己的32核计划。 |
+
+权重SIMT/UDMA偏好还保留行宽阈值（EP4/8为7168B、EP16/32为8192B、EP64为12288B，且要求有辅助AIV）；EP8/16宽行继承会固定其H6144偏好。默认compact weights可用时实际仍连续UDMA发送，不能仅凭偏好字段判断通信实现。低于8核时仍可能为满足容量回退group_round_robin；EP128在8～14核与16核及以上的P16/v32、P8/v16分档是明确保留的计划。combine默认rows的8192B/32768B边界及不满足合并条件时rows1，属于布局/容量选择，不是发送策略回退。
+
 普通V2 BF16非展开、已识别为连续单机G4的EP4，8～30核dispatch在H7168及更大hidden默认延续H6144的rank/P1/W1/Q2/v32：3个payload发送核，其余核处理metadata和本卡复制。fresh/cached共用该计划；32～64核以及combine计划不变。实际行宽和容量检查不变，宽hidden的设备性能仍需验证。
 
 普通V2 BF16非展开、EP8/16、8～64核的H7168及更大hidden也默认继承H6144的完整发送计划，包括P/W/Q、visit及权重偏好；8～30核继承8核档、32～64核继承32核档，原拓扑适用条件保留。无需设置 `DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY`。该兼容选项设为`1`时仍可额外延伸EP4的其他路径，设为`0`不会撤销已默认生效的继承。实际tensor行宽、UB和通信容量检查不变。

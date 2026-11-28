@@ -253,6 +253,13 @@ class UdmaPolicy:
             raise ValueError("payload row bytes must be a positive integer")
         base = self.for_num_aiv(num_aiv)
         cores = num_aiv or 32
+        if cores > 32:
+            # Every automatic launch above 32 AIVs uses the complete 32-AIV
+            # plan for the same operation, row width, API and dtype. Additional
+            # AIVs do not reselect ownership, visit or copy/weight preferences.
+            plan = self.for_launch(32, row_bytes, operation, bf16=bf16, expanded=expanded, v2=v2)
+            plan.validate_num_aiv(num_aiv)
+            return plan
         if (
             (self.extend_large_rows or self.world_size in (8, 16))
             and self.world_size in (4, 8, 16)
@@ -271,14 +278,14 @@ class UdmaPolicy:
             v2
             and not expanded
             and bf16
-            and 8 <= cores <= 64
+            and 8 <= cores < 32
             and (
                 (operation == "dispatch" and self.world_size in (4, 8, 16, 32, 64))
                 or (operation in ("combine", "weighted") and self.world_size in (8, 16, 64))
             )
         )
         if inherit_sender_tier:
-            tier = 8 if cores < 32 else 32
+            tier = 8
             if cores != tier:
                 # Select the complete sender plan at the measured core budget.
                 # Extra cores may assist local work, but cannot change ownership,
@@ -308,15 +315,11 @@ class UdmaPolicy:
             return plan
         if v2 and not expanded and bf16:
             bucket = "small" if row_bytes <= 4096 else "large"
-            # Extra auxiliary AIVs must not discard the EP32 dispatch profile.
             # EP32 unweighted combine has no fitted override: every core budget
             # retains rank/P4/W1/Q1/visit32, with spare cores used independently.
-            # Select a measured tier without truncating the actual launch budget.
-            # Paths not covered by sender-tier inheritance above retain their
-            # existing intermediate and large-budget selection rules.
-            profile_cores = 8 if 8 <= cores < 16 else 32 if 32 <= cores < 64 else None
-            if self.world_size == 32 and operation == "dispatch" and cores >= 32:
-                profile_cores = 32
+            # Larger budgets already inherit the complete 32-core plan above.
+            # Uncovered intermediate budgets retain their existing selection.
+            profile_cores = 8 if 8 <= cores < 16 else 32 if cores == 32 else None
             entry = _PROFILES.get((self.world_size, profile_cores, bucket, operation))
             # EP4's low-core dispatch keeps three payload owners and leaves
             # the remaining AIVs for metadata/self-copy at wider row sizes too.
@@ -365,7 +368,7 @@ class UdmaPolicy:
                 measured_weight_fit = (
                     self.topology_known
                     and (self.world_size, self.ranks_per_group) in ((32, 8), (64, 16))
-                    and (32 <= cores < 64 or (self.world_size == 64 and cores >= 64))
+                    and cores == 32
                     and 8192 <= row_bytes <= 12288
                 )
                 if measured_weight_fit:
@@ -382,7 +385,7 @@ class UdmaPolicy:
                 use_simt_weights = _simt_weight_row_fits(self.world_size, row_bytes) and plan.send_workers < cores
                 plan = replace(plan, weight_mode=2 if use_simt_weights else 1)
             if (self.world_size == 64 and cores >= 8) or (
-                self.world_size in (4, 8, 16, 32) and (8 <= cores < 16 or 32 <= cores < 64)
+                self.world_size in (4, 8, 16, 32) and (8 <= cores < 16 or cores == 32)
             ):
                 # Normalize order after selecting P/W/Q, visit and copy/weight
                 # modes. EP64 also normalizes its large-core weighted plan.
