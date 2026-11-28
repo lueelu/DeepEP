@@ -84,7 +84,8 @@ public:
         resultStride_ = blocks_ * 512U;
         window_ = UbxDispatch::DispatchServerDedupWindowOffset(magic);
         stageBase_ = window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET + uint64_t(bs) * topK * resultStride_;
-        expert_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(expertOut));
+        // An exact-sized Dispatch may leave this rank with no expert storage.
+        if (totalRows_ != 0U) expert_.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(expertOut));
         table_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(assistInfoForCombine));
         types_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(tokenType));
         directUpperMask_ = Allocate<uint8_t>(256U);
@@ -471,6 +472,9 @@ private:
         PipeBarrier<PIPE_ALL>();
         // Seed exactly once, including empty M4. M5 inherits these events.
         for (uint32_t lane = 0; lane < workspace_.outputLanes; ++lane) SetFlag<HardEvent::MTE3_V>(lane);
+        // An empty expert rank still consumes returns for its source tokens.
+        // Leave the events for final aggregation without forming an expert address.
+        if (tokens_ == 0U) return;
         ServerDedupPartial<Group> partial;
         partial.Init(args_, &pipe_, arena_.Get<uint8_t>()[workspace_.residentBytes],
                      expertAddr_ + uint64_t(first) * h_ * 2U,

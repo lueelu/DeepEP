@@ -46,7 +46,7 @@ def test_cpu_dense_ffn_roundtrip_matches_independent_source_oracle(name):
     dtype = torch.bfloat16 if name == "bf16" else torch.float16
     world, tokens, hidden, intermediate, experts = 2, 3, 16, 8, 8
     routes = [[[0, 4], [1, 3], [0, 5]], [[2, 4], [0, 3], [1, 5]]]
-    inputs = [ffn.input_tensor(r, tokens, hidden, dtype, 7, 0) for r in range(world)]
+    inputs = [ffn.input_tensor(r, tokens, hidden, torch.bfloat16, 7, 0) for r in range(world)]
     weights = [ffn.routing_weights(r, tokens, 2, 7, 0) for r in range(world)]
     actual = [torch.zeros(tokens, hidden) for _ in range(world)]
     for expert in range(experts):
@@ -61,11 +61,11 @@ def test_cpu_dense_ffn_roundtrip_matches_independent_source_oracle(name):
         if not entries:
             continue
         received = torch.stack([inputs[r][t] for r, t, _ in entries])
-        values = ffn.expert_forward(received, ffn.expert_parameters(expert, hidden, intermediate, dtype, 7))
+        values = ffn.expert_forward(received.to(dtype), ffn.expert_parameters(expert, hidden, intermediate, dtype, 7))
         for row, (source, token, slot) in enumerate(entries):
             actual[source][token] += values[row].float() * weights[source][token, slot]
     for rank in range(world):
-        expected = ffn.reference_combine(inputs[rank], routes[rank], weights[rank], intermediate, 7)
+        expected = ffn.reference_combine(inputs[rank].to(dtype), routes[rank], weights[rank], intermediate, 7)
         assert ffn.check_close(actual[rank].to(dtype), expected, name)["max_scaled"] <= 1
 
 

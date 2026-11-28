@@ -122,9 +122,23 @@ int main() {
         while (plan(fit + 1).rows == fit + 1) ++fit;
         const auto spill = plan(fit + 1);
         assert(spill.rows == 2048U && spill.lanes && spill.receive.inputLanes);
-        assert(plan(32768).rows == spill.rows);
         assert(spill.receive.totalBytes <= 240U * 1024U);
+        // Every actual count up to the legal EP32/BS256/K8 hotspot, including
+        // empty peers, the whole-table boundary and every possible tail width.
+        const unsigned maximum = deepep::ubx::v2_capacity(32, 256, h, 8, 384, 56, 16);
+        assert(maximum == 65536U);
+        for (unsigned rows = 0; rows <= maximum; ++rows) {
+            const auto actual = plan(rows);
+            assert(actual.rows == (rows <= fit ? rows : spill.rows));
+            assert(actual.lanes && actual.receive.inputLanes && actual.receive.outputLanes);
+            assert(actual.receive.totalBytes <= UbxCombine::kEpServerDedupCombineRecvUbBytes);
+        }
     }
+    // With fewer cores and a larger hidden size, the receive arena cannot fit
+    // even the first 2048-row fallback. The same host/device planner halves it.
+    const auto capacity = deepep::ubx::v2_capacity(32, 32, 12800, 4, 512, 16, 16);
+    const auto reduced = UbxCombine::PlanPutRows(capacity, 32, 12800, 4, 8);
+    assert(capacity == 4096 && reduced.rows == 1024 && reduced.lanes && reduced.receive.inputLanes);
     int rejected = 0;
     try { deepep::ubx::v2_capacity(32, 32, 3584, 8, 384, 56, 4); }
     catch (const std::invalid_argument&) { ++rejected; }

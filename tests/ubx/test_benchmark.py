@@ -67,6 +67,18 @@ def test_route_digest_detects_slot_and_rank_changes():
     assert benchmark.route_digest(routes) != benchmark.route_digest([[[3, 4]], [[1, 2]]])
 
 
+def test_put_route_preflight_distinguishes_capacity_and_actual_bs():
+    # Source 31 and expert rank 2 wrap to region 2 with two local experts.
+    entries = [[(31, 2), (31, 5)], []]
+    physical, slot = 2 * 256 + 1, (31 * 8 + 5) * 4 + 1
+    destinations = [[31, 2, 0], [physical, 3, slot]]
+    benchmark.check_put_destinations(entries, [1, 3], destinations, 2, 32, 8, 256, 4)
+    for broken in ([physical, -1, -1], [physical, 17, slot], [physical, 3, (31 * 256 + 5) * 4 + 1],
+                   [2 * 8 + 1, 3, slot]):
+        with pytest.raises(AssertionError, match="terminal PUT"):
+            benchmark.check_put_destinations(entries, [1, 3], [destinations[0], broken], 2, 32, 8, 256, 4)
+
+
 def test_clock_windows_cover_the_last_rank_before_first_release():
     benchmark.check_clock_windows([[(1, 4), (6, 10)], [(2, 3), (7, 9)]])
     with pytest.raises(ValueError, match="wait 2"):

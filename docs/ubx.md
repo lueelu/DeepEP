@@ -175,11 +175,18 @@ rank 0 写入 `summary.csv` 和 `bs-B-rank-mean.json`，后者保留全部逐轮
 | --- | --- |
 | 常规路由及整表路径 | `--tokens 32 48 64 --output results/combine-normal` |
 | 集中路由及自动分块 | `--tokens 256 --route rank-hot --output results/combine-hot` |
+| 集中路由、精确形状及空专家卡回收源 token | `--tokens 32 256 --route rank-hot --exact-rows --check-only --output results/combine-hot-exact` |
 | 单独验证 Dispatch → Combine 精度及图重放 | `--tokens 1 32 256 --check-only --output results/combine-check` |
 
 以 K8、E384、BS256 为例，集中路由把全部源 token 的八个专家放到 rank 0，
 EP16 和 EP32 的实际展开行数分别为 32,768 和 65,536。EP16 可验证机内 PUT 及分块；
 跨机直返、局部规约后 RDMA 回传需要 EP32 或更大规模。
+
+`--exact-rows` 让 Dispatch 按实际行数返回专家输入。集中路由下，零行的卡仍须产出本卡
+所有源 token 的结果。精度用例在首次 Combine 前按 CPU 路由核对 Dispatch 前缀，
+在分层模式下另查成员行的物理槽、规约卡所在组和收件槽所属源 token。
+各 rank 的 `bs-B-correctness.json` 记录实收行数与专家输入形状。两个入口均使用 BF16
+做 Dispatch，`--dtype fp16` 选择 FP16 专家计算和 Combine。
 
 ## Dispatch → FFN → Combine 精度
 

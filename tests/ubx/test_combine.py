@@ -35,6 +35,8 @@ def parser():
     result.add_argument("--clock-interval-us", type=int, default=1000)
     result.add_argument("--route", choices=["normal", "rank-hot"], default="normal",
                         help="rank-hot concentrates routes on the first K experts to exercise row tiling")
+    result.add_argument("--exact-rows", action="store_true",
+                        help="Request exact Dispatch receive shapes, including [0,H] on empty expert ranks")
     result.add_argument(
         "--check-only", action="store_true", help="Run Dispatch/Combine E2E correctness without profiling"
     )
@@ -73,14 +75,37 @@ def route_digest(routes):
     ).hexdigest()
 
 
+def check_put_destinations(entries, types, destinations, rank, world, bs, capacity, topk):
+    """Check the capacity-based physical row and BS-based inbox against the input routes."""
+    group = 4 if world == 16 else 16
+    row = 0
+    for local_expert, records in enumerate(entries):
+        occurrences = [0] * world
+        for source, token in records:
+            q = occurrences[source]
+            occurrences[source] += 1
+            role = types[row]
+            if role == 3:  # Terminal member sent to the group's reduction rank.
+                physical, owner, slot = destinations[row]
+                region = ((source + rank) % world) * len(entries) + local_expert
+                if (physical != region * capacity + q or owner // group != rank // group
+                        or slot // topk != source * bs + token or slot % topk == 0):
+                    raise AssertionError(f"Invalid terminal PUT destination at row {row}: {destinations[row]}")
+            elif role in (1, 2):
+                origin, source_token, slot = destinations[row]
+                if (origin, source_token) != (source, token) or not 0 <= slot < topk:
+                    raise AssertionError(f"Invalid return destination at row {row}: {destinations[row]}")
+            else:
+                raise AssertionError(f"Invalid Dispatch token type {role} at row {row}")
+            row += 1
+
+
 def benchmark_graph(buffer, expert, handle, expected, args, reference, rank, directory):
     import torch
     import torch.distributed as dist
     import torch_npu
 
     stream = buffer.get_comm_stream()
-    state = reference.clock_alignment_state(buffer)
-    native, session = state["native"], state["runtime"].native
 
     def boundary():
         torch.npu.synchronize()
@@ -111,6 +136,8 @@ def benchmark_graph(buffer, expert, handle, expected, args, reference, rank, dir
                               rtol=0.01, atol=0.03125), args, rank)
     if args.check_only:
         return None
+    state = reference.clock_alignment_state(buffer)
+    native, session = state["native"], state["runtime"].native
     for _ in range(args.warmup):
         boundary()
         with torch.npu.stream(stream):
@@ -259,7 +286,7 @@ def main(argv=None):
                 routes = reference.make_routes(world, bs, args.topk, args.experts, args.seed)
             route_hash = route_digest(routes)
             entries = reference.expert_entries(routes, args.experts, world, rank)
-            x = reference.payload([rank] * bs, range(bs), args.hidden, dtype).npu()
+            x = reference.payload([rank] * bs, range(bs), args.hidden, torch.bfloat16).npu()
             indices = torch.tensor(routes[rank], dtype=torch.int64, device="npu")
             weights = (torch.arange(1, args.topk + 1, dtype=torch.float32, device="npu") / 32).repeat(bs, 1)
             recv, _, _, handle, dispatched = buffer.dispatch(
@@ -269,18 +296,36 @@ def main(argv=None):
                 num_experts=args.experts,
                 num_max_tokens_per_rank=args.capacity,
                 do_expand=True,
-                do_cpu_sync=False,
+                do_cpu_sync=args.exact_rows,
             )
             dispatched.current_stream_wait()
-            assert handle.is_low_latency
+            prefix = handle.send_counts.tolist()
+            rows = prefix[-1]
+
+            def check_dispatch():
+                if not handle.is_low_latency or prefix != reference.expected_send_counts(entries, world):
+                    raise AssertionError("Dispatch receive prefix differs from the input routes")
+                if args.exact_rows and recv.shape[0] != rows:
+                    raise AssertionError(f"Expected {rows} expert rows, got {recv.shape[0]}")
+                # In direct-only mode Dispatch does not write token_type.
+                if args.check_only and (world > 16 or args.capacity > 32):
+                    check_put_destinations(entries, handle.token_type[:rows].tolist(),
+                                           handle.destination_index[:rows].tolist(), rank, world,
+                                           bs, args.capacity, args.topk)
+
+            reference.agree_check(check_dispatch, args, rank)
             expert = reference.prepare_experts(recv, [len(rows) for rows in entries], rank, args.experts, world, dtype)
             expected = reference.expected_combine(routes, rank, args.hidden, dtype)
             torch.npu.synchronize()
 
             samples = benchmark_graph(buffer, expert, handle, expected, args, reference, rank,
                                       rank_dir / f"bs-{bs}-profile")
+            correctness = dict(
+                correctness="PASS", rank=rank, world=world, bs=bs, route=args.route, route_sha256=route_hash,
+                received_rows=rows, expert_storage_rows=expert.shape[0], dtype=args.dtype, exact_rows=args.exact_rows,
+            )
+            (rank_dir / f"bs-{bs}-correctness.json").write_text(json.dumps(correctness) + "\n")
             if args.check_only:
-                (rank_dir / f"bs-{bs}-correctness.json").write_text(json.dumps({"correctness": "PASS", "bs": bs}))
                 continue
             gathered = reference.host_gather(args, samples, f"combine.bs{bs}.samples")
             if rank == 0:
