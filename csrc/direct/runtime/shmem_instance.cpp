@@ -428,7 +428,7 @@ void ShmemInstance::ReleaseHugePageWorkspace()
 void ShmemInstance::InitRuntime()
 {
     if (acquired_global_runtime_) {
-        return;
+        throw std::runtime_error("previous SHMEM runtime cleanup is incomplete; destroy it before reinitializing");
     }
 
     deepep::InstanceLock lock(deepep::instance_mutex());
@@ -528,13 +528,16 @@ void ShmemInstance::InitRuntime()
     } catch (...) {
         const auto original_error = std::current_exception();
         // The selected SDK rolls back a failed init itself. Never finalize a
-        // different live instance. A failed finalize retains its reservation.
-        if (!runtime_started || aclshmemx_finalize(instance_id_) == 0) {
+        // different live instance. A failed finalize retains both its reservation
+        // and backing memory, including through Init's outer DestroyNoThrow().
+        if (runtime_started && aclshmemx_finalize(instance_id_) != 0) {
+            acquired_global_runtime_ = true;
+        } else {
             deepep_release_instance(instance_id_);
-        }
-        try {
-            ReleaseHugePageWorkspace();
-        } catch (...) {
+            try {
+                ReleaseHugePageWorkspace();
+            } catch (...) {
+            }
         }
         std::rethrow_exception(original_error);
     }
