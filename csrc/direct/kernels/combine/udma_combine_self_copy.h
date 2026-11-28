@@ -8,11 +8,92 @@
 
 namespace ascend_deepep::udma {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+// Both fields have dense row strides (checked on the host). GM endpoints may
+// have element alignment; the UB tile is 32-byte aligned. Drain both MTEs
+// before giving the shared scratch back to the sender.
+template <class Resource>
+__aicore__ inline void CopySelfField(Resource& resource, GM_ADDR source, GM_ADDR destination, uint64_t bytes,
+                                    bool double_buffer = false)
+{
+    constexpr uint32_t tile = 64U * 1024U;
+    constexpr uint32_t offset = kBatchWqes * kWqeBytes;
+    // Sender has published all WQEs before entering this function. Keep its
+    // 2 KiB WQE/final-signal scratch intact; the old span/index area is dead.
+    // Two aligned 64 KiB slots end at byte 133120, below the kernel UB budget.
+    static_assert(offset + 2U * tile <= platform::kKernelUbBytes);
+    auto scratch = resource.template GetBufferByByte<uint8_t>(offset);
+    AscendC::GlobalTensor<uint8_t> input, output;
+    input.SetGlobalBuffer(source);
+    output.SetGlobalBuffer(destination);
+    if (double_buffer) {
+        bool pending[2] = {false, false};
+        uint32_t slot = 0;
+        for (uint64_t i = 0; i < bytes; i += tile) {
+            const auto event = slot == 0 ? EVENT_ID0 : EVENT_ID1;
+            // Only wait for a real previous store, including zero/one-tile tails.
+            if (pending[slot]) AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+            const uint32_t n = bytes - i < tile ? uint32_t(bytes - i) : tile;
+            AscendC::DataCopyExtParams copy{1, n, 0, 0, 0};
+            auto buffer = scratch[slot * tile];
+            AscendC::DataCopyPad(buffer, input[i], copy, AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+            AscendC::DataCopyPad(output[i], buffer, copy);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+            pending[slot] = true;
+            slot ^= 1U;
+        }
+        if (pending[0]) AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        if (pending[1]) AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+        return;
+    }
+    for (uint64_t i = 0; i < bytes; i += tile) {
+        const uint32_t n = bytes - i < tile ? uint32_t(bytes - i) : tile;
+        AscendC::DataCopyExtParams copy{1, n, 0, 0, 0};
+        AscendC::DataCopyPad(scratch, input[i], copy, AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
+        AscendC::DataCopyPad(output[i], scratch, copy);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+    }
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+}
+
+template <class Resource>
+__aicore__ inline void CopyCompactSelf(Resource& resource, GM_ADDR x, GM_ADDR weights,
+    GM_ADDR rank_prefix, GM_ADDR workspace, const CombineTilingData& td, uint32_t core)
+{
+    const uint32_t first = td.udma_self_copy_first_aiv;
+    if (core < first) return;
+    AscendC::GlobalTensor<int32_t> ranks;
+    ranks.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(rank_prefix));
+    const uint32_t base = td.rank ? ranks.GetValue((td.rank - 1) * td.world_size + td.rank) : 0U;
+    const uint32_t rows = ranks.GetValue(td.rank * td.world_size + td.rank) - base;
+    const uint32_t workers = td.block_dim - first;
+    const uint32_t begin = uint64_t(rows) * (core - first) / workers;
+    const uint32_t end = uint64_t(rows) * (core - first + 1) / workers;
+    const uint64_t src = base + begin, dst = uint64_t(td.rank) * td.token_capacity + begin;
+    CopySelfField(resource, x + src * td.x_row_stride, workspace + td.x_buffer_offset + dst * td.x_row_stride,
+                  uint64_t(end - begin) * td.x_row_stride, td.combine_self_double_buffer != 0);
+    if (td.has_topk_weights)
+        CopySelfField(resource, weights + src * td.topk_weights_row_stride,
+                      workspace + td.topk_weights_buffer_offset + dst * td.topk_weights_row_stride,
+                      uint64_t(end - begin) * td.topk_weights_row_stride, td.combine_self_double_buffer != 0);
+}
+
 template <class Resource>
 __aicore__ inline void CombineSelfCopy(
     Resource& resource, GM_ADDR x, GM_ADDR topk_weights, GM_ADDR src_idx, GM_ADDR rank_prefix,
     GM_ADDR channel_prefix, GM_ADDR symmetric_buffer, const CombineTilingData& tiling, int32_t core_idx)
 {
+    if (tiling.compact_self_rows) {
+        CopyCompactSelf(resource, x, topk_weights, rank_prefix, symmetric_buffer, tiling, core_idx);
+        return;
+    }
     constexpr uint32_t kCombineUbBytes = platform::kKernelUbBytes;
     constexpr uint32_t kCombineAlignmentBytes = 32;
     constexpr int32_t kCombineSrcIdxTileElements = 4096;
@@ -128,7 +209,7 @@ __aicore__ inline void CombineSelfCopy(
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(x_event_id);
                 staging_buffer_idx = (staging_buffer_idx + 1) & staging_buffer_mask;
 
-                if (tiling.has_topk_weights != 0) {
+                if (tiling.has_topk_weights != 0 && !tiling.combine_compact_weights) {
                     const auto weight_event_id = staging_buffer_idx == 0 ? EVENT_ID0 : EVENT_ID1;
                     AscendC::LocalTensor<uint8_t> weight_staging_ub = staging_ub[staging_buffer_idx * staging_stride];
                     AscendC::LocalTensor<float> weight_staging_float_ub = weight_staging_ub.ReinterpretCast<float>();
@@ -151,12 +232,24 @@ __aicore__ inline void CombineSelfCopy(
         }
     }
 
-    // Drain local writes before sending or entering the completion path.
+    // Drain local writes before entering the completion path.
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
     // Also order a subsequent sender's scalar stores to the reused UB.
     AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID2);
+    if (tiling.combine_compact_weights && core_idx >= first_copy_aiv) {
+        // The payload fallback may scatter rows, but weights always use the
+        // dense contributor layout, including unaligned top-k row widths.
+        const uint32_t worker = core_idx - first_copy_aiv;
+        const uint32_t begin = uint64_t(source_rank_tokens) * worker / copy_aivs;
+        const uint32_t end = uint64_t(source_rank_tokens) * (worker + 1U) / copy_aivs;
+        const uint64_t src = uint64_t(source_rank_base) + begin;
+        const uint64_t dst = uint64_t(rank) * token_capacity + begin;
+        CopySelfField(resource, topk_weights + src * topk_weights_row_bytes,
+                      symmetric_buffer + tiling.topk_weights_buffer_offset + dst * topk_weights_row_bytes,
+                      uint64_t(end - begin) * topk_weights_row_bytes);
+    }
 }
 #endif
 } // namespace ascend_deepep::udma

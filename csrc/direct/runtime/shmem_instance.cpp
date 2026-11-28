@@ -31,6 +31,14 @@ constexpr uint64_t kMicrosecondsPerSecond = 1000000;
 aclshmemx_uniqueid_t g_default_flag_uid{};
 std::map<uint32_t, std::string> bootstrap_keys;
 
+uint32_t ValidateInitTimeoutSeconds(int64_t seconds)
+{
+    constexpr uint32_t max_seconds = std::numeric_limits<uint32_t>::max() / 1000U;
+    TORCH_CHECK(seconds >= 1 && seconds <= max_seconds, "shmem_init_timeout_secs must be in [1, ", max_seconds,
+                "] seconds");
+    return static_cast<uint32_t>(seconds);
+}
+
 uint32_t ReadTimeoutSeconds(const char* name, uint32_t default_seconds,
                             uint32_t max_seconds = std::numeric_limits<uint32_t>::max())
 {
@@ -96,11 +104,15 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
 
 ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_port, int64_t data_op_engine_type,
                              bool use_1g_huge_pages, std::vector<int64_t> unique_id, std::string bootstrap_key,
-                             bool v1_shared_jetty, bool v1_token_schedule, int64_t udma_dispatch_peer_order,
+                             bool shared_jetty, bool token_schedule, int64_t udma_dispatch_peer_order,
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
-                             int64_t udma_qps_per_worker, bool auto_resources)
-    : rank_(static_cast<int>(rank)),
+                             int64_t udma_qps_per_worker, bool auto_resources, std::string auto_qp_plans,
+                             bool combine_notify, bool fused_layout_notify, int64_t shmem_init_timeout_secs)
+    : combine_notify_(combine_notify),
+      fused_layout_notify_(fused_layout_notify),
+      shmem_init_timeout_secs_(ValidateInitTimeoutSeconds(shmem_init_timeout_secs)),
+      rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),
       workspace_size_(0),
@@ -110,8 +122,8 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
       bootstrap_key_(std::move(bootstrap_key)),
       data_op_engine_type_(data_op_engine_type),
       use_1g_huge_pages_(use_1g_huge_pages),
-      shared_jetty_(v1_shared_jetty && (data_op_engine_type & ACLSHMEM_DATA_OP_UDMA) != 0),
-      token_schedule_(v1_token_schedule),
+      shared_jetty_(shared_jetty && (data_op_engine_type & ACLSHMEM_DATA_OP_UDMA) != 0),
+      token_schedule_(token_schedule),
       initialized_(false),
       acquired_global_runtime_(false),
       workspace_source_mapped_(false),
@@ -120,17 +132,14 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
       workspace_ptr_(nullptr),
       ffts_addr_(0)
 {
-    if (udma_dispatch_peer_order < 0 || udma_dispatch_peer_order > 3 || udma_combine_peer_order < 0 ||
-        udma_combine_peer_order > 3) {
-        throw std::invalid_argument("invalid UDMA peer order");
+    if (udma_dispatch_peer_order != 0 || udma_combine_peer_order != 0) {
+        throw std::invalid_argument("only rank UDMA peer order is supported");
     }
-    const bool topology_order = udma_dispatch_peer_order != 0 || udma_combine_peer_order != 0;
     if (udma_ranks_per_group < 0 || udma_ranks_per_group > world_size ||
-        (udma_ranks_per_group != 0 && world_size % udma_ranks_per_group != 0) ||
-        (topology_order && udma_ranks_per_group == 0)) {
+        (udma_ranks_per_group != 0 && world_size % udma_ranks_per_group != 0)) {
         throw std::invalid_argument("UDMA ranks_per_group must divide the EP group size");
     }
-    if ((topology_order || udma_ranks_per_group != 0) && (!shared_jetty_ || token_schedule_)) {
+    if ((udma_ranks_per_group != 0) && (!shared_jetty_ || token_schedule_)) {
         throw std::invalid_argument("UDMA peer order/group size requires explicit shared-Jetty UDMA peer schedule");
     }
     dispatch_peer_order_ = static_cast<uint32_t>(udma_dispatch_peer_order);
@@ -148,29 +157,14 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
             "two QPs per worker require shared-Jetty UDMA peer schedule and one worker per peer");
     qps_per_worker_ = static_cast<uint32_t>(udma_qps_per_worker);
     const uint32_t qp_lanes = workers_per_peer_ * qps_per_worker_;
-    if (qp_lanes != 1 &&
-        (dispatch_peer_order_ != ascend_deepep::udma::kGroupRoundRobinOrder ||
-         combine_peer_order_ != ascend_deepep::udma::kGroupRoundRobinOrder) &&
-        ascend_deepep::udma::Workers(world_size, ascend_deepep::udma::kMaxPeers) * qp_lanes >
-            ascend_deepep::udma::kQpCount)
+    if (ascend_deepep::udma::Workers(world_size, ascend_deepep::udma::kMaxRankPeers) * qp_lanes >
+        ascend_deepep::udma::kQpCount)
         throw std::invalid_argument("no peer configuration fits the 32 sending QP limit");
-    const bool round_robin = dispatch_peer_order_ == ascend_deepep::udma::kGroupRoundRobinOrder ||
-                             combine_peer_order_ == ascend_deepep::udma::kGroupRoundRobinOrder;
-    if (round_robin) {
-        if (udma_peers_per_group_per_worker != 1 && udma_peers_per_group_per_worker != 2 &&
-            udma_peers_per_group_per_worker != 4)
-            throw std::invalid_argument("group_round_robin requires peers per group per worker in 1,2,4");
-        const uint64_t lanes =
-            (udma_ranks_per_group + udma_peers_per_group_per_worker - 1) / udma_peers_per_group_per_worker;
-        const uint64_t count = (udma_ranks_per_group + lanes - 1) / lanes * (world_size / udma_ranks_per_group);
-        if (lanes * qp_lanes > ascend_deepep::udma::kQpCount || count > ascend_deepep::udma::kGroupPeerCapacity)
-            throw std::invalid_argument("group_round_robin exceeds 32 workers or 64 peers per worker");
-    } else if (udma_peers_per_group_per_worker != 0) {
-        throw std::invalid_argument("peers per group per worker requires group_round_robin");
-    }
+    if (udma_peers_per_group_per_worker != 0)
+        throw std::invalid_argument("peers per group per worker is no longer supported");
     peers_per_group_per_worker_ = static_cast<uint32_t>(udma_peers_per_group_per_worker);
     if (token_schedule_ && !shared_jetty_) {
-        throw std::invalid_argument("token schedule requires V1 shared-Jetty UDMA");
+        throw std::invalid_argument("token schedule requires shared-Jetty UDMA");
     }
     if (unique_id_.empty() == ip_port_.empty()) {
         throw std::invalid_argument("provide exactly one SHMEM endpoint or unique ID");
@@ -198,6 +192,16 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     tuning_session_ = tuning && std::strcmp(tuning, "1") == 0;
     if (tuning_session_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
         throw std::invalid_argument("tuning session requires shared-Jetty peer scheduling and a fixed group size");
+    // Python derives automatic reservations from the launch selector.
+    // Tuning sessions retain the union needed for all supported candidates.
+    if (!auto_qp_plans.empty() && !auto_resources_)
+        throw std::invalid_argument("automatic QP plans require automatic launch resources");
+    if (auto_resources_ && !tuning_session_) qp_plan_spec_ = auto_qp_plans;
+    if (!qp_plan_spec_.empty()) {
+        if (!(data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) || !shared_jetty_ || token_schedule_)
+            throw std::invalid_argument("QP reservations require shared-Jetty UDMA peer scheduling");
+        qp_reservation_ = ascend_deepep::udma::QpReservation(qp_plan_spec_, rank_, world_size_, ranks_per_group_);
+    }
 }
 
 std::vector<int64_t> ShmemInstance::ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
@@ -225,16 +229,18 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
                                                        int64_t visit, int64_t cores) const
 {
     using namespace ascend_deepep::udma;
+    if ((cores != 0 && cores < 8) || cores > 64 || cores % 2)
+        throw std::invalid_argument("communication AIV count must be zero or even in [8, 64]");
     if (values.empty()) {
+        if (peers < 1 || peers > kMaxRankPeers || !ValidPeers(peers) || visit < 4 || visit > 128 || !ValidVisit(visit))
+            throw std::invalid_argument("invalid rank P or visit in manual UDMA launch");
         const auto order = combine ? combine_peer_order_ : dispatch_peer_order_;
-        return {order,
-                ranks_per_group_,
-                order == kGroupRoundRobinOrder ? peers_per_group_per_worker_ : uint32_t(peers),
-                workers_per_peer_,
-                qps_per_worker_,
-                uint32_t(visit),
-                -1,
-                0};
+        const auto p = uint32_t(peers);
+        if (!qp_reservation_.Allows(order, p, workers_per_peer_, qps_per_worker_))
+            throw std::invalid_argument(
+                "UDMA launch uses QPs outside the initialization reservation; reserve all plans before Buffer "
+                "initialization");
+        return {order, ranks_per_group_, p, workers_per_peer_, qps_per_worker_, uint32_t(visit), -1, 0};
     }
     // Validate before narrowing or any kernel submission. P/W/Q changes are
     // covered by the symmetric union reserved once in InitRuntime.
@@ -242,17 +248,20 @@ ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t
         throw std::invalid_argument("invalid or unreserved UDMA launch plan");
     const auto order = values[1], group = values[2], p = values[3], w = values[4], q = values[5];
     const auto v = values[6], copy = values[7], weight = values[8];
-    if (order < 0 || order > 3 || group != ranks_per_group_ || p < 1 || p > 8 || !ValidPeers(p) || (w != 1 && w != 2) ||
-        (q != 1 && q != 2) || w * q > 2 || v < 4 || v > 32 || !ValidVisit(v) || copy < 0 || copy > 2 || weight < 0 ||
-        weight > 2 || (!combine && (copy || weight)))
+    // Dispatch plans also carry the normalized after-submit marker (2).
+    // Spare-AIV copy (1) and weight transport overrides remain combine-only.
+    if (order != kRankOrder || group != ranks_per_group_ || p < 1 || p > kMaxRankPeers || !ValidPeers(p) ||
+        (w != 1 && w != 2) || (q != 1 && q != 2) || w * q > 2 || v < 4 || v > 128 || !ValidVisit(v) || copy < 0 ||
+        copy > 2 || weight < 0 || weight > 2 || (!combine && ((copy != 0 && copy != 2) || weight)))
         throw std::invalid_argument("UDMA launch plan is outside the reserved schedule set");
     const auto owners = Workers(world_size_, p, order, group);
     const auto aivs = cores == 0 ? 32 : cores;
     if (cores < 0 || cores % 2 || owners * w > aivs || owners * w * q > kQpCount)
         throw std::invalid_argument("UDMA launch plan exceeds communication AIV/QP budget");
-    if (order == kGroupRoundRobinOrder &&
-        (p > 4 || ((group + owners - 1) / owners) * (world_size_ / group) > kGroupPeerCapacity))
-        throw std::invalid_argument("UDMA launch plan exceeds the round-robin peer table");
+    if (!qp_reservation_.Allows(order, p, w, q))
+        throw std::invalid_argument(
+            "UDMA launch uses QPs outside the initialization reservation; reserve all plans before Buffer "
+            "initialization");
     return {uint32_t(order), uint32_t(group), uint32_t(p), uint32_t(w),
             uint32_t(q),     uint32_t(v),     copy,        uint32_t(weight)};
 }
@@ -419,7 +428,7 @@ void ShmemInstance::ReleaseHugePageWorkspace()
 void ShmemInstance::InitRuntime()
 {
     if (acquired_global_runtime_) {
-        return;
+        throw std::runtime_error("previous SHMEM runtime cleanup is incomplete; destroy it before reinitializing");
     }
 
     deepep::InstanceLock lock(deepep::instance_mutex());
@@ -429,7 +438,8 @@ void ShmemInstance::InitRuntime()
     config << "direct:" << device << ':' << rank_ << ':' << world_size_ << ':' << data_op_engine_type_ << ':'
            << shared_jetty_ << ':' << token_schedule_ << ':' << dispatch_peer_order_ << ':' << combine_peer_order_
            << ':' << ranks_per_group_ << ':' << peers_per_group_per_worker_ << ':' << workers_per_peer_ << ':'
-           << qps_per_worker_ << ':' << tuning_session_ << ':' << auto_resources_ << ':' << bootstrap_key_;
+           << qps_per_worker_ << ':' << tuning_session_ << ':' << auto_resources_ << ':' << bootstrap_key_
+           << ":qp_plans=" << qp_plan_spec_;
     const bool first = !deepep_has_instances();
     instance_id_ = deepep_reserve_instance(config.str().c_str());
     bool runtime_started = false;
@@ -438,18 +448,17 @@ void ShmemInstance::InitRuntime()
             if ((data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) != 0) {
                 if (shared_jetty_) {
                     if (world_size_ > static_cast<int>(ascend_deepep::udma::kQpCount * 8 + 1))
-                        throw std::invalid_argument("V1 shared Jetty supports at most 257 ranks");
+                        throw std::invalid_argument("shared Jetty supports at most 257 ranks");
                     // Refuse the SDK's independent-queue fallback on older HCOMM.
                     void* hcomm = dlopen("libhcomm.so", RTLD_NOW | RTLD_LOCAL);
-                    if (!hcomm) throw std::runtime_error("V1 shared Jetty requires libhcomm.so");
+                    if (!hcomm) throw std::runtime_error("shared Jetty requires libhcomm.so");
                     const char* missing = nullptr;
                     for (const char* symbol : {"HcommChannelConfigCreate", "HcommChannelConfigDestroy",
                                                "HcommChannelConfigSetInt", "HcommChannelCreateWithConfig"}) {
                         if (!dlsym(hcomm, symbol)) missing = symbol;
                     }
                     dlclose(hcomm);
-                    if (missing)
-                        throw std::runtime_error(std::string("V1 shared Jetty requires HCOMM symbol ") + missing);
+                    if (missing) throw std::runtime_error(std::string("shared Jetty requires HCOMM symbol ") + missing);
                 }
                 ASCEND_DEEPEP_CHECK_SHMEM(aclshmemx_set_qp_num(
                     ACLSHMEM_DATA_OP_UDMA, shared_jetty_ ? ascend_deepep::udma::kQpCount : kUdmaQpCount));
@@ -458,7 +467,8 @@ void ShmemInstance::InitRuntime()
                     std::vector<uint64_t> masks(world_size_);
                     for (int peer = 0; peer < world_size_; ++peer)
                         masks[peer] =
-                            (tuning_session_ || auto_resources_)
+                            !qp_reservation_.Masks().empty() ? qp_reservation_.Masks()[peer]
+                            : (tuning_session_ || auto_resources_)
                                 ? ascend_deepep::udma::TuningPeerMask(rank_, peer, world_size_, ranks_per_group_)
                             : token_schedule_ ? ascend_deepep::udma::TokenPeerMask(rank_, peer)
                                               : ascend_deepep::udma::PeerMask(
@@ -484,6 +494,10 @@ void ShmemInstance::InitRuntime()
             init_flags = ACLSHMEMX_INIT_WITH_UNIQUEID;
         }
 
+        // Set after UID attribute setup, which may restore SDK defaults.
+        attributes.option_attr.shm_init_timeout = shmem_init_timeout_secs_;
+        attributes.option_attr.shm_create_timeout = shmem_init_timeout_secs_;
+        attributes.option_attr.control_operation_timeout = shmem_init_timeout_secs_;
         attributes.runtime_config.sync_timeout_us = shmem_sync_timeout_us_;
         attributes.instance_id = instance_id_;
         deepep::InstanceEndpoint endpoint(attributes);
@@ -514,13 +528,16 @@ void ShmemInstance::InitRuntime()
     } catch (...) {
         const auto original_error = std::current_exception();
         // The selected SDK rolls back a failed init itself. Never finalize a
-        // different live instance. A failed finalize retains its reservation.
-        if (!runtime_started || aclshmemx_finalize(instance_id_) == 0) {
+        // different live instance. A failed finalize retains both its reservation
+        // and backing memory, including through Init's outer DestroyNoThrow().
+        if (runtime_started && aclshmemx_finalize(instance_id_) != 0) {
+            acquired_global_runtime_ = true;
+        } else {
             deepep_release_instance(instance_id_);
-        }
-        try {
-            ReleaseHugePageWorkspace();
-        } catch (...) {
+            try {
+                ReleaseHugePageWorkspace();
+            } catch (...) {
+            }
         }
         std::rethrow_exception(original_error);
     }
@@ -670,7 +687,7 @@ void* ShmemInstance::PrepareNotifyHostCounts(std::size_t count)
     return notify_device_counts_;
 }
 
-std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
+std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count, int64_t* total_observed_ns)
 {
     TORCH_CHECK(notify_host_pending_ && count <= notify_count_capacity_, "Notify host counts were not prepared");
     const auto start = std::chrono::steady_clock::now();
@@ -695,6 +712,11 @@ std::vector<int32_t> ShmemInstance::WaitNotifyHostCounts(std::size_t count)
         }
         TORCH_CHECK(value - 1U <= uint32_t(std::numeric_limits<int32_t>::max()), "invalid Notify host count");
         counts[i] = static_cast<int32_t>(value - 1U);
+        if (i == 0 && total_observed_ns != nullptr) {
+            *total_observed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count();
+        }
     }
     notify_host_pending_ = false;
     return counts;

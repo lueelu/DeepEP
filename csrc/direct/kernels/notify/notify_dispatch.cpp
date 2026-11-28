@@ -6,6 +6,7 @@
 
 #include "kernels/notify/notify_recv_prefix.h"
 #include "kernels/notify/notify_dispatch_plan.h"
+#include "kernels/notify/notify_fused_layout.h"
 #include "kernels/common/v2_handle.h"
 #include "common/launch.h"
 #include "common/types.h"
@@ -170,7 +171,9 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     const int32_t tokens_per_channel = (num_tokens + num_channels - 1) / num_channels;
     const int32_t token_begin = NotifyIntMin(core_idx * tokens_per_channel, num_tokens);
     const int32_t token_end = NotifyIntMin(token_begin + tokens_per_channel, num_tokens);
-    if (dispatch_plan != nullptr) {
+    if (tiling.fused_layout_notify != 0) {
+        ascend_deepep::BuildFusedDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
+    } else if (dispatch_plan != nullptr) {
         ascend_deepep::BuildDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
     } else {
         AscendC::Duplicate(accumulator_ub, static_cast<int32_t>(0), rank_stride);
@@ -198,6 +201,16 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         1, static_cast<uint32_t>(rank_stride * kNotifyInt32Bytes), 0, 0, 0);
     AscendC::DataCopyPad(channel_values_gm[core_idx * rank_stride], accumulator_ub, channel_count_store_params);
     AscendC::SyncAll<true>();
+
+    if (tiling.fused_layout_notify != 0) {
+        ascend_deepep::ReduceFusedLayoutPartials(resource,
+            reinterpret_cast<GM_ADDR>(shmem_base + channel_values_offset), num_tokens_per_rank,
+            num_channels, rank_stride, world_size, core_idx, core_num);
+        ascend_deepep::ReduceFusedLayoutPartials(resource,
+            reinterpret_cast<GM_ADDR>(tiling.notify_expert_partials), num_tokens_per_expert,
+            num_channels, expert_stride, num_experts, core_idx, core_num);
+        AscendC::SyncAll<true>();
+    }
 
     // Prefix channel counts as aligned rank-vector tiles in place.
     const int32_t rank_block_count = rank_stride / kNotifyInt32AlignElems;
@@ -572,6 +585,15 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
     }
+    if (tiling.fused_layout_notify && tiling.notify_defer_plan) {
+        // Counts and public prefixes no longer use this AIV's UB. Its mask was
+        // fully stored before the original local join. Re-read only owned rows;
+        // core 0 publishes mapped counts before reaching here, allowing Host
+        // receive allocation to overlap plan/head generation. Same-stream
+        // kernel completion still gates every payload consumer.
+        ascend_deepep::BuildDispatchPlan(resource, is_token_in_rank, dispatch_plan, send_head, tiling, core_idx);
+    }
+    // Metadata packing is owned by dispatch after its payload submission.
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
@@ -587,7 +609,8 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_plan_kernel_do(
         dispatch_plan, send_head, *td, ffts_addr);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(uint64_t ffts_addr, uint32_t instance_id)
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void cached_notify_dispatch_kernel(
+    uint64_t ffts_addr, uint32_t instance_id)
 {
     aclshmemx_instance_ctx_set(instance_id);
     util_set_ffts_config(ffts_addr);
@@ -595,9 +618,10 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void cached_notify_dispatch_kernel_do(
-    uint32_t block_dim, void* stream, uint64_t ffts_addr, uint32_t instance_id)
+    uint32_t block_dim, void* stream, uint8_t* tiling_host, uint64_t ffts_addr)
 {
-    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, instance_id);
+    auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
+    cached_notify_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>(ffts_addr, td->instance_id);
 }
 
 // Legacy six-tensor handles have no private plan. Rebuild locally on the same

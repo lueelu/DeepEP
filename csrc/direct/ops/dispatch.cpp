@@ -9,10 +9,16 @@
 #include <torch_npu/csrc/aten/common/from_blob.h>
 
 #include "common/types.h"
+#include "common/fused_layout.h"
+#include "common/simt_layout.h"
 #include "common/platform.h"
 #include "common/udma_schedule.h"
 #include "ops/launcher.h"
 #include "ops/stream_allocator.h"
+#include "ops/dispatch_host_timing.h"
+#include "ops/dispatch_device_timing.h"
+#include "ops/dispatch_channel_metadata.h"
+#include "common/dispatch_channel_metadata.h"
 #include "torch_npu/csrc/core/npu/NPUGraphsUtils.h"
 #include "runtime/shmem_instance.h"
 
@@ -188,7 +194,7 @@ namespace ascend_deepep::ops {
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor> GetDispatchLayout(
     torch::Tensor topk_idx, int64_t num_experts, int rank, int world_size, int num_device_aiv, uint64_t ffts_addr,
-    c10::optional<int64_t> allocation_stream_id)
+    c10::optional<int64_t> allocation_stream_id, bool allocate_only, int64_t simt_num_aiv)
 {
     StreamAllocator allocator(allocation_stream_id);
     allocator.Record({topk_idx});
@@ -217,8 +223,21 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
     const int64_t layout_parallelism =
         (num_experts + kDeepEpLayoutExpertsPerWorker - 1) / kDeepEpLayoutExpertsPerWorker +
         (world_size + kDeepEpLayoutRanksPerWorker - 1) / kDeepEpLayoutRanksPerWorker;
-    const uint32_t block_dim = static_cast<uint32_t>(std::min<int64_t>(
-        std::min<int64_t>(num_device_aiv, kMaxDispatchAiv), std::max<int64_t>(2, layout_parallelism)));
+    uint32_t block_dim = static_cast<uint32_t>(std::min<int64_t>(std::min<int64_t>(num_device_aiv, kMaxDispatchAiv),
+                                                                 std::max<int64_t>(2, layout_parallelism)));
+    TORCH_CHECK(simt_num_aiv >= 0, "SIMT layout cores must not be negative");
+    if (simt_num_aiv) {
+        TORCH_CHECK(!allocate_only, "SIMT layout requires an independent launch");
+        TORCH_CHECK(simt_num_aiv == ResolveNumAiv(simt_num_aiv) && simt_num_aiv <= num_device_aiv,
+                    "SIMT layout cores exceed device capacity");
+        TORCH_CHECK(
+            CheckedMulInt64(num_tokens, num_topk, "layout histogram bound") <= std::numeric_limits<int32_t>::max(),
+            "layout histogram exceeds int32 capacity");
+        const auto ub = ascend_deepep::MakeSimtLayoutUbPlan(world_size, num_experts, num_topk,
+                                                            sizeof(ascend_deepep::topk_idx_t), kDispatchLayoutUbBytes);
+        TORCH_CHECK(ub.tile != 0, "SIMT layout shape exceeds UB capacity");
+        block_dim = static_cast<uint32_t>(simt_num_aiv);
+    }
     const int64_t rank_stride = AlignUpInt64(world_size, kDispatchLayoutAlignElems);
     const int64_t expert_stride = AlignUpInt64(num_experts, kDispatchLayoutAlignElems);
     const int64_t is_token_in_rank_ub_bytes = AlignUpInt64(world_size, 32);
@@ -231,12 +250,18 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
     auto int_options = topk_idx.options().dtype(torch::kInt32);
     auto bool_options = topk_idx.options().dtype(torch::kBool);
 
-    auto num_tokens_per_rank_storage = allocator.Empty({rank_stride}, int_options);
-    auto num_tokens_per_expert_storage = allocator.Empty({expert_stride}, int_options);
+    // Opt-in fused preparation owns one aligned arena for both count vectors.
+    // Each invocation still owns its allocations; no old handle is overwritten.
+    auto count_storage = allocate_only ? allocator.Empty({rank_stride + expert_stride}, int_options) : torch::Tensor();
+    auto num_tokens_per_rank_storage =
+        allocate_only ? count_storage.narrow(0, 0, rank_stride) : allocator.Empty({rank_stride}, int_options);
+    auto num_tokens_per_expert_storage = allocate_only ? count_storage.narrow(0, rank_stride, expert_stride)
+                                                       : allocator.Empty({expert_stride}, int_options);
     auto num_tokens_per_rank = num_tokens_per_rank_storage.narrow(0, 0, world_size);
     auto num_tokens_per_expert = num_tokens_per_expert_storage.narrow(0, 0, num_experts);
     // Layout writes every route row, including all-invalid rows.
     auto is_token_in_rank = allocator.Empty({num_tokens, world_size}, bool_options);
+    if (allocate_only) return {num_tokens_per_rank, c10::nullopt, num_tokens_per_expert, is_token_in_rank};
     auto scratch_buffer =
         allocator.Empty({static_cast<int64_t>(block_dim) * (rank_stride + expert_stride)}, int_options);
 
@@ -251,7 +276,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
     tiling.expert_stride = static_cast<uint32_t>(expert_stride);
 
     LaunchDispatchLayoutKernel(topk_idx, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank, tiling,
-                               scratch_buffer, ffts_addr);
+                               scratch_buffer, ffts_addr, simt_num_aiv != 0);
 
     return {num_tokens_per_rank, c10::nullopt, num_tokens_per_expert, is_token_in_rank};
 }
@@ -259,19 +284,21 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Te
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>,
            std::vector<int64_t>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            c10::optional<torch::Tensor>>
-V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<torch::Tensor> topk_idx,
-           c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> num_tokens_per_rank,
-           torch::Tensor is_token_in_rank, c10::optional<torch::Tensor> num_tokens_per_expert,
-           int64_t cached_num_recv_tokens, c10::optional<torch::Tensor> cached_rank_prefix_matrix,
-           c10::optional<torch::Tensor> cached_channel_prefix_matrix, int64_t expert_alignment,
-           int64_t num_worst_tokens, int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens,
-           int64_t num_max_nvl_chunked_recv_tokens, bool zero_copy, int rank, int world_size,
-           std::size_t symmetric_buffer_bytes, std::size_t& notify_workspace_bytes, bool symmetric_workspace_active,
-           bool use_udma, ShmemInstance& shmem, void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
-           c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
-           c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
-           bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan)
+Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<torch::Tensor> topk_idx,
+         c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> num_tokens_per_rank,
+         torch::Tensor is_token_in_rank, c10::optional<torch::Tensor> num_tokens_per_expert,
+         int64_t cached_num_recv_tokens, c10::optional<torch::Tensor> cached_rank_prefix_matrix,
+         c10::optional<torch::Tensor> cached_channel_prefix_matrix, int64_t expert_alignment, int64_t num_worst_tokens,
+         int64_t num_aiv, int64_t num_max_nvl_chunked_send_tokens, int64_t num_max_nvl_chunked_recv_tokens,
+         bool zero_copy, int rank, int world_size, std::size_t symmetric_buffer_bytes,
+         std::size_t& notify_workspace_bytes, bool symmetric_workspace_active, bool use_udma, ShmemInstance& shmem,
+         void* symmetric_buffer, c10::optional<int64_t> allocation_stream_id,
+         c10::optional<int64_t> num_max_tokens_per_rank, int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit,
+         c10::optional<torch::Tensor> cached_dispatch_plan, std::vector<torch::Tensor>* public_handle,
+         bool defer_public_expert_prefix, void* dispatch_output_control, const std::vector<int64_t>& launch_plan,
+         c10::optional<torch::Tensor> cached_send_head, bool allow_omit_topk_output, bool layout_inputs_prepared)
 {
+    DispatchHostTiming host_timing;
     const auto udma_launch =
         shmem.ResolveLaunch(launch_plan, false, udma_peers_per_worker, udma_wqes_per_visit, num_aiv);
     udma_peers_per_worker = udma_launch.peers;
@@ -279,8 +306,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     StreamAllocator allocator(allocation_stream_id);
     TORCH_CHECK(!use_udma || dispatch_output_control != nullptr,
                 "UDMA dispatch requires its Buffer-owned output address control");
-    allocator.Record({x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
-                      cached_rank_prefix_matrix, cached_channel_prefix_matrix, cached_dispatch_plan});
+    allocator.Record({x, x_scales, topk_weights, cached_rank_prefix_matrix, cached_channel_prefix_matrix,
+                      cached_dispatch_plan, cached_send_head});
+    // Only the composed Host entry can prove these inputs were prepared and
+    // protected by GetDispatchLayout on this execution stream. General/cached
+    // inputs retain unconditional protection regardless of allocation settings.
+    if (!layout_inputs_prepared) {
+        allocator.Record({topk_idx, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert});
+    }
     CheckNpuContiguous(x, "x");
     CheckNpuContiguous(is_token_in_rank, "is_token_in_rank");
     CheckOptionalNpu(x_scales, "x_scales");
@@ -291,6 +324,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     CheckOptionalNpuContiguous(cached_rank_prefix_matrix, "cached_rank_prefix_matrix");
     CheckOptionalNpuContiguous(cached_channel_prefix_matrix, "cached_channel_prefix_matrix");
     CheckOptionalNpuContiguous(cached_dispatch_plan, "cached_dispatch_plan");
+    CheckOptionalNpuContiguous(cached_send_head, "cached_send_head");
 
     TORCH_CHECK(world_size > 0, "world_size must be greater than zero");
     TORCH_CHECK(world_size <= kDispatchLayoutMaxRanks, "intranode dispatch currently supports at most ",
@@ -313,6 +347,25 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                 "num_max_nvl_chunked_send_tokens must be smaller than num_max_nvl_chunked_recv_tokens");
 
     const bool cached_mode = cached_rank_prefix_matrix.has_value() || cached_channel_prefix_matrix.has_value();
+    const bool fused_layout = !cached_mode && public_handle != nullptr && shmem.FusedLayoutNotify();
+    TORCH_CHECK(!fused_layout || (use_udma && topk_idx.has_value()), "fused layout requires fresh V2 UDMA dispatch");
+    const auto enabled_option = [](const char* name, bool default_value = false) {
+        const char* value = std::getenv(name);
+        TORCH_CHECK(!value || std::strcmp(value, "0") == 0 || std::strcmp(value, "1") == 0, name, " must be 0 or 1");
+        return value ? std::strcmp(value, "1") == 0 : default_value;
+    };
+    const bool direct_metadata = enabled_option("DEEPEP_CLOS_DISPATCH_METADATA_DIRECT", true);
+    const bool omit_topk_output = use_udma && cached_mode && topk_weights.has_value() && allow_omit_topk_output &&
+                                  enabled_option("DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT", true);
+    const bool metadata_src_256 = enabled_option("DEEPEP_CLOS_DISPATCH_SRC_IDX_256");
+    const bool metadata_topk_256 = enabled_option("DEEPEP_CLOS_DISPATCH_TOPK_256");
+    TORCH_CHECK(use_udma || !(metadata_src_256 || metadata_topk_256),
+                "dispatch metadata thread overrides require UDMA");
+    const bool host_prep = fused_layout && enabled_option("DEEPEP_CLOS_NOTIFY_HOST_PREP");
+    const bool deferred_plan = fused_layout && enabled_option("DEEPEP_CLOS_NOTIFY_DEFER_PLAN");
+    host_timing.Value(Fused, fused_layout);
+    host_timing.Value(HostPrep, host_prep);
+    host_timing.Value(DeferredPlan, deferred_plan);
     TORCH_CHECK(cached_rank_prefix_matrix.has_value() == cached_channel_prefix_matrix.has_value(),
                 "cached rank/channel prefix matrices must be passed together");
     if (!cached_mode) {
@@ -355,6 +408,25 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     TORCH_CHECK(num_topk <= kMaxDispatchTopk, "num_topk must not exceed ", kMaxDispatchTopk,
                 " for the dispatch UB layout");
 
+    // Default packing is limited to the supported peer-UDMA path. Legacy
+    // handles, token scheduling and graph capture retain their existing path;
+    // explicit opt-ins still go through the original validation below.
+    const bool default_channel_metadata = use_udma && !shmem.TokenSchedule() && !capturing && num_topk > 0 &&
+                                          world_size <= ascend_deepep::kChannelMetadataMaxRanks &&
+                                          num_topk <= ascend_deepep::kChannelMetadataMaxTopk;
+    const bool cached_weight_pack =
+        cached_mode && topk_weights.has_value() &&
+        enabled_option("DEEPEP_CLOS_CACHED_WEIGHT_PACK",
+                       default_channel_metadata && cached_dispatch_plan.has_value() && cached_send_head.has_value());
+    if (cached_weight_pack) {
+        TORCH_CHECK(
+            use_udma && !shmem.TokenSchedule() && cached_dispatch_plan.has_value() && cached_send_head.has_value(),
+            "cached weight packing requires peer UDMA and handle-owned plan/send_head");
+        TORCH_CHECK(cached_send_head->scalar_type() == torch::kInt32 && cached_send_head->dim() == 2 &&
+                        cached_send_head->size(0) == x.size(0) && cached_send_head->size(1) == world_size,
+                    "cached send_head must be int32 [num_tokens, world_size]");
+    }
+
     int64_t num_scales = 0;
     int64_t scale_element_bytes = 0;
     int64_t scale_row_bytes = 0;
@@ -379,16 +451,17 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     }
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
+    TORCH_CHECK(resolved_num_aiv >= 8, "communication num_aiv must be at least 8");
     const int64_t num_channels = resolved_num_aiv;
-    if (udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder) udma_peers_per_worker = udma_launch.peers;
     if (use_udma) {
-        TORCH_CHECK(shmem.SharedJetty(), "V1 UDMA requires a V1 shared-Jetty Buffer runtime");
-        TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
-                        udma_peers_per_worker == 8,
-                    "udma_peers_per_worker must be 1, 2, 4 or 8");
+        TORCH_CHECK(shmem.SharedJetty(), "UDMA requires a shared-Jetty Buffer runtime");
+        TORCH_CHECK(udma_peers_per_worker > 0 && udma_peers_per_worker <= ascend_deepep::udma::kMaxRankPeers &&
+                        ascend_deepep::udma::ValidPeers(udma_peers_per_worker),
+                    "udma_peers_per_worker must be 1, 2, 4, 8, 16 or 32");
+        TORCH_CHECK(udma_launch.order == ascend_deepep::udma::kRankOrder, "only rank peer order is supported");
         TORCH_CHECK(udma_wqes_per_visit == 4 || udma_wqes_per_visit == 8 || udma_wqes_per_visit == 16 ||
-                        udma_wqes_per_visit == 32,
-                    "udma_wqes_per_visit must be 4, 8, 16 or 32");
+                        udma_wqes_per_visit == 32 || udma_wqes_per_visit == 64 || udma_wqes_per_visit == 128,
+                    "udma_wqes_per_visit must be 4, 8, 16, 32, 64 or 128");
         const int64_t workers =
             shmem.TokenSchedule()
                 ? ascend_deepep::udma::TokenWorkers(static_cast<uint32_t>(resolved_num_aiv))
@@ -480,12 +553,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         cached_mode ? allocator.Empty({0}, int_options) : allocator.Empty({world_size, num_channels}, int_options);
 
     // Notify produces send_head and the private stable token lists for UDMA.
-    // The low-level cached+topk API needs a temporary head; ordinary Python
-    // cached calls have no top-k and reuse the handle-owned plan unchanged.
-    auto send_head = cached_mode && !(use_udma && topk_idx.has_value())
-                         ? allocator.Empty({0}, int_options)
-                         : (use_udma ? allocator.Empty({num_tokens, world_size}, int_options)
-                                     : allocator.Full({num_tokens, world_size}, -1, int_options));
+    // Cached weight packing reuses the immutable handle head/plan. The legacy
+    // cached+topk path rebuilds a temporary head; unweighted cached reuses its plan.
+    auto send_head = cached_weight_pack
+                         ? *cached_send_head
+                         : (cached_mode && !(use_udma && topk_idx.has_value())
+                                ? allocator.Empty({0}, int_options)
+                                : (use_udma ? allocator.Empty({num_tokens, world_size}, int_options)
+                                            : allocator.Full({num_tokens, world_size}, -1, int_options)));
     c10::optional<torch::Tensor> dispatch_plan = c10::nullopt;
     bool rebuild_cached_plan = false;
     TORCH_CHECK(!cached_dispatch_plan.has_value() || (use_udma && cached_mode),
@@ -502,7 +577,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                             plan.size(1) == num_channels && plan.size(2) == stride,
                         "cached dispatch plan must be int32 [world_size, num_aiv, aligned channel tokens]");
         }
-        if (cached_dispatch_plan.has_value() && !topk_idx.has_value()) {
+        if (cached_dispatch_plan.has_value() && (!topk_idx.has_value() || cached_weight_pack)) {
             dispatch_plan = cached_dispatch_plan;
         } else {
             dispatch_plan = allocator.Empty({world_size, num_channels, stride}, int_options);
@@ -535,9 +610,97 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         // Exact metadata ownership follows the normal stream-aware allocator.
         *public_handle = {allocator.Empty({world_size}, int_options), allocator.Empty({num_local_experts}, int_options),
                           notify_num_recv_tokens_per_expert.narrow(0, 0, num_local_experts), torch::Tensor(),
-                          allocator.Empty({num_tokens, num_topk}, int_options)};
+                          host_prep ? torch::Tensor() : allocator.Empty({num_tokens, num_topk}, int_options)};
     }
     ascend_deepep::DispatchTilingData tiling{};
+    const bool metadata_double_buffer = enabled_option("DEEPEP_CLOS_NOTIFY_METADATA_DOUBLE_BUFFER", true);
+    const bool channel_metadata =
+        (enabled_option("DEEPEP_CLOS_DISPATCH_CHANNEL_METADATA", default_channel_metadata) && !cached_mode) ||
+        cached_weight_pack;
+    tiling.cached_weight_pack = cached_weight_pack;
+    tiling.cached_metadata_head = cached_weight_pack ? reinterpret_cast<uint64_t>(send_head.data_ptr()) : 0;
+    tiling.metadata_direct_output = channel_metadata && direct_metadata;
+    tiling.omit_topk_output = omit_topk_output;
+    LastDispatchMetadataOptions() =
+        uint32_t(cached_weight_pack) | (tiling.metadata_direct_output << 1U) | (uint32_t(omit_topk_output) << 2U);
+    LastDispatchChannelMetadata() = false;
+    LastDispatchChannelMetadataTileTokens() = 0;
+    c10::optional<torch::Tensor> packed_channel_indices, packed_channel_weights;
+    if (channel_metadata) {
+        TORCH_CHECK(use_udma && !shmem.TokenSchedule() && topk_idx.has_value() && num_topk > 0,
+                    "channel metadata requires peer-scheduled UDMA dispatch with top-k indices");
+        TORCH_CHECK(!capturing, "channel metadata experiment does not support graph capture");
+        TORCH_CHECK(
+            world_size <= ascend_deepep::kChannelMetadataMaxRanks && num_topk <= ascend_deepep::kChannelMetadataMaxTopk,
+            "channel metadata exceeds the UB input tile capacity");
+        const char* tile_option = std::getenv("DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS");
+        uint32_t requested_tile = 0;
+        if (tile_option && *tile_option) {
+            TORCH_CHECK(std::strcmp(tile_option, "0") == 0 || std::strcmp(tile_option, "32") == 0 ||
+                            std::strcmp(tile_option, "64") == 0 || std::strcmp(tile_option, "128") == 0 ||
+                            std::strcmp(tile_option, "256") == 0,
+                        "DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS must be 0(auto), 32, 64, 128 or 256");
+            requested_tile = static_cast<uint32_t>(std::atoi(tile_option));
+        }
+        const uint32_t peer_capacity = ascend_deepep::udma::RankPeerCapacity(udma_launch.peers);
+        const uint32_t packing_ub = ascend_deepep::platform::kKernelUbBytes -
+                                    ascend_deepep::udma::DispatchLiveSendUbBytes(peer_capacity, udma_launch.qps);
+        const uint32_t descriptor_bytes =
+            AlignUpInt64(peer_capacity * ascend_deepep::kChannelMetadataDescriptorWords * sizeof(uint32_t), 32);
+        const auto metadata_tile = ascend_deepep::SelectChannelMetadataTile(
+            requested_tile, peer_capacity, num_topk, sizeof(ascend_deepep::topk_idx_t), topk_weights.has_value(),
+            packing_ub / (metadata_double_buffer ? 2U : 1U) - descriptor_bytes);
+        tiling.channel_metadata_double_buffer = metadata_double_buffer;
+        TORCH_CHECK(metadata_tile.tokens, "requested channel metadata tile exceeds private sender UB");
+        tiling.channel_metadata_tile_tokens = metadata_tile.tokens;
+        LastDispatchChannelMetadataTileTokens() = metadata_tile.tokens;
+        const int64_t length = CheckedAddInt64(num_tokens, num_channels - 1, "metadata channel length") / num_channels;
+        const int64_t stride = AlignUpInt64(length, 8);
+        const int64_t row_bytes = CheckedMulInt64(num_topk, sizeof(ascend_deepep::topk_idx_t), "metadata index row");
+        TORCH_CHECK(CheckedMulInt64(length, row_bytes, "metadata channel WQE bytes") <= UINT32_MAX,
+                    "channel metadata exceeds WQE byte-count capacity");
+        const int64_t rows =
+            CheckedMulInt64(CheckedMulInt64(world_size, num_channels, "metadata slots"), stride, "metadata rows");
+        const int64_t elements = CheckedMulInt64(rows, num_topk, "metadata elements");
+        (void)CheckedMulInt64(elements, sizeof(ascend_deepep::topk_idx_t) + sizeof(float), "metadata bytes");
+        packed_channel_indices = allocator.Empty({elements}, topk_idx->options());
+        if (topk_weights.has_value()) packed_channel_weights = allocator.Empty({elements}, topk_weights->options());
+        tiling.channel_metadata = 1;
+        tiling.notify_topk_idx = reinterpret_cast<uint64_t>(topk_idx->data_ptr());
+        tiling.notify_topk_weights =
+            topk_weights.has_value() ? reinterpret_cast<uint64_t>(topk_weights->data_ptr()) : 0;
+        tiling.packed_channel_indices = reinterpret_cast<uint64_t>(packed_channel_indices->data_ptr());
+        tiling.packed_channel_weights =
+            packed_channel_weights.has_value() ? reinterpret_cast<uint64_t>(packed_channel_weights->data_ptr()) : 0;
+        LastDispatchChannelMetadata() = true;
+    }
+    tiling.metadata_src_threads = metadata_src_256 ? 256U : 128U;
+    tiling.metadata_src_lanes = metadata_src_256 && world_size <= 8 ? 32U : 16U;
+    tiling.metadata_topk_threads = metadata_topk_256 ? 256U : 128U;
+    // Keep the old experiment variable as a fallback for existing runners.
+    const bool cached_channel =
+        enabled_option("DEEPEP_CLOS_CACHED_CHANNEL", enabled_option("DEEPEP_CLOS_CACHED_CHANNEL_EP16", true));
+    const bool device_timing = enabled_option("DEEPEP_CLOS_DISPATCH_DEVICE_TIMING");
+    TORCH_CHECK(use_udma || !device_timing, "dispatch diagnostics require UDMA");
+    tiling.cached_channel = use_udma && cached_channel;
+    DispatchDeviceTimingSlot().reset();
+    if (device_timing) {
+        TORCH_CHECK(!shmem.TokenSchedule(), "dispatch device timing requires peer scheduling");
+        auto trace = allocator.Empty({resolved_num_aiv, 64}, x.options().dtype(torch::kInt64));
+        tiling.dispatch_device_trace = reinterpret_cast<uint64_t>(trace.data_ptr());
+        DispatchDeviceTimingSlot() = trace;
+    }
+    c10::optional<torch::Tensor> fused_partials;
+    if (fused_layout) {
+        TORCH_CHECK(num_topk > 0 && num_experts > 0 &&
+                        uint64_t(expert_stride) * sizeof(int32_t) <= ascend_deepep::kFusedHistogramBytes,
+                    "fused layout expert histogram exceeds UB capacity");
+        fused_partials = allocator.Empty({num_channels, expert_stride}, int_options);
+        tiling.fused_layout_notify = 1;
+        tiling.notify_defer_plan = deferred_plan;
+        tiling.notify_topk_idx = reinterpret_cast<uint64_t>(topk_idx->data_ptr());
+        tiling.notify_expert_partials = reinterpret_cast<uint64_t>(fused_partials->data_ptr());
+    }
     tiling.instance_id = shmem.InstanceId();
     if (use_udma) tiling.npu_timeout_cycles = shmem.NpuTimeoutCycles();
     if (public_handle != nullptr) {
@@ -545,7 +708,7 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         if (!defer_public_expert_prefix) {
             tiling.v2_expert_prefix = reinterpret_cast<uint64_t>((*public_handle)[1].data_ptr());
         }
-        tiling.v2_dst_slots = reinterpret_cast<uint64_t>((*public_handle)[4].data_ptr());
+        if (!host_prep) tiling.v2_dst_slots = reinterpret_cast<uint64_t>((*public_handle)[4].data_ptr());
     }
     tiling.rank = static_cast<uint32_t>(rank);
     tiling.world_size = static_cast<uint32_t>(world_size);
@@ -566,7 +729,29 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     tiling.udma_qps_per_worker = udma_launch.qps;
     tiling.udma_peers_per_worker = static_cast<uint32_t>(udma_peers_per_worker);
     tiling.udma_wqes_per_visit = static_cast<uint32_t>(udma_wqes_per_visit);
+    LastDispatchLaunch() = {tiling.udma_peer_order,     tiling.udma_peers_per_worker, tiling.udma_workers_per_peer,
+                            tiling.udma_qps_per_worker, tiling.udma_wqes_per_visit,   tiling.block_dim,
+                            tiling.cached_channel};
     tiling.udma_token_schedule = use_udma && shmem.TokenSchedule();
+    // Sending AIVs never copy self before submitting payload. The old overlap
+    // environment variable can no longer restore that ordering.
+    const bool early_slots = enabled_option("DEEPEP_CLOS_DISPATCH_EARLY_SLOTS", true);
+    const bool skip_topk_init = enabled_option("DEEPEP_CLOS_DISPATCH_SKIP_TOPK_INIT", true);
+    const bool peer_dispatch = use_udma && !shmem.TokenSchedule();
+    tiling.dispatch_early_slots = peer_dispatch && public_handle != nullptr && early_slots;
+    tiling.dispatch_skip_topk_init = peer_dispatch && channel_metadata && skip_topk_init;
+    const uint32_t metadata_first =
+        peer_dispatch ? ascend_deepep::udma::MetadataFirst(world_size, udma_peers_per_worker, resolved_num_aiv,
+                                                           udma_launch.order, udma_launch.group, udma_launch.workers)
+                      : resolved_num_aiv;
+    // Scale normalization/packing remains a producer dependency before sends.
+    // Local copy can reuse released WQE staging after final publication if the
+    // private suffix cannot hold a row; UB pressure must not select copy-first.
+    tiling.dispatch_self_after_submit = peer_dispatch && metadata_first == 0;
+    LastDispatchOverlapOptions() = tiling.dispatch_self_after_submit | (tiling.dispatch_early_slots << 1U) |
+                                   (tiling.dispatch_skip_topk_init << 2U) |
+                                   (tiling.channel_metadata_double_buffer << 3U);
+
     tiling.rank_stride = static_cast<uint32_t>(rank_stride);
     tiling.expert_stride = static_cast<uint32_t>(expert_stride);
     tiling.channel_stride = static_cast<uint32_t>(channel_stride);
@@ -633,6 +818,8 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         (!host_poll || std::strcmp(host_poll, "1") == 0)) {
         tiling.notify_host_counts = reinterpret_cast<uint64_t>(shmem.PrepareNotifyHostCounts(1 + num_local_experts));
     }
+    host_timing.Value(MappedCounts, tiling.notify_host_counts != 0);
+    host_timing.Mark(NotifySubmitBegin);
     if (cached_mode) {
         LaunchCachedNotifyDispatchKernel(tiling, shmem.FftsAddr());
         if (rebuild_cached_plan)
@@ -643,6 +830,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
                                    notify_num_recv_tokens_per_expert, dispatch_plan, send_head, tiling,
                                    symmetric_buffer, shmem.FftsAddr());
     }
+    host_timing.Mark(NotifySubmitted);
+    // Notify never reads dst_slots. Allocate owned payload metadata while its
+    // count generation runs, then update only the later dispatch launch tiling.
+    if (host_prep) {
+        (*public_handle)[4] = allocator.Empty({num_tokens, num_topk}, int_options);
+        tiling.v2_dst_slots = reinterpret_cast<uint64_t>((*public_handle)[4].data_ptr());
+    }
+    host_timing.Mark(CountWaitBegin);
     int64_t num_recv_tokens = 0;
     std::vector<int64_t> num_recv_tokens_per_expert_list;
     if (cached_mode) {
@@ -656,12 +851,14 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
         std::vector<int32_t> published_counts;
         const int32_t* recv_counts;
         if (tiling.notify_host_counts) {
-            published_counts = shmem.WaitNotifyHostCounts(1 + num_local_experts);
+            published_counts = shmem.WaitNotifyHostCounts(1 + num_local_experts, host_timing.TotalSlot());
             recv_counts = published_counts.data();
         } else {
             recv_counts_cpu = notify_counts.cpu();
+            host_timing.Mark(TotalObserved);
             recv_counts = recv_counts_cpu.data_ptr<int32_t>();
         }
+        host_timing.Mark(CountsObserved);
         num_recv_tokens = static_cast<int64_t>(recv_counts[0]);
         TORCH_CHECK(num_recv_tokens >= 0, "notify_dispatch returned a negative receive count");
 
@@ -699,9 +896,11 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     c10::optional<torch::Tensor> recv_topk_idx = c10::nullopt;
     c10::optional<torch::Tensor> recv_topk_weights = c10::nullopt;
     if (topk_idx.has_value()) {
-        recv_topk_idx = zero_copy ? MakeShmemTensor(symmetric_buffer, dispatch_workspace.topk_idx_buffer_offset,
-                                                    {num_recv_tokens, num_topk}, topk_idx->scalar_type())
-                                  : allocator.Empty({num_recv_tokens, num_topk}, topk_idx->options());
+        if (!omit_topk_output) {
+            recv_topk_idx = zero_copy ? MakeShmemTensor(symmetric_buffer, dispatch_workspace.topk_idx_buffer_offset,
+                                                        {num_recv_tokens, num_topk}, topk_idx->scalar_type())
+                                      : allocator.Empty({num_recv_tokens, num_topk}, topk_idx->options());
+        }
         if (topk_weights.has_value()) {
             recv_topk_weights = zero_copy
                                     ? MakeShmemTensor(symmetric_buffer, dispatch_workspace.topk_weights_buffer_offset,
@@ -713,10 +912,21 @@ V1Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional
     // Dispatch writes every valid source index. Fixed-capacity tails are
     // unspecified; consumers select valid rows by rank/channel prefixes.
     auto recv_src_idx = allocator.Empty({cached_mode ? 0 : num_recv_tokens}, int_options);
-    LaunchV1DispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
-                           num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
-                           rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
-                           send_head, dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+    if (tiling.channel_metadata) {
+        tiling.metadata_src_output = cached_mode ? 0 : reinterpret_cast<uint64_t>(recv_src_idx.data_ptr());
+        tiling.metadata_topk_output =
+            recv_topk_idx.has_value() ? reinterpret_cast<uint64_t>(recv_topk_idx->data_ptr()) : 0;
+        tiling.metadata_weight_output =
+            recv_topk_weights.has_value() ? reinterpret_cast<uint64_t>(recv_topk_weights->data_ptr()) : 0;
+    }
+    host_timing.Mark(OutputReady);
+    host_timing.Mark(CommSubmitBegin);
+    LaunchDispatchKernel(x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank,
+                         num_tokens_per_expert, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights,
+                         rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head,
+                         dispatch_plan, tiling, symmetric_buffer, shmem.FftsAddr(), use_udma);
+    host_timing.Mark(CommSubmitted);
+    host_timing.Finish();
     return {recv_x,
             recv_x_scales,
             recv_topk_idx,

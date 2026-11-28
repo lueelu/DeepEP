@@ -107,10 +107,37 @@ struct alignas(8) DispatchTilingData {
     // Optional pinned-host count+1 slots. Never used by cached/graph dispatch.
     uint64_t notify_host_counts = 0;
     uint32_t instance_id = 0;
+    // Optional fused layout input and per-channel expert-count scratch.
+    uint32_t fused_layout_notify = 0; // Independent of the pointer for zero-token ranks.
+    uint32_t notify_defer_plan = 0;
+    uint32_t metadata_src_threads = 128;
+    uint32_t metadata_src_lanes = 16;
+    uint32_t metadata_topk_threads = 128;
+    uint32_t cached_channel = 0;
+    uint64_t dispatch_device_trace = 0;
+    uint64_t notify_topk_idx = 0;
+    uint64_t notify_expert_partials = 0;
+    uint32_t channel_metadata = 0;
+    uint32_t channel_metadata_tile_tokens = 32;
+    uint32_t dispatch_self_after_submit = 0;
+    uint32_t dispatch_early_slots = 0;
+    uint32_t dispatch_skip_topk_init = 0;
+    uint32_t channel_metadata_double_buffer = 0;
+    uint32_t cached_weight_pack = 0;
+    uint32_t metadata_direct_output = 0;
+    uint32_t omit_topk_output = 0;
+    uint64_t cached_metadata_head = 0;
+    uint64_t metadata_src_output = 0;
+    uint64_t metadata_weight_output = 0;
+    uint64_t metadata_topk_output = 0;
+    uint64_t notify_topk_weights = 0;
+    uint64_t packed_channel_indices = 0;
+    uint64_t packed_channel_weights = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
 };
 
 struct alignas(8) CombineTilingData {
+    uint64_t combine_device_trace = 0;
     uint32_t rank;
     uint32_t world_size;
     uint32_t num_tokens;
@@ -148,9 +175,20 @@ struct alignas(8) CombineTilingData {
     uint32_t udma_qps_per_worker = 1;
     uint32_t udma_self_copy_first_aiv = 0;
     uint32_t udma_self_copy_after_submit = 0;
+    uint32_t compact_self_rows = 0; // Applies to both communication and reduction.
     uint32_t udma_weight_mode = 0;  // 0 legacy, 1 UDMA, 2 SIMT if spare AIVs exist.
     uint32_t instance_id = 0;
     uint64_t npu_timeout_cycles = kDefaultNpuTimeoutSeconds * kNpuSystemCyclesPerSecond;
+    uint32_t combine_wqe_fast = 0;
+    uint32_t combine_payload_max_rows = 1; // >1: dense remote payload, max rows/WQE; 1: token-addressed legacy.
+    uint32_t combine_self_double_buffer = 0;
+    // Ordinary peer-schedule weights use dense rows within each contributor's
+    // capacity-sized partition. Payload addressing remains unchanged.
+    uint32_t combine_compact_weights = 0;
+    uint64_t combine_send_channel_prefix = 0;
+    // Ordinary V2 reduction reads this rank's contribution from the input.
+    // Internal eligibility, not a user-selectable scheduling policy.
+    uint32_t combine_direct_self = 0;
 };
 
 struct alignas(8) ExpandTilingData {

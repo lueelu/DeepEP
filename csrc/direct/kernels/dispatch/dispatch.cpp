@@ -52,7 +52,7 @@ __aicore__ inline uint32_t DispatchAlignUp32(uint32_t value)
 
 } // namespace
 
-__aicore__ inline void V1DispatchMteKernelImpl(
+__aicore__ inline void DispatchMteKernelImpl(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
@@ -131,7 +131,7 @@ __aicore__ inline void V1DispatchMteKernelImpl(
         if (tiling.needs_x_scales_pack != 0) {
             __gm__ uint8_t* packed_x_scales =
                 reinterpret_cast<__gm__ uint8_t*>(symmetric_buffer) + tiling.x_scales_input_buffer_offset;
-            asc_vf_call<ascend_deepep::PackV1DispatchScalesSimtVf>(
+            asc_vf_call<ascend_deepep::PackDispatchScalesSimtVf>(
                 dim3(ascend_deepep::kDispatchScalePackThreads), reinterpret_cast<const __gm__ uint32_t*>(x_scales),
                 reinterpret_cast<__gm__ uint32_t*>(packed_x_scales), tiling.num_tokens, tiling.num_scales,
                 tiling.scale_token_stride, tiling.scale_hidden_stride, static_cast<uint32_t>(core_idx),
@@ -560,7 +560,7 @@ __aicore__ inline void V1DispatchMteKernelImpl(
     }
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_dispatch_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_dispatch_kernel(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
@@ -568,13 +568,13 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     ascend_deepep::DispatchTilingData tiling, uint64_t ffts_addr)
 {
     aclshmemx_instance_ctx_set(tiling.instance_id);
-    V1DispatchMteKernelImpl(
+    DispatchMteKernelImpl(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, tiling, ffts_addr);
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_kernel_do(
+extern "C" ASCEND_DEEPEP_EXPORT void direct_dispatch_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* x_scales, uint8_t* topk_idx, uint8_t* topk_weights,
     uint8_t* num_tokens_per_rank, uint8_t* is_token_in_rank, uint8_t* num_tokens_per_expert, uint8_t* symmetric_buffer,
     uint8_t* recv_x, uint8_t* recv_x_scales, uint8_t* recv_topk_idx, uint8_t* recv_topk_weights,
@@ -582,7 +582,7 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_kernel_do(
     uint8_t* recv_src_idx, uint8_t* send_head, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
-    v1_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
+    direct_dispatch_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, *td, ffts_addr);

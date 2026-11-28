@@ -1,21 +1,50 @@
 #pragma once
+
+#include "kernels/dispatch/dispatch_device_trace.h"
+#include "kernels/common/v2_handle.h"
+#include "common/platform.h"
 #include "device_simt/shmem_device_simt_instance.h"
 
 #include "kernels/common/udma_shared_sender.h"
+#include "kernels/dispatch/channel_metadata.h"
 #include "common/types.h"
 #include "simt_api/device_sync_functions.h"
 
 namespace ascend_deepep::udma {
-constexpr uint32_t kDispatchMetadataSimtThreads = 128;
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+template <class Resource>
+__aicore__ inline void CopySelfChannelMetadata(Resource& resource, GM_ADDR plan, GM_ADDR workspace,
+    const DispatchTilingData& td, uint32_t channel, uint32_t row, uint32_t count, uint32_t stride, uint32_t scratch_offset = 0)
+{
+    if (!count) return;
+    if (row > td.num_output_tokens || count > td.num_output_tokens - row) {
+        trap(); return;
+    }
+    const uint64_t base = reinterpret_cast<uint64_t>(workspace);
+    const uint64_t src = td.metadata_direct_output ? td.metadata_src_output : base + td.src_idx_buffer_offset;
+    const uint64_t weights = td.metadata_weight_output;
+    // Omitted top-k stays in the internal consumer region; direct top-k uses
+    // the final tensor shared with the handle builder. Weight
+    // always uses its final tensor; src uses it when all-source direct mode is
+    // enabled. No local packed-GM write/read round trip in either mode.
+    ascend_deepep::PackPeerChannelMetadata(resource, plan, td, td.rank, channel, count, stride,
+        (td.metadata_direct_output && !td.omit_topk_output ? td.metadata_topk_output : base + td.topk_idx_buffer_offset) +
+            uint64_t(row) * td.num_topk * sizeof(topk_idx_t),
+        td.has_topk_weights ? weights + uint64_t(row) * td.num_topk * sizeof(float) : 0,
+        td.cached_mode ? 0 : src + uint64_t(row) * sizeof(int32_t), scratch_offset);
+}
+
 // Notify already chose the stable ordinal. Metadata workers only publish it.
-__simt_vf__ __launch_bounds__(kDispatchMetadataSimtThreads) inline void DispatchSourceIndicesVf(
+template <uint32_t Threads, uint32_t Lanes>
+__simt_vf__ __launch_bounds__(Threads) inline void DispatchSourceIndicesVf(
     const __gm__ int32_t* plan, const __gm__ int32_t* ranks, const __gm__ int32_t* channels, __gm__ uint8_t* workspace,
     uint64_t src_offset, uint32_t rank, uint32_t world, uint32_t channel_count, uint32_t channel, uint32_t stride, uint32_t instance_id)
 {
     simt::aclshmemx_instance_ctx_set(instance_id);
-    constexpr uint32_t lanes = 16;
-    for (uint32_t peer = threadIdx.x / lanes; peer < world; peer += kDispatchMetadataSimtThreads / lanes) {
+    static_assert((Threads == 128 && Lanes == 16) ||
+                  (Threads == 256 && (Lanes == 16 || Lanes == 32)));
+    constexpr uint32_t lanes = Lanes;
+    for (uint32_t peer = threadIdx.x / lanes; peer < world; peer += Threads / lanes) {
         const int32_t previous = channel ? channels[uint64_t(peer) * channel_count + channel - 1] : 0;
         const int32_t count = channels[uint64_t(peer) * channel_count + channel] - previous;
         const int32_t base = (rank ? ranks[uint64_t(rank - 1) * world + peer] : 0) + previous;
@@ -30,17 +59,19 @@ __simt_vf__ __launch_bounds__(kDispatchMetadataSimtThreads) inline void Dispatch
 // One VF thread per (token, top-k) slot. Notify precomputes the ordinal in
 // send_head. Only the destination that owns the expert is written; destination
 // rows are initialized to -1/0 so unwritten slots stay invalid.
-__simt_vf__ __launch_bounds__(kDispatchMetadataSimtThreads) inline void DispatchTopkScatterSimtVf(
+template <uint32_t Threads>
+__simt_vf__ __launch_bounds__(Threads) inline void DispatchTopkScatterSimtVf(
     __gm__ ascend_deepep::topk_idx_t* topk_idx, __gm__ float* topk_weights, __gm__ uint8_t* symmetric_buffer,
     const __gm__ int32_t* send_head, const __gm__ int32_t* rank_prefix, const __gm__ int32_t* channel_prefix,
     int32_t rank, int32_t num_channels, int32_t channel, int32_t token_begin, int32_t tile_tokens, int32_t num_topk,
     int32_t world_size, int32_t experts_per_rank, uint64_t topk_idx_buffer_offset, uint64_t topk_weights_buffer_offset,
     uint32_t topk_idx_row_stride, uint32_t topk_weights_row_stride, uint32_t scatter_topk_weights, uint32_t instance_id)
 {
+    static_assert(Threads == 128 || Threads == 256);
     simt::aclshmemx_instance_ctx_set(instance_id);
     const uint32_t thread_index = static_cast<uint32_t>(threadIdx.x);
     const uint64_t route_count = static_cast<uint64_t>(tile_tokens) * num_topk;
-    for (uint64_t route = thread_index; route < route_count; route += kDispatchMetadataSimtThreads) {
+    for (uint64_t route = thread_index; route < route_count; route += Threads) {
         const int32_t local_token = static_cast<int32_t>(route / num_topk);
         const int32_t topk = static_cast<int32_t>(route % num_topk);
         const int32_t token = token_begin + local_token;
@@ -103,8 +134,12 @@ __aicore__ inline void InitializeDispatchTopk(
     for (uint32_t field = 0; field < (td.has_topk_weights ? 2U : 1U); ++field) {
         const uint32_t element_bytes = field == 0 ? sizeof(topk_idx_t) : sizeof(float);
         const uint64_t row_bytes = uint64_t(td.num_topk) * element_bytes;
-        const uint64_t offset =
-            (field == 0 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset) + uint64_t(begin) * row_bytes;
+        const uint64_t base = field == 1 && td.metadata_direct_output ? td.metadata_weight_output :
+            reinterpret_cast<uint64_t>(workspace) + (field == 0 ? td.topk_idx_buffer_offset : td.topk_weights_buffer_offset);
+        const uint64_t target = field == 0 && td.metadata_direct_output && !td.omit_topk_output
+            ? td.metadata_topk_output : base;
+        local.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(target));
+        const uint64_t offset = uint64_t(begin) * row_bytes;
         AscendC::Duplicate(fill_int32, int32_t(field == 0 ? -1 : 0), fill_bytes / sizeof(int32_t));
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
@@ -124,14 +159,15 @@ __aicore__ inline void InitializeDispatchTopk(
 }
 
 // The payload owner/QP mapping is unchanged. Spare AIVs own whole logical
-// channels for metadata and self-copy; when none are spare, every core does its
-// metadata channel before entering the payload sender. No collective belongs
+// channels for metadata and self-copy; without spare cores the peer sender can
+// defer these independent channels until after payload submission. No collective belongs
 // inside this helper: payload cores must be able to run while metadata runs.
-template <class Resource>
+template <class Resource, class Trace>
 __aicore__ inline void DispatchMetadata(
     Resource& resource, GM_ADDR x, GM_ADDR scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR plan,
     GM_ADDR rank_prefix, GM_ADDR channel_prefix, GM_ADDR workspace, GM_ADDR send_head, const DispatchTilingData& td,
-    uint32_t core, uint32_t cores, uint32_t stage_bytes, GM_ADDR recv_x = nullptr, GM_ADDR recv_scales = nullptr)
+    uint32_t core, uint32_t cores, uint32_t stage_bytes, GM_ADDR recv_x, GM_ADDR recv_scales, Trace& trace,
+    bool copy_self = true, bool publish_metadata = true, uint32_t scratch_offset = 0)
 {
     const uint32_t first =
         td.udma_token_schedule ? TokenWorkers(cores) : MetadataFirst(td.world_size, td.udma_peers_per_worker, cores, td.udma_peer_order, td.udma_ranks_per_group, td.udma_workers_per_peer);
@@ -143,7 +179,7 @@ __aicore__ inline void DispatchMetadata(
     const uint32_t world = td.world_size;
     const uint32_t channel_tokens = (td.num_tokens + td.num_channels - 1) / td.num_channels;
     const uint32_t plan_stride = (channel_tokens + 7U) / 8U * 8U;
-    auto staging_ub = resource.template GetBufferByByte<uint8_t>(0);
+    auto staging_ub = resource.template GetBufferByByte<uint8_t>(scratch_offset);
     auto* rank_ptr = reinterpret_cast<__gm__ int32_t*>(rank_prefix);
     auto* channel_ptr = reinterpret_cast<__gm__ int32_t*>(channel_prefix);
     AscendC::GlobalTensor<int32_t> ranks, channels, plan_gm;
@@ -167,25 +203,51 @@ __aicore__ inline void DispatchMetadata(
         const uint64_t channel_begin = uint64_t(ch) * channel_tokens;
         const uint32_t begin = channel_begin < td.num_tokens ? uint32_t(channel_begin) : td.num_tokens;
         const uint32_t end = begin + channel_tokens < td.num_tokens ? begin + channel_tokens : td.num_tokens;
-        if (build_handle) {
-            asc_vf_call<DispatchSourceIndicesVf>(
-                dim3(kDispatchMetadataSimtThreads), reinterpret_cast<__gm__ int32_t*>(plan), rank_ptr, channel_ptr,
-                workspace, td.src_idx_buffer_offset, td.rank, world, td.num_channels, ch, plan_stride, td.instance_id);
+        if (publish_metadata && build_handle && !td.channel_metadata) {
+            const uint64_t started = trace.Now();
+            if (td.metadata_src_threads == 256 && td.metadata_src_lanes == 32) {
+                asc_vf_call<DispatchSourceIndicesVf<256, 32>>(
+                    dim3(256), reinterpret_cast<__gm__ int32_t*>(plan), rank_ptr, channel_ptr,
+                    workspace, td.src_idx_buffer_offset, td.rank, world, td.num_channels, ch, plan_stride, td.instance_id);
+            } else if (td.metadata_src_threads == 256) {
+                asc_vf_call<DispatchSourceIndicesVf<256, 16>>(
+                    dim3(256), reinterpret_cast<__gm__ int32_t*>(plan), rank_ptr, channel_ptr,
+                    workspace, td.src_idx_buffer_offset, td.rank, world, td.num_channels, ch, plan_stride, td.instance_id);
+            } else {
+                asc_vf_call<DispatchSourceIndicesVf<128, 16>>(
+                    dim3(128), reinterpret_cast<__gm__ int32_t*>(plan), rank_ptr, channel_ptr,
+                    workspace, td.src_idx_buffer_offset, td.rank, world, td.num_channels, ch, plan_stride, td.instance_id);
+            }
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            trace.Add(DispatchDeviceTrace::SrcCycles, started);
         }
-        if (td.num_topk && experts_per_rank) {
-            asc_vf_call<DispatchTopkScatterSimtVf>(
-                dim3(kDispatchMetadataSimtThreads), reinterpret_cast<__gm__ topk_idx_t*>(topk_idx),
-                reinterpret_cast<__gm__ float*>(topk_weights), workspace, reinterpret_cast<__gm__ int32_t*>(send_head),
-                rank_ptr, channel_ptr, int32_t(td.rank), int32_t(td.num_channels), int32_t(ch), int32_t(begin),
-                int32_t(end - begin), int32_t(td.num_topk), int32_t(world), int32_t(experts_per_rank),
-                td.topk_idx_buffer_offset, td.topk_weights_buffer_offset, td.num_topk * uint32_t(sizeof(topk_idx_t)),
-                td.num_topk * uint32_t(sizeof(float)), td.has_topk_weights, td.instance_id);
+        if (publish_metadata && td.num_topk && experts_per_rank && !td.channel_metadata) {
+            const uint64_t started = trace.Now();
+            if (td.metadata_topk_threads == 256) {
+                asc_vf_call<DispatchTopkScatterSimtVf<256>>(
+                    dim3(256), reinterpret_cast<__gm__ topk_idx_t*>(topk_idx),
+                    reinterpret_cast<__gm__ float*>(topk_weights), workspace, reinterpret_cast<__gm__ int32_t*>(send_head),
+                    rank_ptr, channel_ptr, int32_t(td.rank), int32_t(td.num_channels), int32_t(ch), int32_t(begin),
+                    int32_t(end - begin), int32_t(td.num_topk), int32_t(world), int32_t(experts_per_rank),
+                    td.topk_idx_buffer_offset, td.topk_weights_buffer_offset, td.num_topk * uint32_t(sizeof(topk_idx_t)),
+                    td.num_topk * uint32_t(sizeof(float)), td.has_topk_weights, td.instance_id);
+            } else {
+                asc_vf_call<DispatchTopkScatterSimtVf<128>>(
+                    dim3(128), reinterpret_cast<__gm__ topk_idx_t*>(topk_idx),
+                    reinterpret_cast<__gm__ float*>(topk_weights), workspace, reinterpret_cast<__gm__ int32_t*>(send_head),
+                    rank_ptr, channel_ptr, int32_t(td.rank), int32_t(td.num_channels), int32_t(ch), int32_t(begin),
+                    int32_t(end - begin), int32_t(td.num_topk), int32_t(world), int32_t(experts_per_rank),
+                    td.topk_idx_buffer_offset, td.topk_weights_buffer_offset, td.num_topk * uint32_t(sizeof(topk_idx_t)),
+                    td.num_topk * uint32_t(sizeof(float)), td.has_topk_weights, td.instance_id);
+            }
             AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            trace.Add(DispatchDeviceTrace::TopkCycles, started);
         }
 
+        if (!copy_self) continue;
+        const uint64_t self_started = trace.Now();
         // Metadata stores are issued before self-copy. Keep self rows in list
         // order and drain BOTH ping-pong slots before the next channel.
         uint32_t row = (td.rank ? ranks.GetValue((td.rank - 1) * world + td.rank) : 0) +
@@ -197,6 +259,8 @@ __aicore__ inline void DispatchMetadata(
         const uint32_t count = channels.GetValue(td.rank * td.num_channels + ch) - previous;
         if (td.udma_output_control && (row > td.num_output_tokens || count > td.num_output_tokens - row))
             trap();
+        if (td.channel_metadata)
+            CopySelfChannelMetadata(resource, plan, workspace, td, ch, row, count, plan_stride, scratch_offset);
         const uint64_t list_base = (uint64_t(td.rank) * td.num_channels + ch) * plan_stride;
         for (uint32_t i = 0; i < count; ++i) {
             const uint32_t token = plan_gm.GetValue(list_base + i);
@@ -232,7 +296,71 @@ __aicore__ inline void DispatchMetadata(
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        trace.SelfDone(self_started);
     }
 }
+// Prefer private UB after submission; once final WQEs release staging, a large
+// row may reuse full UB. GM payload sources stay immutable until Quiet.
+template <class Resource, class Trace>
+struct DispatchOverlapWork {
+    Resource& resource;
+    Trace& trace;
+    // GM_ADDR expands to a pointer declaration, not a pointer typedef.
+    GM_ADDR x;
+    GM_ADDR scales;
+    GM_ADDR topk;
+    GM_ADDR weights;
+    GM_ADDR plan;
+    GM_ADDR ranks;
+    GM_ADDR channels;
+    GM_ADDR workspace;
+    GM_ADDR head;
+    GM_ADDR recv_x;
+    GM_ADDR recv_scales;
+    const DispatchTilingData& td;
+    uint32_t core, cores;
+
+    __aicore__ void BeforePublish(uint32_t scratch_offset)
+    {
+        if (td.dispatch_self_after_submit) {
+            DispatchMetadata(resource, x, scales, topk, weights, plan, ranks, channels,
+                workspace, head, td, core, cores, platform::kKernelUbBytes - scratch_offset,
+                recv_x, recv_scales, trace, false, true, scratch_offset);
+            trace.Mark(Trace::MetadataDone);
+        }
+    }
+
+    __aicore__ void operator()(uint32_t scratch_offset)
+    {
+        if (td.dispatch_self_after_submit) {
+            const uint32_t payload_bytes = td.hidden * td.x_element_bytes;
+            const uint32_t scale_bytes = td.num_scales * td.scale_element_bytes;
+            const uint32_t row_bytes = payload_bytes > scale_bytes ? payload_bytes : scale_bytes;
+            if (platform::kKernelUbBytes - scratch_offset < 32U * 1024U ||
+                row_bytes > platform::kKernelUbBytes - scratch_offset) {
+                // Publish has consumed every descriptor/header. Quiet only uses
+                // retained queue state. Drain MTE3 before reusing the full UB;
+                // UDMA still reads immutable GM sources asynchronously.
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
+                scratch_offset = 0;
+            }
+            DispatchMetadata(resource, x, scales, topk, weights, plan, ranks, channels,
+                workspace, head, td, core, cores, platform::kKernelUbBytes - scratch_offset,
+                recv_x, recv_scales, trace, true, false, scratch_offset);
+        }
+        if (td.dispatch_early_slots && td.v2_dst_slots) {
+            const uint64_t started = trace.Now();
+            asc_vf_call<V2HandleSlotsVf>(dim3(128), reinterpret_cast<__gm__ topk_idx_t*>(topk),
+                reinterpret_cast<__gm__ int32_t*>(head), reinterpret_cast<__gm__ int32_t*>(channels),
+                reinterpret_cast<__gm__ int32_t*>(td.v2_dst_slots), td.rank, td.world_size,
+                td.num_max_tokens_per_rank / td.world_size, td.num_local_experts,
+                td.num_topk, td.num_tokens, td.num_channels, core, cores);
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            trace.Add(Trace::SlotsCycles, started);
+        }
+    }
+};
 #endif
 } // namespace ascend_deepep::udma

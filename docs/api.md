@@ -69,6 +69,12 @@ Mesh+Clos 与 Direct 的同步调用均先建立计算流依赖，再返回 `eve
 
 #### Global Clos 多 Buffer
 
+Global Clos / Mesh+PCIe 的 `Buffer` 与 `ElasticBuffer` 接受 `shmem_init_timeout_secs=600`（秒）。该参数统一设置 SHMEM 的 `shm_init_timeout`、`shm_create_timeout`、`control_operation_timeout`，覆盖 UID 和显式 IP/port 初始化及 bootstrap 控制操作。所有 EP rank 必须一致；仅接受 1～4294967 的整数，不接受 bool。它不改变 UDMA channel 建链轮询超时、设备算子超时或外部进程组/TCPStore 超时。
+
+Global Clos / Mesh+PCIe 的 `Buffer` 与 `ElasticBuffer` 接受初始化参数 `combine_notify=False`。设为 `True` 时，UDMA combine 在通信 kernel 前执行独立 `cached_notify_combine_kernel`；原有完成同步仍保留。该参数在 Buffer 生命周期内固定，所有 EP rank 必须一致；benchmark 固定开启，普通调用默认关闭。它替代原 `DEEPEP_CLOS_PROFILE_COMBINE_NOTIFY` 环境变量。MTE 和需要独立 notify 的特殊阶段仍执行必要同步。
+
+Global Clos / Mesh+PCIe 的 V2 `ElasticBuffer` 接受 `fused_layout_notify=False`。设为 `True` 时，fresh UDMA dispatch 将 layout 融入 notify；cached dispatch 和 combine 不变。该参数在 Buffer 生命周期内固定，同一 EP 所有 rank 必须一致；MTE 不支持开启。
+
 同一进程可创建不同容量的 `Buffer` / `ElasticBuffer`，调用接口不变。每个对象持有独立的 SHMEM 实例、通信工作区、队列和同步状态。构造新对象不会销毁或扩展旧对象的存储：
 
 ```python

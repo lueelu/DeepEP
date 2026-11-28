@@ -70,7 +70,7 @@ python -m pytest tests/api tests/elastic/test_low_latency_host.py tests/elastic/
 python -m pytest tests/test_reference.py tests/test_precision.py tests/test_benchmark.py -q
 ```
 
-普通 pytest 不会自动执行设备 ST。Host 故障注入使用 C++ 编译器；combine 的部分 Host 回归也通过 C++17 编译器或已安装的 ziglang 检查 kernel 判断函数，缺少编译器时相关项跳过。这些检查不验证 AIV 并发、真实 SHMEM 通信或设备性能。
+普通 pytest 不会自动执行设备 ST。Host 故障注入及保留的 CPU 编译检查需要 C++ 编译器，缺少编译器时相关项跳过。这些检查不验证 AIV 并发、真实 SHMEM 通信或设备性能。
 
 ## HT 单机测试
 

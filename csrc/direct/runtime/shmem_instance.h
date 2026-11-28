@@ -8,6 +8,7 @@
 #include <tuple>
 #include <vector>
 #include <torch/custom_class.h>
+#include "runtime/udma_qp_reservation.h"
 
 std::vector<int64_t> GetShmemUniqueId();
 std::tuple<int64_t, std::vector<int64_t>> GetShmemBootstrap(const std::string& key);
@@ -17,10 +18,11 @@ public:
     ShmemInstance(int64_t rank, int64_t world_size, std::string ip_port);
     ShmemInstance(int64_t rank, int64_t world_size, std::string ip_port, int64_t data_op_engine_type,
                   bool use_1g_huge_pages = false, std::vector<int64_t> unique_id = {}, std::string bootstrap_key = {},
-                  bool v1_shared_jetty = false, bool v1_token_schedule = false, int64_t udma_dispatch_peer_order = 0,
+                  bool shared_jetty = false, bool token_schedule = false, int64_t udma_dispatch_peer_order = 0,
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
-                  int64_t udma_qps_per_worker = 1, bool auto_resources = false);
+                  int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {},
+                  bool combine_notify = false, bool fused_layout_notify = false, int64_t shmem_init_timeout_secs = 600);
 
     ~ShmemInstance();
 
@@ -36,8 +38,11 @@ public:
     void Destroy();
     // Serialized fresh dispatches may publish counts before Notify finishes.
     void* PrepareNotifyHostCounts(std::size_t count);
-    std::vector<int32_t> WaitNotifyHostCounts(std::size_t count);
-    uint64_t NpuTimeoutCycles() const { return npu_timeout_cycles_; }
+    std::vector<int32_t> WaitNotifyHostCounts(std::size_t count, int64_t* total_observed_ns = nullptr);
+    uint64_t NpuTimeoutCycles() const
+    {
+        return npu_timeout_cycles_;
+    }
     std::vector<int64_t> ConfigureTuning(int64_t dispatch_order, int64_t combine_order, int64_t group_peers,
                                          int64_t workers, int64_t qps);
 
@@ -61,6 +66,14 @@ public:
     int64_t WorldSize() const;
     void* WorkspacePtr() const;
     bool Use1gHugePages() const;
+    bool CombineNotify() const
+    {
+        return combine_notify_;
+    }
+    bool FusedLayoutNotify() const
+    {
+        return fused_layout_notify_;
+    }
     bool SharedJetty() const
     {
         return shared_jetty_;
@@ -95,6 +108,9 @@ public:
     }
 
 private:
+    const bool combine_notify_ = false;
+    const bool fused_layout_notify_ = false;
+    const uint32_t shmem_init_timeout_secs_;
     uint64_t npu_timeout_cycles_ = 0;
     uint32_t shmem_sync_timeout_us_ = 0;
     uint32_t notify_host_timeout_seconds_ = 0;
@@ -119,6 +135,8 @@ private:
     bool shared_jetty_;
     bool tuning_session_ = false;
     bool auto_resources_ = false;
+    std::string qp_plan_spec_;
+    ascend_deepep::udma::QpReservation qp_reservation_;
     bool token_schedule_;
     uint32_t dispatch_peer_order_ = 0;
     uint32_t combine_peer_order_ = 0;

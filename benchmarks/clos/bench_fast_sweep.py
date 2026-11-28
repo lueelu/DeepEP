@@ -1,7 +1,7 @@
-"""One SHMEM initialization, existing full-Clos peer schedules, performance only.
+"""One SHMEM initialization, full-Clos peer schedules and bandwidth measurement.
 
 Launch on each node with torchrun. --plan-only needs no torch/NPU installation.
-No numerical validation is performed; every report explicitly records that.
+This entrypoint is performance-only; use bench_v1_bandwidth or bench_v2_bandwidth for precision checks.
 """
 
 import argparse
@@ -17,36 +17,34 @@ import statistics
 import time
 import zlib
 
-ORDERS = ("rank", "group", "group_staggered", "group_round_robin")
+ORDERS = ("rank",)
 COMBINE_SELF_COPY_ENV = "DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY"
 COMBINE_AFTER_SUBMIT_ENV = "DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT"
 SELF_COPY_MODES = ("default", "parallel_self_copy", "self_copy_after_submit")
 SHAPES = ((8192, 2816, 8, 32), (16384, 7168, 6, 64))
 
 
-def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32), quick=False):
+def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128)):
+    if aiv < 8 or aiv > 64 or aiv % 2:
+        raise ValueError("communication cores must be even in [8, 64]")
     result = []
-    for order in ORDERS:
-        grouped = order == "group_round_robin"
-        for peers, (workers, qps), visit in itertools.product(
-            (1, 2, 4) if grouped else (1, 2, 4, 8), ((1, 1), (1, 2), (2, 1)), visits
-        ):
-            owners = math.ceil((group_size if grouped else ep - 1) / peers)
-            if owners * workers > aiv or owners * workers * qps > 32:
-                continue
-            if grouped and math.ceil(group_size / owners) * (ep // group_size) > 64:
-                continue
-            if quick and order not in ("rank", "group_round_robin"):
-                continue
-            item = dict(order=order, peers=peers, workers=workers, qps=qps, visit=visit)
-            item["id"] = f"{order}_p{peers}_w{workers}_q{qps}_v{visit}"
-            item["payload_aivs"] = owners * workers
-            result.append(item)
+    for peers, (workers, qps), visit in itertools.product((1, 2, 4, 8, 16, 32), ((1, 1), (1, 2), (2, 1)), visits):
+        owners = math.ceil((ep - 1) / peers)
+        if owners * workers > aiv or owners * workers * qps > 32:
+            continue
+        item = dict(order="rank", peers=peers, workers=workers, qps=qps, visit=visit)
+        item["id"] = f"rank_p{peers}_w{workers}_q{qps}_v{visit}"
+        item["payload_aivs"] = owners * workers
+        result.append(item)
     # Put the production automatic configuration first, as a measured baseline.
     workers = 2 if ep <= 8 else 1
     peers, visit = (1, 8) if ep <= 16 else (4, 32)
-    while math.ceil((ep - 1) / peers) * workers > min(aiv, 32) and peers < 8:
+    while math.ceil((ep - 1) / peers) * workers > min(aiv, 32) and peers < 32:
         peers *= 2
+    if ep == 128 and aiv == 8:
+        peers = 16
+    if ep == 256:
+        peers, visit = (32, 32) if aiv < 16 else (16, 16)
     baseline = f"rank_p{peers}_w{workers}_q1_v{visit}"
     result.sort(key=lambda c: c["id"] != baseline)
     return result
@@ -57,8 +55,8 @@ def parse_shape(value):
         tokens, hidden, topk, aiv = map(int, value.split(","))
     except ValueError as exc:
         raise argparse.ArgumentTypeError("case must be TOKENS,HIDDEN,TOPK,AIV") from exc
-    if min(tokens, hidden, topk, aiv) <= 0 or hidden % 32 or topk > 128 or aiv % 2 or aiv > 64:
-        raise argparse.ArgumentTypeError("positive case required: hidden multiple of 32, topk<=128, even AIV<=64")
+    if min(tokens, hidden, topk, aiv) <= 0 or hidden % 32 or topk > 128 or aiv < 8 or aiv % 2 or aiv > 64:
+        raise argparse.ArgumentTypeError("positive case required: hidden multiple of 32, topk<=128, even AIV in [8,64]")
     return dict(tokens=tokens, hidden=hidden, topk=topk, aiv=aiv)
 
 
@@ -115,8 +113,7 @@ def parse_args(argv=None):
     p.add_argument("--samples", type=int, default=8)
     p.add_argument("--final-samples", type=int, default=30)
     p.add_argument("--top", type=int, default=3)
-    p.add_argument("--visits", type=int, nargs="+", default=[4, 8, 16, 32])
-    p.add_argument("--quick", action="store_true", help="rank and group_round_robin search")
+    p.add_argument("--visits", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128])
     p.add_argument("--strategies", nargs="+", help="restrict to exact strategy IDs for a matched A/B run")
     p.add_argument("--include-weighted-combine", action="store_true", help="also measure returned FP32 top-k weights")
     p.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
@@ -161,8 +158,8 @@ def parse_args(argv=None):
         p.error("duplicate self-copy modes")
     if args.include_weighted_combine and args.combine_self_copy_modes == ["parallel_self_copy"]:
         p.error("weighted combine does not support parallel_self_copy; include default or self_copy_after_submit")
-    if args.strategies and (args.replay_report or args.quick or args.smoke):
-        p.error("strategies cannot be combined with replay-report, quick or smoke")
+    if args.strategies and (args.replay_report or args.smoke):
+        p.error("strategies cannot be combined with replay-report or smoke")
     if args.strategies and len(set(args.strategies)) != len(args.strategies):
         p.error("duplicate strategy IDs")
     args.ranks_per_group = min(8, args.ep_size) if args.ranks_per_group is None else args.ranks_per_group
@@ -173,8 +170,8 @@ def parse_args(argv=None):
         p.error("experts must be divisible by EP and cover topk")
     if args.warmup < 0 or min(args.samples, args.final_samples, args.top) < 1:
         p.error("invalid sampling parameters")
-    if not args.visits or not set(args.visits) <= {4, 8, 16, 32}:
-        p.error("visits must be 4/8/16/32")
+    if not args.visits or not set(args.visits) <= {4, 8, 16, 32, 64, 128}:
+        p.error("visits must be 4/8/16/32/64/128")
     if len({tuple(c.values()) for c in args.case}) != len(args.case):
         p.error("duplicate cases")
     return args
@@ -253,7 +250,7 @@ def configure(buffer, config):
     from deep_ep.backends.direct.config import Config
 
     order = ORDERS.index(config["order"])
-    group_peers = config["peers"] if order >= 3 else 0
+    group_peers = 0
     wanted = [order, order, group_peers, config["workers"], config["qps"]]
     actual = list(buffer.runtime._configure_tuning(*wanted))
     if actual != wanted:
@@ -286,16 +283,19 @@ def parse_capture(directory, op, configs, warmup, samples):
         raise RuntimeError(f"expected one profiler CSV, found {len(paths)}")
     with paths[0].open(encoding="utf-8-sig", newline="") as f:
         rows = sorted(csv.DictReader(f), key=lambda x: float(x["Start Time(us)"].strip()))
+    from stage_metrics import normalize_kernel_rows
+
+    rows = normalize_kernel_rows(rows)
     # buffer.barrier() and pre-combine notify share a kernel name. Match the
     # complete ordered call, so the outer barrier is never charged to notify.
     names = (
-        ["cached_notify_combine_kernel", "cached_notify_dispatch_kernel", "v1_dispatch_udma_kernel"]
+        ["cached_notify_combine_kernel", "cached_notify_dispatch_kernel", "direct_dispatch_udma_kernel"]
         if op == "cached_dispatch"
         else [
             "cached_notify_combine_kernel",
             "cached_notify_combine_kernel",
-            "v1_combine_udma_comm_kernel",
-            "v1_combine_udma_reduce_kernel",
+            "direct_combine_udma_comm_kernel",
+            "direct_combine_udma_reduce_kernel",
         ]
     )
     width = warmup + samples + 2
@@ -354,13 +354,12 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
         result[-1].current_stream_wait()
         torch.npu.synchronize()
 
-    from stage_metrics import L2CacheFlush, prepare_v2_sample, profile_combine_notify
+    from stage_metrics import L2CacheFlush, prepare_v2_sample
 
     flush_cache = L2CacheFlush(torch, buffer, args.flush_l2_cache)
     # Start/stop the profiler once for the entire strategy list, not per strategy.
     profiler = torch_npu.profiler
     with (
-        profile_combine_notify(op in ("combine_unweighted", "combine_weighted")),
         profiler.profile(
             activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
             on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
@@ -444,7 +443,7 @@ def main():
     ):
         raise ValueError("replay EP/experts/seed/group size/L2/page settings must match report")
     for shape in shapes:
-        configs = candidates(args.ep_size, shape["aiv"], args.ranks_per_group, args.visits, args.quick)
+        configs = candidates(args.ep_size, shape["aiv"], args.ranks_per_group, args.visits)
         if not configs:
             raise ValueError(f"no legal candidates for {shape}")
         if args.smoke:
@@ -485,7 +484,7 @@ def main():
         dict.fromkeys(c["self_copy_mode"] for p in plans for c in p["operations"]["combine_unweighted"])
     )
     if args.plan_only:
-        print(json.dumps(dict(ep=args.ep_size, plans=plans), indent=2))
+        print(json.dumps(dict(ep=args.ep_size, plans=plans, qp_reservation="tuning_union"), indent=2))
         return
     import torch
     import torch_npu
@@ -521,6 +520,7 @@ def main():
             and name not in ("DEEPEP_CLOS_TUNING_SESSION", COMBINE_SELF_COPY_ENV, COMBINE_AFTER_SUBMIT_ENV)
         ):
             raise RuntimeError(f"conflicting experimental environment: {name}")
+    # Tuning-session initialization reserves all supported rank candidates.
     group.agree(plans)
     import importlib.util
 
@@ -549,6 +549,7 @@ def main():
             experts=args.experts,
             seed=args.seed,
             plans=plans,
+            qp_reservation="tuning_union",
             workspace_bytes=workspace,
             huge_pages=args.huge_pages,
             flush_l2=args.flush_l2_cache,
@@ -564,6 +565,7 @@ def main():
     init_started = time.monotonic()
     buffer = ElasticBuffer(
         group,
+        combine_notify=True,
         num_bytes=workspace,
         num_max_tokens_per_rank=capacity,
         hidden=0,
@@ -628,10 +630,8 @@ def main():
                 ),
             }
             if weighted:
-                invocations["combine_weighted"] = (
-                    lambda owned=owned, handle=handle, a=a, w=owned_weights: buffer.combine(
-                        owned, handle, topk_weights=w, num_sms=a, async_with_compute_stream=True
-                    )
+                invocations["combine_weighted"] = lambda owned=owned, handle=handle, a=a, w=owned_weights: (
+                    buffer.combine(owned, handle, topk_weights=w, num_sms=a, async_with_compute_stream=True)
                 )
             item = dict(shape=shape, operations={})
             for op, invoke in invocations.items():
@@ -767,11 +767,23 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         import sys
         import traceback
 
-        if "--output" in sys.argv and "RANK" in os.environ:
-            destination = Path(sys.argv[sys.argv.index("--output") + 1]) / f"rank{os.environ['RANK']}" / "exit.json"
-            write(destination, dict(code=1, complete=False, traceback=traceback.format_exc()))
+        try:
+            if "--output" in sys.argv and "RANK" in os.environ:
+                destination = Path(sys.argv[sys.argv.index("--output") + 1]) / f"rank{os.environ['RANK']}" / "exit.json"
+                write(destination, dict(code=1, complete=False, traceback=traceback.format_exc()))
+        except OSError:
+            traceback.print_exc()
+        if (
+            any(a.split("=", 1)[0] in ("--small-rank-sweep", "--combine-payload-max-rows") for a in sys.argv)
+            and "RANK" in os.environ
+        ):
+            # Do not enter native collective destruction after a failed rank.
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
         raise

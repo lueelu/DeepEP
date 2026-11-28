@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <torch/custom_class.h>
 #include <tuple>
@@ -13,6 +15,26 @@ class BufferRuntime;
 }
 
 namespace ascend_deepep::ops {
+
+// Read-only launch observation for benchmarks; never used to choose a policy.
+// order, P, W, Q, visit, communication cores, reduce cores, compact weights, direct self.
+inline std::array<uint32_t, 9>& LastCombineLaunch()
+{
+    static thread_local std::array<uint32_t, 9> launch{};
+    return launch;
+}
+
+inline uint32_t& LastCombineWqeFast()
+{
+    static thread_local uint32_t enabled = 0;
+    return enabled;
+}
+
+inline uint32_t& LastCombinePayloadMaxRows()
+{
+    static thread_local uint32_t rows = 1;
+    return rows;
+}
 
 using CombineResult = std::tuple<torch::Tensor, c10::optional<torch::Tensor>>;
 
@@ -32,7 +54,7 @@ private:
     bool consumed_{false};
 };
 
-std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
+std::tuple<torch::Tensor, c10::optional<torch::Tensor>> Combine(
     torch::Tensor x, c10::optional<torch::Tensor> topk_weights, c10::optional<torch::Tensor> bias_0,
     c10::optional<torch::Tensor> bias_1, torch::Tensor src_idx, torch::Tensor rank_prefix_matrix,
     torch::Tensor channel_prefix_matrix, torch::Tensor send_head, int64_t num_aiv,
@@ -45,6 +67,7 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> V1Combine(
     c10::optional<torch::Tensor> single_source_slots = c10::nullopt, std::function<void()> aggregate = {},
     c10::optional<torch::Tensor> pipeline_mapping = c10::nullopt,
     c10::optional<torch::Tensor> pipeline_values = c10::nullopt, int64_t pipeline_chunk_tokens = 0,
-    int64_t reduce_num_aiv = 0, const std::vector<int64_t>& launch_plan = {});
+    int64_t reduce_num_aiv = 0, const std::vector<int64_t>& launch_plan = {},
+    c10::optional<torch::Tensor> send_channel_prefix_matrix = c10::nullopt);
 
 }  // namespace ascend_deepep::ops

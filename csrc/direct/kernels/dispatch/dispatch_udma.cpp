@@ -37,7 +37,8 @@ __aicore__ inline uint32_t DispatchAlignUp32(uint32_t value)
 
 } // namespace
 
-__aicore__ inline void V1DispatchUdmaKernelImpl(
+template <class Trace>
+__aicore__ inline void DispatchUdmaKernelImpl(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
@@ -56,6 +57,14 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
 
     const int32_t core_idx = get_block_idx() * get_subblockdim() + get_subblockid();
     const int32_t core_num = get_block_num() * get_subblockdim();
+    Trace trace(tiling.dispatch_device_trace);
+    trace.Set(Trace::Version, 2);
+    trace.Set(Trace::Rank, tiling.rank);
+    trace.Set(Trace::Core, core_idx);
+    trace.Set(Trace::Cached, tiling.cached_mode);
+    trace.Set(Trace::SrcThreads, tiling.metadata_src_threads);
+    trace.Set(Trace::TopkThreads, tiling.metadata_topk_threads);
+    trace.Set(Trace::Entry, trace.Now());
     const int32_t rank = static_cast<int32_t>(tiling.rank);
     const int32_t world_size = static_cast<int32_t>(tiling.world_size);
     const int32_t hidden = static_cast<int32_t>(tiling.hidden);
@@ -90,7 +99,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     if (tiling.has_x_scales && tiling.needs_x_scales_pack) {
         dispatch_scales = symmetric_buffer + tiling.x_scales_input_buffer_offset;
         if (!overlap_scales) {
-            asc_vf_call<ascend_deepep::PackV1DispatchScalesSimtVf>(
+            asc_vf_call<ascend_deepep::PackDispatchScalesSimtVf>(
                 dim3(128), reinterpret_cast<const __gm__ uint32_t*>(x_scales),
                 reinterpret_cast<__gm__ uint32_t*>(dispatch_scales), tiling.num_tokens, tiling.num_scales,
                 tiling.scale_token_stride, tiling.scale_hidden_stride, uint32_t(core_idx), uint32_t(core_num));
@@ -119,23 +128,33 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     auto staging_pingpong_ub = resource.template GetBufferByByte<uint8_t>(0);
     AscendC::DataCopyPadExtParams<uint8_t> uint8_pad_params{false, 0, 0, 0};
 
-    if (num_topk > 0) {
+    if (num_topk > 0 && !tiling.dispatch_skip_topk_init) {
+        const uint64_t init_started = trace.Now();
         const uint32_t rows = DispatchMin(
             rank_prefix_gm.GetValue((world_size - 1) * world_size + rank), num_output_tokens);
         ascend_deepep::udma::InitializeDispatchTopk(resource, symmetric_buffer, tiling, rows, core_idx, core_num);
+        trace.Add(Trace::TopkInitCycles, init_started);
     }
     if (tiling.udma_output_control && core_idx == 0) {
         ascend_deepep::udma::PrepareDispatchOutput(resource, tiling.udma_output_control, rank, world_size,
             recv_x, recv_x_scales, tiling.num_output_tokens,
             static_cast<uint32_t>(rank_prefix_gm.GetValue((world_size - 1) * world_size + rank)),
-            hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0, tiling.instance_id);
+            hidden_bytes, tiling.has_x_scales ? scale_row_bytes : 0, tiling.instance_id,
+            tiling.metadata_direct_output ? tiling.metadata_src_output : 0,
+            tiling.metadata_direct_output ? tiling.metadata_weight_output : 0,
+            tiling.metadata_direct_output && !tiling.cached_mode ? sizeof(int32_t) : 0U,
+            tiling.metadata_direct_output && tiling.has_topk_weights ? topk_weights_row_bytes : 0U,
+            tiling.metadata_direct_output && !tiling.omit_topk_output ? tiling.metadata_topk_output : 0,
+            tiling.metadata_direct_output && !tiling.omit_topk_output ? topk_idx_row_bytes : 0U);
     }
+    trace.Mark(Trace::InitDone);
     // Clears incoming payload markers and publishes this invocation's output
     // addresses/top-k initialization before remote writes. Every AIV participates.
     ascend_deepep::udma::Begin(symmetric_buffer, tiling.udma_completion_signal_offset, rank, world_size,
         core_idx, core_num, resource.template GetBufferByByte<uint64_t>(0),
         tiling.udma_token_schedule ? ascend_deepep::udma::TokenWorkers(core_num) : tiling.udma_workers_per_peer * tiling.udma_qps_per_worker);
 
+    trace.Mark(Trace::BeginDone);
     if (overlap_scales) {
         const uint32_t first = ascend_deepep::udma::MetadataFirst(world_size, tiling.udma_peers_per_worker,
             core_num, tiling.udma_peer_order, tiling.udma_ranks_per_group, tiling.udma_workers_per_peer);
@@ -144,7 +163,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             // Both producers read immutable original input independently. No
             // normalization-to-peer-pack barrier is needed on this path.
             if (tiling.needs_x_scales_pack) {
-                asc_vf_call<ascend_deepep::PackV1DispatchScalesSimtVf>(dim3(128),
+                asc_vf_call<ascend_deepep::PackDispatchScalesSimtVf>(dim3(128),
                     reinterpret_cast<const __gm__ uint32_t*>(x_scales),
                     reinterpret_cast<__gm__ uint32_t*>(dispatch_scales), tiling.num_tokens, tiling.num_scales,
                     tiling.scale_token_stride, tiling.scale_hidden_stride, worker, workers);
@@ -170,15 +189,22 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
 
     // With spare cores, payload owners skip this helper and immediately start
     // UDMA while the other cores build metadata and copy self channels.
-    ascend_deepep::udma::DispatchMetadata(resource, x, dispatch_scales, topk_idx, topk_weights,
-        dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head,
-        tiling, core_idx, core_num, kDispatchStageBytes, recv_x, recv_x_scales);
+    if (!tiling.dispatch_self_after_submit) {
+        ascend_deepep::udma::DispatchMetadata(resource, x, dispatch_scales, topk_idx, topk_weights,
+            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head,
+            tiling, core_idx, core_num, kDispatchStageBytes, recv_x, recv_x_scales, trace);
+        trace.Mark(Trace::MetadataDone);
+    }
     if (tiling.udma_token_schedule) {
         ascend_deepep::udma::DispatchTokenRemote(resource, x, dispatch_scales,
             dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num);
     } else {
+        ascend_deepep::udma::DispatchOverlapWork<decltype(resource), Trace> overlap{
+            resource, trace, x, dispatch_scales, topk_idx, topk_weights, dispatch_plan,
+            rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, send_head, recv_x, recv_x_scales,
+            tiling, uint32_t(core_idx), uint32_t(core_num)};
         ascend_deepep::udma::DispatchRemote(resource, x, dispatch_scales,
-            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num);
+            dispatch_plan, rank_prefix_matrix, channel_prefix_matrix, symmetric_buffer, tiling, core_idx, core_num, trace, overlap);
     }
 
     const int32_t actual_recv_tokens = rank_prefix_gm.GetValue((world_size - 1) * world_size + rank);
@@ -200,7 +226,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
     // unaligned, while both ping-pong UB starts remain 32-byte aligned.
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-    if (rebuild_dispatch_handle) {
+    if (rebuild_dispatch_handle && !tiling.metadata_direct_output) {
         int32_t copied_src_idx_tokens = 0;
         int32_t src_idx_buffer_idx = 0;
         while (copied_src_idx_tokens < worker_tokens) {
@@ -224,6 +250,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
                     [static_cast<uint64_t>(recv_token_begin + copied_src_idx_tokens) * kDispatchInt32Bytes],
                 src_idx_staging_ub, src_idx_copy_params);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(src_idx_event_id);
+            trace.Accumulate(Trace::SrcOutputBytes, tile_bytes);
             copied_src_idx_tokens += tile_tokens;
             src_idx_buffer_idx = (src_idx_buffer_idx + 1) & staging_buffer_mask;
         }
@@ -247,40 +274,73 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         }
     }
     if (num_topk > 0) {
-        ascend_deepep::CopyDispatchRecvToGm(
-            recv_topk_idx, symmetric_buffer, tiling.topk_idx_buffer_offset,
-            static_cast<uint64_t>(recv_token_begin) * topk_idx_row_bytes,
-            static_cast<uint64_t>(worker_tokens) * topk_idx_row_bytes, staging_pingpong_ub, staging_capacity);
-        if (tiling.has_topk_weights != 0) {
+        if (!tiling.omit_topk_output && !tiling.metadata_direct_output) {
+            trace.Accumulate(Trace::TopkOutputBytes, uint64_t(worker_tokens) * topk_idx_row_bytes);
             ascend_deepep::CopyDispatchRecvToGm(
-                recv_topk_weights, symmetric_buffer, tiling.topk_weights_buffer_offset,
-                static_cast<uint64_t>(recv_token_begin) * topk_weights_row_bytes,
-                static_cast<uint64_t>(worker_tokens) * topk_weights_row_bytes, staging_pingpong_ub, staging_capacity);
+                recv_topk_idx, symmetric_buffer, tiling.topk_idx_buffer_offset,
+                static_cast<uint64_t>(recv_token_begin) * topk_idx_row_bytes,
+                static_cast<uint64_t>(worker_tokens) * topk_idx_row_bytes, staging_pingpong_ub, staging_capacity);
+        }
+        if (tiling.has_topk_weights != 0 && !tiling.metadata_direct_output) {
+            // Channel packing generated self weights directly into recv output.
+            // Copy only remote contributors; stale self SHMEM must never overwrite
+            // the final tensor. Rank prefixes define one contiguous self interval.
+            const int32_t self_begin = tiling.channel_metadata && rank > 0
+                ? rank_prefix_gm.GetValue((rank - 1) * world_size + rank) : 0;
+            const int32_t self_end = tiling.channel_metadata
+                ? rank_prefix_gm.GetValue(rank * world_size + rank) : 0;
+            for (uint32_t part = 0; part < 2; ++part) {
+                const int32_t begin = part == 0 ? recv_token_begin :
+                    (recv_token_begin > self_end ? recv_token_begin : self_end);
+                const int32_t end = part == 0 ? DispatchMin(recv_token_begin + worker_tokens, self_begin)
+                                             : recv_token_begin + worker_tokens;
+                if (end <= begin) continue;
+                trace.Accumulate(Trace::WeightOutputBytes, uint64_t(end - begin) * topk_weights_row_bytes);
+                ascend_deepep::CopyDispatchRecvToGm(
+                    recv_topk_weights, symmetric_buffer, tiling.topk_weights_buffer_offset,
+                    static_cast<uint64_t>(begin) * topk_weights_row_bytes,
+                    static_cast<uint64_t>(end - begin) * topk_weights_row_bytes, staging_pingpong_ub, staging_capacity);
+            }
         }
     }
 
+    trace.FinishOutput();
     if (tiling.v2_rank_prefix != 0) {
-        // The existing completion boundary has made all local SHMEM metadata
-        // visible. Read it directly: no dependence on another AIV's GM copy.
+        // The existing completion boundary makes staged and direct metadata
+        // visible. Read the producer destination, not another AIV's output copy.
+        const uint64_t source_started = trace.Now();
         asc_vf_call<ascend_deepep::V2HandleSourceVf>(dim3(128),
             reinterpret_cast<__gm__ int32_t*>(rank_prefix_matrix),
-            reinterpret_cast<__gm__ int32_t*>(symmetric_buffer + tiling.src_idx_buffer_offset),
-            reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(symmetric_buffer + tiling.topk_idx_buffer_offset),
+            reinterpret_cast<__gm__ int32_t*>(tiling.metadata_direct_output
+                ? recv_src_idx : symmetric_buffer + tiling.src_idx_buffer_offset),
+            reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(
+                tiling.metadata_direct_output && !tiling.omit_topk_output
+                    ? tiling.metadata_topk_output : reinterpret_cast<uint64_t>(symmetric_buffer) + tiling.topk_idx_buffer_offset),
             reinterpret_cast<__gm__ int32_t*>(tiling.v2_src_metadata),
             tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_topk,
             tiling.num_output_tokens, uint32_t(core_idx), uint32_t(core_num));
         AscendC::PipeBarrier<PIPE_V>();
-        asc_vf_call<ascend_deepep::V2HandleSlotsVf>(dim3(128),
-            reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(topk_idx),
-            reinterpret_cast<__gm__ int32_t*>(send_head),
-            reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix),
-            reinterpret_cast<__gm__ int32_t*>(tiling.v2_dst_slots),
-            tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_local_experts,
-            tiling.num_topk, tiling.num_tokens, tiling.num_channels, uint32_t(core_idx), uint32_t(core_num));
+        if constexpr (Trace::enabled) {
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        }
+        trace.Add(Trace::SourceCycles, source_started);
+        const uint64_t slots_started = trace.Now();
+        if (!tiling.dispatch_early_slots) {
+            asc_vf_call<ascend_deepep::V2HandleSlotsVf>(dim3(128),
+                reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(topk_idx),
+                reinterpret_cast<__gm__ int32_t*>(send_head),
+                reinterpret_cast<__gm__ int32_t*>(channel_prefix_matrix),
+                reinterpret_cast<__gm__ int32_t*>(tiling.v2_dst_slots),
+                tiling.rank, tiling.world_size, tiling.num_max_tokens_per_rank / tiling.world_size, tiling.num_local_experts,
+                tiling.num_topk, tiling.num_tokens, tiling.num_channels, uint32_t(core_idx), uint32_t(core_num));
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID6);
+        if (!tiling.dispatch_early_slots) trace.Add(Trace::SlotsCycles, slots_started);
     }
 
+    trace.Mark(Trace::HandleDone);
     // Padding belongs to the returned storage, whether owned GM or a SHMEM view.
     const int32_t padding_tokens = num_output_tokens - recv_tokens_to_copy;
     const int32_t padding_tokens_per_worker = padding_tokens / core_num;
@@ -298,7 +358,8 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
             output_scales_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_x_scales));
         }
         if (num_topk > 0) {
-            output_topk_idx_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_topk_idx));
+            if (!tiling.omit_topk_output)
+                output_topk_idx_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_topk_idx));
             if (tiling.has_topk_weights != 0) {
                 output_weights_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(recv_topk_weights));
             }
@@ -321,7 +382,7 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         auto topk_idx_ub =
             resource.template GetBufferByByte<ascend_deepep::topk_idx_t>(kDispatchPaddingTopkOffset);
         auto topk_idx_bytes_ub = topk_idx_ub.ReinterpretCast<uint8_t>();
-        if (num_topk > 0) {
+        if (num_topk > 0 && !tiling.omit_topk_output) {
             for (int32_t topk = 0; topk < num_topk; ++topk) {
                 topk_idx_ub.SetValue(topk, static_cast<ascend_deepep::topk_idx_t>(-1));
             }
@@ -344,9 +405,11 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
                     zero_staging_ub, zero_scale_store_params);
             }
             if (num_topk > 0) {
-                AscendC::DataCopyPad(
-                    output_topk_idx_gm[static_cast<uint64_t>(padding_token) * topk_idx_row_bytes],
-                    topk_idx_bytes_ub, invalid_topk_store_params);
+                if (!tiling.omit_topk_output) {
+                    AscendC::DataCopyPad(
+                        output_topk_idx_gm[static_cast<uint64_t>(padding_token) * topk_idx_row_bytes],
+                        topk_idx_bytes_ub, invalid_topk_store_params);
+                }
                 if (tiling.has_topk_weights != 0) {
                     AscendC::DataCopyPad(
                         output_weights_gm[static_cast<uint64_t>(padding_token) * topk_weights_row_bytes],
@@ -357,9 +420,10 @@ __aicore__ inline void V1DispatchUdmaKernelImpl(
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
     }
+    trace.Save(resource, core_idx);
 }
 
-extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void v1_dispatch_udma_kernel(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_dispatch_udma_kernel(
     GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
     GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
     GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
@@ -367,13 +431,27 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ 
     ascend_deepep::DispatchTilingData tiling, uint64_t ffts_addr)
 {
     aclshmemx_instance_ctx_set(tiling.instance_id);
-    V1DispatchUdmaKernelImpl(
+    DispatchUdmaKernelImpl<ascend_deepep::udma::DisabledDispatchDeviceTrace>(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
         symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
         channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, tiling, ffts_addr);
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
+extern "C" [[bisheng::core_ratio(0, 1)]] __schedmode__(1) __global__ __aicore__ void direct_dispatch_udma_trace_kernel(
+    GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_idx, GM_ADDR topk_weights, GM_ADDR num_tokens_per_rank,
+    GM_ADDR is_token_in_rank, GM_ADDR num_tokens_per_expert, GM_ADDR symmetric_buffer, GM_ADDR recv_x,
+    GM_ADDR recv_x_scales, GM_ADDR recv_topk_idx, GM_ADDR recv_topk_weights, GM_ADDR rank_prefix_matrix,
+    GM_ADDR channel_prefix_matrix, GM_ADDR recv_channel_prefix_matrix, GM_ADDR recv_src_idx, GM_ADDR send_head, GM_ADDR dispatch_plan,
+    ascend_deepep::DispatchTilingData tiling, uint64_t ffts_addr)
+{
+    aclshmemx_instance_ctx_set(tiling.instance_id);
+    DispatchUdmaKernelImpl<ascend_deepep::udma::DispatchDeviceTrace>(
+        x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
+        symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
+        channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, tiling, ffts_addr);
+}
+
+extern "C" ASCEND_DEEPEP_EXPORT void direct_dispatch_udma_plan_kernel_do(
     uint32_t block_dim, void* stream, uint8_t* x, uint8_t* x_scales, uint8_t* topk_idx, uint8_t* topk_weights,
     uint8_t* num_tokens_per_rank, uint8_t* is_token_in_rank, uint8_t* num_tokens_per_expert, uint8_t* symmetric_buffer,
     uint8_t* recv_x, uint8_t* recv_x_scales, uint8_t* recv_topk_idx, uint8_t* recv_topk_weights,
@@ -381,13 +459,20 @@ extern "C" ASCEND_DEEPEP_EXPORT void v1_dispatch_udma_plan_kernel_do(
     uint8_t* recv_src_idx, uint8_t* send_head, uint8_t* dispatch_plan, uint8_t* tiling_host, uint64_t ffts_addr)
 {
     auto* td = reinterpret_cast<ascend_deepep::DispatchTilingData*>(tiling_host);
-    v1_dispatch_udma_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
-        x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
-        symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
-        channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, *td, ffts_addr);
+    if (td->dispatch_device_trace) {
+        direct_dispatch_udma_trace_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
+            x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
+            symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
+            channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, *td, ffts_addr);
+    } else {
+        direct_dispatch_udma_kernel<<<block_dim, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kDispatchUbBytes), stream>>>(
+            x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
+            symmetric_buffer, recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, rank_prefix_matrix,
+            channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, dispatch_plan, *td, ffts_addr);
+    }
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT uint64_t v1_multi_instance_abi_4() {
+extern "C" ASCEND_DEEPEP_EXPORT uint64_t direct_multi_instance_abi_4() {
     return (uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
            uint64_t(sizeof(ascend_deepep::CombineTilingData));
 }

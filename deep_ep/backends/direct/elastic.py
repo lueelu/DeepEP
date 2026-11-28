@@ -7,7 +7,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from typing import Any, List, Optional, Tuple, Union
 
-from ._native import get_native_class
+from ._native import get_native_class, load_native_module
 from .buffer import (
     _BOOTSTRAP_LOCK,
     _compact_extra_tensors,
@@ -20,6 +20,7 @@ from .buffer import (
     _try_record_event,
     _use_comm_stream,
     _validate_udma_peer_order,
+    _validate_shmem_init_timeout,
 )
 from .config import Config
 from .config import (
@@ -104,12 +105,27 @@ class ElasticBuffer:
     Fresh dispatch defaults to 32 AIVs. Cached dispatch and combine inherit
     the EPHandle core count. UDMA automatically tunes peer/rank scheduling.
 
-    Dispatch and combine share the optimized V1 backend. V2 keeps EPHandle,
+    Dispatch and combine share the direct communication backend. V2 keeps EPHandle,
     optional expert expansion and independently allocated GM outputs. UDMA
     uses the same shared-Jetty scheduler as V1; MTE retains its own transport.
     ``use_1g_huge_pages`` optionally backs the symmetric workspace with 1 GiB
     HBM pages through CANN SHMEM's user-buffer initialization path.
     """
+
+    @property
+    def shmem_init_timeout_secs(self) -> int:
+        """SHMEM initialization and bootstrap timeout in seconds (read-only)."""
+        return self._shmem_init_timeout_secs
+
+    @property
+    def combine_notify(self) -> bool:
+        """Whether this Buffer requests a separate combine rendezvous (read-only)."""
+        return self._combine_notify
+
+    @property
+    def fused_layout_notify(self) -> bool:
+        """Whether fresh UDMA dispatch fuses layout into notify (read-only)."""
+        return self._fused_layout_notify
 
     def __init__(
         self,
@@ -143,7 +159,18 @@ class ElasticBuffer:
         udma_peers_per_worker: Optional[int] = None,
         udma_wqes_per_visit: Optional[int] = None,
         udma_auto_policy: bool = True,
+        shmem_init_timeout_secs: int = 600,
+        combine_notify: bool = False,
+        fused_layout_notify: bool = False,
     ) -> None:
+        _validate_shmem_init_timeout(shmem_init_timeout_secs)
+        self._shmem_init_timeout_secs = shmem_init_timeout_secs
+        if type(combine_notify) is not bool:
+            raise TypeError("combine_notify must be a bool")
+        self._combine_notify = combine_notify
+        if type(fused_layout_notify) is not bool:
+            raise TypeError("fused_layout_notify must be a bool")
+        self._fused_layout_notify = fused_layout_notify
         rank, num_ranks, resolved_group = _resolve_group_or_comm(group, None)
         transport = _normalize_transport(transport or os.environ.get("ASCEND_DEEPEP_TRANSPORT", "auto"))
         self._udma_auto_policy = resolve_udma_policy(
@@ -178,6 +205,8 @@ class ElasticBuffer:
         udma_schedule = "peer" if udma_schedule is None else udma_schedule
         udma_dispatch_peer_order = "rank" if udma_dispatch_peer_order is None else udma_dispatch_peer_order
         udma_combine_peer_order = "rank" if udma_combine_peer_order is None else udma_combine_peer_order
+        if fused_layout_notify and transport != "udma":
+            raise ValueError("fused_layout_notify requires UDMA transport")
         if udma_schedule not in ("peer", "token"):
             raise ValueError("udma_schedule must be 'peer' or 'token'")
         if udma_schedule == "token" and transport != "udma":
@@ -306,6 +335,9 @@ class ElasticBuffer:
                 num_max_tokens_per_rank or None,
                 udma_schedule,
                 peer_options,
+                combine_notify=combine_notify,
+                shmem_init_timeout_secs=shmem_init_timeout_secs,
+                fused_layout_notify=fused_layout_notify,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
                     if self._udma_auto_policy is not None
@@ -327,6 +359,10 @@ class ElasticBuffer:
                 # Keep the appended flag after all six native peer fields.
                 *(peer_options + (0, 0, 0, 0, 1, 1)[len(peer_options) :]),
                 self._udma_auto_policy is not None,
+                self._udma_auto_policy.reservation_spec() if self._udma_auto_policy is not None else "",
+                combine_notify,
+                fused_layout_notify,
+                shmem_init_timeout_secs,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -338,7 +374,7 @@ class ElasticBuffer:
         self._communication_stream = get_global_comm_stream()
 
         # Match the V2 initialization visibility contract on the communication
-        # stream. The native barrier kernel is reused from the V1 resource layer.
+        # stream. The native barrier kernel is shared by the direct resource layer.
         self.barrier(use_comm_stream=True, with_cpu_sync=True)
 
     @property
@@ -662,6 +698,15 @@ class ElasticBuffer:
     ) -> Tuple[Any, Optional[Any], Optional[Any], EPHandle, EventOverlap]:
         """Dispatch through the intranode kernel, optionally expanding rows."""
 
+        host_timing = None
+        timing_flag = os.environ.get("DEEPEP_CLOS_DISPATCH_HOST_TIMING", "0")
+        if timing_flag not in ("0", "1"):
+            raise ValueError("DEEPEP_CLOS_DISPATCH_HOST_TIMING must be 0 or 1")
+        if timing_flag == "1":
+            host_timing = load_native_module()
+            if getattr(host_timing, "fused_notify_pipeline_version", 0) != 1:
+                raise RuntimeError("rebuild native/device libraries for notify pipeline diagnostics")
+            host_timing.begin_dispatch_host_timing()
         self._ensure_alive()
         _validate_dispatch_scope(
             x,
@@ -788,12 +833,44 @@ class ElasticBuffer:
         make_single_source = (
             not cached_mode and do_expand and self.transport == "udma" and self._use_single_source_combine
         )
-        if make_single_source:
+        fused_layout = "1" if self.fused_layout_notify and not cached_mode else "0"
+        # Independent V2 layout follows dispatch's resolved core count by default.
+        # Explicit fusion owns layout itself; it needs no separate layout launch.
+        simt_layout = (
+            os.environ.get("DEEPEP_CLOS_V2_SIMT_LAYOUT", "0" if fused_layout == "1" else "1")
+            if not cached_mode
+            else "0"
+        )
+        if simt_layout not in ("0", "1"):
+            raise ValueError("DEEPEP_CLOS_V2_SIMT_LAYOUT must be 0 or 1")
+        host_entry_option = os.environ.get("DEEPEP_CLOS_DISPATCH_HOST_ENTRY", "1")
+        if host_entry_option not in ("0", "1"):
+            raise ValueError("DEEPEP_CLOS_DISPATCH_HOST_ENTRY must be 0 or 1")
+        # Older wheels keep the existing two-entry path. Rebuilt wheels default
+        # to one Host entry; the explicit zero is an identical-build A/B control.
+        if simt_layout == "1" and fused_layout == "1":
+            raise ValueError("V2 SIMT layout requires separate layout/notify")
+        host_prep = os.environ.get("DEEPEP_CLOS_NOTIFY_HOST_PREP", "0") if not cached_mode else "0"
+        defer_plan = os.environ.get("DEEPEP_CLOS_NOTIFY_DEFER_PLAN", "0") if not cached_mode else "0"
+        if host_prep not in ("0", "1") or defer_plan not in ("0", "1"):
+            raise ValueError("notify HOST_PREP/DEFER_PLAN options must be 0 or 1")
+        if host_prep == "1" or defer_plan == "1":
+            if fused_layout != "1":
+                raise ValueError("notify HOST_PREP/DEFER_PLAN require fused layout notify")
+            if getattr(load_native_module(), "fused_notify_pipeline_version", 0) != 1:
+                raise RuntimeError("rebuild native/device libraries for notify pipeline options")
+        if make_single_source or (fused_layout == "1" and host_prep == "0"):
             import torch
 
             allocation_stream = self._communication_stream if allocate_on_comm_stream else _current_npu_stream()
         dependency = previous_event or _try_record_event(None)
         with _use_stream_after_event(self._communication_stream, dependency):
+            host_entry = (
+                not cached_mode
+                and fused_layout == "0"
+                and host_entry_option == "1"
+                and getattr(load_native_module(), "dispatch_host_entry_version", 0) == 1
+            )
             if cached_mode:
                 dispatch_layout = handle._dispatch_layout
                 rank_prefix_matrix, channel_prefix_matrix, _, _, is_token_in_rank, _ = dispatch_layout
@@ -812,12 +889,50 @@ class ElasticBuffer:
                     )
             else:
                 kernel_topk_idx = resolved_topk_idx
-                (
-                    num_tokens_per_rank,
-                    _,
-                    num_tokens_per_expert,
-                    is_token_in_rank,
-                ) = self._native.get_dispatch_layout(resolved_topk_idx, resolved_num_experts, allocation_stream_id)
+                if fused_layout == "1":
+                    if self.transport != "udma":
+                        raise ValueError("fused layout requires fresh V2 UDMA dispatch")
+                    if getattr(load_native_module(), "fused_layout_notify_version", 0) != 2:
+                        raise RuntimeError("rebuild both native and device libraries for fused layout notify")
+                    if host_prep == "1":
+                        num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank = (
+                            self._native.allocate_dispatch_layout(
+                                resolved_topk_idx, resolved_num_experts, allocation_stream_id
+                            )
+                        )
+                    else:
+                        with _use_comm_stream(allocation_stream):
+                            num_tokens_per_rank = torch.empty(
+                                (self.num_ranks,), device=x_tensor.device, dtype=torch.int32
+                            )
+                            num_tokens_per_expert = torch.empty(
+                                (resolved_num_experts,), device=x_tensor.device, dtype=torch.int32
+                            )
+                            is_token_in_rank = torch.empty(
+                                (x_tensor.shape[0], self.num_ranks), device=x_tensor.device, dtype=torch.bool
+                            )
+                elif host_entry:
+                    # Allocate and launch layout inside the following native
+                    # fresh-dispatch call, keeping intermediate tensors native.
+                    num_tokens_per_rank = num_tokens_per_expert = is_token_in_rank = None
+                elif simt_layout == "1":
+                    if getattr(load_native_module(), "v2_simt_layout_version", 0) != 1:
+                        raise RuntimeError("rebuild host and kernels for V2 SIMT layout")
+                    (
+                        num_tokens_per_rank,
+                        _,
+                        num_tokens_per_expert,
+                        is_token_in_rank,
+                    ) = self._native.get_dispatch_layout_v2_simt(
+                        resolved_topk_idx, resolved_num_experts, resolved_num_sms, allocation_stream_id
+                    )
+                else:
+                    (
+                        num_tokens_per_rank,
+                        _,
+                        num_tokens_per_expert,
+                        is_token_in_rank,
+                    ) = self._native.get_dispatch_layout(resolved_topk_idx, resolved_num_experts, allocation_stream_id)
                 rank_prefix_matrix = None
                 channel_prefix_matrix = None
             config = Config(
@@ -825,34 +940,64 @@ class ElasticBuffer:
                 udma_peers_per_worker=policy.peers_per_worker if policy else self._udma_config.udma_peers_per_worker,
                 udma_wqes_per_visit=policy.wqes_per_visit if policy else self._udma_config.udma_wqes_per_visit,
             )
-            dispatch_args = (
-                x_tensor,
-                x_scales,
-                kernel_topk_idx,
-                topk_weights,
-                num_tokens_per_rank,
-                is_token_in_rank,
-                num_tokens_per_expert,
-                handle.num_recv_tokens if cached_mode else 0,
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                resolved_alignment,
-                0 if cached_mode or resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
-                config.num_aiv,
-                config.num_max_nvl_chunked_send_tokens,
-                config.num_max_nvl_chunked_recv_tokens,
-                False,
-                allocation_stream_id,
-                resolved_capacity,
-                config.udma_peers_per_worker,
-                config.udma_wqes_per_visit,
-                handle._dispatch_plan if cached_mode else None,
-            )
+            if not host_entry:
+                dispatch_args = (
+                    x_tensor,
+                    x_scales,
+                    kernel_topk_idx,
+                    topk_weights,
+                    num_tokens_per_rank,
+                    is_token_in_rank,
+                    num_tokens_per_expert,
+                    handle.num_recv_tokens if cached_mode else 0,
+                    rank_prefix_matrix,
+                    channel_prefix_matrix,
+                    resolved_alignment,
+                    0 if cached_mode or resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
+                    config.num_aiv,
+                    config.num_max_nvl_chunked_send_tokens,
+                    config.num_max_nvl_chunked_recv_tokens,
+                    False,
+                    allocation_stream_id,
+                    resolved_capacity,
+                    config.udma_peers_per_worker,
+                    config.udma_wqes_per_visit,
+                    handle._dispatch_plan if cached_mode else None,
+                )
             if cached_mode:
+                metadata_options = topk_weights is not None and any(
+                    os.environ.get(name, "1") == "1"
+                    for name in ("DEEPEP_CLOS_CACHED_WEIGHT_PACK", "DEEPEP_CLOS_CACHED_OMIT_TOPK_OUTPUT")
+                )
+                extra = ()
+                if metadata_options:
+                    if getattr(load_native_module(), "dispatch_metadata_output_version", 0) != 2:
+                        raise RuntimeError("rebuild host and kernels for cached metadata output experiments")
+                    extra = (handle._dispatch_layout[5], not do_expand)
                 result = self._native.intranode_dispatch_with_plan(
-                    *dispatch_args, policy.native_plan() if policy else []
+                    *dispatch_args, policy.native_plan() if policy else [], *extra
                 )
                 public_handle = None
+            elif host_entry:
+                result, public_handle, is_token_in_rank = self._native.intranode_dispatch_from_topk(
+                    x_tensor,
+                    x_scales,
+                    kernel_topk_idx,
+                    topk_weights,
+                    resolved_num_experts,
+                    resolved_alignment,
+                    0 if resolved_do_cpu_sync else resolved_capacity * self.num_ranks,
+                    config.num_aiv,
+                    config.num_max_nvl_chunked_send_tokens,
+                    config.num_max_nvl_chunked_recv_tokens,
+                    allocation_stream_id,
+                    resolved_capacity,
+                    config.udma_peers_per_worker,
+                    config.udma_wqes_per_visit,
+                    do_expand,
+                    policy.native_plan() if policy else [],
+                    simt_layout == "1",
+                )
             else:
                 # Expand writes the final expert prefix before this API returns.
                 result, public_handle = self._native.intranode_dispatch_with_handle(
@@ -953,7 +1098,6 @@ class ElasticBuffer:
                 None,
                 None,
             )
-            _record_recv_outputs_on_current_stream(*public_handle)
             handle._buffer_token = self._handle_token
             handle._buffer_owner = self
             handle._udma_policy = policy
@@ -961,12 +1105,13 @@ class ElasticBuffer:
             handle._dispatch_plan = dispatch_plan
             handle._expand_layout = expand_layout
             handle._single_source_slots = single_source_slots
-            _record_recv_outputs_on_current_stream(single_source_slots)
-            _record_recv_outputs_on_current_stream(handle.topk_idx, *dispatch_layout)
-            if expand_layout is not None:
-                _record_recv_outputs_on_current_stream(*expand_layout[:3])
 
-        _record_recv_outputs_on_current_stream(recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, dispatch_plan)
+        # Only returned data is registered on the caller/consumer stream.
+        # Handle metadata remains owned and protected for communication-stream use.
+        # Expert counts are a Python list; FP8 scales are part of returned recv_x.
+        consumer_tensors = (recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights)
+        consumer_streams = {}
+        _record_recv_outputs_on_current_stream(*consumer_tensors, streams=consumer_streams)
 
         if x_scales is not None:
             recv_x = (recv_x, recv_x_scales)
@@ -983,7 +1128,15 @@ class ElasticBuffer:
                 topk_weights,
                 handle,
             ),
+            consumer_tensors=consumer_tensors,
+            # Native input Record() and StreamAllocator.Empty() already protect
+            # communication use, including cached and cross-stream allocations.
+            # Keep the same owners without registering them again in Python.
+            producer_tensors=(),
+            consumer_streams=tuple(consumer_streams.values()),
         )
+        if host_timing is not None:
+            host_timing.end_dispatch_host_timing()
         return recv_x, recv_topk_idx, recv_topk_weights, handle, event
 
     @staticmethod
@@ -1042,7 +1195,7 @@ class ElasticBuffer:
         comm_sms = combine_num_sms or resolved_num_sms
         reduce_sms = reduce_num_sms or resolved_num_sms
         _validate_num_sms(comm_sms, self.num_device_aiv)
-        _validate_num_sms(reduce_sms, self.num_device_aiv)
+        _validate_num_sms(reduce_sms, self.num_device_aiv, communication=False)
         if self.transport != "udma" and (comm_sms != handle.num_sms or reduce_sms != handle.num_sms):
             raise ValueError("independent combine/reduce core counts require UDMA")
         if comm_sms != handle.num_sms and handle.do_expand and self._aggregate_pipeline_chunk_tokens:
@@ -1069,7 +1222,7 @@ class ElasticBuffer:
         )
         (
             rank_prefix_matrix,
-            _,
+            send_channel_prefix_matrix,
             recv_channel_prefix_matrix,
             recv_src_idx,
             _,
@@ -1139,6 +1292,7 @@ class ElasticBuffer:
                 pipeline_chunk,
                 reduce_sms,
                 policy.native_plan() if policy else [],
+                send_channel_prefix_matrix,
             )
             if previous_event_before_epilogue is not None:
                 previous_event_before_epilogue.current_stream_wait()
@@ -1161,10 +1315,24 @@ class ElasticBuffer:
         )
         return combined_x, combined_topk_weights, event
 
-    def _finish_comm_event(self, async_with_compute_stream: bool, extra_tensors: Tuple[Any, ...]) -> EventOverlap:
+    def _finish_comm_event(
+        self,
+        async_with_compute_stream: bool,
+        extra_tensors: Tuple[Any, ...],
+        *,
+        consumer_tensors: Optional[Tuple[Any, ...]] = None,
+        producer_tensors: Optional[Tuple[Any, ...]] = None,
+        consumer_streams: Optional[Tuple[Any, ...]] = None,
+    ) -> EventOverlap:
         event = _try_record_event(self._communication_stream)
         if async_with_compute_stream:
-            return EventOverlap._from_resources(event, _compact_extra_tensors(extra_tensors))
+            return EventOverlap._from_resources(
+                event,
+                _compact_extra_tensors(extra_tensors),
+                consumer_tensors=consumer_tensors,
+                producer_tensors=producer_tensors,
+                consumer_streams=consumer_streams,
+            )
         event.current_stream_wait()
         return EventOverlap()
 
@@ -1440,8 +1608,10 @@ def _validate_combine_tensors(
             raise ValueError(f"{name} has an invalid shape")
 
 
-def _validate_num_sms(num_sms: int, num_device_aiv: int = _MAX_NUM_AIV) -> None:
+def _validate_num_sms(num_sms: int, num_device_aiv: int = _MAX_NUM_AIV, *, communication: bool = True) -> None:
     _validate_positive_int("num_sms", num_sms)
+    if communication and num_sms < 8:
+        raise ValueError("communication num_sms must be at least 8")
     if num_sms % 2:
         raise ValueError("num_sms must be even")
     max_num_aiv = min(_MAX_NUM_AIV, num_device_aiv)

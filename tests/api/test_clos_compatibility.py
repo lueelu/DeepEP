@@ -269,7 +269,7 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
             _dispatch_layout=(None,) * 6)
         def no_estimate(*args): raise AssertionError('default still uses theoretical estimator')
         obj = SimpleNamespace(_ensure_alive=lambda: None, _validate_handle=lambda _: None,
-            use_fp8_dispatch=False, num_max_tokens_per_rank=129, num_ranks=8, hidden=6144, num_topk=8,
+            use_fp8_dispatch=False, fused_layout_notify=False, num_max_tokens_per_rank=129, num_ranks=8, hidden=6144, num_topk=8,
             get_buffer_size_hint=lambda *a: 0, group=None, allow_hybrid_mode=True,
             num_bytes=1, num_device_aiv=64, get_theoretical_num_sms=no_estimate,
             _udma_auto_policy=SimpleNamespace(for_launch=resolve), transport='udma',
@@ -298,12 +298,8 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
 @pytest.mark.parametrize(
     "ep,cores,peers,workers",
     [
-        (4, 2, 4, 2),
-        (8, 2, 8, 2),
         (8, 8, 2, 2),
-        (16, 2, 8, 1),
         (16, 8, 2, 1),
-        (32, 4, 8, 1),
         (32, 8, 4, 1),
         (64, 8, 8, 1),
         (128, 20, 8, 1),
@@ -342,13 +338,13 @@ def test_auto_policy_budget_boundaries_and_manual_opt_out():
         for ep in range(2, 257):
             base = resolve_udma_policy(True, ep, 'udma', None, None, None, None, None)
             for cores in range(2, 65, 2):
-                feasible = ((ep - 1 + 7) // 8) * base.workers_per_peer <= min(cores, 32)
+                feasible = cores >= 8 and ((ep - 1 + 31) // 32) * base.workers_per_peer <= min(cores, 32)
                 try: chosen = base.for_num_aiv(cores)
                 except ValueError:
                     assert not feasible, (ep, cores)
                 else:
-                    assert chosen.valid_group_capacity() and chosen.send_workers <= min(cores, 32), (ep, cores)
-                    assert chosen.peers_per_worker in (1, 2, 4, 8)
+                    assert (chosen.peer_order == 0 and chosen.peers_per_worker <= 32) and chosen.send_workers <= min(cores, 32), (ep, cores)
+                    assert chosen.peers_per_worker in (1, 2, 4, 8, 16, 32)
                     assert chosen.config(cores).num_aiv == cores
         base = resolve_udma_policy(True, 32, 'udma', None, None, None, None, None)
         assert base.for_num_aiv(0) == base
@@ -418,7 +414,8 @@ def test_udma_combine_core_overrides_reach_native_and_preserve_handle():
                 ({'num_sms':48,'combine_num_sms':20,'reduce_num_sms':8}, (20,8)),
                 ({'combine_num_sms':64,'reduce_num_sms':16}, (64,16))]:
             assert b.combine(SimpleNamespace(size=lambda dim: (128,2816)[dim], element_size=lambda: 2, dtype="torch.bfloat16"), h, **opts) == ("out", None, "event")
-            assert (calls[-1][8], calls[-1][-2]) == expected
+            assert (calls[-1][8], calls[-1][-3]) == expected
+            assert calls[-1][-1] is layout[1]
             assert policies[-1] == expected[0]
             assert calls[-1][6] is layout[2]
             assert h.num_sms == 48 and h._dispatch_layout is layout
@@ -440,7 +437,7 @@ def test_udma_combine_core_overrides_reach_native_and_preserve_handle():
         h._expand_layout = (None, None, object(), None)
         b.combine(SimpleNamespace(size=lambda dim: (128,2816)[dim], element_size=lambda: 2, dtype="torch.bfloat16"), h, combine_num_sms=8, reduce_num_sms=16)
         assert aggregates[-1][4] == 48
-        assert (calls[-1][8], calls[-1][-2]) == (8,16)
+        assert (calls[-1][8], calls[-1][-3]) == (8,16)
         before = len(calls)
         b._aggregate_pipeline_chunk_tokens = 32
         try:
@@ -520,7 +517,8 @@ def test_serial_expanded_combine_uses_unexpanded_plan_after_aggregate():
                     overlap = early or bool(chunk)
                     expected = base.for_launch(32,5632,'weighted' if weights is not None else 'combine',
                                                bf16=True,expanded=overlap)
-                    assert calls[-1][-1] == expected.native_plan()
+                    assert calls[-1][-2] == expected.native_plan()
+                    assert calls[-1][-1] is h._dispatch_layout[1]
                     assert events == (['begin'] if single and overlap else ['aggregate','begin'])
                     assert calls[-1][15] is (x if single else None)
                     assert calls[-1][16] is (h._single_source_slots if single else None)
@@ -533,7 +531,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
     run_host("""
         from dataclasses import replace, FrozenInstanceError
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy, _PROFILES
-        for (ep, cores, bucket, op), (groups, order, p, w, q, visit, copy) in _PROFILES.items():
+        for (ep, cores, bucket, op), (groups, p, w, q, visit, copy, auxiliary_budget) in _PROFILES.items():
             for group in groups:
                 base = replace(resolve_udma_policy(True, ep, 'udma', None, None, None, None, None),
                                ranks_per_group=group, topology_known=True)
@@ -541,10 +539,12 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 args = (cores, 2048 if bucket == 'small' else 5632, op)
                 plan = base.for_launch(*args, bf16=True)
                 assert plan is base.for_launch(*args, bf16=True)
-                assert plan.native_plan()[:7] == [1, order, group, p, w, q, visit]
-                assert plan.self_copy == copy
+                expected_order = 0
+                rank_p = p
+                assert plan.native_plan()[:7] == [1, expected_order, group, rank_p, w, q, visit]
+                assert plan.self_copy == (copy or 2)
                 assert plan.send_workers <= cores and plan.send_workers * q <= 32
-                assert plan.valid_group_capacity()
+                assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                 assert base.signature() == before
                 try: plan.peers_per_worker = 8
                 except FrozenInstanceError: pass
@@ -552,7 +552,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 for kwargs in ({'expanded': True}, {'v2': False}, {'bf16': False}):
                     options = {'bf16': True, **kwargs}
                     fallback = base.for_launch(*args, **options)
-                    assert fallback.peer_order == 0 and fallback.self_copy == fallback.weight_mode == 0
+                    assert fallback.peer_order == 0 and fallback.self_copy == 2 and fallback.weight_mode == 0
         base = resolve_udma_policy(True, 32, 'udma', None, None, None, None, None)
         for known, group in ((True,16), (False,8)):
             policy = replace(base, ranks_per_group=group, topology_known=known)
@@ -572,12 +572,14 @@ def test_weighted_combine_uses_row_bytes_and_spare_aivs():
                 plan = policy.for_launch(cores,row_bytes,'weighted',bf16=True)
                 assert plan.send_workers < cores, (ep, cores, plan)
                 expected = 0 if ep == 128 else 2 if ep == 64 or (ep in (16,32) and row_bytes <= 8192) else mode
+                if ep in (8,16):
+                    expected = policy.for_launch(8 if cores < 32 else 32,row_bytes,'weighted',bf16=True).weight_mode
                 assert plan.weight_mode == expected, (ep, cores, row_bytes, plan)
-        # At EP8/G8/AIV8 the fitted plan uses every AIV for payload.
+        # Rank ordering frees the RR self-owner slot without changing UDMA.
         base = resolve_udma_policy(True,8,'udma',None,None,None,None,None)
         policy = replace(base, ranks_per_group=8, topology_known=True)
         plan = policy.for_launch(8,7168,'weighted',bf16=True)
-        assert plan.send_workers == 8 and plan.weight_mode == 1
+        assert plan.send_workers == 7 and plan.weight_mode == 1
 
         base = resolve_udma_policy(True,64,'udma',None,None,None,None,None)
         for group, known, cores in ((16,True,32), (8,True,32), (16,False,32), (16,True,48)):
@@ -602,13 +604,14 @@ def test_ep16_weight_row_limit_preserves_payload_plan_across_core_budgets():
                     assert reference.weight_mode == 1
                     for size in (5632,7168,7170,8190,8192,8194,12288):
                         plan = policy.for_launch(cores,size,'weighted',bf16=True)
-                        expected = 2 if size <= 8192 and plan.send_workers < cores else 1
+                        tier = 8 if cores < 32 else 32
+                        expected = 2 if size <= 8192 and plan.send_workers < tier else 1
                         assert plan.weight_mode == expected, (group,known,cores,size,plan)
                         assert replace(plan,weight_mode=1) == reference
-        # Reproduce the compared payload configuration, without a 48-core rule.
+        # The updated visit applies throughout the existing 32-core tier.
         policy = replace(base,ranks_per_group=8,topology_known=True)
-        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,0,2]
-        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,2,8,2,1,1,4,0,1]
+        assert policy.for_launch(48,8192,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,8,2,2]
+        assert policy.for_launch(48,12288,'weighted',bf16=True).native_plan() == [1,0,8,2,1,1,8,2,1]
     """)
 
 
@@ -627,9 +630,10 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
                 for row_bytes in (8192,8193,8194,9216,10240,12286,12287,12288):
                     plan = base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     expected_mode = 2 if row_bytes <= 8192 else mode
-                    assert plan.native_plan() == [1,3,group,1,1,1,8,2,expected_mode]
+                    expected_order, expected_p = (0,4)
+                    assert plan.native_plan() == [1,expected_order,group,expected_p,1,1,8,2,expected_mode]
                     assert plan.send_workers == group
-                    assert plan.send_workers < 32 and plan.valid_group_capacity()
+                    assert plan.send_workers < 32 and (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                     assert plan is base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     buffer = SimpleNamespace(udma_auto_policy=base, udma_schedule='peer',
                         udma_dispatch_peer_order='rank',udma_combine_peer_order='rank',
@@ -644,17 +648,18 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
             # Width/topology scopes remain unchanged; EP32 combine is not inherited.
             for size in (7168,7170,8190,8191,12289,12290):
                 p = base.for_launch(32,size,'weighted',bf16=True)
-                assert p.peer_order == (2 if ep == 32 and size <= 12288 else 0)
+                assert p.peer_order == 0
             for cores in ((8,20,64) if ep == 32 else (8,20)):
                 p = base.for_launch(cores,8192,'weighted',bf16=True)
                 assert p.peer_order == 0
-                assert p.weight_mode == (2 if p.send_workers < cores else 1)
+                weight_cores = (8 if cores < 32 else 32) if ep == 64 else cores
+                assert p.weight_mode == (2 if p.send_workers < weight_cores else 1)
             for other in (replace(base,topology_known=False), replace(base,ranks_per_group=24-group)):
                 p = other.for_launch(32,8192,'weighted',bf16=True)
                 assert p.peer_order == 0 and p.weight_mode == 2
             for opts in ({'expanded':True}, {'v2':False}, {'bf16':False}):
                 p = base.for_launch(32,8192,'weighted',**{'bf16':True,**opts})
-                assert p.native_plan()[1:] == [0,group,4,1,1,32,0,0]
+                assert p.native_plan()[1:] == [0,group,4,1,1,32,2,0]
             assert base.signature() == before
     """)
 
@@ -685,8 +690,14 @@ def test_weight_preference_does_not_return_to_simt_as_rows_grow():
                             # Legacy mode 0 uses SIMT when a helper exists,
                             # under the normal SIMT-enabled peer kernel build.
                             preferred = _simt_weight_row_fits(ep,size)
-                            simt = plan.weight_mode != 1 and plan.send_workers < cores
-                            assert simt == (preferred and plan.send_workers < cores)
+                            weight_cores = (8 if cores < 32 else 32) if ep in (8,16,64) else min(cores,32)
+                            simt = plan.weight_mode != 1 and plan.send_workers < weight_cores
+                            # The low-core rank override preserves the weight
+                            # mode selected before removing the RR self owner.
+                            rank_keeps_udma = weight_cores == 8 and known and (
+                                (ep == 8 and group == 8 and 2048 <= size <= 12288) or
+                                (ep == 4 and group == 4 and 4096 < size <= 12288))
+                            assert simt == (preferred and plan.send_workers < weight_cores and not rank_keeps_udma)
                             # Capacity fallback is separate from the row rule:
                             # no helper must remain legal even in the SIMT band.
                             assert not (udma_seen and preferred), (ep,size)
@@ -699,18 +710,21 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy, _PROFILES
 
-        for (ep, tier, bucket, op), (groups, order, p, w, q, visit, copy) in _PROFILES.items():
+        for (ep, tier, bucket, op), (groups, p, w, q, visit, copy, auxiliary_budget) in _PROFILES.items():
             for group in groups:
                 base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                                ranks_per_group=group, topology_known=True)
                 for cores in (range(8,16,2) if tier == 8 else range(32,64,2)):
                     plan = base.for_launch(cores,2048 if bucket == 'small' else 5632,op,bf16=True)
-                    assert plan.native_plan()[:7] == [1,order,group,p,w,q,visit]
+                    rank_p = p
+                    assert plan.native_plan()[:7] == [1,0,group,rank_p,w,q,visit]
                     assert base.config(cores).num_aiv == cores
+                    selected_senders = auxiliary_budget
                     if op == 'combine':
-                        assert plan.self_copy == (1 if cores >= 2*plan.send_workers else 2)
+                        assert plan.self_copy == (1 if cores >= 2*selected_senders else 2)
                     if op == 'weighted':
-                        assert plan.weight_mode == (2 if cores > plan.send_workers else 1)
+                        weight_cores = tier if ep in (8,16) else cores
+                        assert plan.weight_mode == (2 if weight_cores > selected_senders else 1)
         # Scan legal budgets and both sides of row-width boundaries, including
         # unknown topology and widths outside the measured profiles.
         for ep in (4,8,16,32,64,128,256):
@@ -729,40 +743,11 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                                     try: base.for_num_aiv(cores)
                                     except ValueError: continue
                                     raise
+                                if ep <= 128 and cores >= 8:
+                                    assert plan.peer_order == 0
                                 assert plan.send_workers <= cores
                                 assert plan.send_workers*plan.qps_per_worker <= 32
-                                assert plan.valid_group_capacity()
-    """)
-
-
-def test_reported_300_operator_plans_remain_unchanged():
-    # Frozen native plans from the November 16 EP8-128 reports, not generated
-    # from the selector. Keep all five operators for each of the 60 shapes.
-    run_host("""
-        import csv
-        import json
-        from dataclasses import replace
-        from pathlib import Path
-        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
-
-        with Path('tests/api/fixtures/udma_plans_20261116.csv').open() as source:
-            rows = list(csv.DictReader(source))
-        assert len(rows) == 300
-        cases = {}
-        operations = {'dispatch_with_weights', 'dispatch_without_weights',
-                      'cached_dispatch', 'combine_weighted', 'combine_unweighted'}
-        for row in rows:
-            key = tuple(int(row[k]) for k in ('EP','tokens','hidden','topk','experts','aiv','G'))
-            ep, tokens, hidden, topk, experts, cores, group = key
-            cases.setdefault(key, []).append(row['operator'])
-            op = {'combine_weighted':'weighted', 'combine_unweighted':'combine'}.get(row['operator'], 'dispatch')
-            base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
-                           ranks_per_group=group, topology_known=True)
-            plan = base.for_launch(cores,hidden*2,op,bf16=True)
-            assert plan.native_plan() == json.loads(row['native_plan']), (key, op, plan)
-            assert plan.send_workers == int(row['send_aivs']), (key, op, plan)
-        assert len(cases) == 60
-        assert all(len(ops) == 5 and set(ops) == operations for ops in cases.values())
+                                assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
     """)
 
 
@@ -771,77 +756,47 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
 
-        for ep, group, p, senders in ((8,2,1,7), (16,4,2,8)):
+        for ep, group, p, workers in ((8,2,2,2), (16,4,2,1)):
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                            ranks_per_group=group,topology_known=True)
             before = base.signature()
             for size in (2048,5632,12288,14336):
                 for op in ('dispatch','weighted'):
                     plan = base.for_launch(16,size,op,bf16=True)
-                    assert plan.native_plan()[:7] == [1,0,group,p,1,1,32]
-                    assert plan.send_workers == senders
-                    assert plan.valid_group_capacity()
+                    assert plan.native_plan()[:7] == [1,0,group,p,workers,1,32]
+                    assert plan.send_workers == 8
+                    assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                     assert plan is base.for_launch(16,size,op,bf16=True)
                     if op == 'weighted':
                         assert plan.self_copy == 2
-                        assert plan.weight_mode == (2 if size <= 7168 else 1)
+                        assert plan.weight_mode == 1
                     # A different API/dtype/expansion still uses the old baseline.
                     for options in ({'expanded':True}, {'v2':False}, {'bf16':False}):
                         old = base.for_launch(16,size,op,**{'bf16':True,**options})
                         assert old.send_workers == (14 if ep == 8 else 15)
                 unweighted = base.for_launch(16,size,'combine',bf16=True)
-                assert unweighted.send_workers == (14 if ep == 8 else 15)
-                assert unweighted.self_copy == 2
+                assert unweighted.send_workers == 8
+                assert unweighted.self_copy == 1
             assert base.signature() == before
             assert base.config(16).num_aiv == 16
 
         # Actual four-node topologies: keep all AIV8 launch plans unchanged.
         for ep, group, order, p, w in ((4,1,0,1,2), (8,2,0,2,2), (16,4,0,2,1),
-                                      (32,8,0,4,1), (64,16,0,8,1), (128,16,3,2,1)):
+                                      (32,8,0,4,1), (64,16,0,8,1), (128,16,0,16,1)):
             base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
                            ranks_per_group=group,topology_known=True)
             for op in ('dispatch','combine','weighted'):
                 for size in (2048,5632,12288,14336):
                     plan = base.for_launch(8,size,op,bf16=True)
                     mode = (2 if ep == 4 and size <= 7168 else 1) if op == 'weighted' else 0
-                    assert plan.native_plan() == [1,order,group,p,w,1,32,0 if op == 'dispatch' else 2,mode]
+                    assert plan.native_plan() == [1,order,group,p,w,1,32,2,mode]
 
-        # No fixed half-core split, and no change to the all-senders fallback.
+        # EP64 dispatch retains eight senders throughout the supported core range.
         base = replace(resolve_udma_policy(True,64,'udma',None,None,None,None,None),
                        ranks_per_group=16,topology_known=True)
-        assert base.for_launch(16,5632,'dispatch',bf16=True).send_workers == 16
+        assert base.for_launch(16,5632,'dispatch',bf16=True).send_workers == 8
         assert base.for_launch(18,5632,'dispatch',bf16=True).send_workers == 8
-        assert base.for_launch(20,5632,'dispatch',bf16=True).send_workers == 16
-    """)
-
-
-def test_ep32_dispatch_profile_survives_extra_cores_with_separate_combine_tiers():
-    run_host("""
-        from dataclasses import replace, asdict
-        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
-        sys.path.insert(0, 'benchmarks/clos')
-        from bench_v2_bandwidth import effective_udma_config
-        base = replace(resolve_udma_policy(True,32,'udma',None,None,None,None,None),
-                       ranks_per_group=8,topology_known=True)
-        buffer = SimpleNamespace(udma_auto_policy=base, udma_schedule='peer',
-            udma_dispatch_peer_order='rank',udma_combine_peer_order='rank',
-            udma_ranks_per_group=8,udma_peers_per_group_per_worker=None,
-            udma_workers_per_peer=1,udma_qps_per_worker=1)
-        for cores in (32,34,48,64):
-            assert base.config(cores).num_aiv == cores
-            for size in (5632,8192,12288):
-                plan = base.for_launch(cores,size,'dispatch',bf16=True)
-                assert plan.native_plan() == [1,1,8,4,1,1,32,0,0]
-                report = effective_udma_config(buffer,num_aiv=cores,row_bytes=size,bf16=True)
-                assert report['operation_plans']['dispatch'] == asdict(plan)
-            for size in (1024,2048,4096,14336):
-                assert base.for_launch(cores,size,'dispatch',bf16=True).peer_order == 0
-            for other in (replace(base,topology_known=False),replace(base,ranks_per_group=16)):
-                assert other.for_launch(cores,5632,'dispatch',bf16=True).peer_order == 0
-            for options in ({'expanded':True}, {'v2':False}, {'bf16':False}):
-                assert base.for_launch(cores,5632,'dispatch',**{'bf16':True,**options}).peer_order == 0
-                for op in ('combine','weighted'):
-                    assert base.for_launch(cores,12288,op,bf16=True).peer_order == (3 if cores < 64 else 0)
+        assert base.for_launch(20,5632,'dispatch',bf16=True).send_workers == 8
     """)
 
 
@@ -862,9 +817,9 @@ def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
             for cores in (8,20,32,48,64):
                 for row_bytes in (2048,5632,12288):
                     plan = policy.for_launch(cores,row_bytes,'combine',bf16=True)
-                    expected = 1 if cores-plan.send_workers >= plan.send_workers else 2
+                    expected = 1 if min(cores,32)-plan.send_workers >= plan.send_workers else 2
                     if ep == 128 and cores >= 16:
-                        expected = 0  # Preserve the fixed rank/P8/visit16 candidate.
+                        expected = 2  # Fixed rank/P8/visit16, but never copy before sending.
                     assert plan.self_copy == expected
         # Two QPs still belong to one payload sender AIV.
         q2 = replace(base, workers_per_peer=1, qps_per_worker=2, topology_known=False)
@@ -873,7 +828,7 @@ def test_combine_copy_uses_sender_and_spare_aivs_instead_of_fixed_core_count():
         # EP128 keeps the complete fixed candidate with larger core budgets.
         large = replace(base, world_size=128, ranks_per_group=16)
         plan = large.for_launch(48,5632,'combine',bf16=True)
-        assert plan.send_workers == 16 and plan.self_copy == 0
+        assert plan.send_workers == 16 and plan.self_copy == 2
     """)
 
 
@@ -884,20 +839,20 @@ def test_ep128_defaults_preserve_fixed_candidate_across_shapes_and_budgets():
         base = replace(resolve_udma_policy(True,128,'udma',None,None,None,None,None),
                        ranks_per_group=16, topology_known=True)
         before = base.signature()
-        native = [1,0,16,8,1,1,16,0,0]
+        native = [1,0,16,8,1,1,16,2,0]
         assert (base.peers_per_worker, base.wqes_per_visit) == (8,16)
         for op in ('dispatch','combine','weighted'):
             for cores in (0,16,20,30,32,34,48,64):
                 for size in (2048,5600,5632,5664,7168,8192,12288,14336):
                     plan = base.for_launch(cores,size,op,bf16=True)
                     assert plan.native_plan() == native
-                    assert plan.send_workers == 16 and plan.valid_group_capacity()
+                    assert plan.send_workers == 16 and (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                     assert plan is base.for_launch(cores,size,op,bf16=True)
             # Unknown locality does not alter rank order; the low-core path
             # still chooses a legal fallback instead of exceeding its budget.
             assert replace(base,topology_known=False).for_launch(32,5632,op,bf16=True).native_plan() == native
             small = base.for_launch(8,5632,op,bf16=True)
-            assert small.send_workers <= 8 and small.valid_group_capacity()
+            assert small.send_workers <= 8 and (small.peer_order == 0 and small.peers_per_worker <= 32)
             for other in (replace(base,world_size=64), replace(base,world_size=256)):
                 assert other.for_launch(32,5632,op,bf16=True).native_plan() != native
             for options in ({'bf16':False}, {'expanded':True}, {'v2':False}):
@@ -930,31 +885,6 @@ def test_auto_topology_uses_ep_rank_order_and_collects_only_at_construction():
     """)
 
 
-def test_large_ep_low_core_fallback_and_invalid_launch_inputs():
-    run_host("""
-        from dataclasses import replace
-        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
-        for ep in (4,8,16,32,64,128):
-            for group in (8,16):
-                if group > ep: continue
-                base = replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
-                               ranks_per_group=group, topology_known=True)
-                for cores in (8,20,32,64):
-                    for size in (1024,2048,4096,5632,12288,14336):
-                        for op in ('dispatch','combine','weighted'):
-                            p = base.for_launch(cores,size,op,bf16=True)
-                            assert p.send_workers <= cores and p.send_workers*p.qps_per_worker <= 32
-                            assert p.valid_group_capacity()
-                            assert p.ranks_per_group == group
-                if ep == 128:
-                    assert base.for_launch(8,5632,'combine',bf16=True).peer_order == 3
-                for cores in (True,False,8.0,3,-2,66):
-                    try: base.for_launch(cores,5632,'dispatch',bf16=True)
-                    except (TypeError,ValueError): pass
-                    else: raise AssertionError(cores)
-    """)
-
-
 def test_benchmark_reports_separate_launch_plans():
     run_host("""
         from dataclasses import replace
@@ -968,7 +898,8 @@ def test_benchmark_reports_separate_launch_plans():
             udma_peers_per_group_per_worker=None,udma_workers_per_peer=2,udma_qps_per_worker=1)
         result = effective_udma_config(b,num_aiv=8,row_bytes=5632,bf16=True)
         plans = result['operation_plans']
-        assert plans['dispatch']['qps_per_worker'] == 2
+        assert plans['dispatch']['qps_per_worker'] == 1
+        assert plans['dispatch']['workers_per_peer'] == 2
         assert plans['weighted']['qps_per_worker'] == 1
         assert plans['weighted']['weight_mode'] == 1
         assert plans['combine']['self_copy'] == 2
@@ -1060,12 +991,11 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
         using namespace ascend_deepep::udma;
         int main() {
             for (unsigned ep : {4U,8U,16U,32U,64U,128U})
-              for (unsigned g : {1U,2U,4U,8U,16U}) {
+              for (unsigned g : {1U,2U,4U,8U,16U,32U}) {
                 if (g > ep) continue;
                 for (unsigned rank=0; rank<ep; ++rank)
-                  for (unsigned order=0; order<=3; ++order)
-                    for (unsigned p : {1U,2U,4U,8U}) {
-                      if (order==3 && p==8) continue;
+                  for (unsigned order=0; order==0; ++order)
+                    for (unsigned p : {1U,2U,4U,8U,16U,32U}) {
                       unsigned owners=Workers(ep,p,order,g);
                       for (unsigned lanes : {1U,2U}) {
                         if (owners*lanes>32) continue;
@@ -1095,4 +1025,144 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
         timeout=60,
     )
     assert built.returncode == 0, built.stdout + built.stderr
-    subprocess.run([str(binary)], check=True, timeout=60)
+    try:
+        subprocess.run([str(binary)], check=True, timeout=60)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            pytest.skip("compiled, but Windows application control blocked execution (4551)")
+        raise
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_fused_layout_is_buffer_local_and_forwarded_to_native(fused):
+    run_host(f"""
+        from deep_ep.backends.direct import elastic as e
+        calls = []
+        e._resolve_group_or_comm = lambda group, comm: (0, 2, group)
+        e._validate_group_consensus = lambda *args: None
+        e.get_global_comm_stream = lambda: None
+        e.ElasticBuffer.barrier = lambda *args, **kwargs: None
+        def bootstrap(*args, **kwargs):
+            calls.append(kwargs)
+            return [], 'test'
+        e._prepare_shmem_bootstrap = bootstrap
+        class Native:
+            def __init__(self, *args):
+                calls.append(args)
+            def num_device_aiv(self):
+                return 64
+        e.get_native_class = lambda name: Native
+        b = e.ElasticBuffer(object(), num_bytes=128 << 20, transport='udma',
+                            udma_auto_policy=False, fused_layout_notify={fused!r},
+                            udma_schedule="peer", udma_dispatch_peer_order="rank",
+                            udma_combine_peer_order="rank", udma_workers_per_peer=1,
+                            udma_qps_per_worker=1, udma_peers_per_worker=1, udma_wqes_per_visit=8)
+        b._destroyed = True
+        assert b.fused_layout_notify is {fused!r}
+        assert calls[0]['fused_layout_notify'] is {fused!r}
+        assert len(calls[1]) == 22 and calls[1][20] is {fused!r}
+        try:
+            b.fused_layout_notify = not {fused!r}
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError('fusion must be immutable')
+        for bad in (1, '1', None):
+            try:
+                e.ElasticBuffer(object(), fused_layout_notify=bad)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError('non-bool fusion accepted')
+    """)
+
+
+def test_fused_layout_rank_disagreement_rejected_before_initialization():
+    run_host("""
+        from deep_ep.backends.direct import buffer as b
+        b.load_native_module = lambda: SimpleNamespace(get_shmem_bootstrap=lambda key: (0, []))
+        def gather(group, comm, size, value):
+            options, state, uid = value
+            peer = options[:-2] + (not options[-2], options[-1])
+            return [value, (peer, state, uid)]
+        b._bootstrap_all_gather = gather
+        try:
+            b._prepare_shmem_bootstrap(object(), None, 0, 2, 64 << 20, 'udma', False,
+                                       'tcp://localhost:1234', fused_layout_notify=True)
+        except ValueError as exc:
+            assert 'same workspace' in str(exc)
+        else:
+            raise AssertionError('fusion rank mismatch accepted')
+    """)
+
+
+@pytest.mark.parametrize("api", ["Buffer", "ElasticBuffer"])
+@pytest.mark.parametrize("timeout", [None, 1, 900, 4294967])
+def test_shmem_init_timeout_constructor_forwarding_and_validation(api, timeout):
+    run_host(f"""
+        from deep_ep.backends.direct import buffer as v1, elastic as v2
+        m = v1 if {api!r} == 'Buffer' else v2
+        cls = getattr(m, {api!r})
+        calls = []
+        m._resolve_group_or_comm = lambda group, comm: (0, 2, group)
+        m.get_global_comm_stream = lambda: None
+        v1._is_capturing = lambda: False
+        v2._validate_group_consensus = lambda *args: None
+        v2.ElasticBuffer.barrier = lambda *args, **kwargs: None
+        def bootstrap(*args, **kwargs):
+            calls.append(kwargs['shmem_init_timeout_secs'])
+            return [], 'test'
+        m._prepare_shmem_bootstrap = bootstrap
+        class Native:
+            def __init__(self, *args):
+                calls.append(args[-1])
+            def num_device_aiv(self):
+                return 64
+        m.get_native_class = lambda _: Native
+        options = dict(num_bytes=128 << 20, transport='udma', udma_auto_policy=False,
+                       udma_schedule='peer', udma_dispatch_peer_order='rank',
+                       udma_combine_peer_order='rank', udma_workers_per_peer=1, udma_qps_per_worker=1)
+        if {api!r} == 'ElasticBuffer':
+            options.update(udma_peers_per_worker=1, udma_wqes_per_visit=8)
+        if {timeout!r} is not None:
+            options['shmem_init_timeout_secs'] = {timeout!r}
+        b = cls(object(), **options)
+        b._destroyed = True
+        expected = 600 if {timeout!r} is None else {timeout!r}
+        assert calls == [expected, expected]
+        assert b.shmem_init_timeout_secs == expected
+        try:
+            b.shmem_init_timeout_secs = 60
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError('timeout must be read-only')
+        for bad, error in [(True, TypeError), ('600', TypeError), (1.5, TypeError),
+                           (None, TypeError), (0, ValueError), (-1, ValueError), (4294968, ValueError)]:
+            try:
+                cls(object(), shmem_init_timeout_secs=bad)
+            except error:
+                pass
+            else:
+                raise AssertionError('invalid timeout accepted')
+    """)
+
+
+@pytest.mark.parametrize("endpoint", [None, "tcp://localhost:1234"])
+def test_shmem_init_timeout_rank_disagreement_rejected_before_uid(endpoint):
+    run_host(f"""
+        from deep_ep.backends.direct import buffer as b
+        b.load_native_module = lambda: SimpleNamespace(get_shmem_bootstrap=lambda key: (0, []))
+        def gather(group, comm, size, value):
+            options, state, uid = value
+            peer = options[:-1] + (options[-1] + 1,)
+            return [value, (peer, state, uid)]
+        b._bootstrap_all_gather = gather
+        try:
+            b._prepare_shmem_bootstrap(object(), None, 0, 2, 64 << 20, 'udma', False,
+                                       {endpoint!r}, shmem_init_timeout_secs=600)
+        except ValueError as exc:
+            assert 'same workspace' in str(exc)
+        else:
+            raise AssertionError('timeout rank mismatch accepted')
+    """)

@@ -127,12 +127,77 @@ def test_driver_timeout_is_not_retried(monkeypatch):
     assert len(calls) == 1 and calls[0]["timeout"] == 5
 
 
-def test_unknown_board_requires_override(monkeypatch, tmp_path):
+def test_explicit_missing_rootinfo_does_not_use_known_board(monkeypatch, tmp_path):
     monkeypatch.setattr(_machine, "physical_device", lambda: 0)
     monkeypatch.setattr(_machine, "board_id", lambda _: 0x46)
     # Explicit absent files are errors, never silently replaced by board guesses.
     with pytest.raises(RuntimeError, match="explicit rootinfo"):
         _machine.select("auto", rootinfo_path=tmp_path / "absent")
+
+
+@pytest.fixture
+def default_rootinfo(monkeypatch, tmp_path):
+    path = tmp_path / "hccl_rootinfo.json"
+    monkeypatch.setattr(_machine, "Path", lambda value: path if value == "/etc/hccl_rootinfo.json" else Path(value))
+    return path
+
+
+@pytest.mark.parametrize(
+    "board,expected",
+    [(0x03, "mesh_clos"), (0x07, "mesh_clos"), (0x46, "global_clos"), (0x48, "global_clos"), (0x6C, "mesh_pcie")],
+)
+def test_missing_default_rootinfo_uses_board_rule(monkeypatch, default_rootinfo, board, expected):
+    queries = []
+    monkeypatch.setattr(_machine, "board_id", lambda physical: queries.append(physical) or board)
+    assert _machine.detect_physical(13) == {
+        "machine_type": expected,
+        "source": "dcmi_board_rule",
+        "physical_device": 13,
+        "board": board,
+    }
+    assert queries == [13]
+
+
+@pytest.mark.parametrize("board", [0x44, 0x2D, 0xFF])
+def test_missing_default_rootinfo_rejects_unsupported_board(monkeypatch, default_rootinfo, board):
+    monkeypatch.setattr(_machine, "board_id", lambda _: board)
+    with pytest.raises(ValueError, match="no validated rule"):
+        _machine.detect_physical(0)
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_existing_default_rootinfo_never_falls_back_to_board(monkeypatch, default_rootinfo, invalid):
+    source = write_clos_files(default_rootinfo.parent)
+    default_rootinfo.write_bytes(b"invalid JSON" if invalid else source.read_bytes())
+    monkeypatch.setattr(_machine, "board_id", lambda _: pytest.fail("file must take precedence"))
+    if invalid:
+        with pytest.raises(json.JSONDecodeError):
+            _machine.detect_physical(0)
+    else:
+        assert _machine.detect_physical(0)["source"] == "rootinfo"
+
+
+@pytest.mark.parametrize("api", ["Buffer", "ElasticBuffer"])
+@pytest.mark.parametrize("board", [0x46, 0x48])
+def test_public_auto_without_rootinfo_selects_clos_udma(monkeypatch, default_rootinfo, api, board):
+    import deep_ep
+
+    entry = getattr(deep_ep, api)
+    monkeypatch.setattr(sys.modules[entry.__module__], "require_native", lambda _: None)
+    monkeypatch.setattr(_machine, "physical_device", lambda: 13)
+    monkeypatch.setattr(_machine, "board_id", lambda _: board)
+    calls = []
+
+    class Backend:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setitem(sys.modules, "deep_ep.backends.global_clos", SimpleNamespace(buffer_class=lambda _: Backend))
+    instance = entry(None)
+    assert instance.machine_type == "global_clos"
+    assert instance.machine_selection["source"] == "dcmi_board_rule"
+    assert instance.machine_selection["board"] == board
+    assert calls == [((None,), {"transport": "udma"})]
 
 
 def test_aliases_preserve_defaults_and_reject_conflicts():

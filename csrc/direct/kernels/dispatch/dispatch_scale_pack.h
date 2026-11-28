@@ -39,7 +39,7 @@ PackDispatchPeerScalesVf(const __gm__ uint32_t* src, __gm__ uint32_t* dst,
 // Normalize an arbitrary nonnegative-stride [token, scale] view into the compact
 // row-major SHMEM staging consumed by both MTE and UDMA dispatch paths.
 __simt_vf__ __launch_bounds__(kDispatchScalePackThreads) inline void
-PackV1DispatchScalesSimtVf(
+PackDispatchScalesSimtVf(
     const __gm__ uint32_t* src,
     __gm__ uint32_t* dst,
     uint32_t num_tokens,

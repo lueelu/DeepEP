@@ -26,7 +26,7 @@ import time
 import traceback
 
 from stage_metrics import L2CacheFlush, L2_CACHE_FLUSH_BYTES, ProfileSamples, PROFILE_GUARD_ITERS
-from stage_metrics import COMBINE_NOTIFY_ENV, prepare_v2_sample, profile_combine_notify
+from stage_metrics import prepare_v2_sample
 
 from route_workloads import (
     DEFAULTS as ROUTE_DEFAULTS,
@@ -332,13 +332,13 @@ def effective_udma_config(
             }
             result["operation_plans"] = {op: asdict(plan) for op, plan in plans.items()}
             policy = plans["dispatch"]
-            names = ("rank", "group", "group_staggered", "group_round_robin")
+            names = ("rank",)
             result.update(
                 policy_scope="dispatch; see operation_plans for combine",
                 udma_dispatch_peer_order=names[policy.peer_order],
                 udma_combine_peer_order=names[plans["combine"].peer_order],
                 udma_ranks_per_group=policy.ranks_per_group,
-                udma_peers_per_group_per_worker=policy.peers_per_worker if policy.peer_order == 3 else None,
+                udma_peers_per_group_per_worker=None,
                 udma_workers_per_peer=policy.workers_per_peer,
                 udma_qps_per_worker=policy.qps_per_worker,
             )
@@ -405,8 +405,7 @@ def worker(args):
     args.profile_sample_markers = True
     args.combine_notify = True
     args.all_rank_sync_each_iteration = True
-    # Precision and caller-stream timing exercise the ordinary library path.
-    os.environ[COMBINE_NOTIFY_ENV] = "0"
+    # The per-Buffer notify setting is shared by validation, warmup and capture.
     device = args.first_device + local_rank
     destination = args.output / f"rank{rank}"
     destination.mkdir(parents=True, exist_ok=False)
@@ -428,6 +427,7 @@ def worker(args):
         dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=args.rendezvous_timeout))
         buffer = ElasticBuffer(
             dist.group.WORLD,
+            combine_notify=True,
             num_max_tokens_per_rank=args.num_tokens,
             hidden=args.hidden,
             num_topk=args.num_topk,
@@ -629,17 +629,16 @@ def worker(args):
             )
             args.profile_dir = str(destination / op / "profiler")
             try:
-                with profile_combine_notify(op.startswith("combine")):
-                    profiling._profile_operator(
-                        rank,
-                        args,
-                        op,
-                        fn,
-                        sample_callback=ProfileSamples(torch),
-                        guard_iters=PROFILE_GUARD_ITERS,
-                        synchronize_each_iteration=True,
-                        before_iteration=before_iteration,
-                    )
+                profiling._profile_operator(
+                    rank,
+                    args,
+                    op,
+                    fn,
+                    sample_callback=ProfileSamples(torch),
+                    guard_iters=PROFILE_GUARD_ITERS,
+                    synchronize_each_iteration=True,
+                    before_iteration=before_iteration,
+                )
             except profiling._ProfileComplete:
                 pass
             profile = parse_profile_collective(
@@ -658,7 +657,8 @@ def worker(args):
             )
             # Independent caller-stream samples; do not subtract from profiler kernel times.
             profile["sampling"]["host_sync_each_iteration"] = True
-            profile["sampling"]["combine_notify_profile_only"] = op.startswith("combine")
+            profile["sampling"]["combine_notify"] = True
+            profile["sampling"]["combine_notify_profile_only"] = False
             dist.barrier()
             for _ in range(args.warmup):
                 before_iteration()

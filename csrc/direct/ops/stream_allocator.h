@@ -24,7 +24,7 @@ public:
     {
         for (const auto& tensor : tensors) {
             if (!tensor.has_value() || !tensor->defined()) continue;
-            TORCH_CHECK(tensor->device() == execution_.device(), "V1 tensors must be on the current NPU device");
+            TORCH_CHECK(tensor->device() == execution_.device(), "tensors must be on the current NPU device");
             // recordStream ignores foreign DataPtr deleters, such as SHMEM
             // from_blob views. Their lifetime is still owned by Buffer.
             c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), execution_);
@@ -33,12 +33,16 @@ public:
 
     torch::Tensor Empty(at::IntArrayRef sizes, const torch::TensorOptions& options) const
     {
-        TORCH_CHECK(options.device() == execution_.device(), "V1 allocation must be on the current NPU device");
+        TORCH_CHECK(options.device() == execution_.device(), "allocation must be on the current NPU device");
         auto tensor = [&] {
             c10_npu::NPUStreamGuard guard(allocation_);
             return torch::empty(sizes, options);
         }();
-        Record({tensor});
+        // Only this freshly allocated storage has known allocation provenance.
+        // Reuse on its allocation stream is ordered without allocator events.
+        // Record() for incoming/cached tensors must remain unconditional: the
+        // caller's allocation setting says nothing about their storage owner.
+        if (allocation_ != execution_) Record({tensor});
         return tensor;
     }
 

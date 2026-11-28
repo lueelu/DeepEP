@@ -112,12 +112,17 @@ class Config:
         self.__post_init__()
 
     def __post_init__(self) -> None:
-        for name, allowed in (("udma_peers_per_worker", (1, 2, 4, 8)), ("udma_wqes_per_visit", (4, 8, 16, 32))):
+        for name, allowed in (
+            ("udma_peers_per_worker", (1, 2, 4, 8, 16, 32)),
+            ("udma_wqes_per_visit", (4, 8, 16, 32, 64, 128)),
+        ):
             value = getattr(self, name)
             _validate_positive_int(name, value)
             if value not in allowed:
                 raise ValueError(f"{name} must be one of {allowed}")
         _validate_nonnegative_int("num_aiv", self.num_aiv)
+        if 0 < self.num_aiv < 8:
+            raise ValueError("communication num_aiv must be at least 8 (or zero for default)")
         if self.num_aiv % 2:
             raise ValueError("num_aiv must be even")
         if self.num_aiv > _MAX_NUM_AIV:
