@@ -2,7 +2,7 @@
 """Tensor/handle adapter for the isolated UBX route-plan kernel."""
 
 from ..._native import npu_api, require_native
-from ..._runtime import runtime_of
+from ..._runtime import _PUT_ROUTE_TAG, runtime_of
 from ...utils.event import EventHandle, EventOverlap
 
 
@@ -25,6 +25,8 @@ def combine(
     runtime.ensure_alive()
     if handle._buffer_token is not buffer._handle_token or handle.metadata_only:
         raise ValueError("UBX Combine requires this buffer's successful LL Dispatch handle")
+    if getattr(handle, "_put_route_tag", None) != _PUT_ROUTE_TAG:
+        raise ValueError("RoCE Combine requires a PUT1 Dispatch handle from a matching wheel")
     if not handle.do_expand or handle.expert_alignment != 1:
         raise NotImplementedError("UBX Combine requires expanded, unpadded LL rows")
     if topk_weights is not None:

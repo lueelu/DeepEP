@@ -112,17 +112,19 @@ flowchart LR
     F --> G[NPU 输出与公共 EventOverlap]
 ```
 
-Host 直接引用 Dispatch 产生的 destination、counts、weights、token type、relay 和 mask，
-不经 CPU 导出/重新建表。两个 kernel 共用双 bank 状态、物理主机分组、通信参数和已注册
-RDMA 暂存区；核数和 QP 由同一 Session 固定。入口位于 `csrc/ops/low_latency.cpp`，
-route-plan kernel 仍在 `csrc/ubx/kernels`，以独立翻译单元编入共同设备库。
+RoCE Dispatch 和 Combine 使用同一版本的 PUT 路由协议。普通专家行的
+`destination_index[row, 1:3]` 给出本组规约卡和该卡的收件槽。槽号按本次实际 BS
+编码，专家输出与路由元数据沿用 Dispatch 的行序。Host 直接传入这些设备 Tensor。
 
-保持既有 route-plan 数据路径：前半核执行 DIRECT 返回，后半核建立并复用路由表，
-优先处理已就绪的跨机 partial；末 8 核兼任 ready 通知。M4 使用 6 路输入流水，
-私有 WQE 预构造后等待 payload 的 MTE3 完成再发布；M5 按有效 TopK 槽完成最终规约。
-例如实际 56 AIV 时仍为 28/28、notify=48..55，保持原 L2 和数据暂存策略。
-发送暂存复用及退出前执行必要的 quiet，接收端检查每个 data-with-flag 块，不能以
-发送方 quiet 替代远端到达检查。本次接入不修改 Dispatch kernel 或 POD kernel。
+各核先将分到的普通专家行经 MTE 写入规约卡，线上每 512 B 含 480 B 数据和 32 B 到达标记。
+随后前半核负责直返，优先处理跨机目标；后半核在本地收件区检查成员是否到齐，
+按 Dispatch 成员顺序做局部规约并回传，最后按源 token 的 TopK 权重规约。
+机内回传走 MTE，跨机回传在注册的暂存区组包后提交 RDMA WRITE。NIC 读取完成后才复用暂存槽。
+单机且 Dispatch 选择直返模式时，各专家直接回传。
+
+每个 rank 从设备查询每个向量核可用的 UB，最多使用 240 KiB。Host 和 kernel 按同一容量规划元数据、搬运 lane 和规约工作区。
+整表能放下就一次处理；放不下时采用最多 2,048 行的块，必要时继续减半。集中路由可以让
+同一批次只有部分 rank 分块。DeepJIT 按本机分组、UB 容量及 H/K/E 静态特化，BS 和实际行数仍是运行时输入。
 
 ## 构建与独立 Combine 测试
 
@@ -130,7 +132,7 @@ route-plan kernel 仍在 `csrc/ubx/kernels`，以独立翻译单元编入共同�
 不再有独立 UBX 扩展或 `DEEPEP_UBX_RANKS_PER_HOST` 编译选项：
 
 ```bash
-git submodule update --init --recursive -- third-party/shmem
+git submodule update --init --recursive -- third-party/shmem third-party/deep_jit third-party/fmt
 python -m pip install -r requirements-build.txt
 python scripts/build_shmem.py
 export DEEPEP_NPU_ARCH=Ascend950
@@ -139,7 +141,7 @@ python -m pip install . --no-build-isolation --no-deps --force-reinstall
 
 已有 SDK 的更新方法和版本校验见[构建指南](build.md)。下列命令每台执行，第二台把
 `NODE_RANK` 改为 1；地址、端口和输出目录须属于同一次作业，且每次使用新的输出目录。
-IPv6 SHMEM endpoint 使用 `tcp://[地址]:端口`。
+SHMEM endpoint 使用本次作业的 IPv4 地址。
 
 ```bash
 export NODE_RANK=0
@@ -153,58 +155,38 @@ python -m torch.distributed.run --nnodes=2 --nproc-per-node=16 \
   tests/ubx/test_combine.py --output results/ubx-v2-ep32-01
 ```
 
-默认 BS=32/48/64/72/256、H3584、K8、E384、BF16、M256、warmup10、采样100。
-用 `--iters 50` 缩短采样。改变采样轮数不改变算子、同步或计时边界。
-加 case 用 `--tokens 1 2 4 8 16 24 32 48 64 72 256`。EP64 改为 `--nnodes=4`，
-四台使用 NODE_RANK=0/1/2/3，仍每机16进程，不需重编。
+默认测试 BS 1、2、4、32、48、64、256，H3584、K8、E384、BF16、容量 256。
+同一组进程先完成 HCCL 预热，再初始化一次 SHMEM。每个 BS 运行真实 Dispatch，
+使用独立 CPU 参考检查正负专家输出交替的四次 ACL Graph replay，覆盖双 bank 复用。
+先在图外完成首次静态 kernel 编译和 tiling 上传。
 
-此入口只采集 Combine 性能：CPU 生成输入/参考值，通过真实 Dispatch 取得 handle，
-先校验精度、正负输入、异步消费、输出保留及双 bank 复用，再预热和采样。
-性能预热与每轮采样**默认开启本地 Notify 启动门控**：先在通信流插入
-`aclrtWaitAndResetNotify`，再提交 HCCL MAX all_reduce、完成依赖和公共 Combine，
-全部入队后由独立 ACL 流 `aclrtRecordNotify` 放行。这样 HCCL 不会在该 rank 的
-Combine 下发前先完成，减小 Host 下发偏斜。每轮等待 NPU 完成后才复用 Notify。
-门控只属于此测试，生产 Combine 不增加 Notify 或 HCCL。HCCL 先于 SHMEM 初始化，
-首次精度调用也在门控外完成 tiling 上传与分配器预热。
+性能阶段默认不刷 L2，不开启 SuperKernel。预热 5 轮后，将 100 组设备时钟等待与 Combine
+录入同一张测量图。所有 rank 完成前序工作并汇合后，装入各自校准过的 deadline 表，
+整图 replay 一次，轮间默认间隔 1,000 µs。用例检查各 rank 的等待记录及跨 rank 放行裕量。
+默认 profiler 按顺序校验时钟与 Combine 一一对应，只取 `combine_put_jit` 的设备执行时间。
+先计算每轮所有 rank 的算术平均，再对最后 50 轮取均值（默认第 51–100 轮）。
+rank 0 写入 `summary.csv` 和 `bs-B-rank-mean.json`，后者保留全部逐轮均值和每个 rank
+的原始样本。可用 `--warmup`、`--iters`、`--perf-tail`
+调整轮数，用 `--clock-interval-us` 调整图内相邻两轮的放行间隔。
 
-无需新增参数即可使用门控；仅在对比时显式传 `--launch-gate none` 关闭，
-回显、`summary.csv` 和 `samples.json` 都记录模式。两组须使用相同参数及不同输出目录。
-门控不能消除链路/设备抖动，也不代表所有 rank 在同一硬件时刻启动。
-**默认 `--timer acl-event`，不启动 profiler。** 用例仍调用公共 V2 Combine，测试侧临时
-包装 native 入口，在实际 Combine 下发两侧记录 `ACL_EVENT_TIME_LINE`，完成后调用
-`aclrtEventElapsedTime` 并将毫秒转换为微秒；测试结束恢复原入口。
-HCCL、Dispatch、tiling 上传、输出分配和框架完成事件均不放进 Event 区间。
-默认门控确保 Event/kernel/Event 都已入队才放行；显式关闭门控时，Event 可能包含
-Host 下发造成的流空隙。生产模块和算子实现不加入测试 hook。
+按相同 torchrun 配置分别使用以下参数，每次选择新的输出目录。
 
-需要流水图时显式传 `--timer profiler`，单独采集 `ubx_combine_route_plan` 的 kernel
-task duration。两种计时都按每轮 rank-MAX 汇总，但 Event 区间与 profiler task 边界
-不同，不能直接相减当固定开销。默认 Event 测试不生成 profiler trace/CSV。
+| 目的 | 用例参数 |
+| --- | --- |
+| 常规路由及整表路径 | `--tokens 32 48 64 --output results/combine-normal` |
+| 集中路由及自动分块 | `--tokens 256 --route rank-hot --output results/combine-hot` |
+| 集中路由、精确形状及空专家卡回收源 token | `--tokens 32 256 --route rank-hot --exact-rows --check-only --output results/combine-hot-exact` |
+| 单独验证 Dispatch → Combine 精度及图重放 | `--tokens 1 32 256 --check-only --output results/combine-check` |
 
-先验证默认 Combine 性能后，可在相同启动命令中加入 `--check-only`，并使用新的输出目录，
-单独验证 Dispatch→Combine E2E 精度、跨流消费和重复调用。此模式不运行 profiler 或性能预热；
-也可增加 `--tokens 1 2 4 8 16 24 32 48 64 72 256`、`--dtype fp16` 扩大验证范围。
-这里的专家计算是确定性的缩放/偏置，不是完整 FFN；真实 FFN 验证使用下方独立入口。
+以 K8、E384、BS256 为例，集中路由把全部源 token 的八个专家放到 rank 0，
+EP16 和 EP32 的实际展开行数分别为 32,768 和 65,536。EP16 可验证机内 PUT 及分块；
+跨机直返、局部规约后 RDMA 回传需要 EP32 或更大规模。
 
-每轮在全部 rank 中取最大值，再对这些值计算 mean/min/P50/max，不删样本、不截尾。
-另行报告按时间顺序选取的前 50 轮均值及后 50 轮 mean/min/P50/max，保留全量统计。
-默认采样 100 轮时后 50 轮即第 51–100 轮，并不是时延最小的 50 轮；不足 50 轮时
-使用全部实测轮次并记录实际数量。`max_iter`、`max_rank` 和最慢 5 轮回显定位拖尾，
-`block10_mean` 按时间顺序列出每 10 轮均值，末组不足 10 轮时按实际数量计算。
-轮次均从预热后的第一轮开始以 1 编号，rank 从 0 编号；并列时列出最早轮次/最小 rank。
-rank 0 在输出根目录额外写入 `bs-B-rank-max.json`，保存全局逐轮时延、最慢 rank、
-分段统计和采样配置。数据复用 case 结束时已有的采样汇总，不在计时循环增加通信。
-每个 case 完成立即追加 `summary.csv`；各 rank 的 `rank-N/bs-B/samples.json` 保存原始时延：
-默认字段 `combine_event_us`，profiler 模式为 `kernel_us`。回显/文件记录 timer、门控模式和
-按 rank/token/TopK 槽顺序的 int32 小端路由 SHA256，便于核对两次采集使用相同路由。
-仅 profiler 模式在相同目录保留 trace/CSV；解析到的 Combine task 数必须等于采样轮数，
-不会使用 HCCL 或 POD kernel 的记录补足。本次路由生成仍沿用 V2 测试的 Python 随机采样；
-相同 seed 不保证与旧 prepared 用例的 C++ shuffle 产生相同路由。
-
-端到端系统回归仍可运行 `tests/elastic/test_ep_low_latency.py`；RDMA 下额外校验 Combine
-跨流依赖、bias、重复 handle 和 bank 复用，并识别新的 Combine task 名。Dispatch 测量逻辑不变。
-CPU 检查覆盖公开签名、流依赖/资源保活、错误路径、元数据 ABI 和 Host tiling；这些检查
-不能替代 CANN 完整编译及 EP32/64 实机的精度、完成性和性能验证。
+`--exact-rows` 让 Dispatch 按实际行数返回专家输入。集中路由下，零行的卡仍须产出本卡
+所有源 token 的结果。精度用例在首次 Combine 前按 CPU 路由核对 Dispatch 前缀，
+在分层模式下另查成员行的物理槽、规约卡所在组和收件槽所属源 token。
+各 rank 的 `bs-B-correctness.json` 记录实收行数与专家输入形状。两个入口均使用 BF16
+做 Dispatch，`--dtype fp16` 选择 FP16 专家计算和 Combine。
 
 ## Dispatch → FFN → Combine 精度
 

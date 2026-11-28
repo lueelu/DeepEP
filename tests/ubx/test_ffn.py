@@ -192,7 +192,8 @@ def main(argv=None):
                     print(f"BS={bs} round={iteration + 1}/{args.repeat} Dispatch -> FFN -> Combine", flush=True)
                 routes = reference.make_routes(world, bs, args.topk, args.experts, args.seed + iteration * 1000003)
                 entries = reference.expert_entries(routes, args.experts, world, rank)
-                cpu_inputs = [input_tensor(r, bs, args.hidden, dtype, args.seed, iteration) for r in range(world)]
+                # LL Dispatch transports BF16. The FFN and Combine can independently use FP16.
+                cpu_inputs = [input_tensor(r, bs, args.hidden, torch.bfloat16, args.seed, iteration) for r in range(world)]
                 weights = routing_weights(rank, bs, args.topk, args.seed, iteration)
                 with torch.npu.stream(compute):
                     x = cpu_inputs[rank].npu()
@@ -206,7 +207,8 @@ def main(argv=None):
                         do_expand=True,
                         do_cpu_sync=False,
                     )
-                    assert dispatched.event is None and handle.is_low_latency
+                    dispatched.current_stream_wait()
+                    assert handle.is_low_latency
                     # LL exposes no public expert-count list. The test reads the
                     # actual device prefix; CPU routing independently checks it.
                     prefix = handle.send_counts.cpu().tolist()
@@ -217,10 +219,10 @@ def main(argv=None):
                     rank,
                 )
                 with torch.npu.stream(compute):
-                    expert = torch.full_like(recv, float("nan"))
+                    expert = torch.full_like(recv, float("nan"), dtype=dtype)
                     for (start, end), parameters in zip(ranges, device_parameters):
                         if end > start:
-                            expert[start:end] = expert_forward(recv[start:end], parameters)
+                            expert[start:end] = expert_forward(recv[start:end].to(dtype), parameters)
                     ready = buffer.capture()
                 # No Host/device-wide sync or collective between the FFN and
                 # Combine: its public predecessor event must order the streams.
@@ -259,10 +261,10 @@ def main(argv=None):
                         torch.testing.assert_close(block[order], expected_input, rtol=0, atol=0)
                         ffn_errors.append(
                             check_close(
-                                computed[start:end][order], reference_ffn(expected_input, parameters), args.dtype
+                                computed[start:end][order], reference_ffn(expected_input.to(dtype), parameters), args.dtype
                             )
                         )
-                    expected = reference_combine(cpu_inputs[rank], routes[rank], weights, args.ffn_hidden, args.seed)
+                    expected = reference_combine(cpu_inputs[rank].to(dtype), routes[rank], weights, args.ffn_hidden, args.seed)
                     metrics["ffn"] = {
                         name: max((value[name] for value in ffn_errors), default=0.0)
                         for name in ("max_abs", "max_scaled")

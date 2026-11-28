@@ -1,8 +1,8 @@
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
-#include "comm_args.h"
-#include "ll_group_policy.h"
+#include <ubx/kernels/comm_args.h>
+#include <ubx/kernels/ll_group_policy.h>
 namespace UbxRdma {
 constexpr uint32_t kBackend = 1U;
 constexpr uint32_t kCoreBytes = 128U * 1024U;

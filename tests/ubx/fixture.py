@@ -56,6 +56,7 @@ def make_fixture(routes, world, rank, bs, hidden, topk, experts, ranks_per_host,
                 target_group = expert // local_experts // group
                 key = target_group if dedup and target_group != source // group else ("direct", k)
                 grouped.setdefault(key, []).append(k)
+            inboxes = {}
             roles = [1] * topk
             members = {}
             token_groups = []
@@ -71,6 +72,8 @@ def make_fixture(routes, world, rank, bs, hidden, topk, experts, ranks_per_host,
                     for k in ks:
                         roles[k] = 3
                     roles[first] = 2
+                    for member, position in enumerate(ordered[1:], 1):
+                        inboxes[position] = (ids[first] // local_experts, (source * bs + token) * topk + member)
                     members[first] = [(ids[k] | (q[k] << 16), 1 / topk) for k in ordered[1:]]
                 if source == rank:
                     masks[token] |= 1 << first
@@ -80,8 +83,8 @@ def make_fixture(routes, world, rank, bs, hidden, topk, experts, ranks_per_host,
                 reference_groups.append(sorted(token_groups))
             for k, expert in enumerate(ids):
                 if expert // local_experts == rank:
-                    slot = (((source + rank) % world) * local_experts + expert % local_experts) * bs + q[k]
-                    destination = (slot, -1, -1) if roles[k] == 3 else (source, token, k)
+                    slot = (((source + rank) % world) * local_experts + expert % local_experts) * capacity + q[k]
+                    destination = (slot, *inboxes[k]) if roles[k] == 3 else (source, token, k)
                     deliveries.append(
                         (expert % local_experts, source, q[k], token, expert, roles[k], destination, members.get(k, []))
                     )

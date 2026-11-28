@@ -32,9 +32,10 @@ def test_wire_routes_reconstruct_complete_output(world, width, bs, capacity):
         for row, role in enumerate(types):
             data = [decode(v) for v in x[row * hidden : (row + 1) * hidden]]
             if role == 3:
-                slot = dest[row * 3]
-                assert (rank, slot) not in stage
-                stage[rank, slot] = data
+                physical, owner, slot = dest[row * 3 : row * 3 + 3]
+                assert physical % capacity < bs
+                assert owner // width == rank // width and (owner, slot) not in stage
+                stage[owner, slot] = (physical, rank, data)
     for rank, f in enumerate(fixtures):
         dest, types, relay = (unpack("i" if k != "relay" else "I", f[k]) for k in ("destination", "types", "relay"))
         x = unpack("H", f["input"])
@@ -53,9 +54,11 @@ def test_wire_routes_reconstruct_complete_output(world, width, bs, capacity):
                 for member in range(1, record[0] + 1):
                     expert, q = record[2 * member] & 65535, record[2 * member] >> 16
                     target, local = divmod(expert, experts // world)
-                    slot = (((source + target) % world) * (experts // world) + local) * bs + q
-                    assert target // width == rank // width
-                    data = [a + b * weight(member) for a, b in zip(data, stage[target, slot])]
+                    physical = (((source + target) % world) * (experts // world) + local) * capacity + q
+                    slot = (source * bs + token) * topk + member
+                    actual_slot, sender, values = stage.pop((rank, slot))
+                    assert (actual_slot, sender) == (physical, target)
+                    data = [a + b * weight(member) for a, b in zip(data, values)]
                 data = [decode(encode(v)) for v in data]
             assert (source, token, k) not in returns
             returns[source, token, k] = data
@@ -76,3 +79,4 @@ def test_wire_routes_reconstruct_complete_output(world, width, bs, capacity):
                 ids = routes[(rank * bs + token) * topk : (rank * bs + token + 1) * topk]
                 expected = sum(value(rank, token, e, h) / topk for e in ids)
                 assert abs(decode(result[token * hidden + h]) - expected) < 0.02
+    assert not stage

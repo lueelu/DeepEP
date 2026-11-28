@@ -36,19 +36,24 @@ message(STATUS "Locked DeepJIT header identity: ${DEEPEP_DEEPJIT_SIGNATURE}")
 # DeepJIT headers use std::format. The adaptation is selected from an actual
 # C++20 compile check, not from CMAKE_CXX_COMPILER_VERSION.
 include(CheckCXXSourceCompiles)
-set(_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
-set(_saved_required_definitions "${CMAKE_REQUIRED_DEFINITIONS}")
-set(_saved_required_libraries "${CMAKE_REQUIRED_LIBRARIES}")
-set(CMAKE_REQUIRED_FLAGS "-std=c++20")
-check_cxx_source_compiles([=[
+include(CMakePushCheckState)
+set(DEEPEP_DEEPJIT_CXX_STANDARD 20)
+function(_deepep_check_format source result)
+    # try_compile inherits CMAKE_CXX_STANDARD (CMP0067). A raw -std flag can
+    # otherwise be overridden by the enclosing project's C++17 setting.
+    set(CMAKE_CXX_STANDARD ${DEEPEP_DEEPJIT_CXX_STANDARD})
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    check_cxx_source_compiles("${source}" ${result})
+endfunction()
+
+_deepep_check_format([=[
 #include <format>
 #include <string>
 int main() {
     const std::string value = std::format("{:016x} {}", 7ull, "ok");
     return value.empty() ? 1 : 0;
 }
-]=] DEEPEP_DEEPJIT_HAS_STD_FORMAT)
-set(CMAKE_REQUIRED_FLAGS "${_saved_required_flags}")
+]=] DEEPEP_DEEPJIT_CXX20_HAS_STD_FORMAT)
 
 set(DEEPEP_DEEPJIT_COMPAT_INCLUDE "" CACHE INTERNAL "Build-output DeepJIT compatibility headers")
 set(DEEPEP_DEEPJIT_FMT_INCLUDE "" CACHE INTERNAL "fmt headers used by the GCC 11 adaptation")
@@ -79,7 +84,7 @@ if(EXISTS "${_deepep_vendor_backend}")
     message(STATUS "DeepJIT Ascend adv_api include: ${_deepep_asc_adv_api_rel}")
 endif()
 
-if(NOT DEEPEP_DEEPJIT_HAS_STD_FORMAT)
+if(NOT DEEPEP_DEEPJIT_CXX20_HAS_STD_FORMAT)
     # GCC 11's libstdc++ has no <format>. Provide a generated <format> header
     # that forwards the used surface to fmt, then compile-check the shim.
     set(DEEPEP_DEEPJIT_FMT_ROOT "" CACHE PATH
@@ -129,43 +134,44 @@ using fmt::format_error;
     set(DEEPEP_DEEPJIT_COMPAT_INCLUDE "${_deepep_compat_dir}")
     set(DEEPEP_DEEPJIT_FMT_INCLUDE "${DEEPEP_FMT_INCLUDE_DIR}")
     set(DEEPEP_DEEPJIT_COMPAT_MODE "fmt")
-    set(CMAKE_REQUIRED_INCLUDES "${_deepep_compat_dir}" "${DEEPEP_FMT_INCLUDE_DIR}")
-    set(CMAKE_REQUIRED_DEFINITIONS "-DFMT_HEADER_ONLY")
-    set(CMAKE_REQUIRED_FLAGS "-std=c++20")
-    check_cxx_source_compiles([=[
+    cmake_push_check_state()
+    list(PREPEND CMAKE_REQUIRED_INCLUDES "${_deepep_compat_dir}" "${DEEPEP_FMT_INCLUDE_DIR}")
+    list(APPEND CMAKE_REQUIRED_DEFINITIONS "-DFMT_HEADER_ONLY=1")
+    _deepep_check_format([=[
 #include <format>
 #include <string>
 int main() {
     const std::string value = std::format("{:016x} {:.2f} {}", 7ull, 1.5, "ok");
     return value.empty() ? 1 : 0;
 }
-]=] DEEPEP_DEEPJIT_FORMAT_SHIM_COMPILES)
-    unset(CMAKE_REQUIRED_INCLUDES)
-    set(CMAKE_REQUIRED_DEFINITIONS "${_saved_required_definitions}")
-    set(CMAKE_REQUIRED_FLAGS "${_saved_required_flags}")
-    if(NOT DEEPEP_DEEPJIT_FORMAT_SHIM_COMPILES)
+]=] DEEPEP_DEEPJIT_CXX20_FORMAT_SHIM_COMPILES)
+    cmake_pop_check_state()
+    if(NOT DEEPEP_DEEPJIT_CXX20_FORMAT_SHIM_COMPILES)
         message(FATAL_ERROR
             "The generated fmt adaptation for <format> does not compile/link with FMT_HEADER_ONLY; "
             "check DEEPEP_DEEPJIT_FMT_ROOT (a C++20-compatible fmt release is required)")
     endif()
     message(STATUS "DeepJIT formatting adapted to fmt at ${DEEPEP_FMT_INCLUDE_DIR}")
 else()
+    # A previous configure may have generated the fmt shim in this build tree.
+    file(REMOVE "${_deepep_compat_dir}/format")
     message(STATUS "DeepJIT formatting uses the standard library <format>")
 endif()
 
 # Compile the locked headers' actual formatting expressions, not a synthetic
 # printf. This also catches a fmt mode that forgot FMT_HEADER_ONLY.
-set(CMAKE_REQUIRED_INCLUDES "${DEEPJIT_ROOT}/include")
+cmake_push_check_state()
+list(PREPEND CMAKE_REQUIRED_INCLUDES "${DEEPJIT_ROOT}/include")
 if(NOT DEEPEP_DEEPJIT_COMPAT_INCLUDE STREQUAL "")
-    list(APPEND CMAKE_REQUIRED_INCLUDES "${DEEPEP_DEEPJIT_COMPAT_INCLUDE}")
+    list(PREPEND CMAKE_REQUIRED_INCLUDES "${DEEPEP_DEEPJIT_COMPAT_INCLUDE}")
 endif()
 if(NOT DEEPEP_DEEPJIT_FMT_INCLUDE STREQUAL "")
     list(APPEND CMAKE_REQUIRED_INCLUDES "${DEEPEP_DEEPJIT_FMT_INCLUDE}")
-    set(CMAKE_REQUIRED_DEFINITIONS "-DFMT_HEADER_ONLY")
+    list(APPEND CMAKE_REQUIRED_DEFINITIONS "-DFMT_HEADER_ONLY=1")
 endif()
-set(CMAKE_REQUIRED_LIBRARIES "pthread")
-set(CMAKE_REQUIRED_FLAGS "-std=c++20")
-check_cxx_source_compiles([=[
+list(APPEND CMAKE_REQUIRED_LIBRARIES pthread)
+set(_deepep_headers_check "DEEPEP_DEEPJIT_CXX20_HEADERS_COMPILE_${DEEPEP_DEEPJIT_COMPAT_MODE}")
+_deepep_check_format([=[
 #include <deep_jit/utils/hash.hpp>
 #include <deep_jit/utils/uuid.hpp>
 int main() {
@@ -173,12 +179,9 @@ int main() {
     const auto uuid = deep_jit::get_uuid();
     return digest.empty() || uuid.empty();
 }
-]=] DEEPEP_DEEPJIT_ACTUAL_FORMAT_COMPILES)
-unset(CMAKE_REQUIRED_INCLUDES)
-set(CMAKE_REQUIRED_DEFINITIONS "${_saved_required_definitions}")
-set(CMAKE_REQUIRED_LIBRARIES "${_saved_required_libraries}")
-set(CMAKE_REQUIRED_FLAGS "${_saved_required_flags}")
-if(NOT DEEPEP_DEEPJIT_ACTUAL_FORMAT_COMPILES)
+]=] ${_deepep_headers_check})
+cmake_pop_check_state()
+if(NOT ${_deepep_headers_check})
     message(FATAL_ERROR
         "The locked DeepJIT headers do not compile/link their actual std::format expressions; "
         "check the <format> adaptation and FMT_HEADER_ONLY configuration")
@@ -233,6 +236,7 @@ endif()
 
 # Apply the locked headers and verified adaptations to one Host target.
 function(deepep_apply_deepjit target)
+    set_target_properties(${target} PROPERTIES CXX_STANDARD ${DEEPEP_DEEPJIT_CXX_STANDARD} CXX_STANDARD_REQUIRED ON)
     target_include_directories(${target} SYSTEM PRIVATE "${DEEPJIT_ROOT}/include")
     if(NOT DEEPEP_DEEPJIT_COMPAT_INCLUDE STREQUAL "")
         target_include_directories(${target} BEFORE PRIVATE "${DEEPEP_DEEPJIT_COMPAT_INCLUDE}")

@@ -15,6 +15,7 @@
 #include "runtime/session.hpp"
 #include "runtime/ll_core_config.hpp"
 #include "ubx/v2.hpp"
+#include "ubx/launch.hpp"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
 #include "host/data_plane/shmem_host_p2p_sync.h"
@@ -33,6 +34,12 @@ extern "C" uint32_t deepep_ll_reference_profile_enabled();
 namespace {
 using Shape = std::vector<int64_t>;
 constexpr uint64_t kRankBaseBiasBytes = 1024U;
+
+uint32_t device_combine_ub_bytes()
+{
+    return ubx::combine_ub_bytes(deep_ep::jit_num_ubuf_bytes_per_vec_core());
+}
+
 uint32_t pin_session_cores(Session& session)
 {
     session.workspace();
@@ -157,6 +164,7 @@ void bind_low_latency(py::module_& module)
 {
     if (deepep_ll_core_protocol_version() != deep_ep::kLlCoreProtocolVersion)
         throw std::runtime_error("LL Host/device core protocol mismatch; rebuild and reinstall the complete wheel");
+    module.attr("low_latency_put_route_tag") = deep_ep::kEpServerDedupPutRouteTag;
     module.attr("low_latency_core_protocol") = deep_ep::kLlCoreProtocolVersion;
     module.attr("low_latency_roce_qps_per_peer") = 0; // actual active physical cores
     module.attr("low_latency_implementation") = "ndr-hns1825";
@@ -324,7 +332,8 @@ void bind_low_latency(py::module_& module)
                [](int p, int b, int h, int k, int e, const std::string& dtype, int num_max_tokens_per_rank, bool rdma) {
                    if (rdma) {
                        return bytes(ubx::v2_tiling(p, b, h, k, e, combine_dtype_code(dtype), num_max_tokens_per_rank,
-                                                 query_ll_core_config().active, deep_ep::kNumRanksPerHost));
+                                                 query_ll_core_config().active, deep_ep::kNumRanksPerHost,
+                                                 device_combine_ub_bytes()));
                    }
                    CombineDedup::Layout plan{};
                    if ((dtype != "bfloat16" && dtype != "float16") ||
@@ -362,6 +371,11 @@ void bind_low_latency(py::module_& module)
         }
         auto get = [&](const char* name, Shape shape, const char* type) { return tensor(tensors[name], shape, type); };
         const bool dedup = deep_ep::EpServerDedupEnabled(uint32_t(capacity), uint32_t(session.world()));
+        // PUT Combine stores the FIRST_HOP inbox base in one 32-bit header word
+        // and publishes base + member as an int32 destination_index row. Reject
+        // launches whose largest slot cannot be represented.
+        if (dedup && uint64_t(session.world()) * uint64_t(b) * uint64_t(k) > uint64_t(INT32_MAX) + 1U)
+            throw std::invalid_argument("LL PUT inbox slots exceed int32 metadata");
 
         void* comm_args = get("comm_args", {sizeof(deep_ep::comm::CommArgs)}, "uint8");
         void* peer_ptrs = static_cast<uint8_t*>(comm_args) + offsetof(deep_ep::comm::CommArgs, peerMems);
@@ -412,18 +426,26 @@ void bind_low_latency(py::module_& module)
     module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int capacity,
                                          const std::string& dtype, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
-        CombineDedup::Layout plan{};
+        ubx::PutLaunchPlan put_plan{};
         if (!stream_address || session.capacity() != deep_ep::kEpServerDedupPeerBytes ||
             (dtype != "bfloat16" && dtype != "float16") || b <= 0 || capacity < b) {
             throw std::invalid_argument("Invalid LL combine dtype, shape, workspace or stream");
         }
+        const auto input_shape = tensors["input"].attr("shape").cast<Shape>();
+        if (input_shape.size() != 2 || input_shape[0] < 0 || input_shape[1] != h) {
+            throw std::invalid_argument("LL combine input must have shape [rows, H]");
+        }
         uint32_t cores = 0;
+        uint32_t ub_bytes = 0;
         if (session.ll_rdma()) {
             cores = pin_session_cores(session);
-            plan.capacityRows =
-                ubx::v2_capacity(session.world(), b, h, k, e, cores, deep_ep::kNumRanksPerHost);
-        } else if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active)) {
-            throw std::invalid_argument("Invalid LL combine shape");
+            ub_bytes = device_combine_ub_bytes();
+            put_plan = ubx::v2_plan(session.world(), b, h, k, e, cores, deep_ep::kNumRanksPerHost, ub_bytes,
+                                    input_shape[0]);
+        } else {
+            CombineDedup::Layout plan{};
+            if (!CombineDedup::BuildLayout(session.world(), b, h, k, e, plan, query_ll_core_config().active))
+                throw std::invalid_argument("Invalid LL combine shape");
         }
         // Row metadata was sized by the Dispatch capacity M, while the kernel
         // still works row-by-row over the actual B tokens.
@@ -446,10 +468,6 @@ void bind_low_latency(py::module_& module)
         args.commArgs = get("comm_args", {sizeof(deep_ep::CommArgs)}, "uint8");
         // Python validates rows against the dispatch handle. The device selects
         // rows below the actual receive count; C_B sizes metadata, not expert storage.
-        const auto input_shape = tensors["input"].attr("shape").cast<Shape>();
-        if (input_shape.size() != 2 || input_shape[0] < 0 || input_shape[1] != h) {
-            throw std::invalid_argument("LL combine input must have shape [rows, H]");
-        }
         args.expertOut = get("input", input_shape, dtype.c_str());
         args.destinationIndex = get("destination_index", {c, 3}, "int32");
         args.sendCounts = get("send_counts", {e}, "int32");
@@ -463,10 +481,10 @@ void bind_low_latency(py::module_& module)
         py::gil_scoped_release release;
         session.invalidate_dispatch_controls();
         if (session.ll_rdma()) {
-            const ubx::CombineArgs rdma_args{args.commArgs,     args.expertOut, args.destinationIndex, args.sendCounts,
-                                             args.expertScales, args.tokenType, args.relayReadIndex,   args.sourceMask,
-                                             args.yOut,         args.tilingData, cores};
-            ubx_combine_launch(reinterpret_cast<void*>(stream_address), &rdma_args);
+            deep_ep::launch_combine_put(
+                reinterpret_cast<void*>(stream_address), cores, deep_ep::LlGroupForWorld(world), ub_bytes, h, k, e,
+                put_plan, args.commArgs, args.expertOut, args.destinationIndex, args.sendCounts, args.expertScales,
+                args.tokenType, args.relayReadIndex, args.sourceMask, args.yOut, args.tilingData);
         } else {
             combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
         }

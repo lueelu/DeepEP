@@ -42,8 +42,7 @@ set(_other_sources
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/dispatch.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/reuse.cpp"
-    "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine_ep8.cpp"
-    "${DEEPEP_SOURCE_DIR}/csrc/ubx/kernels/combine.cpp")
+    "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine_ep8.cpp")
 add_library(deepep_kernel_ll_plain OBJECT ${_ll_sources})
 add_library(deepep_kernel_ll_reference OBJECT ${_ll_sources})
 set_target_properties(deepep_kernel_ll_plain deepep_kernel_ll_reference

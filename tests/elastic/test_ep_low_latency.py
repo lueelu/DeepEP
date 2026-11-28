@@ -390,7 +390,13 @@ def summarize_kernel(samples_by_rank, kernel, tail):
         selected = raw[-tail:] if tail else raw
         selected_samples.extend(selected)
         ranks.append({"rank": rank, **sample_stats(selected), "kernel_us": raw})
-    # Pool individual kernel durations after selecting each rank's stable tail.
+    scope = "pooled_rank_tail_kernel_samples"
+    if kernel == "combine_put_jit":
+        if any(len(row) != len(samples_by_rank[0]) for row in samples_by_rank):
+            raise ValueError("All ranks must report the same number of Combine samples")
+        iterations = [statistics.mean(row) for row in zip(*samples_by_rank)]
+        selected_samples = iterations[-tail:] if tail else iterations
+        scope = "per_iteration_rank_mean_tail"
     pooled = sample_stats(selected_samples)
     fastest = min(ranks, key=lambda row: row["mean_us"])
     slowest = max(ranks, key=lambda row: row["mean_us"])
@@ -399,7 +405,7 @@ def summarize_kernel(samples_by_rank, kernel, tail):
         "kernel": kernel,
         "perf_tail": tail,
         "ranks": ranks,
-        "summary_statistics_scope": "pooled_rank_tail_kernel_samples",
+        "summary_statistics_scope": scope,
         "kernel_samples": pooled["samples"],
         **{f"{name}_kernel_us": pooled[f"{name}_us"] for name in ("mean", "p99", "p90", "p50")},
         "min_rank_mean_kernel_us": fastest["mean_us"],
@@ -1800,7 +1806,8 @@ def measure(buffer, invoke, args, operation, profile_dir, progress=None, after_p
     import torch.distributed as dist
     import torch_npu
 
-    kernel = f"{operation}_server_dedup_kernel"
+    kernel = ("combine_put_jit" if operation == "combine" and os.environ.get("DEEPEP_LL_BACKEND") == "rdma"
+              else f"{operation}_server_dedup_kernel")
     if progress:
         progress(f"{operation}.warmup")
     completion_boundary(args)
@@ -1822,6 +1829,8 @@ def measure(buffer, invoke, args, operation, profile_dir, progress=None, after_p
         profile_memory=True, with_stack=False, with_flops=False, with_modules=False,
     ) as profiler:
         for _ in range(args.warmup):
+            if kernel == "combine_put_jit":
+                completion_boundary(args)
             output = invoke()
         torch.npu.synchronize()
         if clock_aligned:
@@ -1832,6 +1841,9 @@ def measure(buffer, invoke, args, operation, profile_dir, progress=None, after_p
             enqueue_exp_prefix(delay)
         profiler.step()
         for iteration in range(args.num_iters):
+            if kernel == "combine_put_jit":
+                # A standalone Combine batch has no interleaved Dispatch to coordinate bank reuse.
+                completion_boundary(args)
             if clock_state is not None:
                 enqueue_clock_alignment(clock_state, args, iteration)
             output = invoke()
@@ -1921,7 +1933,8 @@ def diagnostic_calls(buffer, invoke, check, args, operation, rank, m, mode,
         with capture(buffer, operation, capture_mode, args.ll_timer_frequency_hz,
                      prepared=trace, defer_complete=True):
             output = invoke()
-            output[-1].current_stream_wait()
+            if output[-1].event is not None:
+                output[-1].current_stream_wait()
         pending.append((iteration, trace, output))
     # No CPU copy, correctness collective or filesystem operation in the sample loop.
     completion_boundary(args)
@@ -2119,7 +2132,8 @@ def run_case(buffer, args, rank, world, m, mode):
         out, returned_weights, completed = trace_call(
             args, "combine.invoke", combine, expert_output, handle, topk_weights=None
         )
-        trace_call(args, "combine.event.wait", completed.current_stream_wait)
+        if completed.event is not None:
+            trace_call(args, "combine.event.wait", completed.current_stream_wait)
         trace_call(args, "device.synchronize", torch.npu.synchronize)
 
         def check_combine():

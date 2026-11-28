@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include "combine_return_schedule.h"
-#include "combine_transfer_batch.h"
+#include <ubx/kernels/combine_return_schedule.h>
+#include <ubx/kernels/combine_transfer_batch.h>
 namespace UbxCombine {
 using ReturnBatch = TransferBatch;
 // Caller has packed this output and acquired V->MTE3.

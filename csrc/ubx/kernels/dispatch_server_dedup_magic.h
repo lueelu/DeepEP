@@ -4,8 +4,8 @@
 #ifndef DISPATCH_SERVER_DEDUP_MAGIC_H
 #define DISPATCH_SERVER_DEDUP_MAGIC_H
 
-#include "kernel_operator.h"
-#include "ep_memory_server_dedup_count_layout.h"
+#include <kernel_operator.h>
+#include <ubx/kernels/ep_memory_server_dedup_count_layout.h>
 
 namespace UbxDispatch {
 
