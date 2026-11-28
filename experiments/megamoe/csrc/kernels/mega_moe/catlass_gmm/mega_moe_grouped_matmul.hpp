@@ -189,8 +189,8 @@ public:
     }
 
 protected:
-    __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
-                                             uint32_t outputN, bool toAiv1 = false)
+    __aicore__ inline bool ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
+                                             uint32_t outputN, __gm__ int32_t* credit = nullptr, int32_t sequence = 0)
     {
         auto a = Tensor<A>(addr_.aGlobal, tla::MakeLayout<A, LayoutA>(config_.m, config_.k));
         auto sa =
@@ -202,7 +202,8 @@ protected:
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
         auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
-        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U, toAiv1);
+        return block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
+                      credit, sequence);
     }
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
@@ -242,17 +243,16 @@ public:
         planarSingle_ = down || config.sharedPolicy.decode;
         halfN_ = config.outputN;
     }
-    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols, bool toAiv1 = false)
+    __aicore__ inline bool Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols,
+                                   __gm__ int32_t* credit = nullptr, int32_t sequence = 0)
     {
         // Logical activation columns map to contiguous gate/up pairs in GM.
         if (fused_) {
-            Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, toAiv1);
-        } else {
-            Pipeline::ComputeProjection(m, n, rows, cols, n);
-            if (!planarSingle_) {
-                Pipeline::ComputeProjection(m, n + halfN_, rows, cols, n + halfN_);
-            }
+            return Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, credit, sequence);
         }
+        Pipeline::ComputeProjection(m, n, rows, cols, n);
+        if (!planarSingle_) Pipeline::ComputeProjection(m, n + halfN_, rows, cols, n + halfN_);
+        return false;
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {

@@ -157,14 +157,14 @@ dist.destroy_process_group()
 
 每机 16 个连续 rank，HNS_1825，两端安装相同的 wheel 和 SHMEM SDK。UBX 在 EP4/8/16、
 每 rank 容量不超过 256 时选基础 MTE，更大的容量选 URMA。双机 EP32 decode 采用分层 MTE + RoCE。
-在 28 AIC / 56 AIV 上，BS96、H5120、I2304、K6、每 rank 13 个 routed FP4 专家和 1 个原生 FP8 shared 专家的 BF16 输入默认启用优化调度。公共输入屏障后，AIV0 执行 shared SwiGLU，AIV1 可同时推进 routed Dispatch。
+在 28 AIC / 56 AIV 上，BS96、H5120、I2304、K6、每 rank 12 或 13 个 routed FP4 专家和 1 个原生 FP8 shared 专家的 BF16 输入默认启用优化调度。公共输入屏障后，AIV0 执行 shared SwiGLU，AIV1 优先处理已就绪的 routed activation，再发下一个 Dispatch slice。
 
 ```bash
-DEEPEP_MEGAMOE_TIMER=OFF bash experiments/megamoe/scripts/build.sh --rdma-backend HNS_1825
+CATLASS_ROOT="$PWD/third-party/catlass" DEEPEP_MEGAMOE_TIMER=OFF bash experiments/megamoe/scripts/build.sh --rdma-backend HNS_1825
 ```
 
-对照基线用 `87d1ccc` 已启用 BF16 BS96 优化的 wheel。两版使用同一份验收脚本和输入，均应报告协议 5、8 个 Dispatch QP、24 个 Combine QP、wave 5。每次切换 wheel 后重新启动作业。生成用例使用固定种子，在共享目录准备一次 CPU golden。复测历史数据时，两版均使用 `--bank "$CASE/bank"` 加载同一份 map136 输入。
-以下命令中的 `NODE_RANK` 在两机分别为 0 和 1，`MASTER_ADDR` 指向第 0 节点。
+调度对照使用 `d7a9f42` 的 wheel。两版使用同一份验收脚本和输入，均应报告协议 5、8 个 Dispatch QP、24 个 Combine QP、wave 5。每次切换 wheel 后重新启动作业。生成用例使用固定种子，在共享目录准备一次 CPU golden。复测历史数据时，两版均使用 `--bank "$CASE/bank"` 加载同一份 map136 输入。
+以下命令中的 `NODE_RANK` 在两机分别为 0 和 1，`MASTER_ADDR` 指向第 0 节点。两机设置相同的 `DEEPEP_SHMEM_ENDPOINT=tcp://<第 0 节点数据网 IPv4>:<空闲端口>`，端口与 torchrun 的主端口分开。
 
 ```bash
 script=experiments/megamoe/scripts/check_ep32_replay.py

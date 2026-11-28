@@ -345,9 +345,10 @@ public:
     /// Perform a block-scoped matrix multiply-accumulate
     template <class TensorA, class TensorC, class TensorMxScaleA = EmptyClass, class TensorMxScaleB = EmptyClass,
               class TensorBias = EmptyClass>
-    CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
+    CATLASS_DEVICE bool operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
-                                   bool allowDynamicB = false, bool toAiv1 = false, TensorBias const& tensorBias = {})
+                                   bool allowDynamicB = false, __gm__ int32_t* credit = nullptr, int32_t sequence = 0,
+                                   TensorBias const& tensorBias = {})
     {
         // Check L1TileShape
         if constexpr (HAS_BIAS) {
@@ -567,7 +568,10 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
         }
         constexpr uint8_t unitFlag = ENABLE_UNIT_FLAG ? 0b11 : 0;
+        bool toAiv1 = false;
 #ifdef DEEPEP_MEGAMOE_ROCE
+        // AIV1 may have released its slot while this projection was computing.
+        toAiv1 = credit && AscendC::ReadGmByPassDCache(credit) == sequence;
         if (toAiv1) {
             // Store the packed [gate128, up128] rows with the same scaled BF16 conversion as GM.
             AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> fix{};
@@ -593,6 +597,7 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0CListId]);
             l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
         }
+        return toAiv1;
     }
 
 protected:

@@ -215,7 +215,13 @@ __aicore__ inline void GatherRouteStripes(const AivJobContext& job, const MoeSta
                                 host * 16U + mesh * 4U, 1U, lane, params);
         }
     }
-    for (uint32_t rank = job.jobIndex; rank < common.worldSize; rank += job.totalJobs) {
+    uint32_t first = job.jobIndex;
+    if (params.tilingData->bf16Bs96 && UseSharedRouteTable(params.tilingData) && job.totalJobs > common.worldSize) {
+        // Leave job 0 free to coordinate shared counts. The first spare job publishes source 0.
+        if (first == 0U) first = common.worldSize;
+        else if (first == common.worldSize) first = 0U;
+    }
+    for (uint32_t rank = first; rank < common.worldSize; rank += job.totalJobs) {
         const uint32_t index = RouteGatherSlot(rank);
         auto* record = params.peermemInfo.gatherPtr + index * bytes;
         {

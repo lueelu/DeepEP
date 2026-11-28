@@ -503,7 +503,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     ExpertTokenPosition dispatch{};
     uint32_t dispatchGroups = 0U;
     uint64_t dispatchWave = 0U;
-    DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
+    if (!params_.tilingData->bf16Bs96) DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
     const bool early = UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr);
     bool readersDone = dispatch.expertIdx >= commonConfig_.moeExpertPerRank;
     if (early && readersDone) PublishCoreClosure(params_, countWorkspace_.blockIdx, false);
@@ -567,7 +567,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         }
 #ifdef DEEPEP_MEGAMOE_ROCE
 
-        this->ProgressGatewayHint();
+        this->ProgressGatewayHint(readersDone);
         if (!UseAiv0CombineOwners(params_.tilingData) &&
             IsHierarchicalCombineOwner(params_.tilingData, this->aivJob_.jobIndex)) {
             combinePipeline_.Drain(timer_);

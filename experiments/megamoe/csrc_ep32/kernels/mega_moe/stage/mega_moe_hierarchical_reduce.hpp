@@ -213,15 +213,14 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
     timing.StartScan();
     uint32_t cursor = progress.nextRow;
     uint32_t posts = 0U;
-    for (uint32_t checked = 0U; checked < (maxPosts == 1U ? 1U : progress.owned) && posts < maxPosts; ++checked) {
+    const bool skipDone = params.tilingData->bf16Bs96 && maxPosts == 1U;
+    for (uint32_t checked = 0U; checked < progress.owned && posts < maxPosts; ++checked) {
         const uint32_t token = progress.tokens[cursor];
+        if (++cursor == progress.owned) cursor = 0U;
         const uint32_t mask = progress.pendingTopkMasks[token];
-        bool ready = mask != 0U;
-        uint32_t observed = 0U;
+        if (skipDone && !mask) continue;
         const int64_t scanStart = diagnostic ? GetSystemCycle() : 0;
-
-        observed = GatewayCombinePacketReadyMask(params, token, mask);
-        ready = ready && observed == mask;
+        const uint32_t observed = GatewayCombinePacketReadyMask(params, token, mask);
         scannedRows += CombineMaskCount(mask);
 
         if (diagnostic && mask != 0U && observed != progress.deferredTopkMasks[token]) {
@@ -230,7 +229,7 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
                                 (static_cast<uint64_t>(mask) << 32) | observed);
             progress.deferredTopkMasks[token] = observed;
         }
-        if (ready) {
+        if (mask && observed == mask) {
             timing.StopScan();
 
             ReduceAndPostHierarchicalToken(common, params, token, mask, lane, roceScratch, timer);
@@ -240,9 +239,7 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
             progress.sentRows += CombineMaskCount(mask);
             ++posts;
         }
-        if (++cursor == progress.owned) {
-            cursor = 0;
-        }
+        if (maxPosts == 1U) break;
     }
     progress.nextRow = cursor;
     timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, scannedRows);

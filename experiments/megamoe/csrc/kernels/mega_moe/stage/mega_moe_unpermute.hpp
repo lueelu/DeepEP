@@ -219,9 +219,7 @@ __aicore__ inline void AccumulateHierarchicalReducedToken(const TokenUnpermuteCo
         PipeBarrier<PIPE_V>();
         return;
     }
-    // At least one remote expert exists here. Its received sum already includes
-    // every remote weight. The per-QP commit join precedes this whole stage.
-    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    // Acquire the remote partial while the vector pipe finishes using the local input slot.
     if (UseInputEarlyClosure(params.tilingData, params.inputScaleGmAddr != nullptr) && params.tilingData->aicNum == 28) {
         const uint32_t qp = scratch.incomingQp[tokenIdx - scratch.firstOutput];
         if ((scratch.acquiredQps & (1U << qp)) == 0) {
@@ -232,6 +230,7 @@ __aicore__ inline void AccumulateHierarchicalReducedToken(const TokenUnpermuteCo
             scratch.acquiredQps |= 1U << qp;
         }
     }
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
     auto partial = scratch.dataResFp32Tensor[bufferConfig.fp32SlotElementCount];
     GlobalTensor<float> partialGm;
     partialGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.peermemInfo.combinePartialRecvPtr));

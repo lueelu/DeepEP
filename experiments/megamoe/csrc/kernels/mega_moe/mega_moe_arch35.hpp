@@ -149,11 +149,12 @@ protected:
 #ifdef DEEPEP_MEGAMOE_ROCE
     HostClosureCursor hostClosure_{};
     uint32_t confirmedPayloadLanes_ = 0U;
-    __aicore__ inline void ProgressGatewayHint()
+    __aicore__ inline void ProgressGatewayHint(bool readersDone = false)
     {
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
         if constexpr (g_coreType == AIC) return;
-        if (UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr) && aivJob_.jobIndex == 1U)
+        if (readersDone && aivJob_.jobIndex == 1U &&
+            UseInputEarlyClosure(params_.tilingData, params_.inputScaleGmAddr != nullptr))
             ProgressHostClosure(params_, rankId_, false, hostClosure_);
         if (UseHierarchicalRoce(params_.tilingData))
             FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr,
@@ -1161,13 +1162,21 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
         timer_.End(AscendTimer::AIV_INPUT_BUFFER_INIT);
         timer_.Start(AscendTimer::AIV_QUANT);
     }
+    auto quantJob = aivJob_;
 #ifdef DEEPEP_MEGAMOE_ROCE
     if constexpr (g_coreType == AIV) {
         if (!earlyMetadata && UseHierarchicalRoce(params_.tilingData)) PackOrPostRailMetadata();
+        if (earlyMetadata && params_.tilingData->bf16Bs96 && aivJob_.totalJobs > 2U) {
+            const uint32_t sender = HierarchicalSendJob(), spare = aivJob_.totalJobs - 2U;
+            if ((aivJob_.jobIndex == sender || aivJob_.jobIndex == spare) &&
+                TilingByJobContext(commonConfig_.tokenNum, spare, aivJob_.totalJobs, 1U).count == 0U) {
+                quantJob.jobIndex = aivJob_.jobIndex == sender ? spare : sender;
+            }
+        }
     }
 #endif
     QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
-        aivJob_, commonConfig_, params_, quantProcessConfig_, quantScratch_);
+        quantJob, commonConfig_, params_, quantProcessConfig_, quantScratch_);
 #ifdef DEEPEP_MEGAMOE_ROCE
     if (params_.tilingData->bf16Bs96) {
         // Only quant/packet stores precede this mixed barrier. Routing and count work can overlap GMM1.

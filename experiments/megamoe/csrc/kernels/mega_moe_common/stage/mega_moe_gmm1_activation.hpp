@@ -271,11 +271,10 @@ __aicore__ inline void Gmm1AicMmadA8W4(BlockMmad& blockMmad, WorkSet& workSet, c
         }
 
 #ifdef DEEPEP_MEGAMOE_ROCE
-        const bool direct = gmmAddrInfo.routedConsumed && config.m <= ROUTED_UB_MAX_ROWS &&
-                            Get<N_VALUE>(actualShape) == GMM1_FUSED_TILE_N &&
-                            params.tilingData->roceScratchUbOffset >= ROUTED_UB_END &&
-                            AscendC::ReadGmByPassDCache(gmmAddrInfo.routedConsumed) == gmm1TileReadySequence;
-        blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape), direct);
+        const bool fits = config.m <= ROUTED_UB_MAX_ROWS && Get<N_VALUE>(actualShape) == GMM1_FUSED_TILE_N &&
+                          params.tilingData->roceScratchUbOffset >= ROUTED_UB_END;
+        const bool direct = blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape),
+                                              fits ? gmmAddrInfo.routedConsumed : nullptr, gmm1TileReadySequence);
 #else
         blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape));
 #endif

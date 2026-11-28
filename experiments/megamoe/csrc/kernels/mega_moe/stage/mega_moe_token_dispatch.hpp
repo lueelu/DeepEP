@@ -149,7 +149,7 @@ struct DispatchRouteSegment {
 struct DispatchProbeRow {
     DispatchRow copy;
     uint8_t* deliveredWindow;
-    uint8_t deliveredBit;
+    uint32_t mark;  // Index in resident UB, or bit in deliveredWindow.
 };
 
 struct DispatchSourceRange {
@@ -630,7 +630,7 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
 #ifdef DEEPEP_MEGAMOE_ROCE
 }
 
-template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
+template <bool MarkInUb, typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void SubmitDispatchProbe(const TokenDispatchConfig& context, const Params& params, GM_ADDR* peers,
                                            TokenDispatchScratch<ActivationType>& scratch, DispatchCopyProgress& progress,
                                            const DispatchProbeRow* candidates, uint32_t& count, uint32_t& remaining,
@@ -643,7 +643,8 @@ __aicore__ inline void SubmitDispatchProbe(const TokenDispatchConfig& context, c
         if (ready & (1U << j)) {
             IssueDispatchRow<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, peers, scratch,
                                                                                   progress, candidate.copy);
-            *candidate.deliveredWindow |= candidate.deliveredBit;
+            if constexpr (MarkInUb) scratch.validTopkIndexTensor.SetValue(candidate.mark, -1);
+            else *candidate.deliveredWindow |= candidate.mark;
             --remaining;
         } else {
             waitingSource = candidate.copy.source;
@@ -652,23 +653,16 @@ __aicore__ inline void SubmitDispatchProbe(const TokenDispatchConfig& context, c
     count = 0U;
 }
 
-template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
+template <bool MarkInUb, typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void DispatchDeferredSources(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
                                                const Params& params, GM_ADDR* peers,
                                                TokenDispatchScratch<ActivationType>& scratch, uint32_t expert,
-                                               DispatchRouteBatch& batch, DispatchCopyProgress& progress)
+                                               DispatchRouteBatch& batch, DispatchCopyProgress& progress,
+                                               uint32_t remaining, bool fits)
 {
     constexpr uint32_t window = DISPATCH_PROBE_ROWS;
-    // A BS<=256 source contributes at most one row per token to this expert.
     uint8_t delivered[HIERARCHICAL_RANKS_PER_HOST][HIERARCHICAL_MAX_TOKENS / window]{};
-    uint32_t extent = 0U, remaining = 0U;
-    for (uint32_t i = 0; i < batch.deferredSources; ++i) {
-        const auto& range = batch.deferred[i];
-        batch.segments[i] = {range.source, range.destination, extent, range.count};
-        remaining += range.count;
-        extent += Ops::Base::CeilAlign(static_cast<uint32_t>(range.count), window);
-    }
-    const bool resident = extent <= static_cast<uint32_t>(context.bufferConfig.routeItemsPerBatch);
+    const bool resident = MarkInUb || fits;
     if (resident) {
         for (uint32_t i = 0; i < batch.deferredSources; ++i) {
             const auto& r = batch.deferred[i];
@@ -689,11 +683,16 @@ __aicore__ inline void DispatchDeferredSources(const TokenDispatchConfig& contex
         for (uint32_t i = 0; i < batch.deferredSources; ++i) {
             const auto& r = batch.deferred[i];
             const uint32_t rows = static_cast<uint32_t>(r.count);
-            for (uint32_t first = 0; first < rows; first += window) {
-                const uint32_t n = rows - first < window ? rows - first : window;
-                auto& done = delivered[i][first / window];
-                const uint32_t pending = ((1U << n) - 1U) & ~done;
-                if (!pending) continue;
+            const uint32_t step = MarkInUb ? rows : window;
+            for (uint32_t first = 0; first < rows; first += step) {
+                const uint32_t n = rows - first < step ? rows - first : step;
+                uint8_t* done = nullptr;
+                uint32_t pending = 0U;
+                if constexpr (!MarkInUb) {
+                    done = &delivered[i][first / window];
+                    pending = ((1U << n) - 1U) & ~*done;
+                    if (!pending) continue;
+                }
                 uint32_t offset = batch.segments[i].indexOffset + first;
                 if (!resident) {
                     // Reuse a single aligned window and revisit every source on every sweep.
@@ -703,24 +702,25 @@ __aicore__ inline void DispatchDeferredSources(const TokenDispatchConfig& contex
                     SyncFuncStatic<HardEvent::MTE2_S, MAX_DISPATCH_BUFFER_COUNT>();
                 }
                 for (uint32_t j = 0; j < n; ++j) {
-                    if (!(pending & (1U << j))) continue;
+                    if (!MarkInUb && !(pending & (1U << j))) continue;
+                    const int32_t route = scratch.validTopkIndexTensor.GetValue(offset + j);
+                    if (MarkInUb && route < 0) continue;
                     const uint32_t ordinal = first + j;
-                    candidates[count++] = {{r.source, scratch.validTopkIndexTensor.GetValue(offset + j),
-                                            r.destination + static_cast<int32_t>(ordinal)},
-                                           &done, static_cast<uint8_t>(1U << j)};
+                    candidates[count++] = {{r.source, route, r.destination + static_cast<int32_t>(ordinal)},
+                                           done, MarkInUb ? offset + j : 1U << j};
                     if (count == window) {
-                        SubmitDispatchProbe<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                        SubmitDispatchProbe<MarkInUb, ActivationType, QuantScaleType, TopkWeightsPrefetch>(
                             context, params, peers, scratch, progress, candidates, count, remaining, waitingSource);
                     }
                 }
                 if (!resident) {
-                    SubmitDispatchProbe<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                    SubmitDispatchProbe<MarkInUb, ActivationType, QuantScaleType, TopkWeightsPrefetch>(
                         context, params, peers, scratch, progress, candidates, count, remaining, waitingSource);
                     SyncFuncStatic<HardEvent::S_MTE2, MAX_DISPATCH_BUFFER_COUNT>();
                 }
             }
         }
-        SubmitDispatchProbe<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+        SubmitDispatchProbe<MarkInUb, ActivationType, QuantScaleType, TopkWeightsPrefetch>(
             context, params, peers, scratch, progress, candidates, count, remaining, waitingSource);
         if (remaining == before) {
 #ifdef DEEPEP_MEGAMOE_TIMER
@@ -750,11 +750,24 @@ __aicore__ inline void FinishDispatchSources(const TokenDispatchConfig& context,
     FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, peers, scratch, batch,
                                                                                  progress);
     if (batch.deferredSources) {
-        // Retire the last ready payload and metadata before waiting for any slow source.
-        DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch,
-                                                                                      progress);
-        DispatchDeferredSources<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, common, params, peers,
-                                                                                     scratch, expert, batch, progress);
+        constexpr uint32_t itemsPerBlock = ALIGN_32 / sizeof(int32_t);
+        uint32_t extent = 0U, remaining = 0U;
+        for (uint32_t i = 0; i < batch.deferredSources; ++i) {
+            const uint32_t rows = batch.deferred[i].count;
+            batch.segments[i].indexOffset = extent;
+            extent += Ops::Base::CeilAlign(rows, itemsPerBlock);
+            remaining += rows;
+        }
+        const bool fits = extent <= static_cast<uint32_t>(context.bufferConfig.routeItemsPerBatch);
+        if (fits && params.tilingData->bf16Bs96) {
+            DispatchDeferredSources<true, ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                context, common, params, peers, scratch, expert, batch, progress, remaining, true);
+        } else {
+            DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                context, params, scratch, progress);
+            DispatchDeferredSources<false, ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                context, common, params, peers, scratch, expert, batch, progress, remaining, fits);
+        }
     }
 #ifdef DEEPEP_MEGAMOE_TIMER
     AscendTimerRelayScope drain(scratch.trace, AscendTimer::RelayStep::Drain, scratch.traceRank, 0U,

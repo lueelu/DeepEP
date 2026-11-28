@@ -867,7 +867,7 @@ __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmm
     }
     AscendTimerSpanScope timing(IsShared && g_coreType == AscendC::AIV ? gmmAddrInfo.timer : nullptr,
                                AscendTimer::AIV_SHARED_GMM2_PROLOGUE);
-    auto run = [&](auto& kernel) {
+    auto run = [&] __aicore__ (auto& kernel) {
         kernel.UpdateProblem(config, gmmAddrInfo, true);
         kernel.Begin();
         if constexpr (g_coreType == AscendC::AIC) {
