@@ -316,12 +316,13 @@ class UdmaPolicy:
             if self.world_size == 32 and operation == "dispatch" and cores >= 32:
                 profile_cores = 32
             entry = _PROFILES.get((self.world_size, profile_cores, bucket, operation))
-            if (
-                entry is not None
-                and 2048 <= row_bytes <= 12288
-                and self.topology_known
-                and self.ranks_per_group in entry[0]
-            ):
+            # EP4's low-core dispatch keeps three payload owners and leaves
+            # the remaining AIVs for metadata/self-copy at wider row sizes too.
+            # Only scheduling is extended; actual transfer sizes remain intact.
+            profile_row_fits = 2048 <= row_bytes and (
+                row_bytes <= 12288 or (self.world_size == 4 and profile_cores == 8 and operation == "dispatch")
+            )
+            if entry is not None and profile_row_fits and self.topology_known and self.ranks_per_group in entry[0]:
                 _, order, p, w, q, visit, copy = entry
                 plan = replace(
                     self,

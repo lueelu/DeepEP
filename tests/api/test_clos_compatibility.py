@@ -1013,6 +1013,39 @@ def test_sender_tiers_inherit_complete_plans_without_changing_launch_budget():
     """)
 
 
+def test_ep4_wide_dispatch_retains_helpers_and_reserved_qps():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        base = replace(resolve_udma_policy(True,4,'udma',None,None,None,None,None),
+                       ranks_per_group=4,topology_known=True,extend_large_rows=False)
+        assert 'rank:1:1:2' in base.reservation_spec().split(';')
+        for size in (12288,12289,14336,16384,24576,32768,65536):
+            for cores in range(8,32,2):
+                plan = base.for_launch(cores,size,'dispatch',bf16=True)
+                assert plan.native_plan() == [1,0,4,1,1,2,32,2,0]
+                assert plan.send_workers == 3 and cores-plan.send_workers >= 5
+                assert plan.send_workers*plan.qps_per_worker == 6
+                assert base.config(cores).num_aiv == cores
+            for cores in (0,*range(32,65,2)):
+                plan = base.for_launch(cores,size,'dispatch',bf16=True)
+                assert plan.native_plan() == [1,0,4,1,2,1,32,2,0]
+            # Changing dispatch must not change combine ownership or fallback
+            # eligibility for other dtypes, API versions, expansion or topology.
+            for cores in (8,16,30,32,64):
+                for op in ('combine','weighted'):
+                    plan = base.for_launch(cores,size,op,bf16=True)
+                    assert (plan.peers_per_worker,plan.workers_per_peer,plan.qps_per_worker) == (1,2,1)
+                for opts in ({'bf16':False},{'bf16':True,'v2':False},{'bf16':True,'expanded':True}):
+                    plan = base.for_launch(cores,size,'dispatch',**opts)
+                    assert (plan.peers_per_worker,plan.workers_per_peer,plan.qps_per_worker) == (1,2,1)
+                for group, known in ((1,True),(2,True),(4,False)):
+                    plan = replace(base,ranks_per_group=group,topology_known=known).for_launch(
+                        cores,size,'dispatch',bf16=True)
+                    assert (plan.peers_per_worker,plan.workers_per_peer,plan.qps_per_worker) == (1,2,1)
+    """)
+
+
 def test_ep32_unweighted_combine_preserves_eight_core_sender_plan():
     run_host("""
         from dataclasses import replace

@@ -9,7 +9,9 @@ Modified by Joyce_An 2026
 
 普通 V2 BF16 非展开路径中，EP64 dispatch 的8～64核均保留8个payload发送核；combine的8～30核继承8核计划，32～64核继承32核计划。EP128的8～14核使用rank/P16/W1/Q1/v32，16～64核保持rank/P8/W1/Q1/v16。额外核数不再反复改变发送分工。
 
-大行宽发送计划延伸仍默认关闭。设备对照时可在创建 Buffer **之前**，为所有rank设置 `DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY=1`：普通V2 BF16非展开、EP4/8/16、8～64核、payload行宽超过12288字节时，继承12288字节对应的发送计划。设为`0`或不设置保留旧行为。该选项在构造时固定并参与rank配置一致性检查；不会改变实际tensor大小、UB/通信容量检查或payload合并行数。它尚未通过H7168设备性能验证，不能视为新的默认推荐。使用允许环境选项的 `clos/bench_v2_bandwidth.py` 做对照；下面的默认策略摸测入口会拒绝该实验覆盖项。
+普通V2 BF16非展开、已识别为连续单机G4的EP4，8～30核dispatch在H7168及更大hidden默认延续H6144的rank/P1/W1/Q2/v32：3个payload发送核，其余核处理metadata和本卡复制。fresh/cached共用该计划；32～64核以及combine计划不变。实际行宽和容量检查不变，宽hidden的设备性能仍需验证。
+
+其他大行宽发送计划延伸仍默认关闭。设备对照时可在创建 Buffer **之前**，为所有rank设置 `DEEPEP_CLOS_EXTEND_LARGE_ROW_POLICY=1`：普通V2 BF16非展开、EP4/8/16、8～64核、payload行宽超过12288字节时，继承12288字节对应的发送计划。设为`0`或不设置使用当前默认策略（包括上述EP4低核dispatch延伸）。该选项在构造时固定并参与rank配置一致性检查；不会改变实际tensor大小、UB/通信容量检查或payload合并行数。使用允许环境选项的 `clos/bench_v2_bandwidth.py` 做对照；下面的默认策略摸测入口会拒绝该实验覆盖项。
 
 visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变。visit 是一个 peer 每轮的 WQE 预算，64/128 会拆为多个最多32条的提交，不扩大 WQE 暂存区，也不改变 SQ 信用保护。带权重等多字段路径按 WQE 计数，不等于同等数量的 token。新增取值需同步更新 Python 和 Host 库。
 
