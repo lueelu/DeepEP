@@ -1,4 +1,4 @@
-"""Fresh dispatch layout/notify A/B, one Buffer per rank, precision before timing."""
+"""Fresh dispatch layout/notify measurement, one fixed-mode Buffer per rank, precision before timing."""
 
 import argparse
 import csv
@@ -12,7 +12,6 @@ from pathlib import Path
 import statistics
 import time
 
-ENV = "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY"
 HOST_PREP_ENV = "DEEPEP_CLOS_NOTIFY_HOST_PREP"
 DEFER_PLAN_ENV = "DEEPEP_CLOS_NOTIFY_DEFER_PLAN"
 HOST_TIMING_ENV = "DEEPEP_CLOS_DISPATCH_HOST_TIMING"
@@ -27,17 +26,18 @@ MODES = {
 }
 
 
-def mode_order(sweep, simt_layout=False):
+def mode_order(sweep, simt_layout=False, fused_layout_notify=False):
     names = (
         ["baseline", "simt"]
         if simt_layout
         else ([name for name in MODES if name != "simt"] if sweep else ["baseline", "fused"])
     )
+    names = [name for name in names if bool(MODES[name][0]) == fused_layout_notify]
     return names + names[::-1]
 
 
 def set_mode(name):
-    for env, value in zip((ENV, HOST_PREP_ENV, DEFER_PLAN_ENV), MODES[name]):
+    for env, value in zip((HOST_PREP_ENV, DEFER_PLAN_ENV), MODES[name][1:]):
         os.environ[env] = str(value)
     os.environ[SIMT_LAYOUT_ENV] = str(int(name == "simt"))
 
@@ -145,12 +145,26 @@ def main():
     p.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--flush-l2", action="store_true")
     p.add_argument("--precision-only", action="store_true")
-    p.add_argument("--pipeline-sweep", action="store_true", help="baseline/fused/host/plan/both, then reverse order")
+    p.add_argument(
+        "--fused-layout-notify",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="fix Buffer fusion at initialization; compare separate on/off runs",
+    )
+    p.add_argument(
+        "--pipeline-sweep",
+        action="store_true",
+        help="fused/host/plan/both, then reverse order; requires --fused-layout-notify",
+    )
     p.add_argument("--simt-layout-sweep", action="store_true", help="separate old/SIMT layout ABBA; fusion stays off")
     p.add_argument("--aiv", type=int, choices=range(2, 65, 2), default=8)
     p.add_argument("--host-timing", action="store_true", help="separate unprofiled Host diagnostic pass")
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
+    if args.pipeline_sweep and not args.fused_layout_notify:
+        p.error("--pipeline-sweep requires --fused-layout-notify")
+    if args.simt_layout_sweep and args.fused_layout_notify:
+        p.error("--simt-layout-sweep requires --no-fused-layout-notify")
     if args.pipeline_sweep and args.simt_layout_sweep:
         p.error("choose either --pipeline-sweep or --simt-layout-sweep")
     if min(args.tokens, args.hidden, args.topk, args.experts, args.samples) <= 0 or args.warmup < 0:
@@ -170,7 +184,7 @@ def main():
         p.error("EP must be >=2, divide experts, and topk must not exceed experts")
     torch.npu.set_device(device)
     native = load_native_module()
-    if getattr(native, "fused_layout_notify_version", 0) != 1:
+    if getattr(native, "fused_layout_notify_version", 0) != 2:
         raise RuntimeError("install this branch's native and device libraries before initializing Buffer")
     if getattr(native, "fused_notify_pipeline_version", 0) != 1:
         raise RuntimeError("rebuild native and device libraries for pipeline sweep/Host timing")
@@ -205,14 +219,13 @@ def main():
         encoding="utf-8",
     )
     rows = []
-    old_env = {
-        key: os.environ.get(key) for key in (ENV, HOST_PREP_ENV, DEFER_PLAN_ENV, HOST_TIMING_ENV, SIMT_LAYOUT_ENV)
-    }
+    old_env = {key: os.environ.get(key) for key in (HOST_PREP_ENV, DEFER_PLAN_ENV, HOST_TIMING_ENV, SIMT_LAYOUT_ENV)}
     os.environ[HOST_TIMING_ENV] = "0"
     with store_topology_collective(group):
         buffer = ElasticBuffer(
             group,
             combine_notify=True,
+            fused_layout_notify=args.fused_layout_notify,
             num_max_tokens_per_rank=args.tokens,
             hidden=args.hidden,
             num_topk=args.topk,
@@ -291,7 +304,7 @@ def main():
         for routing in ("random", "masked", "hot", "empty", "empty_local"):
             if rank == 0:
                 print(
-                    f"PRECISION routing={routing} expand={args.expand} order={mode_order(args.pipeline_sweep, args.simt_layout_sweep)}",
+                    f"PRECISION routing={routing} expand={args.expand} order={mode_order(args.pipeline_sweep, args.simt_layout_sweep, args.fused_layout_notify)}",
                     flush=True,
                 )
             cpu_idx = raw.clone()
@@ -311,7 +324,7 @@ def main():
             idx = cpu_idx.to(dtype=topk_idx_t, device="npu")
             for weighted in (False, True):
                 baseline = None
-                for mode in mode_order(args.pipeline_sweep, args.simt_layout_sweep):
+                for mode in mode_order(args.pipeline_sweep, args.simt_layout_sweep, args.fused_layout_notify):
                     torch.npu.synchronize()
                     group.agree([routing, weighted, mode])
                     set_mode(mode)
@@ -352,7 +365,9 @@ def main():
                         )
                     )
 
-                for turn, mode in enumerate(mode_order(args.pipeline_sweep, args.simt_layout_sweep)):
+                for turn, mode in enumerate(
+                    mode_order(args.pipeline_sweep, args.simt_layout_sweep, args.fused_layout_notify)
+                ):
                     if rank == 0:
                         print(f"PERFORMANCE weights={weighted} round={turn} fused={mode}", flush=True)
                     torch.npu.synchronize()

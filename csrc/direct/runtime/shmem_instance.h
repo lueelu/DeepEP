@@ -22,7 +22,7 @@ public:
                   int64_t udma_combine_peer_order = 0, int64_t udma_ranks_per_group = 0,
                   int64_t udma_peers_per_group_per_worker = 0, int64_t udma_workers_per_peer = 1,
                   int64_t udma_qps_per_worker = 1, bool auto_resources = false, std::string auto_qp_plans = {},
-                  bool combine_notify = false);
+                  bool combine_notify = false, bool fused_layout_notify = false);
 
     ~ShmemInstance();
 
@@ -70,6 +70,10 @@ public:
     {
         return combine_notify_;
     }
+    bool FusedLayoutNotify() const
+    {
+        return fused_layout_notify_;
+    }
     bool SharedJetty() const
     {
         return shared_jetty_;
@@ -105,6 +109,7 @@ public:
 
 private:
     const bool combine_notify_ = false;
+    const bool fused_layout_notify_ = false;
     uint64_t npu_timeout_cycles_ = 0;
     uint32_t shmem_sync_timeout_us_ = 0;
     uint32_t notify_host_timeout_seconds_ = 0;

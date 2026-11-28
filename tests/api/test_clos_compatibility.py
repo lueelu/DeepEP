@@ -269,7 +269,7 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
             _dispatch_layout=(None,) * 6)
         def no_estimate(*args): raise AssertionError('default still uses theoretical estimator')
         obj = SimpleNamespace(_ensure_alive=lambda: None, _validate_handle=lambda _: None,
-            use_fp8_dispatch=False, num_max_tokens_per_rank=129, num_ranks=8, hidden=6144, num_topk=8,
+            use_fp8_dispatch=False, fused_layout_notify=False, num_max_tokens_per_rank=129, num_ranks=8, hidden=6144, num_topk=8,
             get_buffer_size_hint=lambda *a: 0, group=None, allow_hybrid_mode=True,
             num_bytes=1, num_device_aiv=64, get_theoretical_num_sms=no_estimate,
             _udma_auto_policy=SimpleNamespace(for_launch=resolve), transport='udma',
@@ -1031,3 +1031,68 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
         if getattr(exc, "winerror", None) == 4551:
             pytest.skip("compiled, but Windows application control blocked execution (4551)")
         raise
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_fused_layout_is_buffer_local_and_forwarded_to_native(fused):
+    run_host(f"""
+        import os
+        from deep_ep.backends.direct import elastic as e
+        calls = []
+        e._resolve_group_or_comm = lambda group, comm: (0, 2, group)
+        e._validate_group_consensus = lambda *args: None
+        e.get_global_comm_stream = lambda: None
+        e.ElasticBuffer.barrier = lambda *args, **kwargs: None
+        def bootstrap(*args, **kwargs):
+            calls.append(kwargs)
+            return [], 'test'
+        e._prepare_shmem_bootstrap = bootstrap
+        class Native:
+            def __init__(self, *args):
+                calls.append(args)
+            def num_device_aiv(self):
+                return 64
+        e.get_native_class = lambda name: Native
+        os.environ['DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY'] = 'invalid-old-variable'
+        b = e.ElasticBuffer(object(), num_bytes=128 << 20, transport='udma',
+                            udma_auto_policy=False, fused_layout_notify={fused!r},
+                            udma_schedule="peer", udma_dispatch_peer_order="rank",
+                            udma_combine_peer_order="rank", udma_workers_per_peer=1,
+                            udma_qps_per_worker=1, udma_peers_per_worker=1, udma_wqes_per_visit=8)
+        b._destroyed = True
+        assert b.fused_layout_notify is {fused!r}
+        assert calls[0]['fused_layout_notify'] is {fused!r}
+        assert len(calls[1]) == 21 and calls[1][20] is {fused!r}
+        try:
+            b.fused_layout_notify = not {fused!r}
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError('fusion must be immutable')
+        for bad in (1, '1', None):
+            try:
+                e.ElasticBuffer(object(), fused_layout_notify=bad)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError('non-bool fusion accepted')
+    """)
+
+
+def test_fused_layout_rank_disagreement_rejected_before_initialization():
+    run_host("""
+        from deep_ep.backends.direct import buffer as b
+        b.load_native_module = lambda: SimpleNamespace(get_shmem_bootstrap=lambda key: (0, []))
+        def gather(group, comm, size, value):
+            options, state, uid = value
+            peer = options[:-1] + (not options[-1],)
+            return [value, (peer, state, uid)]
+        b._bootstrap_all_gather = gather
+        try:
+            b._prepare_shmem_bootstrap(object(), None, 0, 2, 64 << 20, 'udma', False,
+                                       'tcp://localhost:1234', fused_layout_notify=True)
+        except ValueError as exc:
+            assert 'same workspace' in str(exc)
+        else:
+            raise AssertionError('fusion rank mismatch accepted')
+    """)

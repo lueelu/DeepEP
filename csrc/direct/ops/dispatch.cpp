@@ -347,10 +347,7 @@ Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<t
                 "num_max_nvl_chunked_send_tokens must be smaller than num_max_nvl_chunked_recv_tokens");
 
     const bool cached_mode = cached_rank_prefix_matrix.has_value() || cached_channel_prefix_matrix.has_value();
-    const char* fused_env = std::getenv("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY");
-    TORCH_CHECK(!fused_env || std::strcmp(fused_env, "0") == 0 || std::strcmp(fused_env, "1") == 0,
-                "DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1");
-    const bool fused_layout = !cached_mode && public_handle != nullptr && fused_env && std::strcmp(fused_env, "1") == 0;
+    const bool fused_layout = !cached_mode && public_handle != nullptr && shmem.FusedLayoutNotify();
     TORCH_CHECK(!fused_layout || (use_udma && topk_idx.has_value()), "fused layout requires fresh V2 UDMA dispatch");
     const auto enabled_option = [](const char* name, bool default_value = false) {
         const char* value = std::getenv(name);

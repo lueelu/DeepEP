@@ -27,7 +27,7 @@ static auto buffer_runtime_registry =
     torch::jit::class_<BufferRuntime>("AscendDeepEP", "BufferRuntime")
         .def(torch::jit::init<int64_t, int64_t, int64_t, std::string, bool, std::string, bool, std::vector<int64_t>,
                               std::string, bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool,
-                              std::string, bool>(),
+                              std::string, bool, bool>(),
              "",
              {torch::arg("rank"),
               torch::arg("num_ranks"),
@@ -48,7 +48,8 @@ static auto buffer_runtime_registry =
               torch::arg("udma_qps_per_worker") = 1,
               torch::arg("auto_resources") = false,
               torch::arg("auto_qp_plans") = "",
-              torch::arg("combine_notify") = false})
+              torch::arg("combine_notify") = false,
+              torch::arg("fused_layout_notify") = false})
         .def("is_initialized", &BufferRuntime::IsInitialized)
         .def("_configure_tuning", &BufferRuntime::ConfigureTuning)
         .def("barrier", &BufferRuntime::Barrier)

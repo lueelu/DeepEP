@@ -100,8 +100,9 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
                              int64_t udma_combine_peer_order, int64_t udma_ranks_per_group,
                              int64_t udma_peers_per_group_per_worker, int64_t udma_workers_per_peer,
                              int64_t udma_qps_per_worker, bool auto_resources, std::string auto_qp_plans,
-                             bool combine_notify)
+                             bool combine_notify, bool fused_layout_notify)
     : combine_notify_(combine_notify),
+      fused_layout_notify_(fused_layout_notify),
       rank_(static_cast<int>(rank)),
       world_size_(static_cast<int>(world_size)),
       local_mem_size_(0),

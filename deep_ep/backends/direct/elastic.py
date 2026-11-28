@@ -116,6 +116,11 @@ class ElasticBuffer:
         """Whether this Buffer requests a separate combine rendezvous (read-only)."""
         return self._combine_notify
 
+    @property
+    def fused_layout_notify(self) -> bool:
+        """Whether fresh UDMA dispatch fuses layout into notify (read-only)."""
+        return self._fused_layout_notify
+
     def __init__(
         self,
         group: Any,
@@ -149,10 +154,14 @@ class ElasticBuffer:
         udma_wqes_per_visit: Optional[int] = None,
         udma_auto_policy: bool = True,
         combine_notify: bool = False,
+        fused_layout_notify: bool = False,
     ) -> None:
         if type(combine_notify) is not bool:
             raise TypeError("combine_notify must be a bool")
         self._combine_notify = combine_notify
+        if type(fused_layout_notify) is not bool:
+            raise TypeError("fused_layout_notify must be a bool")
+        self._fused_layout_notify = fused_layout_notify
         rank, num_ranks, resolved_group = _resolve_group_or_comm(group, None)
         transport = _normalize_transport(transport or os.environ.get("ASCEND_DEEPEP_TRANSPORT", "auto"))
         self._udma_auto_policy = resolve_udma_policy(
@@ -187,6 +196,8 @@ class ElasticBuffer:
         udma_schedule = "peer" if udma_schedule is None else udma_schedule
         udma_dispatch_peer_order = "rank" if udma_dispatch_peer_order is None else udma_dispatch_peer_order
         udma_combine_peer_order = "rank" if udma_combine_peer_order is None else udma_combine_peer_order
+        if fused_layout_notify and transport != "udma":
+            raise ValueError("fused_layout_notify requires UDMA transport")
         if udma_schedule not in ("peer", "token"):
             raise ValueError("udma_schedule must be 'peer' or 'token'")
         if udma_schedule == "token" and transport != "udma":
@@ -316,6 +327,7 @@ class ElasticBuffer:
                 udma_schedule,
                 peer_options,
                 combine_notify=combine_notify,
+                fused_layout_notify=fused_layout_notify,
                 **(
                     {"udma_auto_options": self._udma_auto_policy.signature()}
                     if self._udma_auto_policy is not None
@@ -339,6 +351,7 @@ class ElasticBuffer:
                 self._udma_auto_policy is not None,
                 self._udma_auto_policy.reservation_spec() if self._udma_auto_policy is not None else "",
                 combine_notify,
+                fused_layout_notify,
             )
             mapping_check = getattr(self, "_validate_native_mappings", None)
             if mapping_check is not None:
@@ -809,9 +822,7 @@ class ElasticBuffer:
         make_single_source = (
             not cached_mode and do_expand and self.transport == "udma" and self._use_single_source_combine
         )
-        fused_layout = os.environ.get("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY", "0") if not cached_mode else "0"
-        if fused_layout not in ("0", "1"):
-            raise ValueError("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY must be 0 or 1")
+        fused_layout = "1" if self.fused_layout_notify and not cached_mode else "0"
         # Independent V2 layout follows dispatch's resolved core count by default.
         # Explicit fusion owns layout itself; it needs no separate layout launch.
         simt_layout = (
@@ -870,7 +881,7 @@ class ElasticBuffer:
                 if fused_layout == "1":
                     if self.transport != "udma":
                         raise ValueError("fused layout requires fresh V2 UDMA dispatch")
-                    if getattr(load_native_module(), "fused_layout_notify_version", 0) != 1:
+                    if getattr(load_native_module(), "fused_layout_notify_version", 0) != 2:
                         raise RuntimeError("rebuild both native and device libraries for fused layout notify")
                     if host_prep == "1":
                         num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank = (

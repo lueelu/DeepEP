@@ -2,6 +2,7 @@
 
 import csv
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,11 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("fused_bench", ROOT / "benchmarks/clos/bench_fused_notify.py")
 bench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bench)
+
+
+@pytest.fixture(autouse=True)
+def benchmark_imports(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / "benchmarks/clos"))
 
 
 def host_fields():
@@ -94,3 +100,14 @@ def test_profile_sequence_excludes_outer_barrier(tmp_path, fused, simt, expanded
     if fused:
         with pytest.raises(RuntimeError, match="sequence"):
             bench.parse_capture(tmp_path, False, 3, expanded, guards)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_modes_preserve_constructor_fusion(fused, monkeypatch):
+    monkeypatch.setenv("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY", "unused")
+    for name in (bench.HOST_PREP_ENV, bench.DEFER_PLAN_ENV, bench.SIMT_LAYOUT_ENV):
+        monkeypatch.setenv(name, "0")
+    for mode in bench.mode_order(True, fused_layout_notify=fused):
+        assert bool(bench.MODES[mode][0]) is fused
+        bench.set_mode(mode)
+        assert os.environ["DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY"] == "unused"

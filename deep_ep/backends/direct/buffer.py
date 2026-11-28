@@ -1278,6 +1278,7 @@ def _prepare_shmem_bootstrap(
     udma_peer_options=(0, 0, 0),
     udma_auto_options=None,
     combine_notify=False,
+    fused_layout_notify=False,
 ):
     native = load_native_module()
     options = (
@@ -1290,6 +1291,7 @@ def _prepare_shmem_bootstrap(
         udma_schedule,
         udma_peer_options,
         combine_notify,
+        fused_layout_notify,
     )
     if udma_auto_options is not None:
         options += (udma_auto_options,)

@@ -130,7 +130,7 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
                              bool token_schedule, int64_t udma_dispatch_peer_order, int64_t udma_combine_peer_order,
                              int64_t udma_ranks_per_group, int64_t udma_peers_per_group_per_worker,
                              int64_t udma_workers_per_peer, int64_t udma_qps_per_worker, bool auto_resources,
-                             std::string auto_qp_plans, bool combine_notify)
+                             std::string auto_qp_plans, bool combine_notify, bool fused_layout_notify)
     : rank_(rank),
       num_ranks_(num_ranks),
       num_bytes_(num_bytes),
@@ -139,11 +139,11 @@ BufferRuntime::BufferRuntime(int64_t rank, int64_t num_ranks, int64_t num_bytes,
       data_op_engine_type_(ResolveDataOpEngineType(transport)),
       low_latency_mode_(low_latency_mode),
       use_1g_huge_pages_(use_1g_huge_pages),
-      shmem_(std::make_shared<ShmemInstance>(rank, num_ranks, ip_port, data_op_engine_type_, use_1g_huge_pages,
-                                             unique_id, bootstrap_key, shared_jetty, token_schedule,
-                                             udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
-                                             udma_peers_per_group_per_worker, udma_workers_per_peer,
-                                             udma_qps_per_worker, auto_resources, auto_qp_plans, combine_notify))
+      shmem_(std::make_shared<ShmemInstance>(
+          rank, num_ranks, ip_port, data_op_engine_type_, use_1g_huge_pages, unique_id, bootstrap_key, shared_jetty,
+          token_schedule, udma_dispatch_peer_order, udma_combine_peer_order, udma_ranks_per_group,
+          udma_peers_per_group_per_worker, udma_workers_per_peer, udma_qps_per_worker, auto_resources, auto_qp_plans,
+          combine_notify, fused_layout_notify))
 {
     TORCH_CHECK(direct_multi_instance_abi_4() == ((uint64_t(sizeof(ascend_deepep::DispatchTilingData)) << 32) |
                                                   uint64_t(sizeof(ascend_deepep::CombineTilingData))),
