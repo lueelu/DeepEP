@@ -5,23 +5,6 @@ Modified by Joyce_An 2026
 
 # EP benchmark 工具
 
-## CLOS 设备 benchmark
-
-`clos/bench_v1_bandwidth.py` 和 `clos/bench_v2_bandwidth.py` 提供 V1/V2 精度检查和通信测量。
-多机启动与参数见[后端使用说明](../docs/machine_backends.md)，独立 Golden 入口见[测试说明](../tests/README.md)。
-`clos/bench_fast_sweep.py` 支持同一 EP 内复用一个 Buffer；具体参数以 `--help` 为准。
-
-所有 CLOS benchmark 在 Buffer 初始化时固定传入 `combine_notify=True`。
-profiling 分别统计采样前 barrier、notify、通信和 reduce，前置 barrier 不计入 notify。
-带宽分子为去重后的 BF16 逻辑 payload（含本卡、不含权重），分母仅为通信 kernel 耗时，
-按逐次样本取最慢 rank。不同阶段的最慢值不能相加推导完整 API 耗时。
-跳过精度的运行会记录 `precision=skipped`；失败时保留已完成结果和原始错误。
-
-普通自动 Buffer 按本 EP/拓扑的合法自动计划预留 QP，并覆盖动态通信核数。
-手动指定计划时，可在初始化前设置 `DEEPEP_CLOS_QP_PLANS='rank:8:1:1;rank:4:1:1'`，
-格式为 `rank:P:W:Q`，必须覆盖准备 handle 及所有实际测量算子。
-所有 rank 配置须一致，初始化后不可扩大范围。
-
 通用入口提供配置检查、确定性负载规划和 JSON/CSV 结果协议。当前支持无设备 dry-run；native 测量适配器未接入，非 dry-run 返回非零，不以模拟时间代替通信测量。
 
 HT 和 LL 有独立的设备正确性与 kernel 测量入口，运行方式见[测试说明](../tests/README.md)，统计口径见[性能说明](../docs/performance.md)。
@@ -84,5 +67,3 @@ hidden 值可被 BF16 精确表示；FP8 先生成 BF16，再按固定参考的�
 退出码 0 表示规划成功；当前请求 native 测量返回 2，错误为缺少 native benchmark adapter。参数、配置或输出路径错误也返回非零。结构化失败结果只记录错误类型，详细错误位于 stderr。
 
 `_config.py` 实现配置及字节计算，`_utils.py` 实现通用计时、统计和序列化，`_backend.py` 定义内部适配协议。可运行 `python -m pytest tests/test_benchmark.py -q` 检查这些协议；CPU 合成样本不作为性能数据发布。
-
-共享 dispatch/combine kernel 统一使用 `direct_dispatch_*` / `direct_combine_*` 名称；profiling 解析器仍可读取归档中的 `v1_dispatch_*` / `v1_combine_*` 名称。公共 V1/V2 API 名称不变。

@@ -1,7 +1,7 @@
-"""One SHMEM initialization, existing full-Clos peer schedules and staged tuning.
+"""One SHMEM initialization, full-Clos peer schedules and bandwidth measurement.
 
 Launch on each node with torchrun. --plan-only needs no torch/NPU installation.
-Legacy mode is performance-only. Rank/payload sweep modes also check precision.
+This entrypoint is performance-only; use bench_v1_bandwidth or bench_v2_bandwidth for precision checks.
 """
 
 import argparse
@@ -151,46 +151,7 @@ def parse_args(argv=None):
     p.add_argument("--replay-report", type=Path, help="rerun each operator's winner from a prior report")
     p.add_argument("--smoke", action="store_true", help="one legal candidate per peer order")
     p.add_argument("--plan-only", action="store_true")
-    p.add_argument(
-        "--small-rank-sweep",
-        action="store_true",
-        help="staged EP4/8/16/32 rank sweep: six operators, device-stage timing and finalist precision",
-    )
-    p.add_argument("--reduce-cores", type=int, default=48)
-    p.add_argument(
-        "--combine-defaults-only",
-        action="store_true",
-        help="measure only automatic weighted/unweighted combine with separate notify; no strategy search",
-    )
-    p.add_argument("--skip-precision", action="store_true", help="rank/combine modes: explicitly skip golden checks")
-    p.add_argument("--single-pass", action="store_true", help="rank/combine modes: omit the reverse final pass")
-    p.add_argument(
-        "--combine-payload-max-rows",
-        type=int,
-        nargs="+",
-        help="combine-only sweep: 1=legacy, 2..32=dense payload rows/WQE; fixed rank/P/W/Q/visit, one Buffer",
-    )
-    p.add_argument(
-        "--combine-visits",
-        type=int,
-        nargs="+",
-        help="with combine-payload-max-rows: scan visit only, retaining default rank/P/W/Q",
-    )
-    p.add_argument(
-        "--combine-wqe-fast",
-        type=int,
-        nargs="+",
-        help="with combine-payload-max-rows: scan WQE fast 0/1 for rows=1; rows>1 use dense remote payloads",
-    )
     args = p.parse_args(argv)
-    if (args.combine_visits is not None or args.combine_wqe_fast is not None) and args.combine_payload_max_rows is None:
-        p.error("combine-visits/combine-wqe-fast require combine-payload-max-rows")
-    if args.small_rank_sweep or args.combine_payload_max_rows is not None or args.combine_defaults_only:
-        from rank_sweep import validate_args
-
-        validate_args(p, args, argv)
-    elif args.skip_precision or args.single_pass:
-        p.error("skip-precision/single-pass require a rank/combine mode")
     if args.replay_report and args.combine_self_copy_modes and len(args.combine_self_copy_modes) != 1:
         p.error("replay accepts only one explicit self-copy mode")
     args.replay_mode_override = (
@@ -483,10 +444,6 @@ def measure(torch, torch_npu, buffer, group, args, directory, op, configs, invok
 
 def main():
     args = parse_args()
-    if args.small_rank_sweep or args.combine_payload_max_rows is not None or args.combine_defaults_only:
-        from rank_sweep import run
-
-        return run(args)
     shapes = args.case
     plans = []
     replay = json.loads(args.replay_report.read_text()) if args.replay_report else None
