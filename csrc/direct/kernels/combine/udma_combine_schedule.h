@@ -51,8 +51,9 @@ __aicore__ inline void CombineRemoteImpl(
         // Split the original peer row interval, retaining src_idx and output addresses.
         const uint32_t begin = row[p], length = end[p] - begin;
         peer_begin[p] = begin;
-        if (td.combine_payload_max_rows > 1U &&
-            (end[p] < begin || length > td.token_capacity || end[p] > td.num_recv_tokens)) {
+        // Both indexed and compact sends require a bounded peer interval before
+        // loading src_idx or forming payload/compact-weight addresses.
+        if (end[p] < begin || length > td.token_capacity || end[p] > td.num_recv_tokens) {
             trap(); return;
         }
         const uint32_t lane = core % td.udma_workers_per_peer;
