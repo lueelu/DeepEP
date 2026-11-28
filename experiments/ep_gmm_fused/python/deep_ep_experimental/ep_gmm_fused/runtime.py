@@ -10,12 +10,13 @@ import importlib
 import json
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator, Optional
 
 import torch
 
 from deep_ep._native import require_native
+from ._tiling import LARGE_EP_WORKSPACE_BYTES, WORKSPACE_BYTES
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,9 @@ class UdmaConfig:
     device: str
     mode: str = "default"
     members: tuple = ()
+    ranks_per_node: int = 0
+    workspace_data_bytes: int = WORKSPACE_BYTES
+    pipeline_chunks: int = -1
 
 
 _config: Optional[UdmaConfig] = None
@@ -37,7 +41,7 @@ _leases = 0
 _context_owned = False
 _session = None
 _closing = False
-_WORKSPACE_BYTES = 400 * 1024 * 1024 + 4096
+_CONTROL_BYTES = 4096
 
 
 def _env_int(name: str, default: Optional[int] = None) -> int:
@@ -63,6 +67,30 @@ def _resolve_master_addr(host: str) -> str:
             ) from error
 
 
+def _node_width(rank, world_size, members):
+    """Infer a contiguous torchrun world, or use the explicit group-local layout."""
+    if world_size not in (64, 128):
+        return 0
+    override = os.environ.get("DEEPEP_UDMA_RANKS_PER_NODE")
+    if override is not None:
+        try:
+            width = int(override)
+        except ValueError:
+            return -1
+        return width if width == 0 or (0 < width < world_size and world_size % width == 0) else -1
+    if members and members != tuple(range(world_size)):
+        return 0
+    try:
+        width = int(os.environ["LOCAL_WORLD_SIZE"])
+        if (0 < width < world_size and world_size % width == 0 and int(os.environ["WORLD_SIZE"]) == world_size
+                and int(os.environ["RANK"]) == rank and int(os.environ["LOCAL_RANK"]) == rank % width
+                and int(os.environ["GROUP_RANK"]) == rank // width):
+            return width
+    except (KeyError, ValueError):
+        pass
+    return 0
+
+
 def _control_device(group, device):
     backend = str(torch.distributed.get_backend(group)).lower()
     if backend == "hccl":
@@ -74,7 +102,8 @@ def _control_device(group, device):
 
 def _agree(group, device, config, valid, uid_size):
     """Fixed-size exchange also detects partial/reconfigured initialization."""
-    common = (config.world_size, config.heap_size, config.members, config.mode, uid_size)
+    common = (config.world_size, config.heap_size, config.members, config.mode, uid_size,
+              config.ranks_per_node, config.workspace_data_bytes, config.pipeline_chunks)
     digest = hashlib.sha256(json.dumps(common).encode()).digest()
     payload = torch.tensor([int(valid), int(_config is not None), *digest], dtype=torch.uint8, device=device)
     peers = [torch.empty_like(payload) for _ in range(config.world_size)]
@@ -127,11 +156,17 @@ def init_udma_group(
                     raise ValueError("UDMA bootstrap port must be in [1, 65535]")
                 init_method = f"tcp://{host}:{port}"
             requested = UdmaConfig(rank, world_size, init_method, heap_size, f"npu:{local_rank}")
+        width = _node_width(rank, world_size, requested.members)
+        chunks = os.environ.get("DEEPEP_LARGE_EP_PIPELINE_CHUNKS", "") if width > 0 else ""
+        chunk_count = {"": -1, "0": 0, "1": 1, "2": 2, "4": 4}.get(chunks, -2)
+        data_bytes = LARGE_EP_WORKSPACE_BYTES if width > 0 else WORKSPACE_BYTES
+        requested = replace(requested, ranks_per_node=width, workspace_data_bytes=data_bytes, pipeline_chunks=chunk_count)
+        workspace_bytes = requested.workspace_data_bytes + _CONTROL_BYTES
         valid = (
             all(isinstance(v, int) and not isinstance(v, bool) for v in (rank, world_size, heap_size, local_rank))
             and 0 <= rank < world_size <= 128
             and local_rank >= 0
-            and _WORKSPACE_BYTES < heap_size < 1 << 63
+            and width >= 0 and chunk_count >= -1 and workspace_bytes < heap_size < 1 << 63
             and (_config is None or (requested == _config and group is _group_ref))
         )
         if group is None and not valid:
@@ -170,14 +205,15 @@ def init_udma_group(
             uid_bytes = uid.cpu().tolist()
             torch_npu.npu.synchronize()
         session = core.create_udma_runtime(
-            rank, world_size, heap_size, _WORKSPACE_BYTES, requested.init_method, uid_bytes
+            rank, world_size, heap_size, workspace_bytes, requested.init_method, uid_bytes, width > 0
         )
         # Retain the owner even if attachment fails. Cleanup is an explicit
         # collective; never start it implicitly on one failed rank.
         _session = session
         _anchor, _config, _group_ref = anchor, requested, group
         _closing = True
-        native._attach_udma(anchor, rank, world_size, core.udma_workspace_address(session), session.capacity)
+        native._attach_udma(anchor, rank, world_size, core.udma_workspace_address(session), session.capacity,
+                            width, chunk_count)
         _closing = False
         return requested
 

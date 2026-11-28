@@ -15,7 +15,7 @@ from ._tiling import TILING_FIELDS, validate_tiling
 RouteInput = Union[torch.Tensor, Sequence[int]]
 
 
-def _tiling_arguments(operator, tiling, x, weight, ep_size, output_all_to_allv=False):
+def _tiling_arguments(operator, tiling, x, weight, ep_size, workspace_bytes, output_all_to_allv=False):
     if tiling is None:
         return {}
     profile = validate_tiling(
@@ -26,6 +26,7 @@ def _tiling_arguments(operator, tiling, x, weight, ep_size, output_all_to_allv=F
         n=weight.shape[2],
         k=x.shape[1],
         world_size=ep_size,
+        workspace_bytes=workspace_bytes,
     )
     return {"tiling": [profile[name] for name in TILING_FIELDS[operator]]}
 
@@ -231,6 +232,7 @@ def alltoallv_gmm(
         x,
         weight,
         ep_size,
+        config.workspace_data_bytes,
         output_all_to_allv,
     )
     local_tokens_per_expert, local_host_values = _normalize_route(
@@ -329,6 +331,7 @@ def gmm_alltoallv(
         x,
         weight,
         ep_size,
+        config.workspace_data_bytes,
     )
     local_tokens_per_expert, local_host_values = _normalize_route(
         local_tokens_per_expert,

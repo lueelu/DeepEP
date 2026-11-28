@@ -8,11 +8,13 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
 from .framework.cases import generate, load_cases, save_cases
 from .performance.metrics import summarize
@@ -80,6 +82,13 @@ def report_run(root, baseline=None):
                 row["msprof"] = summarize(
                     [c["samples_us"] for c in captures], sample_semantics="max_rank_" + metrics.pop()
                 )
+                peak = plan.get("arguments", {}).get("peak_tflops")
+                case = ranks[0].get("case", {})
+                if peak and case.get("operator") in ("alltoallv_gmm", "gmm_alltoallv"):
+                    world = len(expected)
+                    rate = 2 * world * case["m"] * case["k"] * case["n"] / (row["msprof"]["p50_us"] * 1e6)
+                    row["msprof"].update(global_tflops=rate, peak_tflops_per_rank=peak,
+                                         mfu_percent=100 * rate / (world * peak))
         row["status"] = "passed" if row["passed"] else ("not_run" if not ranks else "failed_or_incomplete")
         results.append(row)
     result = {
@@ -122,8 +131,12 @@ def report_run(root, baseline=None):
         "",
     ]
     if plan["mode"] == "bench":
-        lines += ["| Case | Execution passed | msprof p50 of max-rank kernel duration (us) |", "|---|---|---|"]
-        lines += [f"| {r['case_id']} | {r['passed']} | {r.get('msprof', {}).get('p50_us', '')} |" for r in results]
+        lines += ["| Case | Execution passed | msprof p50 of max-rank kernel duration (us) | Global TFLOPS | MFU (%) |",
+                  "|---|---|---|---|---|"]
+        for r in results:
+            data = r.get("msprof", {})
+            rates = [f"{data[key]:.3f}" if key in data else "" for key in ("global_tflops", "mfu_percent")]
+            lines.append(f"| {r['case_id']} | {r['passed']} | {data.get('p50_us', '')} | {rates[0]} | {rates[1]} |")
         lines += ["", "Accuracy: not run. Composition samples sum the two target kernel durations."]
     else:
         lines += ["| Case | Result |", "|---|---|"]
@@ -138,7 +151,7 @@ def main(argv=None):
     parser.add_argument("--suite", choices=("smoke", "model", "generalization", "all", "nightly"), default="smoke")
     parser.add_argument("--cases", help="saved schema_version=1 case manifest (exact replay)")
     parser.add_argument("--case-id")
-    parser.add_argument("--ep-size", type=int, choices=(1, 2, 4, 8))
+    parser.add_argument("--ep-size", type=int, choices=(1, 2, 4, 8, 16, 32, 64, 128))
     parser.add_argument("--operator", choices=("alltoallv_gmm", "gmm_alltoallv", "composition"))
     parser.add_argument("--category", action="append", help="include category; repeat to select several")
     parser.add_argument("--exclude-category", action="append", default=[])
@@ -158,6 +171,7 @@ def main(argv=None):
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--peak-tflops", type=float, help="per-card dense BF16 peak for msprof bench MFU")
     parser.add_argument("--batches", type=int, default=10)
     parser.add_argument("--metric", choices=("PipeTimeline", "InstrTimeline", "op_summary"), default="PipeTimeline")
     parser.add_argument("--pipes")
@@ -171,6 +185,8 @@ def main(argv=None):
         if args.pipes:
             parser.error("bench uses msprof op_summary; pipe selection is only supported by profile")
         args.metric = "op_summary"
+    if args.peak_tflops is not None and not (math.isfinite(args.peak_tflops) and args.peak_tflops > 0):
+        parser.error("--peak-tflops must be finite and positive")
     if (
         min(args.shard_count, args.golden_block_rows, args.blas_threads) < 1
         or not 0 <= args.shard_index < args.shard_count
@@ -309,6 +325,23 @@ def main(argv=None):
             execute(
                 command, root / selection["case_id"] / f"worker-node-{args.node_rank}.log", args.timeout, worker_env
             )
+        if args.nnodes > 1:
+            # msprof exports and parses in per-rank parents after the last device
+            # barrier. Wait for every node's capture JSON before publishing.
+            (root / f"node-{args.node_rank}.complete").touch()
+            if args.node_rank == 0:
+                deadline = time.monotonic() + args.timeout
+                while not all((root / f"node-{node}.complete").is_file() for node in range(args.nnodes)):
+                    failed = next(root.glob("node-*.failed"), None)
+                    if failed:
+                        raise RuntimeError(f"a peer launcher failed: {failed.name}")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("waiting for peer nodes to finish their rank reports")
+                    time.sleep(1)
+    except BaseException:
+        if args.nnodes > 1:
+            (root / f"node-{args.node_rank}.failed").touch()
+        raise
     finally:
         if args.node_rank == 0:
             result = report_run(root, args.baseline)

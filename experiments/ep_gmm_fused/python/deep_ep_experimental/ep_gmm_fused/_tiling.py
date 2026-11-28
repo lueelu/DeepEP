@@ -49,6 +49,7 @@ MMAD_SHAPES = {
 # CATLASS Ascend950 LocalTensorBuffer allocation, smaller than physical UB.
 UB_BYTES = 248 * 1024
 WORKSPACE_BYTES = 400 * 1024 * 1024
+LARGE_EP_WORKSPACE_BYTES = 512 * 1024 * 1024
 UDMA_SCRATCH_BYTES = 256
 UINT32_MAX = (1 << 32) - 1
 INT32_MAX = (1 << 31) - 1
@@ -78,6 +79,7 @@ def validate_tiling(
     world_size=None,
     aic_cores=None,
     ub_bytes=UB_BYTES,
+    workspace_bytes=WORKSPACE_BYTES,
 ):
     """Validate a complete profile; return a copy in the native field order.
 
@@ -86,6 +88,7 @@ def validate_tiling(
     """
     if operator not in TILING_FIELDS:
         raise ValueError("unsupported operator: {}".format(operator))
+    _integer("workspace_bytes", workspace_bytes)
     if not isinstance(tiling, Mapping):
         raise ValueError("tiling must be a mapping")
     if operator == GROUPED_MATMUL:
@@ -149,8 +152,8 @@ def validate_tiling(
         if k is not None and world_size is not None:
             # DistRowMajor aligns BF16 staging rows to 512 bytes (256 elements).
             workspace = stages * result["stage_rows"] * world_size * _aligned(k, 256) * 2
-            if workspace > WORKSPACE_BYTES:
-                raise ValueError("tiling exceeds the 400 MiB symmetric workspace")
+            if workspace > workspace_bytes:
+                raise ValueError("tiling exceeds the symmetric workspace capacity ({} bytes)".format(workspace_bytes))
         if aic_cores is not None:
             if result["export_core_count"] > aic_cores:
                 raise ValueError("export_core_count exceeds the AI-core count")
@@ -166,6 +169,10 @@ def validate_tiling(
             raise ValueError("local_copy_tile_rows exceeds the native commTileM range")
         stage_rows = result["stage_rows"]
         stages = result["workspace_stages"]
+        if stages == 3:
+            # Three-stage reverse overrides retain the original GM template and
+            # its control offset even when the attached UDMA domain is larger.
+            workspace_bytes = min(workspace_bytes, WORKSPACE_BYTES)
         if stage_rows % result["m0"]:
             raise ValueError("stage_rows must be zero (derived) or divisible by m0")
         if stages not in (2, 3):
@@ -189,8 +196,8 @@ def validate_tiling(
             if stage_rows * world_size > UINT32_MAX:
                 raise ValueError("stage_rows * world_size exceeds uint32")
             if n is not None:
-                if stages * stage_rows * world_size * n * 2 > WORKSPACE_BYTES:
-                    raise ValueError("tiling exceeds the 400 MiB symmetric workspace")
+                if stages * stage_rows * world_size * n * 2 > workspace_bytes:
+                    raise ValueError("tiling exceeds the symmetric workspace capacity ({} bytes)".format(workspace_bytes))
                 n_loops = (n + result["n0"] - 1) // result["n0"]
                 tasks = (stage_rows // result["m0"]) * world_size * n_loops
                 if aic_cores is not None and tasks > UINT32_MAX - aic_cores:
@@ -203,16 +210,33 @@ def validate_tiling(
     return result
 
 
+def _matched_large_ep(case):
+    world = case["world_size"]
+    shape = case["shape"]
+    return (
+        world in (64, 128)
+        and case.get("workspace_bytes", WORKSPACE_BYTES) == LARGE_EP_WORKSPACE_BYTES
+        and case["expert_num"] in (7 * world, 14 * world)
+        and not case.get("output_all_to_allv", False)
+        and ((case["operator"] == ALL_TO_ALLV and shape["m"] == 65536 and shape["k"] == 3584 and shape["n"] in (3072, 6144))
+             or (case["operator"] == GROUPED_MATMUL and shape["n"] == 3584 and shape["k"] in (3072, 6144)))
+    )
+
+
 def default_tiling(case):
     """Express the existing native shape-specific fallback in searchable fields."""
     operator = case["operator"]
     m, n, k = (case["shape"][axis] for axis in ("m", "n", "k"))
     business = case["world_size"] == 8 and case["expert_num"] == 256
     export = case.get("output_all_to_allv", False)
+    if _matched_large_ep(case):
+        values = ([256, 256, 256, 64, 256, 2, 4, 1, 0, 1] if operator == ALL_TO_ALLV
+                  else [256, 256, 256, 1, 4, 256, 2, 1])
+        return dict(zip(TILING_FIELDS[operator], values))
     if operator == ALL_TO_ALLV:
         values = [128, 256, 256, 64, 1280, 2, 32, 1, 0, 1]
         if case["world_size"] > 8:
-            capacity = WORKSPACE_BYTES // 2 // values[5] // case["world_size"] // _aligned(k, 256)
+            capacity = case.get("workspace_bytes", WORKSPACE_BYTES) // 2 // values[5] // case["world_size"] // _aligned(k, 256)
             values[4] = min(values[4], capacity) // values[0] * values[0]
             if values[4] == 0:
                 raise ValueError("symmetric workspace cannot hold one M0 tile per EP rank")
@@ -279,6 +303,16 @@ def default_search_space(case):
     if operator not in TILING_FIELDS:
         raise ValueError("unsupported operator: {}".format(operator))
     result = {"mmad": [list(shape) for shape in MMAD_SHAPES[operator]]}
+    if _matched_large_ep(case):
+        # Both directions stage 3584 BF16 columns. Physical rows must be a
+        # multiple of the selected MMAD M tile; validate_tiling filters the grid.
+        max_rows = case["workspace_bytes"] // (4 * case["world_size"] * 3584)
+        result.update(stage_rows=list(range(128, max_rows + 1, 128)), workspace_stages=[2], self_copy_cores=[1])
+        if operator == ALL_TO_ALLV:
+            result.update(comm_block_m=[32, 64, 128], local_copy_tile_rows=[2, 4], m_split=[1], export_core_count=[0])
+        else:
+            result.update(comm_interval=[1], local_copy_tile_rows=[2, 4, 8])
+        return result
     if operator == ALL_TO_ALLV:
         export = case.get("output_all_to_allv", False)
         result.update(
@@ -383,6 +417,7 @@ def candidates_for_case(
                 world_size=case["world_size"],
                 aic_cores=aic_cores,
                 ub_bytes=ub_bytes,
+                workspace_bytes=case.get("workspace_bytes", WORKSPACE_BYTES),
             )
         except ValueError:
             return

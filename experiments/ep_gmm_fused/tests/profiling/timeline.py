@@ -14,7 +14,7 @@ import subprocess
 
 KERNELS = {
     "alltoallv_gmm": ("Ascend950AllToAllVGroupedMatmul", "AllToAllVGroupedMatMulUdma"),
-    "gmm_alltoallv": ("GroupedMatmulAllToAllV", "GroupedMatMulAllToAllVUdma"),
+    "gmm_alltoallv": ("GroupedMatmulAllToAllV", "GroupedMatMulAllToAllVUdma", "LargeEpPipeline"),
 }
 
 

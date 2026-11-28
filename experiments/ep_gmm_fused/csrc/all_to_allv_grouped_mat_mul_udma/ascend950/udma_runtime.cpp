@@ -17,7 +17,8 @@ UdmaRuntime& UdmaRuntime::Instance()
     return runtime;
 }
 
-void UdmaRuntime::Attach(int32_t rank, int32_t worldSize, uintptr_t workspace, uint64_t workspaceBytes)
+void UdmaRuntime::Attach(int32_t rank, int32_t worldSize, uintptr_t workspace, uint64_t workspaceBytes,
+                         uint32_t ranksPerNode, int32_t pipelineChunks)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     TORCH_CHECK(rank >= 0 && rank < worldSize, "invalid UDMA rank ", rank, " for world size ", worldSize);
@@ -32,6 +33,9 @@ void UdmaRuntime::Attach(int32_t rank, int32_t worldSize, uintptr_t workspace, u
 
     rank_ = rank;
     worldSize_ = worldSize;
+    ranksPerNode_ = ranksPerNode;
+    pipelineChunks_ = pipelineChunks;
+    symmetricDataBytes_ = workspaceBytes - 4096;
     device_ = device;
     initialized_ = true;
 }
@@ -72,6 +76,9 @@ void UdmaRuntime::Detach(aclrtStream stream)
     initialized_ = false;
     rank_ = -1;
     worldSize_ = 0;
+    ranksPerNode_ = 0;
+    pipelineChunks_ = -1;
+    symmetricDataBytes_ = 0;
     workspace_ = nullptr;
     lastStream_ = nullptr;
     fftsAddress_ = 0;

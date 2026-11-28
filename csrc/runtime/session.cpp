@@ -235,7 +235,8 @@ std::vector<uint8_t> Session::udma_unique_id()
 }
 
 std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_bytes, uint64_t workspace_bytes,
-                                              const std::string& endpoint, const std::vector<uint8_t>& uid_bytes)
+                                              const std::string& endpoint, const std::vector<uint8_t>& uid_bytes,
+                                              bool striped_peers)
 {
     if (size < 1 || size > ACLSHMEM_MAX_PES || rank < 0 || rank >= size ||
         heap_bytes > uint64_t(std::numeric_limits<int64_t>::max()) || workspace_bytes == 0 ||
@@ -277,9 +278,19 @@ std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_
     }
     // Preserve the locked SDK's optional-attribute version and timeout defaults.
     attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA;
+    if (striped_peers) {
+        // Different AIVs can post concurrently to different peers. Each peer needs its own SQ pair.
+        check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false), "aclshmemx_set_shared_jetty");
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 2), "aclshmemx_set_qp_num");
+    }
     occupied = true;
     check(aclshmemx_init_attr(mode, &attr), "aclshmemx_init_attr");
     try {
+        if (striped_peers) {
+            uint32_t count = 0;
+            check(aclshmemx_get_qp_num(ACLSHMEM_DATA_OP_UDMA, &count), "aclshmemx_get_qp_num");
+            if (count != 2) throw std::runtime_error("EP GMM requires two UDMA QPs per cross-node peer");
+        }
         session->workspace_ = aclshmem_malloc(workspace_bytes);
         if (session->workspace_ == nullptr) {
             throw std::runtime_error("aclshmem_malloc failed");

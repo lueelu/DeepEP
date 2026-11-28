@@ -274,6 +274,27 @@ python -m experiments.ep_gmm_fused.tests.run profile --ep-size 2 --operator allt
 可用参数以当前环境的 `msopprof --help` 或 `msprof op --help` 输出为准。
 部署版本的 UDMA replay、进程退出和采集文件结构仍需实机验收。
 
+## EP64 / EP128 的 8 个匹配 shape
+
+在每台参测节点的仓库根目录运行。各节点使用不同的 `NODE_RANK`，共用 master、输出根目录和本轮唯一的 `RUN_ID`。
+`NNODES * LOCAL_NPUS` 须等于 64 或 128，`PEAK` 为实际单卡 BF16 稠密峰值，单位 TFLOPS。
+
+```bash
+export DEEPEP_UDMA_RANKS_PER_NODE="$LOCAL_NPUS"
+torchrun --nnodes="$NNODES" --nproc-per-node="$LOCAL_NPUS" --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  -m experiments.ep_gmm_fused.tests.tune --output "$OUT/$RUN_ID-tune" --peak-tflops "$PEAK"
+
+python -m experiments.ep_gmm_fused.tests.run bench \
+  --cases "$OUT/$RUN_ID-tune/selected-cases.json" --ep-size "$((NNODES * LOCAL_NPUS))" \
+  --nnodes "$NNODES" --nproc-per-node "$LOCAL_NPUS" --node-rank "$NODE_RANK" \
+  --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT" \
+  --output "$OUT" --run-id "$RUN_ID-msprof" --peak-tflops "$PEAK"
+```
+
+Event 调优结果见 `comparison.txt`，正式 msprof 结果见对应该 run 的 `summary.json`。
+同一份 `selected-cases.json` 也可交给 `accuracy` 模式复测选中配置的 BF16 数值。
+
 ## 64 卡多个 EP4 域与重放
 
 每节点执行（共享输出文件系统，node-rank 各不相同）：

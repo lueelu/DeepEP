@@ -5,7 +5,7 @@
 import json
 from pathlib import Path
 
-from ._tiling import validate_tiling
+from ._tiling import WORKSPACE_BYTES, validate_tiling
 
 
 def load_tiling_config(path, case_id):
@@ -48,4 +48,5 @@ def load_tiling_config(path, case_id):
         n=item["shape"]["n"],
         k=item["shape"]["k"],
         world_size=item.get("world_size"),
+        workspace_bytes=item.get("workspace_bytes", WORKSPACE_BYTES),
     )

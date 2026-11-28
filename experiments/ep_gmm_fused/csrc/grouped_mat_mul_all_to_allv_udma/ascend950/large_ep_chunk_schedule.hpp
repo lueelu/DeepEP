@@ -26,6 +26,8 @@ class PeerChunkCursor {
 public:
     using ProblemShape = Catccos::DGemm::AllToAllVAllGatherProblemShape;
 
+    CATLASS_DEVICE PeerChunkCursor() = default;
+
     CATLASS_DEVICE PeerChunkCursor(const ProblemShape& shape, uint32_t sourcePeer, uint32_t outputBase,
                                    uint32_t groupsPerRound, uint32_t chunkCount, uint32_t incomingGroups,
                                    uint32_t blockM = 256U)
@@ -130,14 +132,14 @@ private:
     }
 
     ProblemShape problemShape_;
-    const uint32_t sourcePeer_;
-    const uint32_t outputBase_;
-    const uint32_t groupsPerRound_;
-    const uint32_t chunkCount_;
-    const uint32_t expertCount_;
-    const uint32_t expertsPerChunk_;
-    const uint32_t blockM_;
-    uint32_t unconsumedGroups_;
+    uint32_t sourcePeer_{0U};
+    uint32_t outputBase_{0U};
+    uint32_t groupsPerRound_{0U};
+    uint32_t chunkCount_{0U};
+    uint32_t expertCount_{0U};
+    uint32_t expertsPerChunk_{0U};
+    uint32_t blockM_{0U};
+    uint32_t unconsumedGroups_{0U};
     uint32_t round_{0U};
     uint32_t remainingRoundGroups_{0U};
     uint32_t nextChunk_{0U};

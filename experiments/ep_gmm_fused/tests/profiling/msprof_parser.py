@@ -22,6 +22,7 @@ KERNEL_NAME_SUBSTRINGS = {
         "GroupedMatmulAllToAllV",
         "grouped_mat_mul_all_to_allv_udma",
         "GroupedMatMulAllToAllVUdma",
+        "LargeEpPipeline",
     ),
 }
 
@@ -58,13 +59,14 @@ def _read_rows(
     candidate_names = set()
     used_files = []
     fallback_order = 0.0
+    fragments = tuple(fragment.lower() for fragment in kernel_name_substrings)
     for csv_path in op_files:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
             for row in csv.DictReader(stream):
-                name = _field(row, ("Op Name", "Name", "OP Type", "Op Type", "Type"))
-                if name:
-                    candidate_names.add(name)
-                if not any(fragment.lower() in name.lower() for fragment in kernel_name_substrings):
+                names = [value.strip() for key, value in row.items()
+                         if value and key and key.strip().lower() in ("op name", "name", "kernel name", "op type", "type")]
+                candidate_names.update(names)
+                if not any(fragment in name.lower() for name in names for fragment in fragments):
                     continue
                 device = _field(row, ("Device_id", "Device ID", "device_id"), "unknown")
                 duration_text = _field(row, ("Task Duration(us)", "Duration(us)", "Task Duration"))
@@ -185,6 +187,8 @@ def parse_msprof_case(profile_dir: Union[Path, str], case: Mapping[str, Any]) ->
         },
         "expected_target_launches_per_device": expected,
         "op_summary_files": used_files,
+        "matched_op_names": [name for name in candidate_names if any(
+            fragment.lower() in name.lower() for fragment in KERNEL_NAME_SUBSTRINGS[operator])],
     }
 
 

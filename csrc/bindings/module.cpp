@@ -71,6 +71,7 @@ PYBIND11_MODULE(_C, module)
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
     module.def("create_udma_runtime", &deepep::Session::create_udma, py::arg("rank"), py::arg("size"),
                py::arg("heap_bytes"), py::arg("workspace_bytes"), py::arg("endpoint"), py::arg("uid_bytes"),
+               py::arg("striped_peers") = false,
                py::call_guard<py::gil_scoped_release>());
     module.def("udma_unique_id_size", &deepep::Session::udma_unique_id_size);
     module.def("udma_unique_id", &deepep::Session::udma_unique_id, py::call_guard<py::gil_scoped_release>());

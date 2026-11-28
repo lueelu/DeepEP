@@ -87,8 +87,8 @@ def test_forward_fixed_profiles(tiling, world, experts, k, n, export, values):
     [
         (8, 256, 1024, 2048, (128, 256, 256, 10, 4, 0, 2, 1)),
         (8, 256, 512, 2048, (128, 256, 256, 16, 16, 0, 2, 1)),
-        (4, 28, 3072, 3584, (256, 256, 256, 8, 8, 2048, 3, 8)),
-        (4, 28, 6144, 3584, (256, 256, 256, 8, 8, 2048, 2, 8)),
+        (4, 28, 3072, 3584, (256, 256, 256, 1, 1, 256, 3, 8)),
+        (4, 28, 6144, 3584, (256, 256, 256, 1, 16, 256, 3, 8)),
     ],
 )
 def test_inverse_fixed_profiles_and_legacy_overrides(tiling, world, experts, k, n, values):
@@ -98,6 +98,10 @@ def test_inverse_fixed_profiles_and_legacy_overrides(tiling, world, experts, k, 
         case = dict(operator=tiling.GROUPED_MATMUL, shape=dict(m=m, k=k, n=n), world_size=world, expert_num=experts)
         assert tiling.default_tiling(case) == expected
     legacy = {name: expected[name] for name in tiling.TILING_FIELDS[tiling.GROUPED_MATMUL][:5]}
+    if world == 4:
+        # Five-field profiles derive stage rows from this interval; the eight-field
+        # fallback specifies its rows directly and can use a smaller interval.
+        legacy["comm_interval"] = 8
     for profile in (expected, legacy):
         normalized = tiling.validate_tiling(tiling.GROUPED_MATMUL, profile, n=n, world_size=world, aic_cores=32)
         assert normalized == (
@@ -183,6 +187,12 @@ int main() {
     assert(ParseGroupedMatMul(physical, 7, inverse) != nullptr);
     physical[6] = 4;
     assert(ParseGroupedMatMul(physical, 8, inverse) != nullptr);
+    AllToAllV largeForward{256, 256, 256, 64, 256, 2, 4, 1, 0, 1};
+    GroupedMatMul largeReverse{256, 256, 256, 1, 4, 256, 2, 1};
+    assert(ValidateAllToAllV(largeForward, 65536, 3584, 128, 32, kCompiledUbBytes) != nullptr);
+    assert(ValidateAllToAllV(largeForward, 65536, 3584, 128, 32, kCompiledUbBytes, kLargeEpDataBytes) == nullptr);
+    assert(ValidateGroupedMatMul(largeReverse, 3584, 128, 32, kCompiledUbBytes) != nullptr);
+    assert(ValidateGroupedMatMul(largeReverse, 3584, 128, 32, kCompiledUbBytes, kLargeEpDataBytes) == nullptr);
 }
 """,
         encoding="utf-8",

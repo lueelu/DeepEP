@@ -21,7 +21,8 @@ public:
     static UdmaRuntime& Instance();
 
     // Borrow the public Session's workspace; this adapter never owns SHMEM.
-    void Attach(int32_t rank, int32_t worldSize, uintptr_t workspace, uint64_t workspaceBytes);
+    void Attach(int32_t rank, int32_t worldSize, uintptr_t workspace, uint64_t workspaceBytes, uint32_t ranksPerNode,
+                int32_t pipelineChunks);
     void Detach(aclrtStream stream);
     void EnsureInitialized() const;
     void CheckDevice(int32_t device) const;
@@ -31,6 +32,9 @@ public:
     uint64_t FftsAddress() const;
     int32_t Rank() const;
     int32_t WorldSize() const;
+    uint32_t RanksPerNode() const { return ranksPerNode_; }
+    uint64_t SymmetricDataBytes() const { return symmetricDataBytes_; }
+    int32_t PipelineChunks() const { return pipelineChunks_; }
 
 private:
     UdmaRuntime() = default;
@@ -43,6 +47,9 @@ private:
     bool initialized_{false};
     int32_t rank_{-1};
     int32_t worldSize_{0};
+    uint32_t ranksPerNode_{0};
+    uint64_t symmetricDataBytes_{0};
+    int32_t pipelineChunks_{-1};
     uint8_t* workspace_{nullptr};
     aclrtStream lastStream_{nullptr};
     uint64_t fftsAddress_{0};

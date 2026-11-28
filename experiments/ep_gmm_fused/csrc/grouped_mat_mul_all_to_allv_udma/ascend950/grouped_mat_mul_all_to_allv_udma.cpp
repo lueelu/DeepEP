@@ -201,7 +201,7 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     const int64_t inputRows64 = x.size(0);
     const int64_t k64 = x.size(1);
     const int64_t n64 = weight.size(2);
-    TORCH_CHECK(inputRows64 > 0 && k64 > 0 && n64 > 0, "input rows, k and n must be positive");
+    TORCH_CHECK(k64 > 0 && n64 > 0, "k and n must be positive");
     TORCH_CHECK(inputRows64 <= std::numeric_limits<uint32_t>::max() && k64 <= std::numeric_limits<uint32_t>::max() &&
                     n64 <= std::numeric_limits<uint32_t>::max(),
                 "shape exceeds the kernel's uint32 range");
@@ -216,8 +216,35 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     const uint32_t m = static_cast<uint32_t>(inputRows64);
     const uint32_t k = static_cast<uint32_t>(k64);
     const uint32_t n = static_cast<uint32_t>(n64);
-    const TilingProfile tiling = ResolveTiling(
-        SelectTiling(k, n, static_cast<uint32_t>(worldSize), static_cast<uint32_t>(expertNum)), tilingValues);
+    const uint32_t ranksPerNode = runtime.RanksPerNode();
+    const bool highEp = (worldSize == 64 || worldSize == 128) && ranksPerNode > 0;
+    const bool matchedHighEp = highEp && (localExpertNum == 7 || localExpertNum == 14) &&
+                               (k == 3072 || k == 6144) && n == 3584;
+    uint32_t pipelineChunks = matchedHighEp ? 2U : 0U;
+    if (highEp && runtime.PipelineChunks() >= 0) {
+        pipelineChunks = static_cast<uint32_t>(runtime.PipelineChunks());
+    } else if (worldSize == 16) {
+        const char* setting = std::getenv("DEEPEP_LARGE_EP_PIPELINE_CHUNKS");
+        if (setting && *setting) {
+            TORCH_CHECK(std::strcmp(setting, "0") == 0 || std::strcmp(setting, "1") == 0 ||
+                            std::strcmp(setting, "2") == 0 || std::strcmp(setting, "4") == 0,
+                        "DEEPEP_LARGE_EP_PIPELINE_CHUNKS must be 0, 1, 2 or 4");
+            pipelineChunks = static_cast<uint32_t>(setting[0] - '0');
+        }
+    }
+    // Choose using collective-wide dimensions. The routed input row count may differ on each rank.
+    auto defaultTiling = SelectTiling(k, n, static_cast<uint32_t>(worldSize), static_cast<uint32_t>(expertNum));
+    if (highEp && pipelineChunks != 0) {
+        const bool fitsM256 = 2ULL * 256 * worldSize * n * sizeof(uint16_t) <= runtime.SymmetricDataBytes();
+        defaultTiling = {fitsM256 ? KernelVariant::kM0_256N0_256 : KernelVariant::kM0_128,
+                         fitsM256 ? 256U : 128U, 256, 256, 1, 8, 64, 1, 16, fitsM256 ? 256U : 128U, 2, 4, 1};
+    }
+    const TilingProfile tiling = ResolveTiling(defaultTiling, tilingValues);
+    const bool highEpPipeline = highEp && pipelineChunks != 0 && tiling.workspaceStages == 2;
+    const bool useLargeEpPipeline = highEpPipeline || (worldSize == 16 && pipelineChunks != 0);
+    TORCH_CHECK(inputRows64 > 0 || highEpPipeline, "input rows must be positive for the selected kernel");
+    const uint64_t dataBytes = highEpPipeline ? runtime.SymmetricDataBytes() :
+                                                GroupedMatMulAllToAllVUdmaDefaultConfig::kSymmetricDataBytes;
     uint64_t ubBytes = 0;
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubBytes);
     const uint32_t localCopyColumns = TargetOrderLocalCopyColumns(n);
@@ -235,7 +262,7 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
                                                     tiling.workspaceStages,
                                                     tiling.selfCopyCores};
     const char* error =
-        TilingValidation::ValidateGroupedMatMul(requested, n, static_cast<uint32_t>(worldSize), blockDim, ubBytes);
+        TilingValidation::ValidateGroupedMatMul(requested, n, static_cast<uint32_t>(worldSize), blockDim, ubBytes, dataBytes);
     TORCH_CHECK(error == nullptr, "invalid GroupedMatMul tiling: ", error);
     TORCH_CHECK(inputRows64 <= std::numeric_limits<uint32_t>::max() - tiling.m0 + 1,
                 "input rows overflow the target-order tiling scheduler");
@@ -258,9 +285,8 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     const uint64_t requiredWorkspaceBytes = static_cast<uint64_t>(tiling.workspaceStages) * stageRows *
                                             static_cast<uint64_t>(worldSize) * static_cast<uint64_t>(n64) *
                                             sizeof(uint16_t);
-    TORCH_CHECK(requiredWorkspaceBytes <= GroupedMatMulAllToAllVUdmaDefaultConfig::kSymmetricDataBytes,
-                "kernel tiling requires ", requiredWorkspaceBytes, " symmetric workspace bytes, exceeding ",
-                GroupedMatMulAllToAllVUdmaDefaultConfig::kSymmetricDataBytes);
+    TORCH_CHECK(requiredWorkspaceBytes <= dataBytes, "kernel tiling requires ", requiredWorkspaceBytes,
+                " symmetric workspace bytes, exceeding ", dataBytes);
 
     // This fused direction consumes sum(global_tokens) rows and returns
     // sum(local_tokens) rows. Use the caller-provided capacity on the reusable
@@ -294,24 +320,22 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
     Catlass::MatrixCoord commBlockShape{tiling.commBlockM, static_cast<uint32_t>(n64)};
     Catlass::MatrixCoord commTileShape{localCopyRows, localCopyColumns};
     const uint64_t fftsAddress = runtime.FftsAddress();
-    // This measured specialization is confined to EP16; larger groups retain GM scheduling.
-    uint32_t pipelineChunks = 0;
-    if (worldSize == 16) {
-        const char* setting = std::getenv("DEEPEP_LARGE_EP_PIPELINE_CHUNKS");
-        if (setting && *setting && std::strcmp(setting, "0") != 0) {
-            TORCH_CHECK(
-                std::strcmp(setting, "1") == 0 || std::strcmp(setting, "2") == 0 || std::strcmp(setting, "4") == 0,
-                "DEEPEP_LARGE_EP_PIPELINE_CHUNKS must be 0, 1, 2 or 4");
-            pipelineChunks = static_cast<uint32_t>(setting[0] - '0');
-        }
-    }
-    const bool useLargeEpPipeline = pipelineChunks != 0;
-    TORCH_CHECK(!useLargeEpPipeline ||
+    TORCH_CHECK(!highEpPipeline || blockDim == 32,
+                "the high-EP pipeline requires 32 AICs");
+    TORCH_CHECK(worldSize != 16 || !useLargeEpPipeline ||
                     (blockDim == 32 && localExpertNum == 32 && m == 9216 && k == 1024 && n == 384 && tiling.m0 == 256 &&
                      tiling.n0 == 128 && tiling.k0 == 256 && tiling.workspaceStages == 2 &&
                      tiling.selfCopyCores <= 16 && (stageRows == 8192 || stageRows == 2816)),
                 "EP16 pipeline requires the measured S1/M3 shape and M256/N128/K256, WS2 tiling");
-    const bool wholeRound = useLargeEpPipeline && stageRows == 2816 && pipelineChunks == 1;
+    if (highEpPipeline) {
+        // The rank sends and receives at most one acknowledgement per peer and round.
+        const uint64_t groups = static_cast<uint64_t>(std::max(inputRows64, outputRows64)) / tiling.m0 + localExpertNum;
+        const uint64_t groupsPerRound = stageRows / tiling.m0;
+        const uint64_t rounds = (groups + groupsPerRound - 1) / groupsPerRound;
+        TORCH_CHECK(rounds * std::max<uint64_t>(pipelineChunks, worldSize) <= std::numeric_limits<int32_t>::max(),
+                    "high-EP pipeline signal sequence exceeds int32 range");
+    }
+    const bool wholeRound = worldSize == 16 && useLargeEpPipeline && stageRows == 2816 && pipelineChunks == 1;
     auto launchWithConfig = [&](auto configTag) {
         using SelectedConfig = typename decltype(configTag)::type;
         using SelectedDeviceOp = typename SelectedConfig::Device;
@@ -344,6 +368,10 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
         const Catlass::Status initializeStatus = deviceOp.Initialize(arguments);
         TORCH_CHECK(initializeStatus == Catlass::Status::kSuccess, "failed to initialize the CatCCOS device operator");
         typename SelectedDeviceOp::Params params = deviceOp.params();
+        if (highEpPipeline) {
+            // The pipeline uses only the first control region, after the actual symmetric data capacity.
+            params.syncMmadFinish = runtime.Workspace() + dataBytes;
+        }
         at::Tensor schedulerWorkspace;
         if constexpr (SelectedConfig::kUseGmScheduler) {
             if (!useLargeEpPipeline) {
@@ -361,9 +389,18 @@ at::Tensor GroupedMatMulAllToAllVUdmaImpl(const at::Tensor& x, const at::Tensor&
         auto launch = [=]() -> int {
             // Keep the allocation alive while RunOpApi queues the launch callback.
             (void)schedulerWorkspace;
+            if constexpr (std::is_same_v<SelectedConfig, GroupedMatMulAllToAllVUdmaDefaultConfig> ||
+                          std::is_same_v<SelectedConfig, LargeEpN128Config> ||
+                          std::is_same_v<SelectedConfig, GroupedMatMulAllToAllVUdmaM0_256N0_256Config>) {
+                if (highEpPipeline) {
+                    LaunchLargeEp(LargeEpParams<SelectedConfig>{params, pipelineChunks, ranksPerNode},
+                                  blockDim, stream, fftsAddress);
+                    return 0;
+                }
+            }
             if constexpr (std::is_same_v<SelectedConfig, LargeEpN128Config>) {
                 if (useLargeEpPipeline) {
-                    LaunchLargeEpN128(LargeEpN128Params{params, pipelineChunks}, wholeRound, blockDim, stream,
+                    LaunchLargeEpN128(LargeEpN128Params{params, pipelineChunks, 0}, wholeRound, blockDim, stream,
                                       fftsAddress);
                     return 0;
                 }

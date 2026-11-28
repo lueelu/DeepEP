@@ -31,7 +31,6 @@ namespace deepep::ep_gmm_fused {
 namespace {
 
 constexpr uint32_t kMaxLocalExperts = 64;
-constexpr uint64_t kSymmetricDataBytes = 200UL * 1024 * 1024 * sizeof(uint16_t);
 constexpr uint32_t kMaxK0 = 256;
 static_assert(sizeof(Catccos::DGemm::MoeRouteSegment) == 24, "unexpected MoeRouteSegment ABI");
 static_assert(sizeof(Catccos::DGemm::MoeRouteMetadata) == 12880, "unexpected MoeRouteMetadata ABI");
@@ -71,6 +70,8 @@ struct TilingProfile {
 };
 
 constexpr TilingProfile kDefaultTiling{KernelVariant::kM0_128, 128, 256, 256, 10, 64, 64, 1, 16, 1280, 2, 32, 1, 0, 1};
+constexpr TilingProfile kLargeEpAggregateTiling{
+    KernelVariant::kM0_256N0_256, 256, 256, 256, 1, 64, 64, 1, 16, 256, 2, 4, 1, 0, 1};
 constexpr TilingProfile kM131072K2048N1024NonExportTiling{
     KernelVariant::kM0_128, 128, 256, 256, 12, 128, 128, 4, 4, 1536, 2, 64, 1, 0, 1};
 constexpr TilingProfile kM131072K2048N1024ExportTiling{
@@ -103,7 +104,7 @@ constexpr TilingProfile kM65536K3584N3072ExportTiling{
     KernelVariant::kM0_256N0_256, 256, 256, 256, 2, 64, 64, 1, 16, 512, 3, 8, 1, 0, 4};
 
 TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSize, uint32_t expertNum,
-                           bool outputAllToAllV)
+                           bool outputAllToAllV, uint32_t ranksPerNode, uint64_t dataBytes)
 {
     // Every rank participating in one collective launch must select the same
     // communication geometry. In an imbalanced route, received_rows is local
@@ -134,11 +135,16 @@ TilingProfile SelectTiling(uint32_t m, uint32_t k, uint32_t n, uint32_t worldSiz
     if (isEightRank256ExpertCase && m == 131072 && k == 2048 && n == 512) {
         return outputAllToAllV ? kM131072K2048N512ExportTiling : kM131072K2048N512NonExportTiling;
     }
+    if (ranksPerNode != 0 && !outputAllToAllV && (worldSize == 64 || worldSize == 128) &&
+        (expertNum == 7 * worldSize || expertNum == 14 * worldSize) && m == 65536 && k == 3584 &&
+        (n == 3072 || n == 6144)) {
+        return kLargeEpAggregateTiling;
+    }
     TilingProfile result = kDefaultTiling;
     if (worldSize > 8) {
         const uint32_t alignedK = static_cast<uint32_t>(TilingValidation::CeilDiv(k, 256) * 256);
         result.stageRows = TilingValidation::DefaultStageRows(alignedK, worldSize, result.m0, result.stageRows,
-                                                              result.workspaceStages);
+                                                              result.workspaceStages, dataBytes);
     }
     return result;
 }
@@ -198,15 +204,20 @@ void CheckNpuTensor(const at::Tensor& tensor, const char* name, at::ScalarType d
 }
 
 void AttachUdma(const at::Tensor& deviceAnchor, int64_t rank, int64_t worldSize, int64_t workspaceAddress,
-                int64_t workspaceBytes)
+                int64_t workspaceBytes, int64_t ranksPerNode, int64_t pipelineChunks)
 {
     CheckNpuTensor(deviceAnchor, "device_anchor", at::kByte);
     TORCH_CHECK(worldSize > 0 && worldSize <= TilingValidation::kMaxRanks && rank >= 0 && rank < worldSize,
                 "invalid UDMA topology");
     TORCH_CHECK(workspaceAddress > 0 && workspaceBytes > 0, "invalid public runtime workspace");
+    TORCH_CHECK(pipelineChunks == -1 || pipelineChunks == 0 || pipelineChunks == 1 ||
+                pipelineChunks == 2 || pipelineChunks == 4, "invalid UDMA pipeline chunk count");
+    TORCH_CHECK(ranksPerNode == 0 || (ranksPerNode > 0 && ranksPerNode < worldSize &&
+                worldSize % ranksPerNode == 0), "invalid contiguous node layout");
     const c10::OptionalDeviceGuard guard(deviceAnchor.device());
     UdmaRuntime::Instance().Attach(static_cast<int32_t>(rank), static_cast<int32_t>(worldSize),
-                                   static_cast<uintptr_t>(workspaceAddress), static_cast<uint64_t>(workspaceBytes));
+                                   static_cast<uintptr_t>(workspaceAddress), static_cast<uint64_t>(workspaceBytes),
+                                   static_cast<uint32_t>(ranksPerNode), static_cast<int32_t>(pipelineChunks));
 }
 
 void DetachUdma(const at::Tensor& deviceAnchor)
@@ -235,7 +246,7 @@ void InitializeAndLaunch(const TilingProfile& tiling, const Catlass::GemmCoord& 
                          uint8_t* weight, uint8_t* output, uint8_t* localTokensPerExpert,
                          uint8_t* globalTokensPerLocalExpert, uint8_t* workspace, uint8_t* allToAllVOutput,
                          uint8_t* routeMetadata, uint32_t blockDim, aclrtStream stream, uint64_t fftsAddress,
-                         const at::Tensor& tensorAnchor)
+                         const at::Tensor& tensorAnchor, uint32_t ranksPerNode, uint64_t dataBytes)
 {
     using DeviceOp = typename Config::Device;
     using Kernel = typename Config::Kernel;
@@ -268,6 +279,8 @@ void InitializeAndLaunch(const TilingProfile& tiling, const Catlass::GemmCoord& 
         tiling.stageRows,
         tiling.exportCoreCount,
         tiling.selfCopyCores,
+        ranksPerNode,
+        dataBytes,
     };
 
     DeviceOp deviceOp;
@@ -351,9 +364,12 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
     const uint32_t k = static_cast<uint32_t>(k64);
     const uint32_t n = static_cast<uint32_t>(n64);
     const uint32_t receivedRows = static_cast<uint32_t>(receivedRows64);
+    const uint32_t ranksPerNode =
+        worldSize > 8 && !allToAllVOutputOptional.has_value() ? runtime.RanksPerNode() : 0;
+    const uint64_t dataBytes = runtime.SymmetricDataBytes();
     const TilingProfile tiling =
         ResolveTiling(SelectTiling(m, k, n, static_cast<uint32_t>(worldSize), static_cast<uint32_t>(expertNum),
-                                   allToAllVOutputOptional.has_value()),
+                                   allToAllVOutputOptional.has_value(), ranksPerNode, dataBytes),
                       tilingValues, allToAllVOutputOptional.has_value());
     TORCH_CHECK(tiling.stageRows > 0, "symmetric workspace cannot hold one M0 tile per EP rank");
     {
@@ -370,7 +386,8 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
                                                     tiling.selfCopyCores};
         const char* error =
             TilingValidation::ValidateAllToAllV(requested, m, k, static_cast<uint32_t>(worldSize),
-                                                static_cast<uint32_t>(hardware[0]), static_cast<uint64_t>(hardware[1]));
+                                                static_cast<uint32_t>(hardware[0]), static_cast<uint64_t>(hardware[1]),
+                                                dataBytes);
         TORCH_CHECK(error == nullptr, "invalid AllToAllV tiling: ", error);
         error = TilingValidation::ValidateAllToAllVGrid(requested, n, static_cast<uint32_t>(worldSize),
                                                         static_cast<uint32_t>(hardware[0]));
@@ -383,8 +400,8 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
         Catlass::MatrixCoord{tiling.stageRows, k}, static_cast<uint32_t>(worldSize));
     const uint64_t requiredWorkspaceBytes =
         static_cast<uint64_t>(tiling.workspaceStages) * Catccos::layout::Capacity(workspaceLayout) * sizeof(uint16_t);
-    TORCH_CHECK(requiredWorkspaceBytes <= kSymmetricDataBytes, "kernel tiling requires ", requiredWorkspaceBytes,
-                " symmetric workspace bytes, exceeding ", kSymmetricDataBytes);
+    TORCH_CHECK(requiredWorkspaceBytes <= dataBytes, "kernel tiling requires ", requiredWorkspaceBytes,
+                " symmetric workspace bytes, exceeding ", dataBytes);
 
     at::Tensor output =
         outputOptional.has_value() ? outputOptional.value() : at::empty({receivedRows64, n64}, x.options());
@@ -448,7 +465,7 @@ at::Tensor AllToAllVGroupedMatMulUdmaImpl(
                 allToAllVOutputOptional.has_value() ? reinterpret_cast<uint8_t*>(allToAllVOutput.data_ptr()) : nullptr,
                 routeMetadataOptional.has_value() ? reinterpret_cast<uint8_t*>(routeMetadataOptional.value().data_ptr())
                                                   : nullptr,
-                blockDim, stream, fftsAddress, x);
+                blockDim, stream, fftsAddress, x, ranksPerNode, dataBytes);
         };
         if (worldSize <= 8) {
             // A distinct R8/E64 kernel preserves the original stack and peer schedule.
@@ -616,7 +633,8 @@ std::tuple<at::Tensor, at::Tensor> AllToAllVGroupedMatMulUdmaOutExportMeta(
 TORCH_LIBRARY_FRAGMENT(EXTENSION_MODULE_NAME, m)
 {
     m.def(
-        "_attach_udma(Tensor device_anchor, int rank, int world_size, int workspace_address, int workspace_bytes) -> "
+        "_attach_udma(Tensor device_anchor, int rank, int world_size, int workspace_address, int workspace_bytes, "
+        "int ranks_per_node=0, int pipeline_chunks=-1) -> "
         "()");
     m.def("_detach_udma(Tensor device_anchor) -> ()");
     m.def("_tiling_hardware(Tensor device_anchor) -> int[]");

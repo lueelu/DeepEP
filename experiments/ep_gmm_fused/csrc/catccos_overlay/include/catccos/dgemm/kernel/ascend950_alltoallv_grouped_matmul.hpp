@@ -20,6 +20,8 @@
 #include "catlass/matrix_coord.hpp"
 
 #include "catccos/catccos.hpp"
+#include "catccos/comm/tile/udma_striped_peer.hpp"
+#include "catccos/dgemm/kernel/alltoallv_gmm_expert_rows.hpp"
 #include "catccos/dgemm/moe_route_metadata.hpp"
 #include "catccos/layout/dist_matrix.hpp"
 #ifdef ENABLE_TIMER
@@ -155,6 +157,7 @@ public:
         GM_ADDR syncCommFinish;
         uint32_t exportCoreCount;
         uint32_t selfCopyCores;
+        uint32_t ranksPerNode;
         BlockCommParams blockCommParams;
 
         CATLASS_HOST_DEVICE
@@ -166,7 +169,7 @@ public:
                LayoutTagB layoutTagB_, GM_ADDR ptrSymmetric_, GM_ADDR syncMmadFinish_, GM_ADDR syncCommFinish_,
                BlockCommParams const& allToAllVGmmParams_, GM_ADDR ptrAllToAllVOutput_ = nullptr,
                GM_ADDR ptrRouteMetadata_ = nullptr, uint32_t stageRows_ = 0, uint32_t exportCoreCount_ = 0,
-               uint32_t selfCopyCores_ = 0)
+               uint32_t selfCopyCores_ = 0, uint32_t ranksPerNode_ = 0)
             : ExportParams(ptrAllToAllVOutput_),
               problemShape(problemShape_),
               commInterval(commInterval_),
@@ -185,6 +188,7 @@ public:
               syncCommFinish(syncCommFinish_),
               exportCoreCount(exportCoreCount_),
               selfCopyCores(selfCopyCores_),
+              ranksPerNode(ranksPerNode_),
               blockCommParams(allToAllVGmmParams_)
         {
         }
@@ -213,6 +217,8 @@ public:
         uint32_t stageRows{0};
         uint32_t exportCoreCount{0};
         uint32_t selfCopyCores{0};
+        uint32_t ranksPerNode{0};
+        uint64_t symmetricDataBytes{400ULL * 1024 * 1024};
     };
 
     static Params ToUnderlyingArguments(Arguments const& args, uint8_t* workspace = nullptr)
@@ -236,18 +242,17 @@ public:
         typename BlockComm::TileRemoteCopy::Params tileParams{args.commTileShape};
         BlockCommParams blockCommParams{args.commBlockShape, tileParams};
 
-        constexpr size_t IPC_BUFF_MAX_SIZE = 200 * 1024 * 1024 * sizeof(half);
         constexpr size_t SYNC_UNIT_SIZE = 4 * sizeof(int64_t);
         uint64_t symmetricOffset = 0;
         auto gmSymmetric = args.ptrSymmetric + symmetricOffset;
-        symmetricOffset += IPC_BUFF_MAX_SIZE;
+        symmetricOffset += args.symmetricDataBytes;
         auto syncMmadFinish = args.ptrSymmetric + symmetricOffset;
         symmetricOffset += SYNC_UNIT_SIZE;
         auto syncCommFinish = args.ptrSymmetric + symmetricOffset;
 
         return Params(problemShape, args.commInterval, args.ptrA, layoutA, args.ptrB, layoutB, args.ptrC, layoutC, tagA,
                       tagB, gmSymmetric, syncMmadFinish, syncCommFinish, blockCommParams, args.ptrAllToAllVOutput,
-                      args.ptrRouteMetadata, args.stageRows, args.exportCoreCount, args.selfCopyCores);
+                      args.ptrRouteMetadata, args.stageRows, args.exportCoreCount, args.selfCopyCores, args.ranksPerNode);
     }
 
     CATLASS_DEVICE
@@ -293,7 +298,21 @@ public:
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
     {
-        BlockMmad mmad{resource};
+        if constexpr (USE_GM_SCHEDULER && USE_UDMA_PEER_SERIAL_SCHEDULE && !EXPORT_ALLTOALLV) {
+            if (params.ranksPerNode != 0) {
+                RunAic<true>(params);
+                return;
+            }
+        }
+        RunAic<false>(params);
+    }
+
+    template <bool Aggregate>
+    CATLASS_DEVICE void RunAic(Params const& params)
+    {
+        using Mmad = std::conditional_t<Aggregate, ExpertRows::Block<BlockMmad>, BlockMmad>;
+        Mmad mmad{resource};
+        uint32_t nextTask = AscendC::GetBlockIdx();
 
         GemmCoord blockShape = GemmCoord{L1_TILE_M, L1_TILE_N, L1_TILE_K};
         uint32_t commShapeM = params.stageRows == 0 ? params.commInterval * L1_TILE_M : params.stageRows;
@@ -337,32 +356,52 @@ public:
                 size_t localExpertOffsetB = localExpertIdx * layout::Capacity(layoutB);
                 auto tensorB = tla::MakeTensor(gmB[localExpertOffsetB], params.layoutB, Catlass::Arch::PositionGM{});
 
-                // Aggregate every source-rank fragment of one expert into one
-                // AIC task domain.  Small per-peer GEMMs can then occupy all
-                // cores while every task still reuses the same expert weight.
-                scheduler.UpdateMmadContext(localExpertIdx);
-                auto remapperA = scheduler.GetRemapperA(commIdx, localExpertIdx);
-                auto remapperC = scheduler.GetRemapperC(commIdx, localExpertIdx);
+                if constexpr (Aggregate) {
+                    ExpertRows::RowMap<BlockMmadScheduler::MoeConstraints::RANK_SIZE_LIMIT> map;
+                    const uint32_t rows = map.ReadExpert(scheduler, localExpertIdx, stageIdx, commShapeM);
+                    const uint32_t n = params.problemShape.n();
+                    const uint32_t k = params.problemShape.k();
+                    const uint32_t nTiles = CeilDiv(n, L1_TILE_N);
+                    const uint32_t tasks = CeilDiv(rows, L1_TILE_M) * nTiles;
+                    uint32_t task = nextTask;
+                    for (; task < tasks; task += AscendC::GetBlockNum()) {
+                        const uint32_t first = task / nTiles * L1_TILE_M;
+                        const uint32_t column = task % nTiles * L1_TILE_N;
+                        const uint32_t tileM = Min(L1_TILE_M, rows - first);
+                        const uint32_t tileN = Min(L1_TILE_N, n - column);
+                        const auto window = map.Slice(first, tileM);
+                        ExpertRows::Input input{reinterpret_cast<__gm__ bfloat16_t*>(params.ptrSymmetric), window,
+                                                static_cast<uint32_t>(layoutTagSymmetric.stride(0)), 0U, k};
+                        ExpertRows::Output output{params.ptrC, window, n, column, tileN};
+                        auto weight = tla::GetTile(tensorB, tla::MakeCoord(0U, column), tla::MakeShape(k, tileN));
+                        mmad(input, weight, output, GemmCoord{tileM, tileN, k});
+                    }
+                    nextTask = task - tasks;
+                } else {
+                    scheduler.UpdateMmadContext(localExpertIdx);
+                    auto remapperA = scheduler.GetRemapperA(commIdx, localExpertIdx);
+                    auto remapperC = scheduler.GetRemapperC(commIdx, localExpertIdx);
 
-                for (auto iter = scheduler.Begin(); !iter.End(); iter.Next()) {
-                    auto blockOffset = scheduler.GetBlockOffset(iter);
+                    for (auto iter = scheduler.Begin(); !iter.End(); iter.Next()) {
+                        auto blockOffset = scheduler.GetBlockOffset(iter);
 
-                    MatrixCoord commOffsetA{
-                        layoutSymmetricRow(Catlass::MakeCoord<int>(stageIdx, blockOffset.rank(), 0)), 0};
-                    auto blockOffsetA = remapperA(blockOffset);
-                    MatrixCoord blockOffsetB = blockOffset.GetCoordKN();
-                    auto blockOffsetC = remapperC(blockOffset);
-                    auto actualBlockShape = scheduler.RemapActualBlockShape(blockOffset, remapperA, remapperC);
+                        MatrixCoord commOffsetA{
+                            layoutSymmetricRow(Catlass::MakeCoord<int>(stageIdx, blockOffset.rank(), 0)), 0};
+                        auto blockOffsetA = remapperA(blockOffset);
+                        MatrixCoord blockOffsetB = blockOffset.GetCoordKN();
+                        auto blockOffsetC = remapperC(blockOffset);
+                        auto actualBlockShape = scheduler.RemapActualBlockShape(blockOffset, remapperA, remapperC);
 
-                    auto tensorBlockA = GetTile(
-                        tensorSymmetric, tla::MakeCoord(blockOffsetA.row() + commOffsetA.row(), blockOffsetA.column()),
-                        tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
-                    auto tensorBlockB = GetTile(tensorB, tla::MakeCoord(blockOffsetB.row(), blockOffsetB.column()),
-                                                tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
-                    auto tensorBlockC = GetTile(tensorC, tla::MakeCoord(blockOffsetC.row(), blockOffsetC.column()),
-                                                tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
+                        auto tensorBlockA = GetTile(
+                            tensorSymmetric, tla::MakeCoord(blockOffsetA.row() + commOffsetA.row(), blockOffsetA.column()),
+                            tla::MakeShape(actualBlockShape.m(), actualBlockShape.k()));
+                        auto tensorBlockB = GetTile(tensorB, tla::MakeCoord(blockOffsetB.row(), blockOffsetB.column()),
+                                                    tla::MakeShape(actualBlockShape.k(), actualBlockShape.n()));
+                        auto tensorBlockC = GetTile(tensorC, tla::MakeCoord(blockOffsetC.row(), blockOffsetC.column()),
+                                                    tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
 
-                    mmad(tensorBlockA, tensorBlockB, tensorBlockC, actualBlockShape);
+                        mmad(tensorBlockA, tensorBlockB, tensorBlockC, actualBlockShape);
+                    }
                 }
             }
 
@@ -662,14 +701,31 @@ public:
                                     auto layoutCommSrc = layoutA.GetTileLayout(actualCommShape);
                                     auto layoutCommDst = layoutTagSymmetric.GetTileLayout(actualCommShape);
 
-                                    blockRemoteCopy(gmCommSrc, layoutCommSrc, gmCommDst, layoutCommDst, actualCommShape,
-                                                    dstRankIdx);
+                                    const uint32_t columns = actualCommShape.column();
+                                    const bool striped = !EXPORT_ALLTOALLV &&
+                                        Comm::Tile::UseStripedPeer(rankIdx, dstRankIdx, params.ranksPerNode) &&
+                                        layoutCommSrc.stride(0) == columns && layoutCommDst.stride(0) == columns;
+                                    if (striped) {
+                                        auto* dst = reinterpret_cast<__gm__ uint8_t*>(
+                                            const_cast<__gm__ ElementA*>(gmCommDst.GetPhyAddr()));
+                                        auto* src = reinterpret_cast<__gm__ uint8_t*>(
+                                            const_cast<__gm__ ElementA*>(gmCommSrc.GetPhyAddr()));
+                                        Comm::Tile::StripedPutRows(dst, src, actualCommShape.row(),
+                                                                   columns * sizeof(ElementA), dstRankIdx);
+                                    } else {
+                                        blockRemoteCopy(gmCommSrc, layoutCommSrc, gmCommDst, layoutCommDst,
+                                                        actualCommShape, dstRankIdx);
+                                    }
                                     auto peerCompletedBlocks =
                                         static_cast<int32_t>(Numel(CeilDiv(actualCommShape, blockShape)));
                                     if constexpr (EXPORT_ALLTOALLV) {
                                         completedBlocks = peerCompletedBlocks;
                                     } else {
-                                        blockRemoteCopy.CompleteForSignal();
+                                        if (striped) {
+                                            Comm::Tile::FinishStripedPeer(dstRankIdx);
+                                        } else {
+                                            blockRemoteCopy.CompleteForSignal();
+                                        }
                                         aclshmemx_signal_op(syncCommFinish, peerCompletedBlocks, ACLSHMEM_SIGNAL_ADD,
                                                             dstRankIdx);
                                     }

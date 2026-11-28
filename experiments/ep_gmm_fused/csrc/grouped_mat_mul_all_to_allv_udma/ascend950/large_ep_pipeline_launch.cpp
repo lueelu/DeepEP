@@ -20,4 +20,14 @@ void LaunchLargeEpN128(const LargeEpN128Params& params, bool wholeRound, uint32_
         Launch<LargeEpPipeline::Kernel<false>>(params, blockDim, stream, fftsAddress);
     }
 }
+template <class Config>
+void LaunchLargeEp(const LargeEpParams<Config>& params, uint32_t blockDim, void* stream, uint64_t fftsAddress)
+{
+    Launch<LargeEpPipeline::Kernel<false, Config, TilingValidation::kMaxRanks>>(params, blockDim, stream, fftsAddress);
+}
+
+template void LaunchLargeEp(const LargeEpParams<GroupedMatMulAllToAllVUdmaDefaultConfig>&, uint32_t, void*, uint64_t);
+template void LaunchLargeEp(const LargeEpN128Params&, uint32_t, void*, uint64_t);
+template void LaunchLargeEp(const LargeEpParams<GroupedMatMulAllToAllVUdmaM0_256N0_256Config>&, uint32_t, void*,
+                            uint64_t);
 }  // namespace deepep::ep_gmm_fused

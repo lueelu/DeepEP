@@ -5,16 +5,16 @@
 #include "large_ep_pipeline_sync.hpp"
 #include "large_ep_chunk_schedule.hpp"
 #include "peer_aggregate_kernel.hpp"
+#include "catccos/comm/tile/udma_striped_peer.hpp"
 namespace deepep::ep_gmm_fused::LargeEpPipeline {
-template <bool WholeRound>
+template <bool WholeRound, class Config = LargeEpN128Config, uint32_t PeerCapacity = 16U>
 class Kernel {
 public:
-    using Config = LargeEpN128Config;
-    using Params = LargeEpN128Params;
+    using Params = LargeEpParams<Config>;
     using Policy = Catlass::Gemm::MmadPingpong<Catlass::Arch::Ascend950, false, false, 1, false, 2, 2, 2, 2>;
     using Block = Catlass::Gemm::Block::BlockMmadTla<Policy, typename Config::L1TileShape, typename Config::L0TileShape,
                                                      bfloat16_t, bfloat16_t, bfloat16_t, void, PeerAggregate::TileCopy>;
-    using Scheduler = PeerAggregate::RoundSchedule<16U>;
+    using Scheduler = PeerAggregate::RoundSchedule<PeerCapacity>;
     using SegmentedOutput = PeerAggregate::SegmentedOutputFor<Scheduler::kPeerCapacity>;
     using OutputSegment = PeerAggregate::OutputSegment;
     template <int32_t CORE_TYPE = g_coreType>
@@ -148,15 +148,30 @@ private:
         const uint32_t columns = params.problemShape.n();
         const uint32_t selfCores = Max(1U, Min(params.selfCopyCores, 16U));
         const bool notifier = subcore == 0;
-        const bool coordinator = subcore == 1 && core == 31;
-        // 15 remote owners, up to16 self workers, and one coordinator.
-        const bool remoteOwner = subcore == 1 && core < ranks - 1;
-        const uint32_t selfWorker = core - (ranks - 1);
-        const bool selfOwner = subcore == 1 && core >= ranks - 1 && core < ranks - 1 + selfCores;
-        const bool copyOwner = remoteOwner || selfOwner;
-        const uint32_t peer = remoteOwner ? (core < rank ? core : core + 1) : rank;
-        ChunkCommSchedule<16> schedule(params.problemShape, params.stageRows / 256U, chunks);
-        auto cursor = schedule.MakePeerCursor(peer);
+        constexpr uint32_t remoteLanes = SyncState::kCoreCount - 1;
+        constexpr uint32_t cursorsPerLane = (PeerCapacity - 1 + remoteLanes - 1) / remoteLanes;
+        const bool coordinator = subcore == 1 && core == remoteLanes;
+        // At high EP, subblock 1 has 31 independent remote queue owners. Subblock 0
+        // performs self copies after publishing its AIC's chunks. Publishing readiness
+        // never waits on a peer, even when peers progress at different rates.
+        const uint32_t selfWorker = PeerCapacity > 16 ? core : core - (ranks - 1);
+        const bool selfOwner = PeerCapacity > 16 ? notifier && selfWorker < selfCores
+                                                 : subcore == 1 && core >= ranks - 1 && selfWorker < selfCores;
+        uint32_t peers[cursorsPerLane];
+        uint32_t peerCount = 0;
+        if (selfOwner) {
+            peers[peerCount++] = rank;
+        } else if (subcore == 1 && !coordinator) {
+            for (uint32_t ordinal = core; ordinal < ranks - 1; ordinal += remoteLanes) {
+                peers[peerCount++] = ordinal < rank ? ordinal : ordinal + 1;
+            }
+        }
+        ChunkCommSchedule<PeerCapacity> schedule(params.problemShape, params.stageRows / Config::kM0, chunks,
+                                                 Config::kM0);
+        PeerChunkCursor cursors[cursorsPerLane];
+        for (uint32_t i = 0; i < peerCount; ++i) {
+            cursors[i] = schedule.MakePeerCursor(peers[i]);
+        }
         const uint32_t loops = schedule.GetControlLoops();
         SyncState sync(params.syncMmadFinish);
         // The same initialization barrier as the original kernel also orders
@@ -205,43 +220,68 @@ private:
             if (coordinator) {
                 expected[stage] += schedule.GetExpectedReaders(round);
                 aclshmem_signal_wait_until(sync.Complete(stage), ACLSHMEM_CMP_GE, expected[stage]);
-            } else if (copyOwner) {
-                cursor.BeginRound(round);
-                const bool hasInput = cursor.HasInput();
+            } else if (peerCount != 0) {
                 AscendC::GlobalTensor<bfloat16_t> source;
                 source.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(params.ptrSymmetric) +
-                                       (static_cast<uint64_t>(stage) * ranks + rank) * params.stageRows * columns);
-                auto remoteReady = static_cast<__gm__ int32_t*>(aclshmem_ptr(sync.Ready(stage), peer));
-                while (cursor.HasInput()) {
-                    const uint32_t next = cursor.NextNonEmptyChunk();
-                    const int32_t ready =
-                        aclshmem_signal_wait_until(remoteReady, ACLSHMEM_CMP_GE, sequenceBase + next + 1);
-                    // Self workers use identical chunk boundaries, because
-                    // different ready snapshots would otherwise repartition
-                    // the same rows differently across workers.
-                    const uint32_t readyPrefix =
-                        selfOwner ? next + 1 : Min(chunks, static_cast<uint32_t>(ready) - sequenceBase);
-                    const auto transfer = cursor.AdvanceThroughChunk(readyPrefix);
-                    uint32_t offset = 0;
-                    uint32_t rows = transfer.rows;
-                    if (selfOwner) {
-                        const uint32_t perWorker = CeilDiv(rows, selfCores);
-                        offset = selfWorker * perWorker;
-                        rows = Min(perWorker, offset < rows ? rows - offset : 0U);
-                    }
-                    if (rows != 0) {
-                        const Catlass::MatrixCoord shape{rows, columns};
-                        const Catlass::MatrixCoord srcOffset{transfer.stageRow + offset, 0};
-                        const Catlass::MatrixCoord dstOffset{transfer.outputRow + offset, 0};
-                        copy.InitBlockLoop();
-                        copy(source[sourceLayout.GetOffset(srcOffset)], sourceLayout.GetTileLayout(shape),
-                             output[outputLayout.GetOffset(dstOffset)], outputLayout.GetTileLayout(shape), shape, peer);
-                        copy.FinalizeBlockLoop();
+                    (static_cast<uint64_t>(stage) * ranks + rank) * params.stageRows * columns);
+                uint32_t active = 0;
+                __gm__ int32_t* readyWords[cursorsPerLane];
+                for (uint32_t i = 0; i < peerCount; ++i) {
+                    cursors[i].BeginRound(round);
+                    if (cursors[i].HasInput()) {
+                        readyWords[i] = static_cast<__gm__ int32_t*>(aclshmem_ptr(sync.Ready(stage), peers[i]));
+                        ++active;
                     }
                 }
-                if (hasInput && (remoteOwner || selfWorker == 0)) {
-                    aclshmemx_mte_quiet();
-                    aclshmemx_signal_op(sync.Complete(stage), 1, ACLSHMEM_SIGNAL_ADD, peer);
+                while (active != 0) {
+                    for (uint32_t i = 0; i < peerCount; ++i) {
+                        auto& cursor = cursors[i];
+                        if (!cursor.HasInput()) continue;
+                        const uint32_t peer = peers[i];
+                        const uint32_t next = cursor.NextNonEmptyChunk();
+                        const int32_t wanted = sequenceBase + next + 1;
+                        // Readiness is nonnegative and monotonically increasing per stage.
+                        // If several peers share this lane, take a snapshot and service
+                        // any ready peer before polling a stalled peer again.
+                        const int32_t ready = aclshmem_signal_wait_until(readyWords[i], ACLSHMEM_CMP_GE,
+                                                                         active == 1 ? wanted : 0);
+                        if (ready < wanted) continue;
+                        const uint32_t prefix = selfOwner ? next + 1 : Min(chunks, static_cast<uint32_t>(ready) - sequenceBase);
+                        const auto transfer = cursor.AdvanceThroughChunk(prefix);
+                        uint32_t offset = 0;
+                        uint32_t rows = transfer.rows;
+                        if (selfOwner) {
+                            const uint32_t perWorker = CeilDiv(rows, selfCores);
+                            offset = selfWorker * perWorker;
+                            rows = Min(perWorker, offset < rows ? rows - offset : 0U);
+                        }
+                        if (rows != 0) {
+                            const Catlass::MatrixCoord shape{rows, columns};
+                            const Catlass::MatrixCoord srcOffset{transfer.stageRow + offset, 0};
+                            const Catlass::MatrixCoord dstOffset{transfer.outputRow + offset, 0};
+                            auto src = source[sourceLayout.GetOffset(srcOffset)];
+                            auto dst = output[outputLayout.GetOffset(dstOffset)];
+                            if (PeerCapacity > 16 && Catccos::Comm::Tile::UseStripedPeer(rank, peer, pipeline.ranksPerNode)) {
+                                Catccos::Comm::Tile::StripedGetRows(
+                                    reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ bfloat16_t*>(dst.GetPhyAddr())),
+                                    reinterpret_cast<__gm__ uint8_t*>(const_cast<__gm__ bfloat16_t*>(src.GetPhyAddr())),
+                                    rows, columns * sizeof(bfloat16_t), peer);
+                                Catccos::Comm::Tile::FinishStripedPeer(peer);
+                            } else {
+                                copy.InitBlockLoop();
+                                copy(src, sourceLayout.GetTileLayout(shape), dst, outputLayout.GetTileLayout(shape),
+                                     shape, peer);
+                                copy.FinalizeBlockLoop();
+                            }
+                        }
+                        if (!cursor.HasInput()) {
+                            --active;
+                            if (!selfOwner || selfWorker == 0) {
+                                aclshmemx_mte_quiet();
+                                aclshmemx_signal_op(sync.Complete(stage), 1, ACLSHMEM_SIGNAL_ADD, peer);
+                            }
+                        }
+                    }
                 }
             }
             // Joins every local self worker as well as coordinator's remote

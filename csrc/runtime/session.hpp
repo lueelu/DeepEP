@@ -46,7 +46,8 @@ public:
     uintptr_t workspace_address() const;
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
     static std::unique_ptr<Session> create_udma(int rank, int size, uint64_t heap_bytes, uint64_t workspace_bytes,
-                                                const std::string& endpoint, const std::vector<uint8_t>& uid_bytes);
+                                                const std::string& endpoint, const std::vector<uint8_t>& uid_bytes,
+                                                bool striped_peers = false);
     static size_t udma_unique_id_size();
     static std::vector<uint8_t> udma_unique_id();
     uintptr_t udma_workspace_address() const;

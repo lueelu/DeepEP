@@ -134,6 +134,7 @@ def prepare(case, rank, package, torch, device, *, cache_dir=None, output_pool=N
             w2.copy_(torch.from_numpy(second).to(device=device, dtype=w2.dtype))
 
     call.refresh = refresh
+    call.set_tiling = lambda profile: common.update(tiling=profile)
     call.reference_store = store
     call.close = lambda: store.__exit__(None, None, None) if store else None
     return call, table
@@ -226,7 +227,8 @@ def run(args):
     ep_group = None
     groups = domain_groups(size, case.ep_size, (case.scenario or {}).get("layout", "contiguous"))
     for domain, members in enumerate(groups):
-        group = dist.new_group(members, backend="hccl")
+        full_high_ep = size in (64, 128) and members == list(range(size))
+        group = dist.group.WORLD if full_high_ep else dist.new_group(members, backend="hccl")
         if rank in members:
             ep_group = group
             domain_id = domain

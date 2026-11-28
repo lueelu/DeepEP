@@ -41,7 +41,7 @@ class CaseSpec:
             raise ValueError("unknown expected error contract")
         if self.operator not in {"alltoallv_gmm", "gmm_alltoallv", "composition"}:
             raise ValueError("unknown operator")
-        if self.ep_size not in (1, 2, 4, 8) or self.local_experts < 1:
+        if self.ep_size not in (1, 2, 4, 8, 16, 32, 64, 128) or self.local_experts < 1:
             raise ValueError("invalid EP size or local expert count")
         if min(self.m, self.k, self.n) < 1:
             raise ValueError("m/k/n must be positive; zero input is tested as an API rejection")

@@ -16,6 +16,7 @@ namespace deepep::ep_gmm_fused::TilingValidation {
 
 constexpr uint32_t kMaxRanks = 128;
 constexpr uint64_t kSymmetricDataBytes = 400ULL * 1024 * 1024;
+constexpr uint64_t kLargeEpDataBytes = 512ULL * 1024 * 1024;
 // CATLASS Ascend950 LocalTensorBuffer allocates ArchTag::UB_SIZE, not the
 // physical 256 KiB. Device configuration headers assert this budget matches.
 constexpr uint64_t kCompiledUbBytes = 248ULL * 1024;
@@ -41,12 +42,12 @@ inline uint64_t CeilDiv(uint64_t value, uint64_t divisor)
 }
 
 inline uint32_t DefaultStageRows(uint32_t columns, uint32_t worldSize, uint32_t tileRows, uint32_t preferredRows,
-                                 uint32_t stages)
+                                 uint32_t stages, uint64_t dataBytes = kSymmetricDataBytes)
 {
     if (columns == 0 || worldSize == 0) {
         return 0;
     }
-    const uint64_t capacity = kSymmetricDataBytes / 2 / stages / worldSize / columns;
+    const uint64_t capacity = dataBytes / 2 / stages / worldSize / columns;
     return static_cast<uint32_t>(std::min<uint64_t>(preferredRows, capacity) / tileRows * tileRows);
 }
 
@@ -159,7 +160,7 @@ inline const char* CheckHardware(uint32_t worldSize, uint32_t coreCount, uint64_
 }
 
 inline const char* ValidateAllToAllV(const AllToAllV& tiling, uint32_t m, uint32_t k, uint32_t worldSize,
-                                     uint32_t coreCount, uint64_t ubBytes)
+                                     uint32_t coreCount, uint64_t ubBytes, uint64_t dataBytes = kSymmetricDataBytes)
 {
     if (const char* error = CheckHardware(worldSize, coreCount, ubBytes)) {
         return error;
@@ -176,7 +177,7 @@ inline const char* ValidateAllToAllV(const AllToAllV& tiling, uint32_t m, uint32
     const uint64_t stageElements = static_cast<uint64_t>(tiling.stageRows) * worldSize;
     // DistRowMajor aligns BF16 staging rows to 512 bytes (256 elements).
     const uint64_t alignedK = CeilDiv(k, 256) * 256;
-    if (k == 0 || stageElements > kSymmetricDataBytes / 2 / tiling.workspaceStages / alignedK) {
+    if (k == 0 || stageElements > dataBytes / 2 / tiling.workspaceStages / alignedK) {
         return "tiling exceeds the symmetric workspace capacity";
     }
     const uint64_t blockCount = CeilDiv(tiling.stageRows, tiling.commBlockM);
@@ -189,7 +190,7 @@ inline const char* ValidateAllToAllV(const AllToAllV& tiling, uint32_t m, uint32
 }
 
 inline const char* ValidateGroupedMatMul(const GroupedMatMul& tiling, uint32_t n, uint32_t worldSize,
-                                         uint32_t coreCount, uint64_t ubBytes)
+                                         uint32_t coreCount, uint64_t ubBytes, uint64_t dataBytes = kSymmetricDataBytes)
 {
     if (const char* error = CheckHardware(worldSize, coreCount, ubBytes)) {
         return error;
@@ -216,7 +217,7 @@ inline const char* ValidateGroupedMatMul(const GroupedMatMul& tiling, uint32_t n
         stageRows = (blocks / worldSize / nLoops) * tiling.m0;
     }
     if (stageRows > kUintMax / worldSize ||
-        stageRows > kSymmetricDataBytes / 2 / tiling.workspaceStages / worldSize / n) {
+        stageRows > dataBytes / 2 / tiling.workspaceStages / worldSize / n) {
         return "tiling exceeds the target-order symmetric workspace capacity";
     }
     if ((stageRows / tiling.m0) * worldSize * nLoops > kUintMax - coreCount) {
