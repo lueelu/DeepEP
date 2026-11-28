@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("clos_fast_sweep", ROOT / "benchmarks/clos/bench_fast_sweep.py")
 sweep = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sweep)
+sys.path.insert(0, str(ROOT / "benchmarks/clos"))
 
 
 @pytest.mark.parametrize("ep", [2, 4, 8, 16, 32, 64, 128, 256])
@@ -26,24 +27,29 @@ def test_admission_and_unique_candidates(ep, aiv):
     assert configs
     assert len({c["id"] for c in configs}) == len(configs)
     for c in configs:
-        owners = ((group if c["order"] == "group_round_robin" else ep - 1) + c["peers"] - 1) // c["peers"]
+        owners = ((ep - 1) + c["peers"] - 1) // c["peers"]
         assert c["payload_aivs"] == owners * c["workers"] <= aiv
         assert owners * c["workers"] * c["qps"] <= 32
         assert c["workers"] == 1 or c["qps"] == 1
-        if c["order"] == "group_round_robin":
-            assert ((group + owners - 1) // owners) * (ep // group) <= 64
+        assert c["order"] == "rank"
 
 
-def test_quick_subset_and_auto_baseline():
+def test_rank_candidates_and_auto_baseline():
     configs = sweep.candidates(64, 32, 8)
     assert configs[0]["id"] == "rank_p4_w1_q1_v32"
-    quick = sweep.candidates(64, 32, 8, quick=True)
-    assert {c["id"] for c in quick} < {c["id"] for c in configs}
-    assert {c["order"] for c in quick} == {"rank", "group_round_robin"}
-    ep128 = sweep.candidates(128, 8, 16, quick=True)
+    assert {c["order"] for c in configs} == {"rank"}
+    ep128 = sweep.candidates(128, 8, 16)
     assert ep128[0]["id"] == "rank_p16_w1_q1_v32"
     assert ep128[0]["payload_aivs"] == 8
-    assert all(c["order"] == "rank" for c in ep128 if c["peers"] == 16)
+    assert all(c["order"] == "rank" for c in ep128)
+    for cores, peers in ((8, 32), (32, 16)):
+        ep256 = sweep.candidates(256, cores, 16)
+        assert ep256[0]["peers"] == peers and ep256[0]["workers"] == ep256[0]["qps"] == 1
+    with pytest.raises(ValueError, match="only rank"):
+        sweep.qp_plan_spec([{"operations": {"dispatch": [dict(ep128[0], order="group")]}}])
+    for cores in (2, 4, 6):
+        with pytest.raises(ValueError, match="communication cores"):
+            sweep.candidates(64, cores, 16)
 
 
 @pytest.mark.parametrize("ep", [4, 8, 16, 32])
@@ -87,7 +93,7 @@ def test_multi_mode_cli_and_conflicts():
         ["--combine-self-copy-modes", "default", "--combine-self-copy-after-submit"],
         ["--combine-parallel-self-copy", "--combine-self-copy-after-submit"],
         ["--include-weighted-combine", "--combine-parallel-self-copy"],
-        ["--strategies", "group_p1_w1_q1_v32", "--smoke"],
+        ["--strategies", "rank_p1_w1_q1_v32", "--smoke"],
     ):
         with pytest.raises(SystemExit):
             sweep.parse_args(argv)
@@ -134,7 +140,7 @@ def test_weighted_fixed_strategy_plan(tmp_path, monkeypatch, capsys):
         "8192,2816,8,32",
         "--include-weighted-combine",
         "--strategies",
-        "group_p1_w1_q1_v32",
+        "rank_p1_w1_q1_v32",
         "--combine-self-copy-modes",
         *sweep.SELF_COPY_MODES,
         "--plan-only",
@@ -147,11 +153,11 @@ def test_weighted_fixed_strategy_plan(tmp_path, monkeypatch, capsys):
     assert len(ops["combine_unweighted"]) == 3
     assert {c["self_copy_mode"] for c in ops["combine_weighted"]} == {"default", "self_copy_after_submit"}
     assert all(
-        c["order"] == "group" and c["peers"] == c["workers"] == c["qps"] == 1 and c["visit"] == 32
+        c["order"] == "rank" and c["peers"] == c["workers"] == c["qps"] == 1 and c["visit"] == 32
         for cs in ops.values()
         for c in cs
     )
-    argv[argv.index("group_p1_w1_q1_v32")] = "group_p1_w99_q1_v32"
+    argv[argv.index("rank_p1_w1_q1_v32")] = "group_p1_w99_q1_v32"
     with pytest.raises(ValueError, match="invalid strategies"):
         sweep.main()
 
@@ -447,7 +453,7 @@ def test_production_qp_union_covers_all_schedules(tmp_path):
 using namespace ascend_deepep::udma;
 int main() {
   for (uint32_t world : {2U,4U,8U,16U,32U,64U,128U,256U})
-  for (uint32_t group : {1U,2U,4U,8U,16U}) {
+  for (uint32_t group : {1U,2U,4U,8U,16U,32U}) {
     if (group > world || world % group) continue;
     for (uint32_t rank=0; rank<world; ++rank)
     for (uint32_t peer=0; peer<world; ++peer) {
@@ -455,14 +461,11 @@ int main() {
       assert(mask==TuningPeerMask(peer,rank,world,group));
       if (rank==peer) { assert(mask==0); continue; }
       assert(mask & 1);
-      for (uint32_t order=0; order<=3; ++order)
-      for (uint32_t peers : {1U,2U,4U,8U,16U})
+      for (uint32_t order=0; order==0; ++order)
+      for (uint32_t peers : {1U,2U,4U,8U,16U,32U})
       for (uint32_t lanes : {1U,2U}) {
-        if (peers==16 && order!=0) continue;
-        if (order==3 && peers==8) continue;
         const auto workers=Workers(world,peers,order,group);
         if (workers*lanes>32) continue;
-        if (order==3 && ((group+workers-1)/workers)*(world/group)>64) continue;
         const auto owner=Owner(rank,peer,world,peers,order,group);
         assert(owner<workers);
         for (uint32_t lane=0;lane<lanes;++lane)
@@ -501,9 +504,9 @@ int main() {
 def test_qp_reservation_uses_all_operations_but_not_visit_or_copy_mode():
     a = dict(order="rank", peers=8, workers=1, qps=1, visit=8)
     b = dict(a, visit=32, self_copy_mode="parallel_self_copy")
-    c = dict(a, order="group_round_robin", peers=2, qps=2)
+    c = dict(a, peers=16, qps=2)
     plans = [dict(operations={"cached_dispatch": [a, b], "combine_weighted": [c]})]
-    assert sweep.qp_plan_spec(plans) == "group_round_robin:2:1:2;rank:8:1:1"
+    assert sweep.qp_plan_spec(plans) == "rank:16:1:2;rank:8:1:1"
 
 
 def test_exact_qp_reservation_matches_worker_assignment(tmp_path):
@@ -532,27 +535,26 @@ constexpr bool pair_coverage(uint32_t world,uint32_t group,uint32_t order,uint32
 }
 static_assert(pair_coverage(4,4,0,1,2,0,3));
 static_assert(pair_coverage(8,8,0,2,1,0,7));
-static_assert(pair_coverage(16,16,2,2,2,3,15));
+static_assert(pair_coverage(16,16,0,2,2,3,15));
 static_assert(pair_coverage(32,16,0,4,1,0,31));
 static_assert(pair_coverage(64,16,0,8,1,0,63));
-static_assert(pair_coverage(128,16,3,2,2,17,127));
+static_assert(pair_coverage(256,16,0,32,2,17,255));
 static_assert(pair_coverage(128,16,0,16,1,17,127));
 static_assert(pair_coverage(128,16,0,16,2,127,0));
 static_assert(Workers(128,16)==8);
 static_assert(DispatchLiveSendUbBytes(16,1)==23200);
 static_assert(DispatchLiveSendUbBytes(16,2)==26784);
-static_assert(pair_coverage(256,16,1,8,1,127,255));
+static_assert(pair_coverage(256,16,0,32,1,127,255));
 static_assert(pair_coverage(64,16,0,8,1,0,0));
 int main() {
   for (uint32_t world : {4U,8U,16U,32U,64U,128U,256U}) {
     const uint32_t group = world < 16 ? world : 16;
-    for (uint32_t order=0; order<4; ++order)
-    for (uint32_t p : {1U,2U,4U,8U,16U})
+    for (uint32_t order=0; order==0; ++order)
+    for (uint32_t p : {1U,2U,4U,8U,16U,32U})
     for (uint32_t lanes : {1U,2U}) {
-      if (p==16 && order!=0) continue;
       const auto owners=Workers(world,p,order,group);
-      if (owners*lanes>32 || (order==3 && (p>4 || ((group+owners-1)/owners)*(world/group)>64))) continue;
-      const char* names[]={"rank","group","group_staggered","group_round_robin"};
+      if (owners*lanes>32) continue;
+      const char* names[]={"rank"};
       const auto spec=std::string(names[order])+":"+std::to_string(p)+":1:"+std::to_string(lanes);
       std::vector<QpReservation> reservations;
       for (uint32_t rank=0; rank<world; ++rank) reservations.emplace_back(spec,rank,world,group);
@@ -586,15 +588,21 @@ int main() {
   assert(p16.Allows(0,16,1,1));
   assert(!p16.Allows(0,8,1,1) && !p16.Allows(0,16,1,2));
   assert(!p16.Allows(1,16,1,1) && !p16.Allows(3,16,1,1));
-  const QpReservation ab("rank:16:1:1;group_round_robin:2:1:1",0,128,16);
-  assert(ab.Allows(0,16,1,1) && ab.Allows(3,2,1,1));
+  const QpReservation ab("rank:16:1:1;rank:32:1:1",0,256,16);
+  assert(ab.Allows(0,16,1,1) && ab.Allows(0,32,1,1));
+  const QpReservation p32("rank:32:1:1",0,256,16);
+  assert(p32.Allows(0,32,1,1) && !p32.Allows(0,16,1,1));
+  static_assert(DispatchLiveSendUbBytes(32,1)==43168);
+  static_assert(DispatchLiveSendUbBytes(32,2)==50336);
+  static_assert(RankPeerCapacity(4)==8 && RankPeerCapacity(16)==16 && RankPeerCapacity(32)==32);
   for (const auto* bad : {"rank:0:1:1","rank:8:2:2","rank:8:1:1;","rank:8:1", "rank:8:1:1:1", "rank:-1:1:1", "unknown:8:1:1", "group:16:1:1", "group_round_robin:16:1:1", ";"}) {
     bool rejected=false;
     try { QpReservation unused(bad,0,64,16); } catch (const std::invalid_argument&) { rejected=true; }
     assert(rejected);
   }
   assert(QpReservation().Masks().empty());
-  assert(QpReservation().Allows(3,4,2,1));
+  assert(!QpReservation().Allows(3,4,2,1));
+  assert(QpReservation().Allows(0,4,2,1));
   for (uint32_t world : {32U,64U}) {
     QpReservation r(world==32 ? "rank:4:1:1" : "rank:8:1:1",0,world,16);
     uint32_t before=0,after=0;

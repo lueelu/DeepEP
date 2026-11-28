@@ -56,7 +56,7 @@ class Buffer:
     each with its own QP to all peers. All ranks must select the same schedule
     and launch configuration; changing schedule requires a new Buffer.
     ``udma_dispatch_peer_order`` and ``udma_combine_peer_order`` select immutable
-    ``rank`` (default), ``group``, ``group_staggered`` or ``group_round_robin`` traversal in peer mode.
+    ``rank`` traversal in peer mode.
     Group orders require ``udma_ranks_per_group``, a positive divisor of EP size;
     groups are contiguous EP-local ranks, not automatically discovered servers.
     ``use_1g_huge_pages`` registers the workspace as one caller-owned CANN VMM
@@ -401,6 +401,8 @@ class Buffer:
             raise TypeError("new_num_sms must be an integer")
         if new_num_sms < 0:
             raise ValueError("new_num_sms must be greater than or equal to zero")
+        if 0 < new_num_sms < 8:
+            raise ValueError("communication num_sms must be at least 8 (or zero for default)")
         if new_num_sms % 2:
             raise ValueError("new_num_sms must be even")
         if new_num_sms > _MAX_NUM_AIV:
@@ -1233,18 +1235,15 @@ def _validate_udma_peer_order(
     qps_per_worker=1,
 ):
     """Validate immutable EP-local topology and return native enum values."""
-    orders = ("rank", "group", "group_staggered", "group_round_robin")
+    orders = ("rank",)
     if dispatch_order not in orders or combine_order not in orders:
-        raise ValueError("UDMA peer order must be rank, group, group_staggered or group_round_robin")
-    topology = dispatch_order != "rank" or combine_order != "rank"
+        raise ValueError("only rank peer order is supported")
     if ranks_per_group is not None:
         if isinstance(ranks_per_group, bool) or not isinstance(ranks_per_group, int):
             raise TypeError("udma_ranks_per_group must be an integer or None")
         if ranks_per_group <= 0 or ranks_per_group > size or size % ranks_per_group:
             raise ValueError("udma_ranks_per_group must be a positive divisor of the EP group size")
-    if topology and ranks_per_group is None:
-        raise ValueError("group peer order requires udma_ranks_per_group")
-    if (topology or ranks_per_group is not None) and (transport != "udma" or schedule != "peer"):
+    if ranks_per_group is not None and (transport != "udma" or schedule != "peer"):
         raise ValueError("UDMA peer order/group size requires transport='udma' and udma_schedule='peer'")
     if isinstance(workers_per_peer, bool) or not isinstance(workers_per_peer, int) or workers_per_peer not in (1, 2):
         raise ValueError("udma_workers_per_peer must be 1 or 2")
@@ -1255,26 +1254,11 @@ def _validate_udma_peer_order(
     qp_lanes = workers_per_peer * qps_per_worker
     if workers_per_peer != 1 and (transport != "udma" or schedule != "peer"):
         raise ValueError("multiple workers per peer require transport='udma' and udma_schedule='peer'")
-    if (
-        qp_lanes != 1
-        and (dispatch_order != "group_round_robin" or combine_order != "group_round_robin")
-        and ((size - 1 + 7) // 8) * qp_lanes > 32
-    ):
+    if ((size - 1 + 31) // 32) * qp_lanes > 32:
         raise ValueError("no peer configuration fits the 32 sending QP limit")
-    result = (orders.index(dispatch_order), orders.index(combine_order), ranks_per_group or 0)
-    if "group_round_robin" in (dispatch_order, combine_order):
-        count = 1 if peers_per_group_per_worker is None else peers_per_group_per_worker
-        if isinstance(count, bool) or not isinstance(count, int) or count not in (1, 2, 4):
-            raise ValueError("udma_peers_per_group_per_worker must be 1, 2 or 4")
-        workers = (ranks_per_group + count - 1) // count
-        capacity = ((ranks_per_group + workers - 1) // workers) * (size // ranks_per_group)
-        if workers * qp_lanes > 32 or capacity > 64:
-            raise ValueError("group_round_robin exceeds 32 workers or 64 peers per worker")
-        if qps_per_worker != 1:
-            return result + (count, workers_per_peer, qps_per_worker)
-        return result + (count,) + ((workers_per_peer,) if workers_per_peer != 1 else ())
+    result = (0, 0, ranks_per_group or 0)
     if peers_per_group_per_worker is not None:
-        raise ValueError("udma_peers_per_group_per_worker requires group_round_robin")
+        raise ValueError("udma_peers_per_group_per_worker is no longer supported")
     if qps_per_worker != 1:
         return result + (0, workers_per_peer, qps_per_worker)
     return result + ((0, workers_per_peer) if workers_per_peer != 1 else ())

@@ -158,7 +158,7 @@ using GM_ADDR = uint8_t*;
 struct CombineTilingData { unsigned udma_qps_per_worker, udma_peer_order, udma_peers_per_worker; };
 struct DisabledDispatchDeviceTrace { explicit DisabledDispatchDeviceTrace(uint64_t) {} };
 struct EnabledTrace { explicit EnabledTrace(uint64_t) {} };
-constexpr unsigned kGroupRoundRobinOrder=1, kGroupPeerCapacity=8, kMaxPeers=256, kMaxRankPeers=16;
+constexpr unsigned kMaxPeers=256, kMidRankPeers=16, kMaxRankPeers=32;
 // FUNCTIONS
 void test() {
     int resource=0;

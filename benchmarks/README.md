@@ -7,7 +7,7 @@ Modified by Joyce_An 2026
 
 ## Clos 单次初始化摸测
 
-普通 V2 BF16 非展开路径中，EP64 dispatch 的8～64核均保留8个payload发送核；combine的8～30核继承8核计划，32～64核继承32核计划。EP128的8～14核使用rank/P16/W1/Q1/v32，16～64核保持rank/P8/W1/Q1/v16。额外核数不再反复改变发送分工。
+普通 V2 BF16 非展开路径中，EP64 dispatch 的8～64核均保留8个payload发送核；combine的8～30核继承8核计划，32～64核继承32核计划。EP128的8～14核使用rank/P16/W1/Q1/v32，16～64核保持rank/P8/W1/Q1/v16。EP256的8～14核使用rank/P32/W1/Q1/v32，16～64核使用rank/P16/W1/Q1/v16。额外核数不再反复改变发送分工。
 
 所有自动UDMA launch在通信核数大于32时，统一继承相同shape、算子、接口及dtype的完整32核计划，包括P/W/Q、发送顺序、visit及copy/weight偏好；实际启动核数仍使用用户设置值。EP32/G8带权combine的64核不再丢失32核的visit拟合；EP32/G16保持P4/W1/Q1/v32，EP64各hidden对应的既有visit不变。独立reduce核数不参与发送计划选择。
 
@@ -21,7 +21,7 @@ Modified by Joyce_An 2026
 | EP4/G4带权combine，BF16 H1024～2048 | 8～14核为P1/W1/Q2；16～30核仍使用P1/W2/Q1。两者visit均为32。 |
 | 拓扑未识别或不在profile适用G范围、非BF16、V1、按expanded选择的路径 | 不强行套用普通BF16 profile，保留相应基础计划；32核以上仍完整继承该路径自己的32核计划。 |
 
-权重SIMT/UDMA偏好还保留行宽阈值（EP4/8为7168B、EP16/32为8192B、EP64为12288B，且要求有辅助AIV）；EP8/16宽行继承会固定其H6144偏好。默认compact weights可用时实际仍连续UDMA发送，不能仅凭偏好字段判断通信实现。低于8核时仍可能为满足容量回退group_round_robin；EP128在8～14核与16核及以上的P16/v32、P8/v16分档是明确保留的计划。combine默认rows的8192B/32768B边界及不满足合并条件时rows1，属于布局/容量选择，不是发送策略回退。
+权重SIMT/UDMA偏好还保留行宽阈值（EP4/8为7168B、EP16/32为8192B、EP64为12288B，且要求有辅助AIV）；EP8/16宽行继承会固定其H6144偏好。默认compact weights可用时实际仍连续UDMA发送，不能仅凭偏好字段判断通信实现。实际dispatch/combine通信核数必须为8～64的偶数，0仍表示默认32核；低于8核在提交前拒绝，独立reduce及内部barrier不受此限制。EP128在8～14核与16核及以上的P16/v32、P8/v16分档是明确保留的计划。combine默认rows的8192B/32768B边界及不满足合并条件时rows1，属于布局/容量选择，不是发送策略回退。
 
 普通V2 BF16非展开、已识别为连续单机G4的EP4，8～30核dispatch在H7168及更大hidden默认延续H6144的rank/P1/W1/Q2/v32：3个payload发送核，其余核处理metadata和本卡复制。fresh/cached共用该计划；32～64核以及combine计划不变。实际行宽和容量检查不变，宽hidden的设备性能仍需验证。
 
@@ -31,9 +31,9 @@ Modified by Joyce_An 2026
 
 visit 可扫描 `4/8/16/32/64/128`（`--visits`）；自动策略默认值不变。visit 是一个 peer 每轮的 WQE 预算，64/128 会拆为多个最多32条的提交，不扩大 WQE 暂存区，也不改变 SQ 信用保护。带权重等多字段路径按 WQE 计数，不等于同等数量的 token。新增取值需同步更新 Python 和 Host 库。
 
-普通自动 Buffer 会按本 EP/拓扑的所有可用自动计划预留 QP 并集，涵盖动态2～64核、V1/V2、dtype/展开兼容路径和各行宽档位。每对 peer 保留控制 QP0，并合并双向映射；无需另设 `DEEPEP_CLOS_QP_PLANS`。低于8核的容量回退可能让 EP64/128 的预留集合仍含 RR，但不改变8～64核的 rank launch。手动摸测则按实际候选集合预留。
+普通自动 Buffer 会按本 EP/拓扑的所有可用自动计划预留 QP 并集，涵盖动态8～64核、V1/V2、dtype/展开兼容路径和各行宽档位。每对 peer 保留控制 QP0，并合并双向映射；无需另设 `DEEPEP_CLOS_QP_PLANS`。预留不再包含非rank映射。手动摸测则按实际候选集合预留。
 
-按 G=min(EP,16) 计算，每 rank 的 peer-QP 位数相较旧的全策略 `TuningPeerMask` 并集：EP4为18～22→16，EP8为66～81→54，EP16为206～265→118，EP32为500～616→121，EP64为1016～1256→313～343，EP128为1851～2460→631～691。此处统计连接映射位，不是物理SQ数量或初始化耗时实测；不同rank可能不同。
+按 G=min(EP,16) 且拓扑已识别计算，当前自动预留每 rank 的 peer-QP 位数为：EP4=11、EP8=47、EP16=107、EP32=84、EP64=283、EP128=571、EP256=1147（包含双向映射及QP0）。这是连接映射位数，不是物理SQ数量，也不是初始化耗时实测。
 
 `clos/bench_fast_sweep.py` 在候选策略过滤完成后，自动将本次所有算子（包括准备 handle 的 fresh dispatch）的 QP 映射并集传给 SHMEM，每个进程只初始化一个 Buffer。`--plan-only` 和输出 `plan.json` 中的 `qp_plans` 记录建链范围；`BUFFER_READY` 记录初始化耗时。visit 不改变 QP 映射，固定 P/W/Q 的 visit 扫描不会额外预建其他策略的连接。普通模式**不做精度验证**；下面的精简 rank 模式会检查入围配置。
 
@@ -95,7 +95,7 @@ export DEEPEP_CLOS_QP_PLANS='rank:8:1:1'
 # 同一 Buffer 如还要测试 P4，使用 'rank:8:1:1;rank:4:1:1'
 ```
 
-格式为 `order:P:W:Q`，多组用分号分隔；order 支持 `rank/group/group_staggered/group_round_robin`，沿用 Buffer 的固定 G。必须包含 dispatch、cached dispatch、combine 和准备阶段实际会用到的 QP。所有 rank 必须配置一致；初始化后不可扩大范围，超出已建链范围的调用会在提交 kernel 前报错。多 Buffer 复用也会校验配置一致。未设置时，自动模式从当前策略选择器生成各合法核数、行宽区间、V1/展开/非BF16回退路径的QP并集；无需为动态通信核数重新初始化。摸测 session 仍预留完整候选范围，手动模式保留原规则，显式设置本变量优先。该选项仅支持全 Clos shared-Jetty UDMA peer 路径，不修改发送策略、QP 编号、visit、权重方式或大页设置。须使用当前 lock 指定的 SHMEM，重编 Host，并在设备上验证初始化和算子精度；连接数量减少不等同于已测得初始化加速。
+格式为 `rank:P:W:Q`，多组用分号分隔；仅支持rank，P支持1/2/4/8/16/32，旧的非rank手动参数、预留项及摸测候选直接报错。必须包含 dispatch、cached dispatch、combine 和准备阶段实际会用到的 QP。所有 rank 必须配置一致；初始化后不可扩大范围，超出已建链范围的调用会在提交 kernel 前报错。多 Buffer 复用也会校验配置一致。未设置时，自动模式从当前策略选择器生成各合法核数、行宽区间、V1/展开/非BF16回退路径的QP并集；无需为动态通信核数重新初始化。摸测 session 仍预留完整候选范围，手动模式保留原规则，显式设置本变量优先。该选项仅支持全 Clos shared-Jetty UDMA peer 路径，不修改发送策略、QP 编号、visit、权重方式或大页设置。须使用当前 lock 指定的 SHMEM，重编 Host，并在设备上验证初始化和算子精度；连接数量减少不等同于已测得初始化加速。
 
 通用入口提供配置检查、确定性负载规划和 JSON/CSV 结果协议。当前支持无设备 dry-run；native 测量适配器未接入，非 dry-run 返回非零，不以模拟时间代替通信测量。
 

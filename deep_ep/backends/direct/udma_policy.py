@@ -65,11 +65,7 @@ def validate_manual_options(
             udma_workers_per_peer=workers,
             udma_qps_per_worker=qps,
         )
-        if any(order is not None and order != "rank" for order in (dispatch_order, combine_order)):
-            required["udma_ranks_per_group"] = ranks_per_group
-        if "group_round_robin" in (dispatch_order, combine_order):
-            required["udma_peers_per_group_per_worker"] = peers_per_group_per_worker
-        if not operation_config and (dispatch_order, combine_order) != ("group_round_robin", "group_round_robin"):
+        if not operation_config:
             required["udma_peers_per_worker"] = peers
     if not operation_config:
         required["udma_wqes_per_visit"] = wqes
@@ -80,7 +76,7 @@ def validate_manual_options(
 
 def validate_manual_config(config, schedule, dispatch_order, combine_order):
     required = ["udma_wqes_per_visit"]
-    if schedule == "peer" and (dispatch_order, combine_order) != ("group_round_robin", "group_round_robin"):
+    if schedule == "peer":
         required.append("udma_peers_per_worker")
     flags = {"udma_wqes_per_visit": "_udma_wqes_explicit", "udma_peers_per_worker": "_udma_peers_explicit"}
     missing = [name for name in required if config is None or not getattr(config, flags[name], False)]
@@ -106,13 +102,13 @@ class UdmaPolicy:
     def __post_init__(self):
         # Historical profiles/manual callers may still supply 0. Never report
         # or submit a copy-before-send plan, including the fixed EP128 profile.
+        if self.peer_order != 0:
+            raise ValueError("only rank peer order is supported")
         if self.self_copy == 0:
             object.__setattr__(self, "self_copy", 2)
 
     @property
     def send_workers(self):
-        if self.peer_order == 3:
-            return ((self.ranks_per_group - 1) // self.peers_per_worker + 1) * self.workers_per_peer
         return ((self.world_size - 2) // self.peers_per_worker + 1) * self.workers_per_peer
 
     def signature(self):
@@ -141,7 +137,7 @@ class UdmaPolicy:
         # Representatives of the selector's <=4096 bucket, 2048..12288
         # profile range and 8192..12288 weighted range, including fallbacks.
         row_sizes = (1, 2048, 4096, 4097, 8192, 12288, 12289)
-        for cores in range(2, _MAX_NUM_AIV + 1, 2):
+        for cores in range(8, _MAX_NUM_AIV + 1, 2):
             try:
                 baseline = self.for_num_aiv(cores)
             except ValueError:
@@ -152,15 +148,14 @@ class UdmaPolicy:
                     plans.append(self.for_launch(cores, size, operation, bf16=True))
             for plan in plans:
                 mappings.add((plan.peer_order, plan.peers_per_worker, plan.workers_per_peer, plan.qps_per_worker))
-        names = ("rank", "group", "group_staggered", "group_round_robin")
-        return ";".join(f"{names[order]}:{p}:{w}:{q}" for order, p, w, q in sorted(mappings))
+        return ";".join(f"rank:{p}:{w}:{q}" for _, p, w, q in sorted(mappings))
 
     def validate_num_aiv(self, num_aiv):
         """Check the supplied count without changing it or the selected schedule."""
         if isinstance(num_aiv, bool) or not isinstance(num_aiv, int):
             raise TypeError("num_aiv/num_sms must be an integer")
-        if num_aiv < 0 or num_aiv % 2 or num_aiv > _MAX_NUM_AIV:
-            raise ValueError(f"num_aiv/num_sms must be zero or an even count <= {_MAX_NUM_AIV}")
+        if num_aiv != 0 and (num_aiv < 8 or num_aiv % 2 or num_aiv > _MAX_NUM_AIV):
+            raise ValueError(f"num_aiv/num_sms must be zero or an even communication count from 8 to {_MAX_NUM_AIV}")
         effective = 32 if num_aiv == 0 else num_aiv
         if self.send_workers > effective or self.send_workers * self.qps_per_worker > 32:
             raise ValueError(
@@ -173,38 +168,21 @@ class UdmaPolicy:
     def for_num_aiv(self, num_aiv):
         """Fit ownership without mutating resources or another handle's plan.
 
-        Grow P first, then use single-worker round robin if rank ownership
-        cannot fit. Every candidate must fit the reserved mapping union.
+        Grow rank P to fit the communication budget. Every candidate must fit
+        the reserved mapping union; unsupported budgets fail before launch.
         """
         if isinstance(num_aiv, bool) or not isinstance(num_aiv, int):
             raise TypeError("num_aiv/num_sms must be an integer")
-        if num_aiv < 0 or num_aiv % 2 or num_aiv > _MAX_NUM_AIV:
-            raise ValueError(f"num_aiv/num_sms must be zero or an even count <= {_MAX_NUM_AIV}")
+        if num_aiv != 0 and (num_aiv < 8 or num_aiv % 2 or num_aiv > _MAX_NUM_AIV):
+            raise ValueError(f"num_aiv/num_sms must be zero or an even communication count from 8 to {_MAX_NUM_AIV}")
         budget = min(32 // self.qps_per_worker, 32 if num_aiv == 0 else num_aiv)
         policy = self
-        if self.world_size == 128 and 8 <= num_aiv < 16 and self.workers_per_peer == self.qps_per_worker == 1:
-            policy = replace(self, peer_order=0, peers_per_worker=16, wqes_per_visit=32)
-        while policy.send_workers > budget and policy.peers_per_worker < 8:
+        if self.world_size in (128, 256) and 8 <= num_aiv < 16 and self.workers_per_peer == self.qps_per_worker == 1:
+            policy = replace(self, peer_order=0, peers_per_worker=self.world_size // 8, wqes_per_visit=32)
+        while policy.send_workers > budget and policy.peers_per_worker < 32:
             policy = replace(policy, peers_per_worker=policy.peers_per_worker * 2)
-        if policy.send_workers > budget:
-            # Other constrained budgets retain the existing fallback. Logical groups are a
-            # correctness fallback, never evidence of physical server locality.
-            group = self.ranks_per_group or _logical_group(self.world_size)
-            for p in (1, 2, 4):
-                candidate = replace(
-                    self, ranks_per_group=group, peer_order=3, peers_per_worker=p, workers_per_peer=1, qps_per_worker=1
-                )
-                if candidate.send_workers <= min(32, num_aiv or 32) and candidate.valid_group_capacity():
-                    policy = candidate
-                    break
         policy.validate_num_aiv(num_aiv)
         return policy
-
-    def valid_group_capacity(self):
-        if self.peer_order != 3:
-            return True
-        owners = self.send_workers // self.workers_per_peer
-        return ((self.ranks_per_group + owners - 1) // owners) * (self.world_size // self.ranks_per_group) <= 64
 
     def native_plan(self):
         """Versioned, per-launch value. No mutation of Buffer or SHMEM state."""
@@ -297,15 +275,14 @@ class UdmaPolicy:
                 return plan
         plan = replace(base, wqes_per_visit=32, self_copy=0, weight_mode=0)
         auxiliary_sender_budget = 0
-        if self.world_size == 128 and cores >= 16:
-            # One fixed EP128 schedule for every row size and operation. Match
-            # the measured rank/P8/W1/Q1/visit16 candidate and weight path.
-            # Legacy self-copy 0 is normalized to after-submit. Budgets 8..14
-            # retain rank/P16/visit32 selected by for_num_aiv().
+        if self.world_size in (128, 256) and cores >= 16:
+            # EP128 retains rank/P8; EP256 extends it to P16. Both use
+            # W1/Q1/visit16 at 16+ cores, independently of shape/API.
+            # Budgets 8..14 retain P16/P32 with visit32, respectively.
             plan = replace(
                 base,
                 peer_order=0,
-                peers_per_worker=8,
+                peers_per_worker=self.world_size // 16,
                 workers_per_peer=1,
                 qps_per_worker=1,
                 wqes_per_visit=16,
@@ -346,10 +323,10 @@ class UdmaPolicy:
                 # First remove duplicate payload workers, then grow peer ownership
                 # only as needed. No fixed sender/helper ratio or low-core change.
                 candidate = replace(plan, workers_per_peer=1)
-                max_peers = 4 if candidate.peer_order == 3 else 8
+                max_peers = 8
                 while 0 < cores - candidate.send_workers <= 2 and candidate.peers_per_worker < max_peers:
                     candidate = replace(candidate, peers_per_worker=candidate.peers_per_worker * 2)
-                if cores - candidate.send_workers > 2 and candidate.valid_group_capacity():
+                if cores - candidate.send_workers > 2:
                     plan = candidate
             if operation == "combine":
                 # Keep the accepted profile's auxiliary-core threshold. Rank
@@ -388,8 +365,6 @@ class UdmaPolicy:
                 # Channel count and visit remain launch inputs, unchanged here.
                 plan = replace(plan, peer_order=0, peers_per_worker=8, workers_per_peer=1, qps_per_worker=1)
         plan.validate_num_aiv(num_aiv)
-        if not plan.valid_group_capacity():
-            raise ValueError("automatic UDMA plan exceeds the per-worker peer table")
         return plan
 
     def config(self, num_aiv=0):
@@ -441,6 +416,10 @@ def resolve_udma_policy(
     operation_config=False,
 ):
     """Auto is authoritative. Manual mode requires its relevant inputs."""
+    if any(order not in (None, "rank") for order in (dispatch_order, combine_order)):
+        raise ValueError("only rank peer order is supported")
+    if peers_per_group_per_worker is not None:
+        raise ValueError("udma_peers_per_group_per_worker is no longer supported")
     if not isinstance(enabled, bool):
         raise TypeError("udma_auto_policy must be a bool")
     # Native transport='auto' currently selects MTE, not UDMA.
@@ -464,12 +443,12 @@ def resolve_udma_policy(
         raise ValueError("automatic UDMA policy requires EP between 2 and 1024")
     w, q = (2 if world_size <= 8 else 1), 1
     p, visit = (1, 8) if world_size <= 16 else (4, 32)
-    if world_size == 128:
-        p, visit = 8, 16
-    while ((world_size - 2) // p + 1) * w * q > 32 and p < 8:
+    if world_size in (128, 256):
+        p, visit = world_size // 16, 16
+    while ((world_size - 2) // p + 1) * w * q > 32 and p < 32:
         p *= 2
     if ((world_size - 2) // p + 1) * w * q > 32:
-        raise ValueError("automatic UDMA policy cannot fit the 32-QP budget with P<=8")
+        raise ValueError("automatic UDMA policy cannot fit the 32-QP budget with P<=32")
     for name, supplied, effective in (
         ("udma_schedule", schedule, "peer"),
         ("udma_dispatch_peer_order", dispatch_order, "rank"),

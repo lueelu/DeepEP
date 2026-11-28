@@ -17,7 +17,7 @@ import statistics
 import time
 import zlib
 
-ORDERS = ("rank", "group", "group_staggered", "group_round_robin")
+ORDERS = ("rank",)
 COMBINE_SELF_COPY_ENV = "DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY"
 COMBINE_AFTER_SUBMIT_ENV = "DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT"
 QP_PLANS_ENV = "DEEPEP_CLOS_QP_PLANS"
@@ -27,6 +27,8 @@ SHAPES = ((8192, 2816, 8, 32), (16384, 7168, 6, 64))
 
 def qp_plan_spec(plans):
     """Reserve every measured/preparation schedule once; visit does not select QPs."""
+    if any(c["order"] != "rank" for plan in plans for configs in plan["operations"].values() for c in configs):
+        raise ValueError("only rank sweep candidates are supported")
     return ";".join(
         sorted(
             {
@@ -39,30 +41,27 @@ def qp_plan_spec(plans):
     )
 
 
-def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128), quick=False):
+def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128)):
+    if aiv < 8 or aiv > 64 or aiv % 2:
+        raise ValueError("communication cores must be even in [8, 64]")
     result = []
-    for order in ORDERS:
-        grouped = order == "group_round_robin"
-        peer_choices = (1, 2, 4) if grouped else (1, 2, 4, 8, 16) if order == "rank" else (1, 2, 4, 8)
-        for peers, (workers, qps), visit in itertools.product(peer_choices, ((1, 1), (1, 2), (2, 1)), visits):
-            owners = math.ceil((group_size if grouped else ep - 1) / peers)
-            if owners * workers > aiv or owners * workers * qps > 32:
-                continue
-            if grouped and math.ceil(group_size / owners) * (ep // group_size) > 64:
-                continue
-            if quick and order not in ("rank", "group_round_robin"):
-                continue
-            item = dict(order=order, peers=peers, workers=workers, qps=qps, visit=visit)
-            item["id"] = f"{order}_p{peers}_w{workers}_q{qps}_v{visit}"
-            item["payload_aivs"] = owners * workers
-            result.append(item)
+    for peers, (workers, qps), visit in itertools.product((1, 2, 4, 8, 16, 32), ((1, 1), (1, 2), (2, 1)), visits):
+        owners = math.ceil((ep - 1) / peers)
+        if owners * workers > aiv or owners * workers * qps > 32:
+            continue
+        item = dict(order="rank", peers=peers, workers=workers, qps=qps, visit=visit)
+        item["id"] = f"rank_p{peers}_w{workers}_q{qps}_v{visit}"
+        item["payload_aivs"] = owners * workers
+        result.append(item)
     # Put the production automatic configuration first, as a measured baseline.
     workers = 2 if ep <= 8 else 1
     peers, visit = (1, 8) if ep <= 16 else (4, 32)
-    while math.ceil((ep - 1) / peers) * workers > min(aiv, 32) and peers < 8:
+    while math.ceil((ep - 1) / peers) * workers > min(aiv, 32) and peers < 32:
         peers *= 2
     if ep == 128 and aiv == 8:
         peers = 16
+    if ep == 256:
+        peers, visit = (32, 32) if aiv < 16 else (16, 16)
     baseline = f"rank_p{peers}_w{workers}_q1_v{visit}"
     result.sort(key=lambda c: c["id"] != baseline)
     return result
@@ -73,8 +72,8 @@ def parse_shape(value):
         tokens, hidden, topk, aiv = map(int, value.split(","))
     except ValueError as exc:
         raise argparse.ArgumentTypeError("case must be TOKENS,HIDDEN,TOPK,AIV") from exc
-    if min(tokens, hidden, topk, aiv) <= 0 or hidden % 32 or topk > 128 or aiv % 2 or aiv > 64:
-        raise argparse.ArgumentTypeError("positive case required: hidden multiple of 32, topk<=128, even AIV<=64")
+    if min(tokens, hidden, topk, aiv) <= 0 or hidden % 32 or topk > 128 or aiv < 8 or aiv % 2 or aiv > 64:
+        raise argparse.ArgumentTypeError("positive case required: hidden multiple of 32, topk<=128, even AIV in [8,64]")
     return dict(tokens=tokens, hidden=hidden, topk=topk, aiv=aiv)
 
 
@@ -132,7 +131,6 @@ def parse_args(argv=None):
     p.add_argument("--final-samples", type=int, default=30)
     p.add_argument("--top", type=int, default=3)
     p.add_argument("--visits", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128])
-    p.add_argument("--quick", action="store_true", help="rank and group_round_robin search")
     p.add_argument("--strategies", nargs="+", help="restrict to exact strategy IDs for a matched A/B run")
     p.add_argument("--include-weighted-combine", action="store_true", help="also measure returned FP32 top-k weights")
     p.add_argument("--huge-pages", action=argparse.BooleanOptionalAction, default=True)
@@ -216,8 +214,8 @@ def parse_args(argv=None):
         p.error("duplicate self-copy modes")
     if args.include_weighted_combine and args.combine_self_copy_modes == ["parallel_self_copy"]:
         p.error("weighted combine does not support parallel_self_copy; include default or self_copy_after_submit")
-    if args.strategies and (args.replay_report or args.quick or args.smoke):
-        p.error("strategies cannot be combined with replay-report, quick or smoke")
+    if args.strategies and (args.replay_report or args.smoke):
+        p.error("strategies cannot be combined with replay-report or smoke")
     if args.strategies and len(set(args.strategies)) != len(args.strategies):
         p.error("duplicate strategy IDs")
     args.ranks_per_group = min(8, args.ep_size) if args.ranks_per_group is None else args.ranks_per_group
@@ -308,7 +306,7 @@ def configure(buffer, config):
     from deep_ep.backends.direct.config import Config
 
     order = ORDERS.index(config["order"])
-    group_peers = config["peers"] if order >= 3 else 0
+    group_peers = 0
     wanted = [order, order, group_peers, config["workers"], config["qps"]]
     actual = list(buffer.runtime._configure_tuning(*wanted))
     if actual != wanted:
@@ -505,7 +503,7 @@ def main():
     ):
         raise ValueError("replay EP/experts/seed/group size/L2/page settings must match report")
     for shape in shapes:
-        configs = candidates(args.ep_size, shape["aiv"], args.ranks_per_group, args.visits, args.quick)
+        configs = candidates(args.ep_size, shape["aiv"], args.ranks_per_group, args.visits)
         if not configs:
             raise ValueError(f"no legal candidates for {shape}")
         if args.smoke:

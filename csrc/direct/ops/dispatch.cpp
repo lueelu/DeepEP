@@ -454,15 +454,14 @@ Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<t
     }
 
     const int64_t resolved_num_aiv = ResolveNumAiv(num_aiv);
+    TORCH_CHECK(resolved_num_aiv >= 8, "communication num_aiv must be at least 8");
     const int64_t num_channels = resolved_num_aiv;
-    if (udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder) udma_peers_per_worker = udma_launch.peers;
     if (use_udma) {
         TORCH_CHECK(shmem.SharedJetty(), "UDMA requires a shared-Jetty Buffer runtime");
-        TORCH_CHECK(udma_peers_per_worker == 1 || udma_peers_per_worker == 2 || udma_peers_per_worker == 4 ||
-                        udma_peers_per_worker == 8 || udma_peers_per_worker == 16,
-                    "udma_peers_per_worker must be 1, 2, 4, 8 or 16");
-        TORCH_CHECK(udma_peers_per_worker <= 8 || udma_launch.order == ascend_deepep::udma::kRankOrder,
-                    "P16 requires rank peer order");
+        TORCH_CHECK(udma_peers_per_worker > 0 && udma_peers_per_worker <= ascend_deepep::udma::kMaxRankPeers &&
+                        ascend_deepep::udma::ValidPeers(udma_peers_per_worker),
+                    "udma_peers_per_worker must be 1, 2, 4, 8, 16 or 32");
+        TORCH_CHECK(udma_launch.order == ascend_deepep::udma::kRankOrder, "only rank peer order is supported");
         TORCH_CHECK(udma_wqes_per_visit == 4 || udma_wqes_per_visit == 8 || udma_wqes_per_visit == 16 ||
                         udma_wqes_per_visit == 32 || udma_wqes_per_visit == 64 || udma_wqes_per_visit == 128,
                     "udma_wqes_per_visit must be 4, 8, 16, 32, 64 or 128");
@@ -646,11 +645,7 @@ Dispatch(torch::Tensor x, c10::optional<torch::Tensor> x_scales, c10::optional<t
                         "DEEPEP_CLOS_NOTIFY_METADATA_TILE_TOKENS must be 0(auto), 32, 64, 128 or 256");
             requested_tile = static_cast<uint32_t>(std::atoi(tile_option));
         }
-        const uint32_t peer_capacity =
-            udma_launch.order == ascend_deepep::udma::kGroupRoundRobinOrder
-                ? ascend_deepep::udma::kGroupPeerCapacity
-                : (udma_launch.peers > ascend_deepep::udma::kMaxPeers ? ascend_deepep::udma::kMaxRankPeers
-                                                                      : ascend_deepep::udma::kMaxPeers);
+        const uint32_t peer_capacity = ascend_deepep::udma::RankPeerCapacity(udma_launch.peers);
         const uint32_t packing_ub = ascend_deepep::platform::kKernelUbBytes -
                                     ascend_deepep::udma::DispatchLiveSendUbBytes(peer_capacity, udma_launch.qps);
         const uint32_t descriptor_bytes =

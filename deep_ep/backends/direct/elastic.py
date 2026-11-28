@@ -1173,7 +1173,7 @@ class ElasticBuffer:
         comm_sms = combine_num_sms or resolved_num_sms
         reduce_sms = reduce_num_sms or resolved_num_sms
         _validate_num_sms(comm_sms, self.num_device_aiv)
-        _validate_num_sms(reduce_sms, self.num_device_aiv)
+        _validate_num_sms(reduce_sms, self.num_device_aiv, communication=False)
         if self.transport != "udma" and (comm_sms != handle.num_sms or reduce_sms != handle.num_sms):
             raise ValueError("independent combine/reduce core counts require UDMA")
         if comm_sms != handle.num_sms and handle.do_expand and self._aggregate_pipeline_chunk_tokens:
@@ -1586,8 +1586,10 @@ def _validate_combine_tensors(
             raise ValueError(f"{name} has an invalid shape")
 
 
-def _validate_num_sms(num_sms: int, num_device_aiv: int = _MAX_NUM_AIV) -> None:
+def _validate_num_sms(num_sms: int, num_device_aiv: int = _MAX_NUM_AIV, *, communication: bool = True) -> None:
     _validate_positive_int("num_sms", num_sms)
+    if communication and num_sms < 8:
+        raise ValueError("communication num_sms must be at least 8")
     if num_sms % 2:
         raise ValueError("num_sms must be even")
     max_num_aiv = min(_MAX_NUM_AIV, num_device_aiv)

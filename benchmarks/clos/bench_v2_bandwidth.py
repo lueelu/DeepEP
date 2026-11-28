@@ -332,13 +332,13 @@ def effective_udma_config(
             }
             result["operation_plans"] = {op: asdict(plan) for op, plan in plans.items()}
             policy = plans["dispatch"]
-            names = ("rank", "group", "group_staggered", "group_round_robin")
+            names = ("rank",)
             result.update(
                 policy_scope="dispatch; see operation_plans for combine",
                 udma_dispatch_peer_order=names[policy.peer_order],
                 udma_combine_peer_order=names[plans["combine"].peer_order],
                 udma_ranks_per_group=policy.ranks_per_group,
-                udma_peers_per_group_per_worker=policy.peers_per_worker if policy.peer_order == 3 else None,
+                udma_peers_per_group_per_worker=None,
                 udma_workers_per_peer=policy.workers_per_peer,
                 udma_qps_per_worker=policy.qps_per_worker,
             )

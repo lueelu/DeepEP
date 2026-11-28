@@ -342,7 +342,7 @@ BufferRuntime::FreshDispatchHostResult BufferRuntime::IntranodeDispatchFromTopk(
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, bool defer_public_expert_prefix,
     const std::vector<int64_t>& launch_plan, bool simt_layout)
 {
-    TORCH_CHECK(num_aiv > 0 && num_aiv <= num_device_aiv_, "fresh dispatch requires resolved device AIV cores");
+    TORCH_CHECK(num_aiv >= 8 && num_aiv <= num_device_aiv_, "fresh dispatch requires resolved device AIV cores");
     // Same layout kernels and allocation policy as the two-call path. Keep all
     // layout owners alive through notify/dispatch submission without a Python
     // round trip. This is Host entry composition, not device-kernel fusion.
@@ -400,7 +400,8 @@ BufferRuntime::IntranodeDispatchWithPlan(
     c10::optional<torch::Tensor> cached_dispatch_plan, const std::vector<int64_t>& launch_plan,
     c10::optional<torch::Tensor> cached_send_head, bool allow_omit_topk_output)
 {
-    TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
+    TORCH_CHECK((num_aiv == 0 || num_aiv >= 8) && num_aiv <= num_device_aiv_,
+                "dispatch communication num_aiv must be zero or >=8 and must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     auto result = ascend_deepep::ops::Dispatch(
         x, x_scales, topk_idx, topk_weights, num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert,
@@ -431,7 +432,8 @@ BufferRuntime::IntranodeDispatchWithHandle(
     c10::optional<torch::Tensor> cached_dispatch_plan, bool defer_public_expert_prefix,
     const std::vector<int64_t>& launch_plan)
 {
-    TORCH_CHECK(num_aiv <= num_device_aiv_, "dispatch num_aiv must not exceed the device AIV core count ",
+    TORCH_CHECK((num_aiv == 0 || num_aiv >= 8) && num_aiv <= num_device_aiv_,
+                "dispatch communication num_aiv must be zero or >=8 and must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     std::vector<torch::Tensor> public_handle;
     auto result = ascend_deepep::ops::Dispatch(
@@ -455,7 +457,8 @@ std::tuple<torch::Tensor, c10::optional<torch::Tensor>> BufferRuntime::Intranode
     c10::optional<int64_t> allocation_stream_id, c10::optional<int64_t> num_max_tokens_per_rank,
     int64_t udma_peers_per_worker, int64_t udma_wqes_per_visit, const std::vector<int64_t>& launch_plan)
 {
-    TORCH_CHECK(num_aiv <= num_device_aiv_, "combine num_aiv must not exceed the device AIV core count ",
+    TORCH_CHECK((num_aiv == 0 || num_aiv >= 8) && num_aiv <= num_device_aiv_,
+                "combine communication num_aiv must be zero or >=8 and must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     auto result = ascend_deepep::ops::Combine(
         x, topk_weights, bias_0, bias_1, src_idx, rank_prefix_matrix, channel_prefix_matrix, send_head, num_aiv,
@@ -481,7 +484,8 @@ c10::intrusive_ptr<ascend_deepep::ops::CombineEpilogue> BufferRuntime::BeginComb
 {
     TORCH_CHECK(reduce_num_aiv >= 0 && reduce_num_aiv <= num_device_aiv_,
                 "reduce_num_aiv must be between zero and the device AIV count");
-    TORCH_CHECK(num_aiv <= num_device_aiv_, "combine num_aiv must not exceed the device AIV core count ",
+    TORCH_CHECK((num_aiv == 0 || num_aiv >= 8) && num_aiv <= num_device_aiv_,
+                "combine communication num_aiv must be zero or >=8 and must not exceed the device AIV core count ",
                 num_device_aiv_, ", got ", num_aiv);
     TORCH_CHECK(pipeline_chunk_tokens == 0 || pipeline_chunk_tokens == 32 || pipeline_chunk_tokens == 64,
                 "aggregate pipeline chunk must be 0, 32 or 64");

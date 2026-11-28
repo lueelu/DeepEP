@@ -47,7 +47,7 @@ def validate_args(parser, args, argv):
                 parser.error(f"{name} requires distinct values from {allowed}")
     if args.ep_size not in SUPPORTED_EPS:
         parser.error("rank/payload sweeps require EP4/8/16/32")
-    if (args.case and not payload_only) or args.strategies or args.replay_report or args.quick or args.smoke:
+    if (args.case and not payload_only) or args.strategies or args.replay_report or args.smoke:
         parser.error("small-rank-sweep owns its case/candidate matrix; do not supply other selectors")
     if args.combine_self_copy_modes or args.combine_parallel_self_copy or args.combine_self_copy_after_submit:
         parser.error("small-rank-sweep preserves production self-copy behavior")

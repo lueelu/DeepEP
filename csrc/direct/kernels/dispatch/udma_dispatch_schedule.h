@@ -337,16 +337,16 @@ __aicore__ inline void DispatchRemote(
     GM_ADDR workspace, const DispatchTilingData& td, uint32_t core, uint32_t cores, Trace& trace, PostSubmit post_submit = PostSubmit())
 {
     if (td.udma_qps_per_worker == 2) {
-        if (td.udma_peer_order == kGroupRoundRobinOrder)
-            DispatchRemoteImpl<kGroupPeerCapacity, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
-        else if (td.udma_peers_per_worker > kMaxPeers)
+        if (td.udma_peers_per_worker > kMidRankPeers)
             DispatchRemoteImpl<kMaxRankPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
+        else if (td.udma_peers_per_worker > kMaxPeers)
+            DispatchRemoteImpl<kMidRankPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
         else
             DispatchRemoteImpl<kMaxPeers, 2>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
-    } else if (td.udma_peer_order == kGroupRoundRobinOrder)
-        DispatchRemoteImpl<kGroupPeerCapacity, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
-    else if (td.udma_peers_per_worker > kMaxPeers)
+    } else if (td.udma_peers_per_worker > kMidRankPeers)
         DispatchRemoteImpl<kMaxRankPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
+    else if (td.udma_peers_per_worker > kMaxPeers)
+        DispatchRemoteImpl<kMidRankPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
     else
         DispatchRemoteImpl<kMaxPeers, 1>(r, x, scales, plan, rp, cp, workspace, td, core, cores, trace, post_submit);
 }

@@ -394,12 +394,8 @@ def test_v2_core_defaults_and_handle_inheritance(operation, requested):
 @pytest.mark.parametrize(
     "ep,cores,peers,workers",
     [
-        (4, 2, 4, 2),
-        (8, 2, 8, 2),
         (8, 8, 2, 2),
-        (16, 2, 8, 1),
         (16, 8, 2, 1),
-        (32, 4, 8, 1),
         (32, 8, 4, 1),
         (64, 8, 8, 1),
         (128, 20, 8, 1),
@@ -438,13 +434,13 @@ def test_auto_policy_budget_boundaries_and_manual_opt_out():
         for ep in range(2, 257):
             base = resolve_udma_policy(True, ep, 'udma', None, None, None, None, None)
             for cores in range(2, 65, 2):
-                feasible = ((ep - 1 + 7) // 8) * base.workers_per_peer <= min(cores, 32)
+                feasible = cores >= 8 and ((ep - 1 + 31) // 32) * base.workers_per_peer <= min(cores, 32)
                 try: chosen = base.for_num_aiv(cores)
                 except ValueError:
                     assert not feasible, (ep, cores)
                 else:
-                    assert chosen.valid_group_capacity() and chosen.send_workers <= min(cores, 32), (ep, cores)
-                    assert chosen.peers_per_worker in (1, 2, 4, 8, 16)
+                    assert (chosen.peer_order == 0 and chosen.peers_per_worker <= 32) and chosen.send_workers <= min(cores, 32), (ep, cores)
+                    assert chosen.peers_per_worker in (1, 2, 4, 8, 16, 32)
                     assert chosen.config(cores).num_aiv == cores
         base = resolve_udma_policy(True, 32, 'udma', None, None, None, None, None)
         assert base.for_num_aiv(0) == base
@@ -644,7 +640,7 @@ def test_launch_profiles_are_immutable_cached_and_topology_scoped():
                 assert plan.native_plan()[:7] == [1, expected_order, group, rank_p, w, q, visit]
                 assert plan.self_copy == (copy or 2)
                 assert plan.send_workers <= cores and plan.send_workers * q <= 32
-                assert plan.valid_group_capacity()
+                assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                 assert base.signature() == before
                 try: plan.peers_per_worker = 8
                 except FrozenInstanceError: pass
@@ -733,7 +729,7 @@ def test_fitted_weight_payload_plans_and_reports_follow_row_preference():
                     expected_order, expected_p = (0,4)
                     assert plan.native_plan() == [1,expected_order,group,expected_p,1,1,8,2,expected_mode]
                     assert plan.send_workers == group
-                    assert plan.send_workers < 32 and plan.valid_group_capacity()
+                    assert plan.send_workers < 32 and (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                     assert plan is base.for_launch(cores,row_bytes,'weighted',bf16=True)
                     buffer = SimpleNamespace(udma_auto_policy=base, udma_schedule='peer',
                         udma_dispatch_peer_order='rank',udma_combine_peer_order='rank',
@@ -847,7 +843,7 @@ def test_core_tiers_preserve_actual_budgets_and_capacity():
                                     assert plan.peer_order == 0
                                 assert plan.send_workers <= cores
                                 assert plan.send_workers*plan.qps_per_worker <= 32
-                                assert plan.valid_group_capacity()
+                                assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
     """)
 
 
@@ -880,7 +876,7 @@ def test_low_core_rank_defaults_match_measured_plans():
                 plan = base.for_launch(8,hidden*2,op,bf16=True)
                 assert plan.native_plan() == [1,0,group,p,w,q,visit,2,mode]
                 assert plan.send_workers == senders
-                assert plan.valid_group_capacity()
+                assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
             assert base.native_plan() == original
     """)
 
@@ -1002,7 +998,7 @@ def test_metadata_starvation_adjustment_preserves_low_core_and_unweighted_plans(
                     plan = base.for_launch(16,size,op,bf16=True)
                     assert plan.native_plan()[:7] == [1,0,group,p,workers,1,32]
                     assert plan.send_workers == 8
-                    assert plan.valid_group_capacity()
+                    assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                     assert plan is base.for_launch(16,size,op,bf16=True)
                     if op == 'weighted':
                         assert plan.self_copy == 2
@@ -1091,7 +1087,7 @@ def test_sender_tiers_inherit_complete_plans_without_changing_launch_budget():
                                 assert plan.send_workers == anchor.send_workers
                                 assert plan.send_workers <= cores
                                 assert plan.send_workers*plan.qps_per_worker <= 32
-                                assert plan.valid_group_capacity()
+                                assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                                 assert base.config(cores).num_aiv == cores
     """)
 
@@ -1205,7 +1201,7 @@ def test_large_row_extension_defaults_and_compatibility_option_are_reserved():
         # Configuration is immutable per Buffer; changing the environment cannot
         # leave cached launch plans inconsistent with its original QP reservation.
         assert old.for_launch(32,14336,'combine',bf16=True).native_plan() == old_plan
-        names = ('rank','group','group_staggered','group_round_robin')
+        names = ('rank',)
         for ep in (4,8,16,32,64,128):
             base = resolve(ep)
             disabled = replace(base,extend_large_rows=False)
@@ -1310,13 +1306,13 @@ def test_ep128_defaults_preserve_fixed_candidate_across_shapes_and_budgets():
                 for size in (2048,5600,5632,5664,7168,8192,12288,14336):
                     plan = base.for_launch(cores,size,op,bf16=True)
                     assert plan.native_plan() == native
-                    assert plan.send_workers == 16 and plan.valid_group_capacity()
+                    assert plan.send_workers == 16 and (plan.peer_order == 0 and plan.peers_per_worker <= 32)
                     assert plan is base.for_launch(cores,size,op,bf16=True)
             # Unknown locality does not alter rank order; the low-core path
             # still chooses a legal fallback instead of exceeding its budget.
             assert replace(base,topology_known=False).for_launch(32,5632,op,bf16=True).native_plan() == native
             small = base.for_launch(8,5632,op,bf16=True)
-            assert small.send_workers <= 8 and small.valid_group_capacity()
+            assert small.send_workers <= 8 and (small.peer_order == 0 and small.peers_per_worker <= 32)
             for other in (replace(base,world_size=64), replace(base,world_size=256)):
                 assert other.for_launch(32,5632,op,bf16=True).native_plan() != native
             for options in ({'bf16':False}, {'expanded':True}, {'v2':False}):
@@ -1344,7 +1340,7 @@ def test_ep128_low_core_rank_p16_preserves_larger_core_plans():
                                 mode = (2 if cores > 8 else 1) if op == 'weighted' and opts == {'bf16':True} else 0
                                 assert plan.native_plan() == [1,0,group,16,1,1,32,2,mode]
                                 assert plan.send_workers == 8
-                                assert plan.valid_group_capacity()
+                                assert (plan.peer_order == 0 and plan.peers_per_worker <= 32)
         base = replace(base,ranks_per_group=16,topology_known=True)
         for cores in (10,12,14):
             assert base.for_launch(cores,5632,'dispatch',bf16=True).native_plan() == [1,0,16,16,1,1,32,2,0]
@@ -1408,7 +1404,7 @@ def test_auto_qp_reservation_covers_dynamic_launches_and_legacy_paths(ep):
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
         base = resolve_udma_policy(True,{ep},'udma',None,None,None,None,None)
-        names = ('rank','group','group_staggered','group_round_robin')
+        names = ('rank',)
         sizes = (32,2047,2048,2049,4095,4096,4097,5632,7168,8191,8192,8193,12287,12288,12289,14336,32768)
         for group in (1,2,4,8,16,32,64,128,256):
             if group > {ep}: continue
@@ -1428,9 +1424,9 @@ def test_auto_qp_reservation_covers_dynamic_launches_and_legacy_paths(ep):
                                 assert key in reserved, (group,known,cores,size,op,kwargs,key,reserved)
         if {ep} in (32,64,128):
             policy = replace(base,ranks_per_group=16,topology_known=True)
-            expected = {{32:'rank:4:1:1;rank:8:1:1',
-                        64:'rank:4:1:1;rank:8:1:1;group_round_robin:4:1:1',
-                        128:'rank:8:1:1;rank:16:1:1;group_round_robin:4:1:1'}}
+            expected = {{32:'rank:4:1:1',
+                        64:'rank:4:1:1;rank:8:1:1',
+                        128:'rank:8:1:1;rank:16:1:1'}}
             assert policy.reservation_spec() == expected[{ep}]
     """)
 
@@ -1466,7 +1462,7 @@ def test_auto_qp_masks_preserve_control_symmetry_and_reduce_tuning_union(tmp_pat
         check=True,
     )
     source = ['#include "runtime/udma_qp_reservation.h"', "using namespace ascend_deepep::udma;"]
-    names = ("rank", "group", "group_staggered", "group_round_robin")
+    names = ("rank",)
     for ep, group, spec in json.loads(generated.stdout):
         expressions = []
         for entry in spec.split(";"):
@@ -1484,6 +1480,26 @@ constexpr bool check{ep}() {{
     return after < before;
 }}
 static_assert(check{ep}(), "automatic mask must retain control and symmetry while reducing reservations");
+""")
+    source.append(r"""
+constexpr bool ep256_p32_all_rank_ownership() {
+    for (unsigned rank=0; rank<256; ++rank) {
+        bool seen[256]{};
+        unsigned count=0;
+        for (unsigned owner=0; owner<8; ++owner)
+            for (unsigned i=0; i<WorkerCount(rank,256,owner,32); ++i) {
+                const auto peer=WorkerPeer(rank,256,owner,32,i);
+                if (peer>=256 || peer==rank || seen[peer] || Owner(rank,peer,256,32)!=owner) return false;
+                seen[peer]=true; ++count;
+                const auto mask=QpReservation::Mask(rank,peer,256,16,0,32,1);
+                if (!(mask & (uint64_t{1}<<owner)) || !(mask & 1) ||
+                    mask!=QpReservation::Mask(peer,rank,256,16,0,32,1)) return false;
+            }
+        if(count!=255) return false;
+    }
+    return true;
+}
+static_assert(ep256_p32_all_rank_ownership(), "P32 must cover every remote peer once with symmetric QPs");
 """)
     path = tmp_path / "auto_qp_masks.cpp"
     path.write_text("\n".join(source))
@@ -1508,7 +1524,7 @@ static_assert(check{ep}(), "automatic mask must retain control and symmetry whil
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_large_ep_low_core_fallback_and_invalid_launch_inputs():
+def test_large_ep_rank_capacity_and_invalid_launch_inputs():
     run_host("""
         from dataclasses import replace
         from deep_ep.backends.direct.udma_policy import resolve_udma_policy
@@ -1522,11 +1538,11 @@ def test_large_ep_low_core_fallback_and_invalid_launch_inputs():
                         for op in ('dispatch','combine','weighted'):
                             p = base.for_launch(cores,size,op,bf16=True)
                             assert p.send_workers <= cores and p.send_workers*p.qps_per_worker <= 32
-                            assert p.valid_group_capacity()
+                            assert (p.peer_order == 0 and p.peers_per_worker <= 32)
                             assert p.ranks_per_group == group
                 if ep == 128:
                     assert base.for_launch(8,5632,'combine',bf16=True).native_plan()[:7] == [1,0,group,16,1,1,32]
-                for cores in (True,False,8.0,3,-2,66):
+                for cores in (True,False,8.0,2,3,4,6,-2,66):
                     try: base.for_launch(cores,5632,'dispatch',bf16=True)
                     except (TypeError,ValueError): pass
                     else: raise AssertionError(cores)
@@ -1639,13 +1655,11 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
         using namespace ascend_deepep::udma;
         int main() {
             for (unsigned ep : {4U,8U,16U,32U,64U,128U})
-              for (unsigned g : {1U,2U,4U,8U,16U}) {
+              for (unsigned g : {1U,2U,4U,8U,16U,32U}) {
                 if (g > ep) continue;
                 for (unsigned rank=0; rank<ep; ++rank)
-                  for (unsigned order=0; order<=3; ++order)
-                    for (unsigned p : {1U,2U,4U,8U,16U}) {
-                      if (p==16 && order!=0) continue;
-                      if (order==3 && p==8) continue;
+                  for (unsigned order=0; order==0; ++order)
+                    for (unsigned p : {1U,2U,4U,8U,16U,32U}) {
                       unsigned owners=Workers(ep,p,order,g);
                       for (unsigned lanes : {1U,2U}) {
                         if (owners*lanes>32) continue;
@@ -1743,7 +1757,7 @@ def test_python_plans_pass_native_launch_validation(tmp_path, legacy_guard):
         "ShmemInstance::LaunchPlan ShmemInstance::ResolveLaunch(const std::vector<int64_t>& values",
         "template<size_t N> constexpr LaunchPlan ResolveLaunch(const std::array<int64_t,N>& values",
     )
-    body = re.sub(r'throw std::invalid_argument\("[^"\n]*"\);', "return {UINT32_MAX,0,0,0,0,0,0,0};", body)
+    body = re.sub(r'throw std::invalid_argument\(\s*(?:"[^"\n]*"\s*)+\);', "return {UINT32_MAX,0,0,0,0,0,0,0};", body)
     if legacy_guard:
         fixed = "(!combine && ((copy != 0 && copy != 2) || weight))"
         assert fixed in body
@@ -1790,6 +1804,9 @@ static_assert(matches(64,16,8,false,{1,0,16,8,1,1,64,2,0}));
 static_assert(matches(64,16,8,true,{1,0,16,8,1,1,128,2,1}));
 static_assert(matches(128,16,8,false,{1,0,16,16,1,1,32,2,0}));
 static_assert(matches(128,16,8,true,{1,0,16,16,1,1,32,2,1}));
+static_assert(matches(256,16,8,false,{1,0,16,32,1,1,32,2,0}));
+static_assert(matches(256,16,32,true,{1,0,16,16,1,1,16,2,0}));
+static_assert(reject(1,1) && reject(1,2) && reject(1,3));
 static_assert(reject(7,-1) && reject(7,1) && reject(7,3));
 static_assert(reject(8,-1) && reject(8,1) && reject(8,2) && reject(8,3));
 static_assert(reject(7,2,-2) && reject(7,2,7) && reject(7,2,6));
@@ -1800,13 +1817,15 @@ constexpr bool resources() {
     if(instance.ResolveLaunch(std::array<int64_t,8>{},false,1,32,8).order!=UINT32_MAX)return false;
     instance.auto_resources_=false;
     if(instance.ResolveLaunch(good,false,1,32,8).order!=UINT32_MAX)return false;
+    for (int64_t bad : {-1LL,0LL,3LL,64LL,(1LL<<32)+32})
+        if(instance.ResolveLaunch(std::array<int64_t,0>{},false,bad,16,8).order!=UINT32_MAX)return false;
     const auto legacy=instance.ResolveLaunch(std::array<int64_t,0>{},false,2,16,8);
     if(legacy.self_copy!=-1 || legacy.peers!=2 || legacy.visit!=16)return false;
     instance={64,16};
     if(instance.ResolveLaunch(std::array<int64_t,9>{1,0,16,1,1,1,32,2,0},false,1,32,64).order!=UINT32_MAX)
         return false; // Physical QP capacity still applies.
     if(instance.ResolveLaunch(std::array<int64_t,9>{1,3,16,8,1,1,32,2,0},false,1,32,64).order!=UINT32_MAX)
-        return false; // RR peer capacity still applies.
+        return false; // Non-rank schedules are rejected.
     return true;
 }
 static_assert(resources());
@@ -1838,3 +1857,71 @@ static_assert(unreserved());
         assert built.returncode != 0 and "static assertion" in built.stderr, built.stderr
     else:
         assert built.returncode == 0, built.stderr
+
+
+def test_rank_only_core_boundary_and_ep256_capacity():
+    run_host("""
+        from dataclasses import replace
+        from deep_ep.backends.direct.config import Config
+        from deep_ep.backends.direct.buffer import Buffer, _validate_udma_peer_order
+        from deep_ep.backends.direct.elastic import _validate_num_sms
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        for count in (1,2,3,4,5,6,7):
+            for check in (Config, Buffer.set_num_sms, _validate_num_sms):
+                try: check(count)
+                except ValueError: pass
+                else: raise AssertionError((check,count))
+        assert Config(0).num_aiv == 0
+        for count in (2,4,6):
+            _validate_num_sms(count, communication=False)  # Independent reduce remains legal.
+        for order in ('group','group_staggered','group_round_robin'):
+            for enabled in (False,True):
+                try: resolve_udma_policy(enabled,64,'udma','peer',order,'rank',16,None)
+                except ValueError: pass
+                else: raise AssertionError((enabled,order))
+            try: _validate_udma_peer_order('udma','peer',64,order,'rank',16)
+            except ValueError: pass
+            else: raise AssertionError(order)
+        assert Config(8,udma_peers_per_worker=32).udma_peers_per_worker == 32
+        for known in (False,True):
+            base = replace(resolve_udma_policy(True,256,'udma',None,None,None,None,None),
+                           ranks_per_group=16,topology_known=known)
+            assert base.reservation_spec() == 'rank:16:1:1;rank:32:1:1'
+            for cores in (0,*range(8,65,2)):
+                p,visit = (32,32) if 8<=cores<16 else (16,16)
+                for op in ('dispatch','combine','weighted'):
+                    for size in (1,2048,5632,12288,14336,32768,65536):
+                        for opts in ({'bf16':True},{'bf16':False},{'expanded':True},{'v2':False}):
+                            plan = base.for_launch(cores,size,op,**opts)
+                            assert (plan.peer_order,plan.peers_per_worker,plan.workers_per_peer,
+                                    plan.qps_per_worker,plan.wqes_per_visit)==(0,p,1,1,visit)
+                            assert plan.send_workers == (256+p-2)//p
+    """)
+
+
+def test_rank_cleanup_preserves_f210289_ep4_to_128_anchor_plans():
+    # Complete plan digests from f210289, including copy/weight preferences.
+    run_host("""
+        import hashlib, itertools, json
+        from dataclasses import replace
+        from deep_ep.backends.direct.udma_policy import resolve_udma_policy
+        expected = {
+            4: '7cf73eaf64f50227de676aa1e600d250507f3a29f7472b57ddbe6178875268a6',
+            8: '4d1d70e61c50cffee547edeb7dcfacd9ed5bc5e4cd79d1696423cf52d54e47cc',
+            16: '46f8a2921ded4bd8dc177b16a67a7e04847ba898205e303ddb04aba365002eca',
+            32: 'fdb0d759a510ddae2d0698989712c73c2e7063ff392bbf5b4165ca7d6c7ac30b',
+            64: '7be7262ebe9956faf6ef36072b975abe1f184208bf6363c2f2fc629e1f909f87',
+            128: '95c8b30b7138d4957b07b89e4997a9c392bb0d77797b6ccaeca6911a19524c81',
+        }
+        for ep,digest in expected.items():
+            plans=[]
+            for group in (g for g in (1,2,4,8,16,32,64,128) if ep%g==0):
+                for known,extend in itertools.product((False,True),repeat=2):
+                    policy=replace(resolve_udma_policy(True,ep,'udma',None,None,None,None,None),
+                                   ranks_per_group=group,topology_known=known,extend_large_rows=extend)
+                    for cores,size,op,bf16,expanded,v2 in itertools.product(
+                        (8,32),(1,2047,2048,4096,4097,5632,7168,8192,8193,12288,12289,14336,32768,65536),
+                        ('dispatch','combine','weighted'),(False,True),(False,True),(False,True)):
+                        plans.append(policy.for_launch(cores,size,op,bf16=bf16,expanded=expanded,v2=v2).native_plan())
+            assert hashlib.sha256(json.dumps(plans).encode()).hexdigest()==digest,ep
+    """)

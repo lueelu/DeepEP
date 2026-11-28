@@ -11,20 +11,16 @@ ownership, sparse CQEs and completion guarantees, see
   32--64 AIVs and 8192--12288 payload bytes per row uses P4/W1/Q1/visit8
   (16 payload senders), replacing group-round-robin P1 without changing visit,
   weight preference or local-copy mode. Eight-core plans remain P8/W1/Q1/visit32.
-- EP128 with exactly 8 communication AIVs uses rank/P16/W1/Q1/visit32.
-  Other EP128 core budgets retain their previous plans. P16 is supported only
-  for rank order; existing P<=8 and token sender windows retain their sizes.
-  Fresh/cached dispatch and combine select a separate 16-peer sender. Its Q1
-  live UB prefix is 23,200 bytes for dispatch and at most 21,664 bytes for
-  combine (including merged-row scratch), followed by existing local-work
-  storage. Output row mapping and final completion semantics are unchanged.
-  All launched AIVs still participate in entry/final sync.
-  To compare with the former G16 8-core plan in one tuning Buffer, reserve
-  `rank:16:1:1;group_round_robin:2:1:1` before initialization and compare
-  `rank_p16_w1_q1_v32` with `group_round_robin_p2_w1_q1_v32` using
-  `bench_fast_sweep.py --strategies`. Keep the actual metadata/weight modes
-  identical and validate outputs before measuring; this is not a performance
-  guarantee and requires rebuilding Host and device libraries.
+- Communication launches require an even 8--64 AIVs; zero still resolves to
+  the default. Independent reduce and internal barrier core counts are unchanged.
+  Only rank peer ordering remains, including manual plans and sweep candidates.
+- EP128 uses rank/P16/W1/Q1/visit32 at 8--14 cores and P8/W1/Q1/visit16
+  at 16--64 cores. EP256 extends these to P32 and P16 respectively.
+  Existing P<=8 and P16 sender capacities are unchanged; P32 uses a separate
+  32-peer instantiation. Dispatch Q1 live UB prefixes are 23,200 bytes at P16
+  and 43,168 bytes at P32. Host metadata packing uses the same capacity selector.
+  Row mapping, final completion and all-AIV sync participation are unchanged.
+  P32 still requires remote CANN compilation and device precision/performance validation.
 - V2 fresh dispatch uses independent SIMT layout, following resolved `num_sms`.
   `DEEPEP_CLOS_V2_SIMT_LAYOUT=0` selects the original layout baseline.
 - Automatic V2 non-expanded BF16 plans for EP8/16/32 use rank ordering in
