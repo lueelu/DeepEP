@@ -1036,7 +1036,6 @@ def test_reserved_native_masks_cover_all_supported_launch_owners(tmp_path):
 @pytest.mark.parametrize("fused", [False, True])
 def test_fused_layout_is_buffer_local_and_forwarded_to_native(fused):
     run_host(f"""
-        import os
         from deep_ep.backends.direct import elastic as e
         calls = []
         e._resolve_group_or_comm = lambda group, comm: (0, 2, group)
@@ -1053,7 +1052,6 @@ def test_fused_layout_is_buffer_local_and_forwarded_to_native(fused):
             def num_device_aiv(self):
                 return 64
         e.get_native_class = lambda name: Native
-        os.environ['DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY'] = 'invalid-old-variable'
         b = e.ElasticBuffer(object(), num_bytes=128 << 20, transport='udma',
                             udma_auto_policy=False, fused_layout_notify={fused!r},
                             udma_schedule="peer", udma_dispatch_peer_order="rank",

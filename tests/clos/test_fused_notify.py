@@ -104,10 +104,10 @@ def test_profile_sequence_excludes_outer_barrier(tmp_path, fused, simt, expanded
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_modes_preserve_constructor_fusion(fused, monkeypatch):
-    monkeypatch.setenv("DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY", "unused")
     for name in (bench.HOST_PREP_ENV, bench.DEFER_PLAN_ENV, bench.SIMT_LAYOUT_ENV):
         monkeypatch.setenv(name, "0")
     for mode in bench.mode_order(True, fused_layout_notify=fused):
         assert bool(bench.MODES[mode][0]) is fused
         bench.set_mode(mode)
-        assert os.environ["DEEPEP_CLOS_FUSED_LAYOUT_NOTIFY"] == "unused"
+        assert os.environ[bench.HOST_PREP_ENV] == str(bench.MODES[mode][1])
+        assert os.environ[bench.DEFER_PLAN_ENV] == str(bench.MODES[mode][2])
