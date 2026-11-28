@@ -1316,14 +1316,9 @@ def _prepare_shmem_bootstrap(
     )
     if udma_auto_options is not None:
         options += (udma_auto_options,)
-    qp_plans = os.environ.get("DEEPEP_CLOS_QP_PLANS", "")
-    if qp_plans:
-        options += (("qp_plans", qp_plans),)
     # This key is compared only within this process. Buffer retains group, so
     # its identity cannot be recycled while the associated runtime is alive.
     key = repr((id(group) if comm is None else id(comm), transport, udma_schedule, udma_peer_options))
-    if qp_plans:
-        key += repr(("qp_plans", qp_plans))
     state, uid = native.get_shmem_bootstrap(key)
     peers = _bootstrap_all_gather(group, comm, size, (options, state, uid))
     if any(peer[0] != options for peer in peers):

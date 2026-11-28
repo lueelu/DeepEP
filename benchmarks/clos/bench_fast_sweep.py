@@ -20,25 +20,8 @@ import zlib
 ORDERS = ("rank",)
 COMBINE_SELF_COPY_ENV = "DEEPEP_CLOS_COMBINE_PARALLEL_SELF_COPY"
 COMBINE_AFTER_SUBMIT_ENV = "DEEPEP_CLOS_COMBINE_SELF_COPY_AFTER_SUBMIT"
-QP_PLANS_ENV = "DEEPEP_CLOS_QP_PLANS"
 SELF_COPY_MODES = ("default", "parallel_self_copy", "self_copy_after_submit")
 SHAPES = ((8192, 2816, 8, 32), (16384, 7168, 6, 64))
-
-
-def qp_plan_spec(plans):
-    """Reserve every measured/preparation schedule once; visit does not select QPs."""
-    if any(c["order"] != "rank" for plan in plans for configs in plan["operations"].values() for c in configs):
-        raise ValueError("only rank sweep candidates are supported")
-    return ";".join(
-        sorted(
-            {
-                f"{c['order']}:{c['peers']}:{c['workers']}:{c['qps']}"
-                for plan in plans
-                for configs in plan["operations"].values()
-                for c in configs
-            }
-        )
-    )
 
 
 def candidates(ep, aiv, group_size, visits=(4, 8, 16, 32, 64, 128)):
@@ -501,7 +484,7 @@ def main():
         dict.fromkeys(c["self_copy_mode"] for p in plans for c in p["operations"]["combine_unweighted"])
     )
     if args.plan_only:
-        print(json.dumps(dict(ep=args.ep_size, plans=plans, qp_plans=qp_plan_spec(plans)), indent=2))
+        print(json.dumps(dict(ep=args.ep_size, plans=plans, qp_reservation="tuning_union"), indent=2))
         return
     import torch
     import torch_npu
@@ -537,9 +520,7 @@ def main():
             and name not in ("DEEPEP_CLOS_TUNING_SESSION", COMBINE_SELF_COPY_ENV, COMBINE_AFTER_SUBMIT_ENV)
         ):
             raise RuntimeError(f"conflicting experimental environment: {name}")
-    # Candidate filtering/replay is complete. Build only this session's symmetric
-    # QP union, rather than the union of every possible Clos schedule.
-    os.environ[QP_PLANS_ENV] = qp_plan_spec(plans)
+    # Tuning-session initialization reserves all supported rank candidates.
     group.agree(plans)
     import importlib.util
 
@@ -568,7 +549,7 @@ def main():
             experts=args.experts,
             seed=args.seed,
             plans=plans,
-            qp_plans=qp_plan_spec(plans),
+            qp_reservation="tuning_union",
             workspace_bytes=workspace,
             huge_pages=args.huge_pages,
             flush_l2=args.flush_l2_cache,

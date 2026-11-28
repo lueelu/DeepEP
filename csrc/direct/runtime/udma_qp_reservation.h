@@ -36,8 +36,7 @@ public:
                 const char* last = item.data() + (next == std::string::npos ? item.size() : next);
                 const auto parsed = std::from_chars(first, last, values[i]);
                 if (parsed.ec != std::errc{} || parsed.ptr != last || (i < 2) != (next != std::string::npos))
-                    throw std::invalid_argument(
-                        "DEEPEP_CLOS_QP_PLANS expects rank:P:W:Q entries separated by semicolons");
+                    throw std::invalid_argument("QP reservation expects rank:P:W:Q entries separated by semicolons");
                 offset = next == std::string::npos ? item.size() : next + 1;
             }
             const auto p = values[0], w = values[1], q = values[2];

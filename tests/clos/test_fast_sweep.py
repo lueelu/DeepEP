@@ -45,8 +45,6 @@ def test_rank_candidates_and_auto_baseline():
     for cores, peers in ((8, 32), (32, 16)):
         ep256 = sweep.candidates(256, cores, 16)
         assert ep256[0]["peers"] == peers and ep256[0]["workers"] == ep256[0]["qps"] == 1
-    with pytest.raises(ValueError, match="only rank"):
-        sweep.qp_plan_spec([{"operations": {"dispatch": [dict(ep128[0], order="group")]}}])
     for cores in (2, 4, 6):
         with pytest.raises(ValueError, match="communication cores"):
             sweep.candidates(64, cores, 16)
@@ -124,7 +122,7 @@ def test_extended_visit_scan_keeps_qp_reservation_fixed(monkeypatch, capsys):
     )
     sweep.main()
     plan = json.loads(capsys.readouterr().out)
-    assert plan["qp_plans"] == "rank:8:1:1"
+    assert plan["qp_reservation"] == "tuning_union"
     assert {c["visit"] for c in plan["plans"][0]["configs"]} == {32, 64, 128}
     for bad in (0, 33, 96, 129, 256):
         with pytest.raises(SystemExit):
@@ -340,7 +338,6 @@ def test_full_runner_reuses_one_buffer_across_aiv_and_modes(tmp_path, monkeypatc
         sweep.COMBINE_SELF_COPY_ENV: "0",
         sweep.COMBINE_AFTER_SUBMIT_ENV: "0",
         "DEEPEP_CLOS_TUNING_SESSION": "0",
-        sweep.QP_PLANS_ENV: "",
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -499,14 +496,6 @@ int main() {
             pytest.skip("compiled, but Windows application control blocked execution (4551)")
         raise
     assert "QP_UNION_OK" in result.stdout
-
-
-def test_qp_reservation_uses_all_operations_but_not_visit_or_copy_mode():
-    a = dict(order="rank", peers=8, workers=1, qps=1, visit=8)
-    b = dict(a, visit=32, self_copy_mode="parallel_self_copy")
-    c = dict(a, peers=16, qps=2)
-    plans = [dict(operations={"cached_dispatch": [a, b], "combine_weighted": [c]})]
-    assert sweep.qp_plan_spec(plans) == "rank:16:1:2;rank:8:1:1"
 
 
 def test_exact_qp_reservation_matches_worker_assignment(tmp_path):

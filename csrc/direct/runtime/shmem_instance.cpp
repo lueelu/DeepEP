@@ -192,13 +192,11 @@ ShmemInstance::ShmemInstance(int64_t rank, int64_t world_size, std::string ip_po
     tuning_session_ = tuning && std::strcmp(tuning, "1") == 0;
     if (tuning_session_ && (!shared_jetty_ || token_schedule_ || ranks_per_group_ == 0))
         throw std::invalid_argument("tuning session requires shared-Jetty peer scheduling and a fixed group size");
-    const char* qp_plans = std::getenv("DEEPEP_CLOS_QP_PLANS");
-    qp_plan_spec_ = qp_plans ? qp_plans : "";
-    // Python derives this set from the same selector used at launch. Explicit
-    // reservations take precedence; tuning sessions retain their broad union.
+    // Python derives automatic reservations from the launch selector.
+    // Tuning sessions retain the union needed for all supported candidates.
     if (!auto_qp_plans.empty() && !auto_resources_)
         throw std::invalid_argument("automatic QP plans require automatic launch resources");
-    if (qp_plan_spec_.empty() && auto_resources_ && !tuning_session_) qp_plan_spec_ = auto_qp_plans;
+    if (auto_resources_ && !tuning_session_) qp_plan_spec_ = auto_qp_plans;
     if (!qp_plan_spec_.empty()) {
         if (!(data_op_engine_type_ & ACLSHMEM_DATA_OP_UDMA) || !shared_jetty_ || token_schedule_)
             throw std::invalid_argument("QP reservations require shared-Jetty UDMA peer scheduling");
