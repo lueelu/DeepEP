@@ -631,3 +631,13 @@ int main() {
         raise
     assert "QP_RESERVATION_OK" in result.stdout
     print(result.stdout)
+
+
+def test_aggregation_is_max_per_sample_not_max_rank_mean():
+    from rank_sweep import slowest, stats
+
+    result = slowest([{"notify": [10, 100], "comm": [1, 9]}, {"notify": [100, 10], "comm": [9, 1]}])
+    assert stats(result["notify"])["mean"] == 100
+    assert stats(result["comm"])["p95"] == 9
+    with pytest.raises(ValueError):
+        slowest([{"comm": [1]}, {"comm": [1, 2]}])

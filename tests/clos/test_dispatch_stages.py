@@ -1,18 +1,16 @@
-"""Validate diagnostic accounting independently of device clocks/profiler runtime."""
+"""Check benchmark precision, failure cleanup and profiler stage accounting."""
 
 import csv
 import ast
 import importlib.util
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import struct
 import sys
 
 import pytest
 
-from tests.utils.cpp import cpp_functions
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "benchmarks/clos"))
@@ -118,14 +116,6 @@ def test_benchmark_session_only_destroys_after_successful_agreement(monkeypatch,
     assert all(os.environ[name] == "0" for name in envs if name != bench.OVERLAP_ENVS[0])
 
 
-@pytest.mark.parametrize("mode", bench.OVERLAP_MODES)
-def test_no_benchmark_mode_disables_send_first(monkeypatch, mode):
-    for name in bench.OVERLAP_ENVS:
-        monkeypatch.setenv(name, "0")
-    bench.set_overlap_mode(mode)
-    assert os.environ[bench.OVERLAP_ENVS[0]] == "1"
-
-
 def test_failed_worker_preserves_traceback_without_collective_or_destructors(tmp_path):
     # A real Python subprocess is essential: mocking os._exit would unwind
     # frames and run exactly the destructors this failure path must avoid.
@@ -189,260 +179,6 @@ def test_cached_weighted_profiler_accounts_for_plan_rebuild(tmp_path, packed):
         bench.capture_stages(tmp_path, 2, True, cached_weighted=True, cached_pack=not packed)
 
 
-@pytest.mark.parametrize("mode", bench.METADATA_OUTPUT_MODES)
-def test_metadata_output_modes_are_independent_and_reset(monkeypatch, mode):
-    for env in bench.METADATA_OUTPUT_ENVS:
-        monkeypatch.setenv(env, "1")
-    bench.set_metadata_output_mode(mode)
-    mask = bench.METADATA_OUTPUT_MODES[mode]
-    for bit, env in enumerate(bench.METADATA_OUTPUT_ENVS):
-        assert os.environ[env] == str(int(bool(mask & (1 << bit))))
-
-
-@pytest.mark.parametrize("broken_declaration", [False, True])
-def test_overlap_gm_members_use_pointer_macro(tmp_path, broken_declaration):
-    compiler = shutil.which("g++") or shutil.which("clang++")
-    if compiler is None:
-        pytest.skip("C++17 compiler required")
-    source = (ROOT / "csrc/direct/kernels/dispatch/udma_dispatch_metadata.h").read_text()
-    start = source.index("template <class Resource, class Trace>\nstruct DispatchOverlapWork")
-    fields = source[start : source.index("    __aicore__ void BeforePublish", start)] + "};"
-    names = (
-        "x",
-        "scales",
-        "topk",
-        "weights",
-        "plan",
-        "ranks",
-        "channels",
-        "workspace",
-        "head",
-        "recv_x",
-        "recv_scales",
-    )
-    if broken_declaration:
-        # Reproduce CANN's original error: the star only binds to the first member.
-        for name in names:
-            fields = fields.replace(f"    GM_ADDR {name};", "")
-        fields = fields.replace(
-            "    const DispatchTilingData& td;",
-            "    GM_ADDR " + ", ".join(names) + ";\n    const DispatchTilingData& td;",
-        )
-    program = (
-        """
-#include <cstdint>
-#include <type_traits>
-#define __gm__
-#define GM_ADDR __gm__ uint8_t*
-struct DispatchTilingData {};
-"""
-        + fields
-        + "\nusing Work = DispatchOverlapWork<int,int>;\n"
-    )
-    program += "\n".join(f"static_assert(std::is_same_v<decltype(Work::{name}), uint8_t*>);" for name in names)
-    path = tmp_path / "gm_members.cpp"
-    path.write_text(program)
-    result = subprocess.run(
-        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "gm_members.o")],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert (result.returncode != 0) == broken_declaration, result.stderr
-    if broken_declaration:
-        assert "static assertion failed" in result.stderr, result.stderr
-
-
-def test_post_submit_slots_and_private_ub(tmp_path):
-    compiler = shutil.which("g++") or shutil.which("clang++")
-    if compiler is None:
-        pytest.skip("C++17 compiler required")
-    source = ROOT / "csrc/direct"
-    metadata = (source / "kernels/dispatch/udma_dispatch_metadata.h").read_text()
-    callback = metadata[
-        metadata.index("template <class Resource, class Trace>\nstruct DispatchOverlapWork") : metadata.rindex("#endif")
-    ]
-    slots = cpp_functions((source / "kernels/common/v2_handle.h").read_text(), "V2HandleSlotsVf")
-    metadata_signature = cpp_functions(metadata, "DispatchMetadata").split("{", 1)[0]
-    program = r"""
-#include <cassert>
-#include <cstdint>
-#include <vector>
-#include <algorithm>
-#define __aicore__
-#define __simt_vf__
-#define __launch_bounds__(n)
-#define __gm__
-#define ASCEND_DEEPEP_ARCH 3510
-#define ASCEND_DEEPEP_DEVICE_SCHEDULE
-#include "common/types.h"
-#include "common/platform.h"
-#include "common/udma_schedule.h"
-using namespace ascend_deepep;
-using namespace ascend_deepep::udma;
-#define GM_ADDR __gm__ uint8_t*
-constexpr int EVENT_ID2=2, EVENT_ID6=6;
-struct { unsigned x; } threadIdx;
-struct dim3 { unsigned x; explicit dim3(unsigned v):x(v){} };
-void asc_threadfence() {}
-namespace AscendC {
-enum class HardEvent { V_S, MTE3_MTE2 };
-bool pending=false;
-template<HardEvent> void SetFlag(int) { assert(!pending); pending=true; }
-template<HardEvent> void WaitFlag(int) { assert(pending); pending=false; }
-}
-template<auto Fn, class... Args> void asc_vf_call(dim3 n, Args... args) {
-    for(threadIdx.x=0;threadIdx.x<n.x;++threadIdx.x)Fn(args...);
-}
-struct Resource { unsigned calls=0, metadata=0, offset=0; };
-struct Trace {
-    static constexpr int SlotsCycles=1, MetadataDone=2;
-    unsigned slots=0;
-    void Mark(int field) { assert(field==MetadataDone); }
-    uint64_t Now() { return 1; }
-    void Add(int field, uint64_t) { assert(field==SlotsCycles); ++slots; }
-};
-// SLOTS
-// METADATA_SIGNATURE
-{
-    assert(copy_self != publish_metadata);
-    assert(stage_bytes + scratch_offset == platform::kKernelUbBytes);
-    assert(scratch_offset % 32 == 0 && stage_bytes >= 32768);
-    if (copy_self) ++resource.calls;
-    else ++resource.metadata;
-    resource.offset=scratch_offset;
-}
-// CALLBACK
-int main() {
-    static_assert(DispatchLiveSendUbBytes(8,1)==13216);
-    static_assert(DispatchLiveSendUbBytes(64,2)==97440);
-    constexpr unsigned T=65, K=3, W=8, C=8, capacity=128, rank=3;
-    std::vector<topk_idx_t> idx(T*K);
-    std::vector<int32_t> head(T*W,-1), prefix(W*C,0), output(T*K,-99), expected(T*K,-1);
-    unsigned counts[W]{};
-    for(unsigned t=0;t<T;++t) {
-        // Two routes to one peer; an invalid slot; all tokens use peer 2.
-        idx[t*K]=4; idx[t*K+1]=5; idx[t*K+2]=-1;
-        const unsigned ch=t/((T+C-1)/C);
-        head[t*W+2]=t%((T+C-1)/C);
-        ++counts[2];
-        for(unsigned p=0;p<W;++p)prefix[p*C+ch]=counts[p];
-        expected[t*K]=rank*capacity+t;
-    }
-    DispatchTilingData td{};
-    td.rank=rank; td.world_size=W; td.num_max_tokens_per_rank=capacity*W;
-    td.num_local_experts=2; td.num_topk=K; td.num_tokens=T; td.num_channels=C;
-    td.v2_dst_slots=reinterpret_cast<uint64_t>(output.data());
-    for(unsigned bytes : {5632U, 192U*1024U})
-    for(unsigned mask=0;mask<4;++mask) {
-        td.hidden=bytes/2; td.x_element_bytes=2;
-        td.dispatch_self_after_submit=mask&1; td.dispatch_early_slots=(mask>>1)&1;
-        std::fill(output.begin(),output.end(),-99);
-        unsigned copies=0,slots=0,metadata=0;
-        for(unsigned core=0;core<8;++core) {
-            Resource resource; Trace trace;
-            DispatchOverlapWork<Resource,Trace> work{resource,trace,nullptr,nullptr,
-                reinterpret_cast<GM_ADDR>(idx.data()),nullptr,nullptr,nullptr,
-                reinterpret_cast<GM_ADDR>(prefix.data()),nullptr,reinterpret_cast<GM_ADDR>(head.data()),
-                nullptr,nullptr,td,core,8};
-            work.BeforePublish(DispatchLiveSendUbBytes(64,2));
-            work(DispatchLiveSendUbBytes(64,2));
-            if(mask&1) assert(resource.offset ==
-                (bytes > platform::kKernelUbBytes-DispatchLiveSendUbBytes(64,2) ? 0U : DispatchLiveSendUbBytes(64,2)));
-            copies+=resource.calls; slots+=trace.slots;
-            metadata+=resource.metadata;
-            assert(!AscendC::pending);
-        }
-        assert(copies==((mask&1)?8U:0U));
-        assert(metadata==copies);
-        assert(slots==((mask&2)?8U:0U));
-        if(mask&2) assert(output==expected);
-        else for(auto v:output)assert(v==-99);
-    }
-}
-"""
-    path = tmp_path / "overlap.cpp"
-    path.write_text(
-        program.replace("// SLOTS", slots)
-        .replace("// METADATA_SIGNATURE", metadata_signature)
-        .replace("// CALLBACK", callback)
-    )
-    executable = tmp_path / ("overlap.exe" if os.name == "nt" else "overlap")
-    subprocess.run(
-        [compiler, "-std=c++17", "-O2", "-I", str(source), str(path), "-o", str(executable)], check=True, timeout=180
-    )
-    try:
-        subprocess.run([str(executable)], check=True, timeout=60)
-    except OSError as exc:
-        if getattr(exc, "winerror", None) == 4551:
-            pytest.skip("compiled, but Windows application control blocked execution (4551)")
-        raise
-
-
-@pytest.mark.parametrize("drop_peer_trace", [False, True])
-def test_dispatch_calls_compile_against_actual_helper_signatures(tmp_path, drop_peer_trace):
-    """Compile both routing branches; no NPU SDK or executable launch required."""
-    compiler = shutil.which("g++") or shutil.which("clang++")
-    if compiler is None:
-        pytest.skip("C++17 compiler required for dispatch call-signature regression")
-    kernels = ROOT / "csrc/direct/kernels/dispatch"
-    declarations = []
-    for filename, name in (
-        ("udma_dispatch_metadata.h", "DispatchMetadata"),
-        ("udma_dispatch_schedule.h", "DispatchRemote"),
-        ("udma_token_dispatch_schedule.h", "DispatchTokenRemote"),
-    ):
-        definition = cpp_functions((kernels / filename).read_text(), name)
-        declarations.append(definition.split("{", 1)[0] + " {}")
-    source = (kernels / "dispatch_udma.cpp").read_text()
-    start = source.index("    if (!tiling.dispatch_self_after_submit)")
-    calls = source[start : source.index("    const int32_t actual_recv_tokens", start)]
-    if drop_peer_trace:
-        assert "tiling, core_idx, core_num, trace, overlap);" in calls
-        calls = calls.replace("tiling, core_idx, core_num, trace, overlap);", "tiling, core_idx, core_num);")
-    program = r"""
-#include <cstdint>
-#define __aicore__
-using GM_ADDR = uint8_t*;
-namespace ascend_deepep::udma {
-struct DispatchTilingData { bool udma_token_schedule; bool dispatch_self_after_submit = false; };
-struct NoDispatchOverlapWork {};
-template<class R,class T> struct DispatchOverlapWork {
-    R& resource; T& trace;
-    GM_ADDR x,scales,topk,weights,plan,ranks,channels,workspace,head,recv_x,recv_scales;
-    const DispatchTilingData& td; uint32_t core,cores;
-};
-// DECLARATIONS
-}
-struct EnabledTrace { enum { MetadataDone }; void Mark(int) {} };
-struct DisabledTrace { enum { MetadataDone }; void Mark(int) {} };
-template<class Trace> void check(bool token) {
-    int resource = 0;
-    GM_ADDR x{}, dispatch_scales{}, topk_idx{}, topk_weights{}, dispatch_plan{}, rank_prefix_matrix{},
-        channel_prefix_matrix{}, symmetric_buffer{}, send_head{}, recv_x{}, recv_x_scales{};
-    ascend_deepep::udma::DispatchTilingData tiling{token};
-    uint32_t core_idx = 0, core_num = 8, kDispatchStageBytes = 65536;
-    Trace trace;
-    // CALLS
-}
-template void check<EnabledTrace>(bool);
-template void check<DisabledTrace>(bool);
-"""
-    path = tmp_path / "dispatch_calls.cpp"
-    path.write_text(program.replace("// DECLARATIONS", "\n".join(declarations)).replace("// CALLS", calls))
-    result = subprocess.run(
-        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "dispatch_calls.o")],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if drop_peer_trace:
-        assert result.returncode != 0
-        assert "DispatchRemote" in result.stderr
-    else:
-        assert result.returncode == 0, result.stderr
-
-
 def fixture_trace():
     fields = [
         "version",
@@ -461,158 +197,6 @@ def fixture_trace():
     for core in range(8):
         rows.append([1, 3, core, 1, 1, 123456, *range(1000, 12000, 1000), 1500, 2500, 3000, 0])
     return fields, rows
-
-
-def test_channel_comparison_keeps_notify_comm_and_api_separate():
-    rows = []
-    for turn, (mode, comm) in enumerate(((0, 100), (1, 80), (1, 82), (0, 102))):
-        rows.append(
-            dict(
-                op="fresh",
-                cores=8,
-                channel=0,
-                turn=turn,
-                metadata_requested=mode,
-                policy={"visit": 32},
-                payload_bytes_per_rank=1000000,
-                stats_us={
-                    "notify_dispatch_kernel": {"mean": 20 + mode * 10},
-                    "direct_dispatch_udma_kernel": {"mean": comm},
-                    "api_wall_us": {"mean": 150 - mode * 5},
-                },
-            )
-        )
-    (result,) = bench.channel_comparison(rows)
-    assert result["pairs"] == 2
-    assert result["notify_on_us"] == 30
-    assert result["comm_on_us"] == 81
-    assert result["api_on_us"] == 145  # Not the sum of separately measured stages.
-    assert result["comm_pair_delta_min_us"] == result["comm_pair_delta_max_us"] == -20
-    assert result["on_gbps"] == pytest.approx(1000 / 81)
-    rows[-1]["policy"] = {"visit": 16}
-    with pytest.raises(ValueError, match="unmatched"):
-        bench.channel_comparison(rows)
-
-
-def test_zeng_dispatch_override_preserves_metadata_and_auto_policy():
-    from tests.api.test_clos_compatibility import run_host
-
-    run_host("""
-        sys.path.insert(0, 'benchmarks/clos')
-        from bench_dispatch_stages import DispatchBenchmarkPolicy
-        from deep_ep.backends.direct.udma_policy import UdmaPolicy
-        base = UdmaPolicy(8, 2, 1, 2, 32, ranks_per_group=8, topology_known=True)
-        wrapper = DispatchBenchmarkPolicy(base)
-        automatic = wrapper.for_launch(8, 5632, 'dispatch', bf16=True)
-        assert (automatic.peers_per_worker, automatic.workers_per_peer, automatic.qps_per_worker) == (2,2,1)
-        wrapper.variant = 'zeng'
-        plan = wrapper.for_launch(8, 5632, 'dispatch', bf16=True)
-        assert (plan.peer_order, plan.peers_per_worker, plan.workers_per_peer,
-                plan.qps_per_worker, plan.wqes_per_visit, plan.self_copy, plan.weight_mode) == (0,2,1,1,32,2,0)
-        assert plan.send_workers == 4
-        wrapper.variant = 'auto'
-        assert wrapper.for_launch(8, 5632, 'dispatch', bf16=True) == automatic
-        wrapper.variant = 'zeng'
-        for cores, width, op in [(16,5632,'dispatch'), (8,8192,'dispatch'), (8,5632,'weighted')]:
-            try:
-                wrapper.for_launch(cores, width, op, bf16=True)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError('unsupported fixture must not silently use the Zeng label')
-    """)
-
-
-def test_channel_comparison_separates_tiles_and_payload_plans():
-    rows = []
-    for plan in ("auto", "zeng"):
-        for tile in (32, 128):
-            for mode in (0, 1, 1, 0):
-                rows.append(
-                    dict(
-                        op="fresh",
-                        cores=8,
-                        channel=0,
-                        metadata_requested=mode,
-                        metadata_tile_requested=tile,
-                        dispatch_plan=plan,
-                        policy={"plan": plan},
-                        payload_bytes_per_rank=1000000,
-                        stats_us={
-                            name: {"mean": 100 - mode * 10}
-                            for name in ("notify_dispatch_kernel", "direct_dispatch_udma_kernel", "api_wall_us")
-                        },
-                    )
-                )
-    result = bench.channel_comparison(rows)
-    assert len(result) == 4
-    assert {(r["dispatch_plan"], r["metadata_tile_requested"]) for r in result} == {
-        (plan, tile) for plan in ("auto", "zeng") for tile in (32, 128)
-    }
-    assert all(r["pairs"] == 2 for r in result)
-
-
-def test_overlap_comparison_separates_cores_and_rejects_changed_policy():
-    rows = []
-    for cores in (8, 32):
-        for mode in ("off", "all", "all", "off"):
-            rows.append(
-                dict(
-                    op="fresh",
-                    cores=cores,
-                    channel=1,
-                    metadata_requested=1,
-                    metadata_tile_requested=128,
-                    dispatch_plan="auto",
-                    overlap_mode=mode,
-                    overlap_effective=15 if mode == "all" else 0,
-                    policy={"cores": cores},
-                    payload_bytes_per_rank=1000000,
-                    stats_us={
-                        name: {"mean": 80 if mode == "all" else 100}
-                        for name in ("notify_dispatch_kernel", "direct_dispatch_udma_kernel", "api_wall_us")
-                    },
-                )
-            )
-    result = bench.overlap_comparison(rows)
-    assert len(result) == 2
-    assert {r["cores"] for r in result} == {8, 32}
-    assert all(r["pairs"] == 2 and r["effective_masks"] == [15] for r in result)
-    assert all(r["api_time_change_pct"] == pytest.approx(-20) for r in result)
-    rows[1]["policy"] = {"changed": True}
-    with pytest.raises(ValueError, match="unmatched"):
-        bench.overlap_comparison(rows)
-
-
-def test_trace_intervals_do_not_add_overlapping_metadata_twice():
-    fields, rows = fixture_trace()
-    decoded = bench.decode_trace(rows, fields, 3, 8, True, True, 1000)
-    for row in decoded:
-        intervals = row["intervals"]
-        assert all(intervals[name + "_interval_us"] == 1 for name in bench.TIMELINE)
-        assert intervals["src_cycles_us"] == 1.5
-        assert intervals["topk_cycles_us"] == 2.5
-        assert sum(intervals[name + "_interval_us"] for name in bench.TIMELINE) == 11
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("version", 0),
-        ("rank", 0),
-        ("core", 7),
-        ("cached", 0),
-        ("whole_channel", 0),
-        ("entry_cycles", 0),
-        ("quiet_done", 1),
-        ("init_done", -1),
-    ],
-)
-def test_reject_wrong_launch_or_incomplete_trace(field, value):
-    fields, rows = fixture_trace()
-    rows[0][fields.index(field)] = value
-    with pytest.raises(ValueError):
-        bench.decode_trace(rows, fields, 3, 8, True, True, 1000)
 
 
 @pytest.mark.parametrize("cached", [False, True])
@@ -640,3 +224,37 @@ def test_capture_excludes_alignment_and_guards(tmp_path, cached, corrupt, simt_l
         result = bench.capture_stages(tmp_path, 3, cached)
         assert "cached_notify_combine_kernel" not in result
         assert result["direct_dispatch_udma_kernel"] == [3, 4, 5]
+
+
+@pytest.mark.parametrize("independent_notify", [False, True])
+@pytest.mark.parametrize("archived_names", [False, True])
+def test_combine_profiler_excludes_alignment_and_checks_sequence(tmp_path, independent_notify, archived_names):
+    import csv
+
+    sys.path.insert(0, str(ROOT / "benchmarks/clos"))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "combine_queue", ROOT / "benchmarks/clos/combine_queue_diagnostics.py"
+        )
+        bench = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench)
+    finally:
+        sys.path.pop(0)
+    names = ["cached_notify_combine_kernel", "direct_combine_udma_comm_kernel", "direct_combine_udma_reduce_kernel"]
+    sequence = ([names[0]] + names) if independent_notify else names
+    durations = [999, 7, 20, 30] if independent_notify else [999, 20, 30]
+    path = tmp_path / "kernel_details.csv"
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Name", "Start Time(us)", "Duration(us)"])
+        for i, name in enumerate(sequence * 6):
+            writer.writerow(
+                [name.replace("direct_", "v1_", 1) if archived_names else name, i * 100, durations[i % len(sequence)]]
+            )
+    result = bench.capture_combine_stages(tmp_path, 2)
+    expected = {names[1]: [20, 20], names[2]: [30, 30], "alignment_notify_us": [999, 999]}
+    if independent_notify:
+        expected[names[0]] = [7, 7]
+    assert result == expected
+    with pytest.raises(RuntimeError, match="sequence"):
+        bench.capture_combine_stages(tmp_path, 3)

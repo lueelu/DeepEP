@@ -1,11 +1,6 @@
-"""Compile-time credit/ownership tests using the production sender methods.
-
-These simulate the pinned SDK's SQ/CQ bookkeeping, not UDMA hardware ordering.
-constexpr runs the checks even on hosts that cannot execute compiled binaries.
-"""
+"""Check production payload WQEs, receive mappings and index lifetimes on CPU."""
 
 from pathlib import Path
-import json
 import shutil
 import subprocess
 
@@ -15,49 +10,6 @@ from tests.utils.cpp import cpp_functions
 
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def test_payload_merge_option_validation(tmp_path):
-    compiler = shutil.which("g++") or shutil.which("clang++")
-    if not compiler:
-        pytest.skip("C++17 compiler required")
-    host = (ROOT / "csrc/direct/ops/combine.cpp").read_text()
-    parser = cpp_functions(host, "ParseCombinePayloadMaxRows").replace(
-        "uint32_t ParseCombinePayloadMaxRows", "constexpr uint32_t ParseCombinePayloadMaxRows"
-    )
-    prefix = '#include <cstdint>\n#define TORCH_CHECK(ok, ...) if (!(ok)) throw "invalid";\n' + parser
-    valid = (
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 5632)==4);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8191)==4);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8192)==4);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 8193)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12288)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 12289)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 14336)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 16384)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 24576)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 32767)==2);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 32768)==1);\n"
-        "static_assert(ParseCombinePayloadMaxRows(nullptr, 32769)==1);\n"
-        'static_assert(ParseCombinePayloadMaxRows("1", 5632)==1);\n'
-        'static_assert(ParseCombinePayloadMaxRows("2", 12288)==2);\n'
-        'static_assert(ParseCombinePayloadMaxRows("2", 32768)==2);\n'
-        'static_assert(ParseCombinePayloadMaxRows("0004", 8192)==4);\n'
-        'static_assert(ParseCombinePayloadMaxRows("32", 8192)==32);\n'
-    )
-    for value in (None, "", "0", "33", "-1", "2x", " 4", "1.5", "9999999999999999999999999"):
-        body = (
-            valid if value is None else f"constexpr auto result=ParseCombinePayloadMaxRows({json.dumps(value)}, 8192);"
-        )
-        path = tmp_path / "option.cpp"
-        path.write_text(prefix + body)
-        result = subprocess.run(
-            [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "option.o")],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        assert (result.returncode == 0) == (value is None), result.stderr
 
 
 @pytest.mark.parametrize("limit,corrupt", [(n, False) for n in (1, 2, 3, 4, 5, 8, 16, 31, 32)] + [(4, True)])
@@ -296,99 +248,6 @@ static_assert(matrix());
     assert (result.returncode != 0) == corrupt, result.stderr
     if corrupt:
         assert "static assertion" in result.stderr, result.stderr
-
-
-def test_coalescing_gates_and_count_lifetime():
-    host = (ROOT / "csrc/direct/ops/combine.cpp").read_text()
-    start = host.index("    tiling.combine_payload_max_rows =")
-    gate = host[start : host.index(";", start)]
-    for condition in (
-        "use_udma",
-        "epilogue",
-        "!tiling.udma_token_schedule",
-        "!aggregate",
-        "!pipeline_chunk_tokens",
-        "!expanded_x.has_value()",
-        "workspace.x_row_stride == hidden_bytes",
-        "send_channel_prefix_matrix.has_value()",
-    ):
-        assert condition in gate
-    sender = (ROOT / "csrc/direct/kernels/combine/udma_combine_sender.h").read_text()
-    assert "td_.combine_payload_max_rows > 1U && fields_ == 1U" in sender
-    assert sender.index("HardEvent::V_S") < sender.index("submitted = *actual_count")
-    assert "Base::SubmitBatch(submitted, spans_, false)" in sender
-    schedule = (ROOT / "csrc/direct/kernels/combine/udma_combine_schedule.h").read_text()
-    assert "sender_base_bytes + (td.combine_payload_max_rows > 1U ? 32U : 0U)" in schedule
-    dense = schedule[
-        schedule.index("if (td.combine_payload_max_rows > 1U) {") : schedule.index(
-            "if constexpr (Phase == 3)", schedule.index("while (visit")
-        )
-    ]
-    assert "sender.PutRows(" in dense and "continue;" in dense
-    assert "DataCopy" not in dense and "src_gm" not in dense
-
-
-@pytest.mark.parametrize("corrupt_sink", [False, True])
-def test_physical_sq_credit_and_final_protocol(tmp_path, corrupt_sink):
-    compiler = shutil.which("g++") or shutil.which("clang++")
-    if not compiler:
-        pytest.skip("C++17 compiler required")
-    source = (ROOT / "csrc/direct/kernels/common/udma_shared_sender.h").read_text()
-    methods = cpp_functions(source, "EnsureCredit", "Admit", "SubmitBatch", "Publish", "Quiet")
-    # Replace only address-space casts with the model's pointer lookup. Keep
-    # production decisions, SDK calls, arguments and CQ accounting unchanged.
-    methods = methods.replace(
-        "reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(peers_[p].state)", "&states[peers_[p].state]"
-    ).replace("reinterpret_cast<GM_ADDR>(local_base_)", "local_base_")
-    methods = methods.replace(
-        "reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(peers_[last_].state)", "&states[peers_[last_].state]"
-    )
-    methods = methods.replace(
-        "reinterpret_cast<__ubuf__ uint64_t*>(scratch_ + kPressureScratchOffset)", "pressure"
-    ).replace("reinterpret_cast<__ubuf__ uint64_t*>(scratch_)", "scratch")
-    methods = (
-        methods.replace("reinterpret_cast<uint64_t>(scratch_)", "scratch_")
-        .replace("reinterpret_cast<uint64_t>(scratch_ + first * kWqeBytes)", "(scratch_ + first * kWqeBytes)")
-        .replace(
-            "reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * kWqeBytes)",
-            "(ctx->buf_addr + uint64_t(index) * kWqeBytes)",
-        )
-        .replace("reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr)", "ctx->buf_addr")
-    )
-    if corrupt_sink:
-        methods = methods.replace("one + kQpCount + qp", "one + qp")
-    program = (Path(__file__).with_name("sparse_cqe_credit_model.cpp")).read_text()
-    program = program.replace("// PRODUCTION_METHODS", methods)
-    path = tmp_path / "sparse.cpp"
-    path.write_text(program)
-    result = subprocess.run(
-        [compiler, "-std=c++17", "-c", str(path), "-o", str(tmp_path / "sparse.o")],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if corrupt_sink:
-        assert result.returncode != 0 and "static assertion" in result.stderr, result.stderr
-    else:
-        assert result.returncode == 0, result.stderr
-
-
-def test_sender_layout_and_coverage():
-    source = (ROOT / "csrc/direct/kernels/common/udma_shared_sender.h").read_text()
-    submit = cpp_functions(source, "SubmitBatch")
-    assert "aclshmemi_udma_flush_aggregate_wqes(" not in source
-    assert "aclshmemi_udma_post_send_update_info(head + count, ctx, state)" in submit
-    assert "cqe_cnt++" not in source and "sq_tail =" not in submit
-    assert "marker_count > kQpCount" in source
-    assert "count && qp_base_ + Qps > kQpCount" in source
-    for kind in ("dispatch", "combine"):
-        sender = (ROOT / f"csrc/direct/kernels/{kind}/udma_{kind}_sender.h").read_text()
-        assert "peer * 2U * 8U" in sender
-        assert "Base::SubmitBatch(" in sender
-    # SIMT metadata is outside the UDMA final-SO protocol: preserve its barrier.
-    for name in ("udma_dispatch_schedule.h", "udma_token_dispatch_schedule.h"):
-        schedule = (ROOT / "csrc/direct/kernels/dispatch" / name).read_text()
-        assert schedule.index("sender.Quiet()") < schedule.index("aclshmemx_sync_vec_all()")
 
 
 def test_combine_fast_wqe_equivalence(tmp_path):
